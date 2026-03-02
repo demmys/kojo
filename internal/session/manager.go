@@ -2,30 +2,22 @@ package session
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/creack/pty/v2"
 	"github.com/google/uuid"
 )
 
 const (
 	// exitDrainTimeout is the maximum time to wait for readLoop to finish
-	// draining output after the session process exits. On some platforms
-	// (notably macOS), closing a FIFO fd opened with O_RDWR may not
-	// reliably interrupt a blocked read(), so we use a timeout to prevent
-	// finalizeTmuxSession from deadlocking and leaving the session stuck
-	// in "running" state forever.
+	// draining output after the session process exits.
 	exitDrainTimeout = 3 * time.Second
 
 	// exitKillTimeout is the maximum time to wait for the attach process
@@ -67,9 +59,9 @@ var userTools = map[string]bool{
 	"gemini": true,
 }
 
-var internalTools = map[string]bool{
-	"tmux": true,
-}
+// internalTools is populated by platform-specific init() functions.
+// Unix adds "tmux", Windows adds "shell".
+var internalTools = map[string]bool{}
 
 func isAllowedTool(name string) bool {
 	return userTools[name] || internalTools[name]
@@ -94,175 +86,8 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger:   logger,
 		store:    st,
 	}
-	loadOK := m.loadPersistedSessions()
-	// Only clean up orphaned tmux sessions when we successfully loaded
-	// persisted state. On load failure, "known" would be empty and we'd
-	// mistakenly kill all live kojo_ tmux sessions.
-	if loadOK {
-		m.cleanupOrphanedTmuxSessions()
-	}
+	m.platformInit()
 	return m
-}
-
-// loadPersistedSessions restores previously saved sessions.
-// For tmux-backed sessions with live tmux processes, it reattaches and resumes monitoring.
-// Returns true if the persisted state was loaded successfully (or was empty).
-func (m *Manager) loadPersistedSessions() bool {
-	infos, err := m.store.Load()
-	if err != nil {
-		m.logger.Error("failed to load persisted sessions, skipping orphan cleanup", "err", err)
-		return false
-	}
-	for _, info := range infos {
-		s := m.restoreSession(info)
-		m.sessions[info.ID] = s
-	}
-	if len(infos) > 0 {
-		m.logger.Info("restored persisted sessions", "count", len(infos))
-	}
-	return true
-}
-
-// restoreSession creates a Session from persisted info, reattaching to a live tmux session if possible.
-func (m *Manager) restoreSession(info SessionInfo) *Session {
-	t, _ := time.Parse(time.RFC3339, info.CreatedAt)
-	var lastOutput []byte
-	if info.LastOutput != "" {
-		lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
-	}
-	s := &Session{
-		ID:              info.ID,
-		Tool:            info.Tool,
-		WorkDir:         info.WorkDir,
-		Args:            info.Args,
-		CreatedAt:       t,
-		Status:          StatusExited,
-		ExitCode:        info.ExitCode,
-		YoloMode:        info.YoloMode,
-		Internal:        info.Internal || internalTools[info.Tool],
-		ToolSessionID:   info.ToolSessionID,
-		ParentID:        info.ParentID,
-		TmuxSessionName: info.TmuxSessionName,
-		lastCols:        info.LastCols,
-		lastRows:        info.LastRows,
-		scrollback:      NewRingBuffer(defaultRingSize),
-		subscribers:     make(map[chan []byte]struct{}),
-		done:            make(chan struct{}),
-		lastOutput:      lastOutput,
-	}
-
-	restored := false
-	if info.TmuxSessionName != "" && tmuxHasSession(info.TmuxSessionName) {
-		restored = m.tryReattachPersistedTmux(s, info)
-	}
-
-	if !restored {
-		close(s.done)
-	}
-	return s
-}
-
-// tryReattachPersistedTmux attempts to reattach to a persisted tmux session.
-// Returns true if the session was successfully reattached and is now running.
-func (m *Manager) tryReattachPersistedTmux(s *Session, info SessionInfo) bool {
-	dead, exitCode, err := tmuxPaneDead(info.TmuxSessionName)
-	if err != nil {
-		m.logger.Warn("failed to check tmux pane state, killing session", "id", info.ID, "tmux", info.TmuxSessionName, "err", err)
-		_ = tmuxKillSession(info.TmuxSessionName)
-		return false
-	}
-	if dead {
-		s.ExitCode = &exitCode
-		_ = tmuxKillSession(info.TmuxSessionName)
-		return false
-	}
-
-	// Pane is running → reattach
-	tmuxEnsureServerConfig()
-
-	rawPipe, rawPipePath, pipeErr := tmuxStartPipePane(info.TmuxSessionName)
-	if pipeErr != nil {
-		m.logger.Warn("pipe-pane setup failed on restore", "id", info.ID, "err", pipeErr)
-	}
-
-	cmd := tmuxAttachCommand(info.TmuxSessionName)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ws := defaultWinsize(info.LastCols, info.LastRows)
-	ptmx, err := pty.StartWithSize(cmd, &ws)
-	if err != nil {
-		tmuxCleanupPipePane(info.TmuxSessionName, rawPipe, rawPipePath)
-		m.logger.Error("failed to reattach persisted tmux session", "id", info.ID, "err", err)
-		_ = tmuxKillSession(info.TmuxSessionName)
-		return false
-	}
-
-	s.PTY = ptmx
-	s.Cmd = cmd
-	s.rawPipe = rawPipe
-	s.rawPipePath = rawPipePath
-	s.Status = StatusRunning
-	s.ExitCode = nil
-	s.lastOutput = nil
-	s.readDone = make(chan struct{})
-
-	// Capture current pane content so the terminal isn't blank
-	// after server restart. pipe-pane only captures new output;
-	// this seeds the scrollback with the existing screen state.
-	if rawPipe != nil {
-		if content := tmuxCapturePaneContent(info.TmuxSessionName); len(content) > 0 {
-			s.scrollback.Write(content)
-		}
-	}
-
-	go m.readLoop(s)
-	if rawPipe != nil {
-		go m.drainLoop(s)
-	}
-	go m.tmuxWaitLoop(s)
-
-	m.logger.Info("reattached to persisted tmux session", "id", info.ID, "tmux", info.TmuxSessionName)
-	return true
-}
-
-// cleanupOrphanedTmuxSessions kills kojo_ tmux sessions that are not tracked by the manager.
-func (m *Manager) cleanupOrphanedTmuxSessions() {
-	sessions, err := tmuxListKojoSessions()
-	if err != nil {
-		m.logger.Debug("failed to list tmux sessions for cleanup", "err", err)
-		return
-	}
-
-	m.mu.Lock()
-	known := make(map[string]bool)
-	for _, s := range m.sessions {
-		s.mu.Lock()
-		if s.TmuxSessionName != "" && s.Status == StatusRunning {
-			known[s.TmuxSessionName] = true
-		}
-		s.mu.Unlock()
-	}
-	m.mu.Unlock()
-
-	for _, name := range sessions {
-		if !known[name] {
-			m.logger.Info("killing orphaned tmux session", "name", name)
-			_ = tmuxKillSession(name)
-		}
-	}
-
-	// Clean up stale FIFO files from previous crashes
-	fifoDir := filepath.Join(os.TempDir(), "kojo")
-	entries, err := os.ReadDir(fifoDir)
-	if err == nil {
-		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".pipe") {
-				name := strings.TrimSuffix(e.Name(), ".pipe")
-				if !known[name] {
-					os.Remove(filepath.Join(fifoDir, e.Name()))
-				}
-			}
-		}
-	}
 }
 
 func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, parentID string) (*Session, error) {
@@ -270,9 +95,14 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
-	toolPath, err := exec.LookPath(tool)
-	if err != nil {
-		return nil, fmt.Errorf("tool not found: %s", tool)
+	// Internal tools (tmux/shell) are resolved by platform functions, not LookPath
+	var toolPath string
+	var err error
+	if userTools[tool] {
+		toolPath, err = exec.LookPath(tool)
+		if err != nil {
+			return nil, fmt.Errorf("tool not found: %s", tool)
+		}
 	}
 
 	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
@@ -307,46 +137,23 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 			runArgs = append(runArgs, "--session-id", toolSessionID)
 		}
 	}
-	if tool == "tmux" {
-		toolSessionID = "kojo_" + id
-		// Start a login shell so PATH matches the user's standard terminal
-		loginCmd := tmuxLoginShellCmd()
-		runArgs = []string{"new-session", "-A", "-s", toolSessionID, "-c", workDir, loginCmd}
+
+	// For internal tools, build platform-specific args
+	if !userTools[tool] {
+		runArgs, toolSessionID = platformBuildInternalToolArgs(id, tool, workDir, args)
 	}
 
 	// codex: session ID is captured from PTY output in readLoop
 	// gemini: no session ID mechanism; uses --resume latest on restart
 
-	var ptmx *os.File
-	var cmd *exec.Cmd
-	var tmuxName string
-
-	var rawPipe *os.File
-	var rawPipePath string
-
+	var res *startResult
 	if userTools[tool] {
-		// User tools: run inside a tmux session for crash resilience
-		tmuxName = tmuxSessionName(id)
-		res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, runArgs, 0, 0)
-		if err != nil {
-			return nil, err
-		}
-		ptmx, cmd, rawPipe, rawPipePath = res.ptmx, res.cmd, res.rawPipe, res.rawPipePath
+		res, err = m.platformStartUserTool(id, workDir, toolPath, runArgs, 0, 0)
 	} else {
-		// Internal tools (tmux): direct PTY as before
-		cmd = exec.Command(toolPath, runArgs...)
-		cmd.Dir = workDir
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		ptmx, err = pty.Start(cmd)
-		if err != nil {
-			return nil, fmt.Errorf("failed to start pty: %w", err)
-		}
-		if tool == "tmux" && toolSessionID != "" {
-			// Enable mouse mode so the web UI can send per-pane scroll events
-			tmuxEnableMouse(toolSessionID)
-			// Use login shell for new windows so PATH matches the user's terminal
-			tmuxSetLoginShell(toolSessionID)
-		}
+		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, runArgs, toolSessionID)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	s := &Session{
@@ -354,21 +161,22 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		Tool:            tool,
 		WorkDir:         workDir,
 		Args:            args,
-		PTY:             ptmx,
-		Cmd:             cmd,
+		PTY:             res.pty,
+		Cmd:             res.cmd,
 		CreatedAt:       time.Now(),
 		Status:          StatusRunning,
 		YoloMode:        yoloMode,
 		Internal:        internalTools[tool],
 		ToolSessionID:   toolSessionID,
 		ParentID:        parentID,
-		TmuxSessionName: tmuxName,
-		rawPipe:         rawPipe,
-		rawPipePath:     rawPipePath,
+		TmuxSessionName: res.tmuxName,
+		rawPipe:         res.rawPipe,
+		rawPipePath:     res.rawPipePath,
 		scrollback:      NewRingBuffer(defaultRingSize),
 		subscribers:     make(map[chan []byte]struct{}),
 		done:            make(chan struct{}),
 		readDone:        make(chan struct{}),
+		attachments:     make(map[string]*Attachment),
 	}
 
 	m.mu.Lock()
@@ -381,14 +189,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 				existing.mu.Unlock()
 				if status == StatusRunning {
 					m.mu.Unlock()
-					// Kill the PTY we just started and reap the process
-					_ = cmd.Process.Kill()
-					_ = cmd.Wait()
-					ptmx.Close()
-					tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
-					if tmuxName != "" {
-						_ = tmuxKillSession(tmuxName)
-					}
+					m.platformCleanupDuplicate(res)
 					return existing, nil
 				}
 			}
@@ -397,7 +198,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	m.sessions[id] = s
 	m.mu.Unlock()
 
-	m.startLoops(s)
+	m.platformStartLoops(s)
 
 	m.logger.Info("session created", "id", id, "tool", tool, "workDir", workDir)
 	m.save()
@@ -415,13 +216,11 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session is still running: %s", id)
 	}
-	// Set restarting flag to prevent concurrent restarts and Stop during restart
 	s.restarting = true
 	tool := s.Tool
 	workDir := s.WorkDir
 	args := s.Args
 	toolSessionID := s.ToolSessionID
-	tmuxName := s.TmuxSessionName
 	s.mu.Unlock()
 
 	clearRestarting := func() {
@@ -444,66 +243,44 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
-	toolPath, err := exec.LookPath(tool)
-	if err != nil {
-		clearRestarting()
-		return nil, fmt.Errorf("tool not found: %s", tool)
+	// Internal tools are resolved by platform functions, not LookPath
+	var toolPath string
+	if userTools[tool] {
+		var err error
+		toolPath, err = exec.LookPath(tool)
+		if err != nil {
+			clearRestarting()
+			return nil, fmt.Errorf("tool not found: %s", tool)
+		}
 	}
 
-	// Clean up old pipe-pane FIFO if it exists
-	s.mu.Lock()
-	s.cleanupPipePane()
-	s.mu.Unlock()
-
-	// Clean up old tmux session if it still exists
-	if tmuxName != "" && tmuxHasSession(tmuxName) {
-		_ = tmuxKillSession(tmuxName)
-	}
+	// Platform-specific cleanup of old session resources
+	m.platformPrepareRestart(s)
 
 	restartArgs := buildRestartArgs(tool, args, toolSessionID)
 
-	var ptmx *os.File
-	var cmd *exec.Cmd
-	var rawPipe *os.File
-	var rawPipePath string
-
+	var res *startResult
+	var err error
 	if userTools[tool] {
-		// User tools: run inside a tmux session
-		if tmuxName == "" {
-			tmuxName = tmuxSessionName(id)
-		}
 		s.mu.Lock()
 		cols, rows := s.lastCols, s.lastRows
 		s.mu.Unlock()
-		res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, restartArgs, cols, rows)
-		if err != nil {
-			clearRestarting()
-			return nil, err
-		}
-		ptmx, cmd, rawPipe, rawPipePath = res.ptmx, res.cmd, res.rawPipe, res.rawPipePath
+		res, err = m.platformStartUserTool(id, workDir, toolPath, restartArgs, cols, rows)
 	} else {
-		// Internal tools: direct PTY
-		cmd = exec.Command(toolPath, restartArgs...)
-		cmd.Dir = workDir
-		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-		ptmx, err = pty.Start(cmd)
-		if err != nil {
-			clearRestarting()
-			return nil, fmt.Errorf("failed to start pty: %w", err)
-		}
-		if tool == "tmux" && toolSessionID != "" {
-			tmuxEnableMouse(toolSessionID)
-			tmuxSetLoginShell(toolSessionID)
-		}
+		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, restartArgs, toolSessionID)
+	}
+	if err != nil {
+		clearRestarting()
+		return nil, err
 	}
 
 	s.mu.Lock()
-	s.PTY = ptmx
-	s.Cmd = cmd
+	s.PTY = res.pty
+	s.Cmd = res.cmd
 	s.Args = args // Keep original args (without --resume), not restartArgs
-	s.TmuxSessionName = tmuxName
-	s.rawPipe = rawPipe
-	s.rawPipePath = rawPipePath
+	s.TmuxSessionName = res.tmuxName
+	s.rawPipe = res.rawPipe
+	s.rawPipePath = res.rawPipePath
 	s.Status = StatusRunning
 	s.ExitCode = nil
 	s.lastOutput = nil
@@ -512,7 +289,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.readDone = make(chan struct{})
 	s.mu.Unlock()
 
-	m.startLoops(s)
+	m.platformStartLoops(s)
 
 	m.logger.Info("session restarted", "id", id, "tool", tool)
 	m.save()
@@ -537,7 +314,6 @@ func (m *Manager) List() []*Session {
 }
 
 // FindChildSession returns a child session of the given parent with the specified tool.
-// Returns the first matching running session, or any matching session if none are running.
 func (m *Manager) FindChildSession(parentID, tool string) (*Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -592,8 +368,6 @@ func (m *Manager) Remove(id string) error {
 			}
 		}
 	}
-	// Hold s.mu through delete to prevent Restart from setting restarting=true
-	// between our check and the map removal (Restart acquires s.mu to set the flag).
 	s.mu.Lock()
 	if s.Status == StatusRunning || s.restarting {
 		s.mu.Unlock()
@@ -602,7 +376,6 @@ func (m *Manager) Remove(id string) error {
 	}
 	delete(m.sessions, id)
 	s.mu.Unlock()
-	// Remove exited internal children (e.g. tmux terminal tabs)
 	for cid, cs := range m.sessions {
 		if cs.ParentID == id {
 			delete(m.sessions, cid)
@@ -624,47 +397,9 @@ func (m *Manager) Stop(id string) error {
 		s.mu.Unlock()
 		return fmt.Errorf("session not running: %s", id)
 	}
-	cmd := s.Cmd
-	tool := s.Tool
-	toolSessionID := s.ToolSessionID
-	tmuxName := s.TmuxSessionName
 	s.mu.Unlock()
 
-	// Kill tmux session backing this session (sends SIGHUP to the CLI process)
-	if tmuxName != "" {
-		_ = tmuxKillSession(tmuxName)
-	}
-
-	// Kill tmux session for internal tmux tool
-	if tool == "tmux" && toolSessionID != "" {
-		_ = exec.Command("tmux", "kill-session", "-t", toolSessionID).Run()
-	}
-
-	// Also stop any child sessions (e.g. tmux terminal tab)
-	for _, child := range m.findChildSessions(id, "tmux") {
-		child.mu.Lock()
-		childStatus := child.Status
-		child.mu.Unlock()
-		if childStatus == StatusRunning {
-			_ = m.Stop(child.ID)
-		}
-	}
-
-	if cmd != nil && cmd.Process != nil {
-		// SIGTERM to the attach/direct process
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-
-		go func() {
-			select {
-			case <-s.done:
-				return
-			case <-time.After(stopKillTimeout):
-				_ = cmd.Process.Kill()
-			}
-		}()
-	}
-
-	return nil
+	return m.platformStop(s, id)
 }
 
 // TmuxAction executes a whitelisted tmux action on a terminal session.
@@ -680,7 +415,7 @@ func (m *Manager) TmuxAction(id, action string) error {
 	toolSessionID := s.ToolSessionID
 	s.mu.Unlock()
 
-	if tool != "tmux" {
+	if !internalTools[tool] {
 		return fmt.Errorf("not a terminal session: %s", id)
 	}
 	if status != StatusRunning {
@@ -698,53 +433,7 @@ func (m *Manager) StopAll() {
 	m.shuttingDown = true
 	m.mu.Unlock()
 
-	// Collect session IDs by type
-	m.mu.Lock()
-	var nonTmuxIDs []string
-	var tmuxSessions []*Session
-	for id, s := range m.sessions {
-		s.mu.Lock()
-		running := s.Status == StatusRunning
-		isTmuxBacked := s.TmuxSessionName != ""
-		s.mu.Unlock()
-		if !running {
-			continue
-		}
-		if isTmuxBacked {
-			tmuxSessions = append(tmuxSessions, s)
-		} else {
-			nonTmuxIDs = append(nonTmuxIDs, id)
-		}
-	}
-	m.mu.Unlock()
-
-	// Stop non-tmux sessions (internal tools) and wait
-	for _, id := range nonTmuxIDs {
-		_ = m.Stop(id)
-	}
-	for _, id := range nonTmuxIDs {
-		if s, ok := m.Get(id); ok {
-			select {
-			case <-s.done:
-			case <-time.After(shutdownTimeout):
-			}
-		}
-	}
-
-	// Detach tmux-backed sessions: kill attach process, close PTY, but keep tmux session alive
-	for _, s := range tmuxSessions {
-		s.mu.Lock()
-		// Stop pipe-pane to avoid orphaned cat processes
-		s.cleanupPipePane()
-		if s.Cmd != nil && s.Cmd.Process != nil {
-			_ = s.Cmd.Process.Kill()
-		}
-		if s.PTY != nil {
-			s.PTY.Close()
-			s.PTY = nil
-		}
-		s.mu.Unlock()
-	}
+	m.platformStopAll()
 }
 
 // SaveAll persists all sessions to disk. Called on shutdown.
@@ -756,7 +445,7 @@ func (m *Manager) save() {
 	m.mu.Lock()
 	infos := make([]SessionInfo, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		infos = append(infos, s.Info())
+		infos = append(infos, s.InfoForSave())
 	}
 	m.mu.Unlock()
 	m.store.Save(infos)
@@ -767,8 +456,8 @@ func (m *Manager) readLoop(s *Session) {
 
 	s.mu.Lock()
 	// Prefer raw pipe (pipe-pane FIFO) for complete output capture;
-	// fall back to attach PTY output (may lose intermediate scroll content).
-	var reader *os.File
+	// fall back to PTY output.
+	var reader io.Reader
 	if s.rawPipe != nil {
 		reader = s.rawPipe
 	} else {
@@ -808,6 +497,11 @@ func (m *Manager) readLoop(s *Session) {
 					}
 				})
 			}
+
+			// attachment detection
+			if newAttachments := s.CheckAttachments(data); len(newAttachments) > 0 {
+				s.BroadcastAttachments(newAttachments)
+			}
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -818,25 +512,7 @@ func (m *Manager) readLoop(s *Session) {
 	}
 }
 
-// drainLoop reads and discards output from the attach PTY to prevent its buffer
-// from filling up and blocking tmux. Only used when rawPipe is active (readLoop
-// reads from the FIFO instead).
-func (m *Manager) drainLoop(s *Session) {
-	s.mu.Lock()
-	ptmx := s.PTY
-	s.mu.Unlock()
-	if ptmx == nil {
-		return
-	}
-	buf := make([]byte, readBufSize)
-	for {
-		if _, err := ptmx.Read(buf); err != nil {
-			return
-		}
-	}
-}
-
-// waitLoop monitors a direct PTY process (internal tools only).
+// waitLoop monitors a direct PTY process (non-tmux sessions).
 func (m *Manager) waitLoop(s *Session) {
 	err := s.Cmd.Wait()
 
@@ -848,7 +524,7 @@ func (m *Manager) waitLoop(s *Session) {
 	}
 	s.mu.Unlock()
 
-	// wait for readLoop to finish draining (PTY close above guarantees exit)
+	// wait for readLoop to finish draining
 	<-s.readDone
 
 	exitCode := 0
@@ -861,365 +537,7 @@ func (m *Manager) waitLoop(s *Session) {
 	m.completeExit(s, exitCode)
 }
 
-// tmuxWaitLoop monitors a tmux-backed session by polling pane status
-// and watching the attach process.
-func (m *Manager) tmuxWaitLoop(s *Session) {
-	attachExited := m.startAttachReaper(s)
-
-	ticker := time.NewTicker(paneStatusPollInterval)
-	defer ticker.Stop()
-
-	consecutiveErrors := 0
-
-	for {
-		select {
-		case <-ticker.C:
-			action := m.handlePanePoll(s, &consecutiveErrors, attachExited)
-			switch action {
-			case pollDone:
-				return
-			case pollRetry:
-				continue
-			}
-
-		case <-attachExited:
-			newCh, done := m.handleAttachExit(s)
-			if done {
-				return
-			}
-			attachExited = newCh
-		}
-	}
-}
-
-// pollAction represents the outcome of a pane status poll.
-type pollAction int
-
-const (
-	pollOK    pollAction = iota // continue normally
-	pollDone                    // session finalized, return from loop
-	pollRetry                   // transient error, skip to next tick
-)
-
-// handlePanePoll checks tmux pane status on each tick.
-// Returns a pollAction indicating how the caller should proceed.
-func (m *Manager) handlePanePoll(s *Session, consecutiveErrors *int, attachExited <-chan struct{}) pollAction {
-	m.mu.Lock()
-	shuttingDown := m.shuttingDown
-	m.mu.Unlock()
-	if shuttingDown {
-		return pollDone
-	}
-
-	s.mu.Lock()
-	tmuxName := s.TmuxSessionName
-	s.mu.Unlock()
-
-	if !tmuxHasSession(tmuxName) {
-		m.finalizeTmuxSession(s, 1, attachExited)
-		return pollDone
-	}
-
-	dead, exitCode, err := tmuxPaneDead(tmuxName)
-	if err != nil {
-		*consecutiveErrors++
-		if *consecutiveErrors >= maxPaneCheckErrors {
-			m.logger.Error("tmux pane check failed repeatedly, finalizing session", "id", s.ID, "err", err)
-			_ = tmuxKillSession(tmuxName)
-			m.finalizeTmuxSession(s, 1, attachExited)
-			return pollDone
-		}
-		return pollRetry
-	}
-	*consecutiveErrors = 0
-	if dead {
-		_ = tmuxKillSession(tmuxName)
-		m.finalizeTmuxSession(s, exitCode, attachExited)
-		return pollDone
-	}
-
-	// Check if readLoop exited unexpectedly (FIFO failure).
-	// If pipe-pane died but the pane is still running, force a
-	// reattach by killing the attach process. The attachExited
-	// handler will create a new pipe-pane and readLoop.
-	s.mu.Lock()
-	readDone := s.readDone
-	hasRawPipe := s.rawPipe != nil
-	s.mu.Unlock()
-	if hasRawPipe {
-		select {
-		case <-readDone:
-			m.logger.Warn("pipe-pane FIFO lost, forcing reattach", "id", s.ID)
-			s.mu.Lock()
-			s.cleanupPipePane()
-			cmd := s.Cmd
-			s.mu.Unlock()
-			if cmd != nil && cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		default:
-		}
-	}
-
-	return pollOK
-}
-
-// handleAttachExit handles the case when the tmux attach process exits.
-// It determines whether to finalize the session or reattach.
-// Returns (newAttachExited, done). If done is true the caller should return.
-func (m *Manager) handleAttachExit(s *Session) (chan struct{}, bool) {
-	m.mu.Lock()
-	shuttingDown := m.shuttingDown
-	m.mu.Unlock()
-	if shuttingDown {
-		return nil, true
-	}
-
-	// Close only the attach PTY (drainLoop exits naturally).
-	// Keep pipe-pane/FIFO alive so readLoop continues capturing output.
-	s.mu.Lock()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
-	tmuxName := s.TmuxSessionName
-	hasRawPipe := s.rawPipe != nil
-	s.mu.Unlock()
-
-	// If no pipe-pane, readLoop was using the PTY — wait for it.
-	// If pipe-pane is active but readLoop died concurrently (FIFO
-	// failure just before attach exit), clean up so reattach does
-	// a full pipe-pane recreation instead of assuming it's healthy.
-	if !hasRawPipe {
-		m.awaitReadDone(s)
-	} else {
-		select {
-		case <-s.readDone:
-			s.mu.Lock()
-			s.cleanupPipePane()
-			s.mu.Unlock()
-			hasRawPipe = false
-		default:
-		}
-	}
-
-	if !tmuxHasSession(tmuxName) {
-		m.cleanupPipeAndExit(s, hasRawPipe, 1)
-		return nil, true
-	}
-
-	dead, exitCode, _ := tmuxPaneDead(tmuxName)
-	if dead {
-		_ = tmuxKillSession(tmuxName)
-		m.cleanupPipeAndExit(s, hasRawPipe, exitCode)
-		return nil, true
-	}
-
-	// tmux session still alive with running pane → reattach
-	if err := m.reattachTmux(s); err != nil {
-		m.logger.Error("failed to reattach tmux", "id", s.ID, "err", err)
-		m.cleanupPipeAndExit(s, hasRawPipe, 1)
-		return nil, true
-	}
-
-	return m.startAttachReaper(s), false
-}
-
-// cleanupPipeAndExit cleans up pipe-pane if active and completes session exit.
-func (m *Manager) cleanupPipeAndExit(s *Session, hasRawPipe bool, exitCode int) {
-	if hasRawPipe {
-		s.mu.Lock()
-		s.cleanupPipePane()
-		s.mu.Unlock()
-		m.awaitReadDone(s)
-	}
-	m.completeExit(s, exitCode)
-}
-
-// startAttachReaper starts a goroutine that waits for the attach process to exit.
-func (m *Manager) startAttachReaper(s *Session) chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		s.mu.Lock()
-		cmd := s.Cmd
-		s.mu.Unlock()
-		if cmd != nil {
-			_ = cmd.Wait()
-		}
-		close(ch)
-	}()
-	return ch
-}
-
-// finalizeTmuxSession handles the case where the tmux pane is dead or gone,
-// killing the still-running attach process and cleaning up.
-func (m *Manager) finalizeTmuxSession(s *Session, exitCode int, attachExited <-chan struct{}) {
-	// Kill attach process if still running
-	s.mu.Lock()
-	if s.Cmd != nil && s.Cmd.Process != nil {
-		_ = s.Cmd.Process.Kill()
-	}
-	s.mu.Unlock()
-
-	// Wait for attach process reaper (with timeout as safety net)
-	select {
-	case <-attachExited:
-	case <-time.After(exitKillTimeout):
-		m.logger.Warn("attach process did not exit in time after kill", "id", s.ID)
-	}
-
-	// Clean up pipe-pane and close PTY so readLoop/drainLoop exit
-	s.mu.Lock()
-	s.cleanupPipePane()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
-	s.mu.Unlock()
-
-	// Wait for readLoop to drain remaining output
-	m.awaitReadDone(s)
-
-	m.completeExit(s, exitCode)
-}
-
-// tmuxAttachResult holds the outputs from startTmuxAttach.
-type tmuxAttachResult struct {
-	ptmx        *os.File
-	cmd         *exec.Cmd
-	rawPipe     *os.File
-	rawPipePath string
-}
-
-// startTmuxAttach creates a tmux session, sets up pipe-pane, and attaches via PTY.
-// Used by Create and Restart to avoid duplicating the tmux startup flow.
-func (m *Manager) startTmuxAttach(tmuxName, workDir, toolPath string, args []string, cols, rows uint16) (*tmuxAttachResult, error) {
-	shellCmd := buildShellCommand(toolPath, args)
-	if err := tmuxNewSession(tmuxName, workDir, shellCmd, true); err != nil {
-		return nil, fmt.Errorf("failed to create tmux session: %w", err)
-	}
-
-	var rawPipe *os.File
-	var rawPipePath string
-	rp, rpPath, pipeErr := tmuxStartPipePane(tmuxName)
-	if pipeErr != nil {
-		m.logger.Warn("pipe-pane setup failed", "tmux", tmuxName, "err", pipeErr)
-	} else {
-		rawPipe = rp
-		rawPipePath = rpPath
-	}
-
-	cmd := tmuxAttachCommand(tmuxName)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ws := defaultWinsize(cols, rows)
-	ptmx, err := pty.StartWithSize(cmd, &ws)
-	if err != nil {
-		tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
-		_ = tmuxKillSession(tmuxName)
-		return nil, fmt.Errorf("failed to attach to tmux session: %w", err)
-	}
-
-	return &tmuxAttachResult{ptmx: ptmx, cmd: cmd, rawPipe: rawPipe, rawPipePath: rawPipePath}, nil
-}
-
-// startLoops starts the background goroutines (readLoop, drainLoop, waitLoop) for a session.
-func (m *Manager) startLoops(s *Session) {
-	go m.readLoop(s)
-	s.mu.Lock()
-	hasRawPipe := s.rawPipe != nil
-	hasTmux := s.TmuxSessionName != ""
-	s.mu.Unlock()
-	if hasRawPipe {
-		go m.drainLoop(s)
-	}
-	if hasTmux {
-		go m.tmuxWaitLoop(s)
-	} else {
-		go m.waitLoop(s)
-	}
-}
-
-// reattachTmux creates a new PTY attach to an existing tmux session.
-// If pipe-pane is already active (rawPipe != nil), it is kept running and only
-// the attach PTY is recreated. Otherwise a full pipe-pane+readLoop is set up.
-func (m *Manager) reattachTmux(s *Session) error {
-	s.mu.Lock()
-	tmuxName := s.TmuxSessionName
-	pipeAlreadyActive := s.rawPipe != nil
-	readDone := s.readDone
-	s.mu.Unlock()
-
-	// Double-check: if pipe-pane appears active but readLoop already died
-	// (TOCTOU between caller's check and here), clean up and do full recreation.
-	if pipeAlreadyActive {
-		select {
-		case <-readDone:
-			s.mu.Lock()
-			s.cleanupPipePane()
-			s.mu.Unlock()
-			pipeAlreadyActive = false
-		default:
-		}
-	}
-
-	tmuxEnsureServerConfig()
-
-	// Only set up pipe-pane if there is no active one
-	var rawPipe *os.File
-	var rawPipePath string
-	if !pipeAlreadyActive {
-		rp, rpPath, pipeErr := tmuxStartPipePane(tmuxName)
-		if pipeErr != nil {
-			m.logger.Warn("pipe-pane setup failed on reattach", "id", s.ID, "err", pipeErr)
-		} else {
-			rawPipe = rp
-			rawPipePath = rpPath
-		}
-	}
-
-	cmd := tmuxAttachCommand(tmuxName)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	s.mu.Lock()
-	ws := defaultWinsize(s.lastCols, s.lastRows)
-	s.mu.Unlock()
-	ptmx, err := pty.StartWithSize(cmd, &ws)
-	if err != nil {
-		if rawPipe != nil {
-			tmuxCleanupPipePane(tmuxName, rawPipe, rawPipePath)
-		}
-		return fmt.Errorf("reattach pty.Start: %w", err)
-	}
-
-	s.mu.Lock()
-	s.PTY = ptmx
-	s.Cmd = cmd
-	if rawPipe != nil {
-		s.rawPipe = rawPipe
-		s.rawPipePath = rawPipePath
-		s.readDone = make(chan struct{})
-	}
-	s.mu.Unlock()
-
-	// New readLoop only if we created a new pipe-pane (otherwise existing one continues)
-	if rawPipe != nil {
-		go m.readLoop(s)
-	}
-	// Always drain the new attach PTY when pipe-pane is capturing output
-	s.mu.Lock()
-	hasPipe := s.rawPipe != nil
-	s.mu.Unlock()
-	if hasPipe {
-		go m.drainLoop(s)
-	}
-
-	m.logger.Info("reattached to tmux session", "id", s.ID, "tmux", tmuxName)
-	return nil
-}
-
 // awaitReadDone waits for readLoop to finish with a timeout.
-// If readLoop does not exit within exitDrainTimeout, it logs a warning
-// and returns so that completeExit can proceed. This prevents deadlock
-// when closing a FIFO fd does not reliably interrupt a blocked read().
 func (m *Manager) awaitReadDone(s *Session) {
 	select {
 	case <-s.readDone:
@@ -1229,7 +547,6 @@ func (m *Manager) awaitReadDone(s *Session) {
 }
 
 // completeExit captures final output, updates session state, and notifies.
-// Shared by waitLoop (internal tools) and tmux exit paths.
 func (m *Manager) completeExit(s *Session, exitCode int) {
 	// capture last output from scrollback
 	scrollback := s.scrollback.Bytes()
@@ -1246,8 +563,9 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	close(s.done)
 	m.save()
 
-	// Stop child sessions (e.g. tmux terminal tab) when parent exits
-	for _, child := range m.findChildSessions(s.ID, "tmux") {
+	// Stop child sessions when parent exits
+	shellTool := ShellToolName()
+	for _, child := range m.findChildSessions(s.ID, shellTool) {
 		child.mu.Lock()
 		childStatus := child.Status
 		child.mu.Unlock()
@@ -1274,7 +592,6 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 				skipNext = false
 				continue
 			}
-			// Strip any existing continuation/resume flags
 			if a == "--resume" || a == "-r" {
 				skipNext = true
 				continue
@@ -1290,7 +607,6 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 		return append(args, "--continue")
 
 	case "codex":
-		// codex uses a subcommand: `codex resume <SESSION_ID>`
 		if toolSessionID != "" {
 			return []string{"resume", toolSessionID}
 		}
@@ -1305,20 +621,18 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 				continue
 			}
 			if a == "--resume" || a == "-r" {
-				skipNext = true // skip the value after the flag
+				skipNext = true
 				continue
 			}
 			args = append(args, a)
 		}
 		return append(args, "--resume", "latest")
 
-	case "tmux":
-		if toolSessionID != "" {
-			return []string{"new-session", "-A", "-s", toolSessionID, tmuxLoginShellCmd()}
-		}
-		return origArgs
-
 	default:
+		// Internal tools (tmux/shell) use platform-specific restart args
+		if internalTools[tool] {
+			return buildInternalToolRestartArgs(origArgs, toolSessionID)
+		}
 		out := make([]string, len(origArgs))
 		copy(out, origArgs)
 		return out

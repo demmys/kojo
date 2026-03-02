@@ -6,41 +6,59 @@
 
 > [日本語](README.ja.md)
 
-Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS from your mobile device.
+Remotely operate AI coding CLIs (Claude Code, Codex, Gemini CLI) on macOS / Windows from your mobile device.
 
 ```
-┌─────────────────┐        Tailscale        ┌──────────────────┐
-│  macOS Machine   │◄──────(P2P encrypted)──────►│  Mobile Browser  │
-│                  │                         │                  │
-│  kojo server     │   WebSocket / HTTP      │  Web UI          │
-│  ├─ PTY: claude  │◄──────────────────────►│  ├─ xterm.js     │
-│  ├─ PTY: codex   │                         │  ├─ React        │
-│  └─ PTY: gemini  │                         │  └─ Web Push     │
-└─────────────────┘                         └──────────────────┘
+┌──────────────────┐        Tailscale        ┌──────────────────┐
+│  macOS / Windows  │◄──────(P2P encrypted)──────►│  Mobile Browser  │
+│                   │                         │                  │
+│  kojo server      │   WebSocket / HTTP      │  Web UI          │
+│  ├─ PTY: claude   │◄──────────────────────►│  ├─ xterm.js     │
+│  ├─ PTY: codex    │                         │  ├─ React        │
+│  └─ PTY: gemini   │                         │  └─ Web Push     │
+└──────────────────┘                         └──────────────────┘
 ```
 
 ## Features
 
 - **Single binary** — Built with Go, web UI embedded
-- **tmux-backed sessions** — CLI tools run inside tmux for crash resilience and persistence across kojo restarts
+- **Cross-platform** — macOS/Linux (tmux + PTY) and Windows (ConPTY) native support
+- **tmux-backed sessions** (macOS/Linux) — CLI tools run inside tmux for crash resilience and persistence across kojo restarts
 - **Unified PTY** — All CLIs handled uniformly via PTY. No SDK dependencies
 - **Tailscale P2P** — No central server or database. Encrypted with WireGuard
 - **Zero config** — Just run `kojo` with Tailscale running
 
 ## Requirements
 
-- macOS
+### macOS / Linux
+
 - Go 1.25+
 - Node.js 20+
 - tmux
 - [Tailscale](https://tailscale.com/)
 - Supported CLIs: `claude`, `codex`, `gemini` (at least one)
 
+### Windows
+
+- Go 1.25+
+- Node.js 20+
+- Windows 10 1809+ / Windows 11 (ConPTY support required)
+- [Tailscale](https://tailscale.com/)
+- Supported CLIs: `claude`, `codex`, `gemini` (at least one)
+
+> **Note:** On Windows, sessions run via ConPTY instead of tmux. Session persistence across kojo restarts is not available.
+
 ## Build
 
 ```bash
-# Production build
+# Production build (macOS/Linux)
 make build
+
+# Cross-compile for Windows (from macOS/Linux)
+make build-windows
+
+# Build on Windows
+build.bat
 
 # Development (two terminals)
 make dev-server   # Go server (--dev mode, proxies to Vite)
@@ -147,7 +165,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 ## What it does
 
 - Manage multiple sessions simultaneously (newest first)
-- Session persistence via tmux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
+- Session persistence via tmux on macOS/Linux (`~/.config/kojo/sessions.json`, auto-cleanup after 7 days). Sessions survive kojo restarts and crashes
 - Session restart with tool-specific resume (`claude --resume`, `codex resume`, `gemini --resume`)
 - Real-time PTY output streaming (xterm.js)
 - Text input (Enter for newline, Shift+Enter to send) and special keys (Esc, Tab, Ctrl, arrows)
@@ -162,7 +180,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 | Layer | Technology |
 |-------|-----------|
-| Server | Go, `net/http`, `coder/websocket`, `creack/pty`, tmux, `tsnet` |
+| Server | Go, `net/http`, `coder/websocket`, `creack/pty` (Unix) / ConPTY (Windows), tmux (Unix), `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |

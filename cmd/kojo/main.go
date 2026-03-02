@@ -12,13 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
+	"github.com/loppo-llc/kojo/internal/session"
 	"github.com/loppo-llc/kojo/web"
 	"tailscale.com/tsnet"
 )
@@ -45,9 +46,11 @@ func main() {
 		Level: logLevel,
 	}))
 
-	// tmux is required for user tool sessions (claude, codex, gemini)
-	if _, err := exec.LookPath("tmux"); err != nil {
-		logger.Warn("tmux not found in PATH; user tool sessions (claude, codex, gemini) will not work")
+	// tmux is required for user tool sessions on Unix
+	if runtime.GOOS != "windows" {
+		if _, err := exec.LookPath("tmux"); err != nil {
+			logger.Warn("tmux not found in PATH; user tool sessions (claude, codex, gemini) will not work")
+		}
 	}
 
 	// embed static files (sub to strip "dist/" prefix)
@@ -78,7 +81,7 @@ func main() {
 	})
 
 	// graceful shutdown
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), session.ShutdownSignals()...)
 	defer stop()
 
 	if *local || *dev {

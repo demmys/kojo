@@ -200,10 +200,22 @@ func (b *Browser) ServeRaw(w http.ResponseWriter, r *http.Request, path string) 
 	http.ServeFile(w, r, absPath)
 }
 
+// ValidatePath checks that the given path is under an allowed root directory.
+func (b *Browser) ValidatePath(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+	return b.validatePath(absPath)
+}
+
 func (b *Browser) validatePath(path string) error {
 	// resolve symlinks to prevent symlink traversal
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("access denied: cannot resolve path: %w", err)
+		}
 		// if file doesn't exist yet, resolve the parent
 		resolved, err = filepath.EvalSymlinks(filepath.Dir(path))
 		if err != nil {
@@ -212,13 +224,23 @@ func (b *Browser) validatePath(path string) error {
 		resolved = filepath.Join(resolved, filepath.Base(path))
 	}
 
-	home, _ := os.UserHomeDir()
-	homeResolved, _ := filepath.EvalSymlinks(home)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return fmt.Errorf("access denied: cannot determine home directory")
+	}
+	homeResolved, err := filepath.EvalSymlinks(home)
+	if err != nil || homeResolved == "" {
+		return fmt.Errorf("access denied: cannot resolve home directory")
+	}
 
 	// use path separator suffix to prevent /Users/loppo-evil matching /Users/loppo
 	allowedRoots := []string{
 		homeResolved + string(filepath.Separator),
-		"/tmp" + string(filepath.Separator),
+	}
+	if tmpDir := os.TempDir(); tmpDir != "" {
+		if tmpResolved, err := filepath.EvalSymlinks(tmpDir); err == nil && tmpResolved != "" {
+			allowedRoots = append(allowedRoots, tmpResolved+string(filepath.Separator))
+		}
 	}
 
 	// exact match on root itself

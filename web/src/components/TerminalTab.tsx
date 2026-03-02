@@ -33,6 +33,11 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
   const initRef = useRef(false);
 
   const [error, setError] = useState<string | null>(null);
+  const [shellTool, setShellTool] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.info().then((info) => setShellTool(info.shellTool)).catch(() => setShellTool("tmux"));
+  }, []);
 
   const sendInput = useCallback((data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -100,7 +105,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
           break;
         case "exit":
           if (msg.live) {
-            term.write(`\r\n\x1b[90m[tmux exited with code ${msg.exitCode ?? 0}]\x1b[0m\r\n`);
+            term.write(`\r\n\x1b[90m[terminal exited with code ${msg.exitCode ?? 0}]\x1b[0m\r\n`);
           }
           break;
       }
@@ -157,8 +162,8 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
       return;
     }
 
-    // Wait for workDir to be resolved before initializing
-    if (!workDir) return;
+    // Wait for workDir and shellTool to be resolved before initializing
+    if (!workDir || !shellTool) return;
 
     // Refit when becoming visible
     requestAnimationFrame(() => safeFit());
@@ -202,9 +207,9 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         }
       }
 
-      // Create new tmux session linked to parent
+      // Create new terminal session linked to parent
       try {
-        const s = await api.sessions.create({ tool: "tmux", workDir, parentId: parentSessionId });
+        const s = await api.sessions.create({ tool: shellTool, workDir, parentId: parentSessionId });
         if (cancelled) return;
         sessionIdRef.current = s.id;
         connectWs(s.id);
@@ -212,7 +217,11 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         if (cancelled) return;
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("tool not found")) {
-          setError("tmux is not installed.\nInstall: brew install tmux");
+          setError(
+            shellTool === "tmux" || shellTool === null
+              ? "tmux is not installed.\nInstall: brew install tmux"
+              : `${shellTool} is not available.`,
+          );
         } else {
           setError(msg);
         }
@@ -224,7 +233,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     return () => {
       cancelled = true;
     };
-  }, [visible, parentSessionId, workDir, connectWs, safeFit]);
+  }, [visible, parentSessionId, workDir, shellTool, connectWs, safeFit]);
 
   if (error) {
     return (
@@ -245,23 +254,25 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
         <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
       </div>
 
-      {/* tmux shortcuts */}
-      <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
-        {TMUX_SHORTCUTS.map((s) => (
-          <button
-            key={s.action}
-            onPointerDown={(e) => e.preventDefault()}
-            onClick={() => {
-              if (sessionIdRef.current) {
-                api.sessions.tmux(sessionIdRef.current, { action: s.action }).catch(() => {});
-              }
-            }}
-            className="px-3 py-2.5 text-xs rounded font-mono bg-neutral-800 text-neutral-400 active:bg-neutral-600 whitespace-nowrap"
-          >
-            {s.label}
-          </button>
-        ))}
-      </div>
+      {/* tmux shortcuts (only shown for tmux sessions) */}
+      {shellTool === "tmux" && (
+        <div className="flex gap-1.5 px-2 py-1.5 border-t border-neutral-800 overflow-x-auto shrink-0">
+          {TMUX_SHORTCUTS.map((s) => (
+            <button
+              key={s.action}
+              onPointerDown={(e) => e.preventDefault()}
+              onClick={() => {
+                if (sessionIdRef.current) {
+                  api.sessions.tmux(sessionIdRef.current, { action: s.action }).catch(() => {});
+                }
+              }}
+              className="px-3 py-2.5 text-xs rounded font-mono bg-neutral-800 text-neutral-400 active:bg-neutral-600 whitespace-nowrap"
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Special keys */}
       <SpecialKeysBar ctrlMode={ctrlMode} shiftMode={shiftMode} onKeyPress={handleKeyPress} />

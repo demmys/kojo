@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { toBase64 } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
+import type { Attachment } from "../lib/api";
 
 interface WSMessage {
   type: string;
@@ -10,6 +11,7 @@ interface WSMessage {
   rows?: number;
   tail?: string;
   live?: boolean;
+  attachments?: Attachment[];
 }
 
 interface UseWebSocketOptions {
@@ -18,10 +20,11 @@ interface UseWebSocketOptions {
   onScrollback: (data: Uint8Array) => void;
   onExit: (exitCode: number, live: boolean) => void;
   onYoloDebug?: (tail: string) => void;
+  onAttachment?: (attachments: Attachment[]) => void;
   onConnected?: () => void;
 }
 
-export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onConnected }: UseWebSocketOptions) {
+export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYoloDebug, onAttachment, onConnected }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>(null);
@@ -77,6 +80,9 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
         case "yolo_debug":
           if (msg.tail && onYoloDebug) onYoloDebug(msg.tail);
           break;
+        case "attachment":
+          if (msg.attachments && onAttachment) onAttachment(msg.attachments);
+          break;
       }
     };
 
@@ -94,7 +100,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
     };
 
     wsRef.current = ws;
-  }, [sessionId, onScrollback, onExit, onYoloDebug]);
+  }, [sessionId, onScrollback, onExit, onYoloDebug, onAttachment]);
 
   useEffect(() => {
     activeRef.current = true;

@@ -20,6 +20,7 @@ export interface ServerInfo {
   hostname: string;
   homeDir: string;
   tools: Record<string, { available: boolean; path: string }>;
+  shellTool: string; // "tmux" on Unix, "shell" on Windows
 }
 
 export interface DirEntry {
@@ -36,6 +37,15 @@ export interface FileView {
   mime?: string;
   size: number;
   url?: string;
+}
+
+export interface Attachment {
+  path: string;
+  name: string;
+  size: number;
+  mime: string;
+  modTime: string;
+  createdAt: string;
 }
 
 export interface GitStatus {
@@ -103,6 +113,10 @@ export const api = {
     restart: (id: string) => post<SessionInfo>(`/api/v1/sessions/${id}/restart`),
     tmux: (id: string, body: { action: string }) =>
       post<{ ok: boolean }>(`/api/v1/sessions/${id}/tmux`, body),
+    attachments: (id: string) =>
+      get<{ attachments: Attachment[] }>(`/api/v1/sessions/${id}/attachments`).then((r) => r.attachments),
+    deleteAttachment: (id: string, path: string) =>
+      del<{ ok: boolean }>(`/api/v1/sessions/${id}/attachments?path=${encodeURIComponent(path)}`),
   },
 
   files: {

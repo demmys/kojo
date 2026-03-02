@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type DirEntry, type FileView } from "../lib/api";
+import { formatSize } from "../lib/utils";
 
 interface FileBrowserProps {
   embedded?: boolean;
@@ -140,8 +141,4 @@ export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
   );
 }
 
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+

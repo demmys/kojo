@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"encoding/base64"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -23,7 +24,7 @@ type Session struct {
 	Tool            string
 	WorkDir         string
 	Args            []string
-	PTY             *os.File
+	PTY             io.ReadWriteCloser
 	Cmd             *exec.Cmd
 	CreatedAt       time.Time
 	Status          Status
@@ -61,6 +62,11 @@ type Session struct {
 
 	// yolo debug subscribers
 	yoloDebugSubs map[chan string]struct{}
+
+	// attachment tracking
+	attachTail  []byte
+	attachments map[string]*Attachment
+	attachSubs  map[chan []*Attachment]struct{}
 
 	// last terminal output captured on exit (for persistence)
 	lastOutput []byte
@@ -100,10 +106,11 @@ type SessionInfo struct {
 	CreatedAt       string   `json:"createdAt"`
 	ToolSessionID string   `json:"toolSessionId,omitempty"`
 	ParentID        string   `json:"parentId,omitempty"`
-	TmuxSessionName string   `json:"tmuxSessionName,omitempty"`
-	LastOutput      string   `json:"lastOutput,omitempty"`
-	LastCols        uint16   `json:"lastCols,omitempty"`
-	LastRows        uint16   `json:"lastRows,omitempty"`
+	TmuxSessionName string        `json:"tmuxSessionName,omitempty"`
+	LastOutput      string        `json:"lastOutput,omitempty"`
+	LastCols        uint16        `json:"lastCols,omitempty"`
+	LastRows        uint16        `json:"lastRows,omitempty"`
+	Attachments     []*Attachment `json:"attachments,omitempty"`
 }
 
 func (s *Session) Info() SessionInfo {
@@ -128,6 +135,21 @@ func (s *Session) Info() SessionInfo {
 	}
 	info.LastCols = s.lastCols
 	info.LastRows = s.lastRows
+	return info
+}
+
+// InfoForSave returns session info including attachment metadata for persistence.
+func (s *Session) InfoForSave() SessionInfo {
+	info := s.Info()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.attachments) > 0 {
+		atts := make([]*Attachment, 0, len(s.attachments))
+		for _, att := range s.attachments {
+			atts = append(atts, att)
+		}
+		info.Attachments = atts
+	}
 	return info
 }
 
@@ -188,6 +210,35 @@ func (s *Session) BroadcastYoloDebug(tail string) {
 	}
 }
 
+func (s *Session) SubscribeAttachments() chan []*Attachment {
+	ch := make(chan []*Attachment, 16)
+	s.subMu.Lock()
+	if s.attachSubs == nil {
+		s.attachSubs = make(map[chan []*Attachment]struct{})
+	}
+	s.attachSubs[ch] = struct{}{}
+	s.subMu.Unlock()
+	return ch
+}
+
+func (s *Session) UnsubscribeAttachments(ch chan []*Attachment) {
+	s.subMu.Lock()
+	delete(s.attachSubs, ch)
+	s.subMu.Unlock()
+	close(ch)
+}
+
+func (s *Session) BroadcastAttachments(attachments []*Attachment) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range s.attachSubs {
+		select {
+		case ch <- attachments:
+		default:
+		}
+	}
+}
+
 func (s *Session) Write(data []byte) (int, error) {
 	// Retry briefly when PTY is nil (e.g. during tmux reattach) to avoid
 	// silently dropping user input during the short reconnection window.
@@ -241,17 +292,6 @@ func (s *Session) CaptureToolSessionID(data []byte) {
 		}
 		s.mu.Unlock()
 	}
-}
-
-// cleanupPipePane stops pipe-pane and cleans up the FIFO, clearing Session fields.
-// Caller must hold s.mu.
-func (s *Session) cleanupPipePane() {
-	if s.rawPipePath == "" && s.rawPipe == nil {
-		return
-	}
-	tmuxCleanupPipePane(s.TmuxSessionName, s.rawPipe, s.rawPipePath)
-	s.rawPipe = nil
-	s.rawPipePath = ""
 }
 
 func (s *Session) SetYoloMode(enabled bool) {

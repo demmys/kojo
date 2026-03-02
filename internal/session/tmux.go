@@ -1,3 +1,5 @@
+//go:build !windows
+
 package session
 
 import (
@@ -85,11 +87,13 @@ func tmuxSetLoginShell(name string) {
 // If disablePrefix is true, it also disables prefix keys, status bar, and mouse
 // to make tmux transparent for user-facing tools.
 func tmuxNewSession(name, workDir, shellCmd string, disablePrefix bool) error {
-	// Wrap in login shell so PATH, SSH agent, credential helpers etc.
-	// match the user's standard terminal environment.
+	// Wrap in interactive login shell (-lic) so PATH, SSH agent, credential
+	// helpers etc. match the user's standard terminal environment.
+	// -i is required because ~/.zshrc (where many users add PATH entries)
+	// is only sourced for interactive shells.
 	// Unset PATH first so the login shell rebuilds it from scratch.
 	shell := loginShellPath()
-	wrappedCmd := "unset PATH; " + shellQuote(shell) + " -lc " + shellQuote(shellCmd)
+	wrappedCmd := "unset PATH; " + shellQuote(shell) + " -lic " + shellQuote(shellCmd)
 
 	// Create a detached session running the shell command
 	args := []string{

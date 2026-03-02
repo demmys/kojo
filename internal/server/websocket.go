@@ -49,6 +49,11 @@ type WSYoloDebugMsg struct {
 	Tail string `json:"tail"`
 }
 
+type WSAttachmentMsg struct {
+	Type        string                `json:"type"`
+	Attachments []*session.Attachment `json:"attachments"`
+}
+
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
@@ -87,11 +92,25 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		defer sess.UnsubscribeYoloDebug(yoloCh)
 	}
 
+	attachCh := sess.SubscribeAttachments()
+	defer sess.UnsubscribeAttachments(attachCh)
+
 	// send scrollback
 	if len(scrollback) > 0 {
 		msg := WSScrollbackMsg{
 			Type: "scrollback",
 			Data: base64.StdEncoding.EncodeToString(scrollback),
+		}
+		if err := writeJSON(ctx, conn, msg); err != nil {
+			return
+		}
+	}
+
+	// send existing attachments
+	if atts := sess.Attachments(); len(atts) > 0 {
+		msg := WSAttachmentMsg{
+			Type:        "attachment",
+			Attachments: atts,
 		}
 		if err := writeJSON(ctx, conn, msg); err != nil {
 			return
@@ -122,7 +141,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go s.wsPingLoop(ctx, cancel, conn)
 
 	// write to client
-	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh)
+	s.wsWriteLoop(ctx, conn, sess, ch, yoloCh, attachCh)
 }
 
 func (s *Server) wsPingLoop(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn) {
@@ -188,7 +207,7 @@ func (s *Server) wsReadLoop(ctx context.Context, cancel context.CancelFunc, conn
 	}
 }
 
-func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string) {
+func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *session.Session, ch chan []byte, yoloCh chan string, attachCh chan []*session.Attachment) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -224,6 +243,14 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, sess *se
 			msg := WSYoloDebugMsg{
 				Type: "yolo_debug",
 				Tail: tail,
+			}
+			if err := writeJSON(ctx, conn, msg); err != nil {
+				return
+			}
+		case attachments := <-attachCh:
+			msg := WSAttachmentMsg{
+				Type:        "attachment",
+				Attachments: attachments,
 			}
 			if err := writeJSON(ctx, conn, msg); err != nil {
 				return

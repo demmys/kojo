@@ -86,6 +86,8 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("POST /api/v1/sessions/{id}/restart", s.handleRestartSession)
 	mux.HandleFunc("GET /api/v1/sessions/{id}/terminal", s.handleTerminalSession)
 	mux.HandleFunc("POST /api/v1/sessions/{id}/tmux", s.handleTmuxAction)
+	mux.HandleFunc("GET /api/v1/sessions/{id}/attachments", s.handleListAttachments)
+	mux.HandleFunc("DELETE /api/v1/sessions/{id}/attachments", s.handleDeleteAttachment)
 	mux.HandleFunc("GET /api/v1/ws", s.handleWebSocket)
 
 	// Directory suggestions
@@ -194,10 +196,11 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	hostname, _ := os.Hostname()
 	homeDir, _ := os.UserHomeDir()
 	resp := map[string]any{
-		"version": s.version,
-		"hostname": hostname,
-		"homeDir":  homeDir,
-		"tools":    session.ToolAvailability(),
+		"version":   s.version,
+		"hostname":  hostname,
+		"homeDir":   homeDir,
+		"tools":     session.ToolAvailability(),
+		"shellTool": session.ShellToolName(),
 	}
 	writeJSONResponse(w, http.StatusOK, resp)
 }
@@ -300,7 +303,7 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTerminalSession(w http.ResponseWriter, r *http.Request) {
 	parentID := r.PathValue("id")
-	sess, ok := s.sessions.FindChildSession(parentID, "tmux")
+	sess, ok := s.sessions.FindChildSession(parentID, session.ShellToolName())
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "no terminal session for parent: "+parentID)
 		return
@@ -350,6 +353,52 @@ func (s *Server) handleTmuxAction(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// --- Attachment Handlers ---
+
+func (s *Server) handleListAttachments(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.sessions.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "session not found: "+id)
+		return
+	}
+	attachments := sess.Attachments()
+	if attachments == nil {
+		attachments = []*session.Attachment{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"attachments": attachments})
+}
+
+func (s *Server) handleDeleteAttachment(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.sessions.Get(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "session not found: "+id)
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "missing path parameter")
+		return
+	}
+	// Only allow deleting files that are tracked as attachments
+	absPath, _ := filepath.Abs(path)
+	if !sess.HasAttachment(absPath) {
+		writeError(w, http.StatusBadRequest, "bad_request", "path is not a tracked attachment")
+		return
+	}
+	if err := s.files.ValidatePath(path); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", err.Error())
+		return
+	}
+	if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	sess.RemoveAttachment(absPath)
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // --- Directory Suggestion Handler ---
 
 func (s *Server) handleDirSuggest(w http.ResponseWriter, r *http.Request) {
@@ -371,8 +420,8 @@ func (s *Server) handleDirSuggest(w http.ResponseWriter, r *http.Request) {
 	dir := filepath.Dir(prefix)
 	partial := filepath.Base(prefix)
 
-	// if prefix ends with /, list that directory
-	if strings.HasSuffix(prefix, "/") {
+	// if prefix ends with a path separator, list that directory
+	if strings.HasSuffix(prefix, "/") || strings.HasSuffix(prefix, string(filepath.Separator)) {
 		dir = prefix
 		partial = ""
 	}
@@ -445,7 +494,7 @@ func (s *Server) handleRawFile(w http.ResponseWriter, r *http.Request) {
 
 // --- Upload Handler ---
 
-const uploadDir = "/tmp/kojo/upload"
+var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
 const maxUploadSize = 20 << 20 // 20MB
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {

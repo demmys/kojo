@@ -11,7 +11,6 @@ import (
 	webpush "github.com/SherClockHolmes/webpush-go"
 )
 
-const configDir = ".config/kojo"
 const vapidFile = "vapid.json"
 
 type Manager struct {
@@ -92,8 +91,7 @@ func (m *Manager) Send(payload []byte) {
 }
 
 func (m *Manager) loadOrGenerateVAPID() error {
-	home, _ := os.UserHomeDir()
-	dir := filepath.Join(home, configDir)
+	dir := configDirPath()
 	path := filepath.Join(dir, vapidFile)
 
 	data, err := os.ReadFile(path)

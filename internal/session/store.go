@@ -10,7 +10,6 @@ import (
 )
 
 const (
-	configDir    = ".config/kojo"
 	sessionsFile = "sessions.json"
 	maxAge       = 7 * 24 * time.Hour
 )
@@ -23,9 +22,8 @@ type Store struct {
 }
 
 func newStore(logger *slog.Logger) *Store {
-	home, _ := os.UserHomeDir()
 	return &Store{
-		path:   filepath.Join(home, configDir, sessionsFile),
+		path:   filepath.Join(configDirPath(), sessionsFile),
 		logger: logger,
 	}
 }

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package session
 
 import (
@@ -29,7 +31,13 @@ func (s *Session) Resize(cols, rows uint16) error {
 		return os.ErrClosed
 	}
 
-	if err := pty.Setsize(ptmx, &pty.Winsize{
+	// Type-assert to *os.File for pty.Setsize (Unix PTY is always *os.File)
+	ptmxFile, ok := ptmx.(*os.File)
+	if !ok {
+		return os.ErrClosed
+	}
+
+	if err := pty.Setsize(ptmxFile, &pty.Winsize{
 		Cols: cols,
 		Rows: rows,
 	}); err != nil {

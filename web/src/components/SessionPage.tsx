@@ -2,21 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { useTerminal } from "../hooks/useTerminal";
-import { api, type SessionInfo } from "../lib/api";
+import { api, type SessionInfo, type Attachment } from "../lib/api";
 import { restoreScrollback } from "../lib/utils";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { FileBrowser } from "./FileBrowser";
 import { GitPanel } from "./GitPanel";
 import { SpecialKeysBar } from "./SpecialKeysBar";
 import { TerminalTab } from "./TerminalTab";
+import { AttachmentsTab } from "./AttachmentsTab";
 
-type SessionTab = "cli" | "terminal" | "files" | "git";
+type SessionTab = "cli" | "terminal" | "files" | "git" | "attachments";
 
 const TABS: { key: SessionTab; label: string }[] = [
   { key: "cli", label: "CLI" },
   { key: "terminal", label: "Terminal" },
   { key: "files", label: "Files" },
   { key: "git", label: "Git" },
+  { key: "attachments", label: "Attach" },
 ];
 
 export function SessionPage() {
@@ -33,7 +35,7 @@ export function SessionPage() {
 
   // Tab state — derive from URL and keep in sync
   const tabFromPath = (pathname: string): SessionTab =>
-    pathname.endsWith("/terminal") ? "terminal" : pathname.endsWith("/files") ? "files" : pathname.endsWith("/git") ? "git" : "cli";
+    pathname.endsWith("/terminal") ? "terminal" : pathname.endsWith("/files") ? "files" : pathname.endsWith("/git") ? "git" : pathname.endsWith("/attachments") ? "attachments" : "cli";
   const [activeTab, setActiveTab] = useState<SessionTab>(tabFromPath(location.pathname));
 
   useEffect(() => {
@@ -81,6 +83,18 @@ export function SessionPage() {
     }
   }, [xtermRef]);
 
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+
+  const mergeAttachments = useCallback((incoming: Attachment[]) => {
+    setAttachments((prev) => {
+      const existing = new Set(prev.map((a) => a.path));
+      const added = incoming.filter((a) => !existing.has(a.path));
+      return added.length > 0 ? [...prev, ...added] : prev;
+    });
+  }, []);
+
+  const onAttachment = mergeAttachments;
+
   const onYoloDebug = useCallback((tail: string) => {
     yoloTailRef.current = tail;
     const el = yoloOverlayRef.current;
@@ -102,6 +116,7 @@ export function SessionPage() {
     onScrollback,
     onExit,
     onYoloDebug,
+    onAttachment,
     onConnected: immediateFit,
   });
   sendInputRef.current = sendInput;
@@ -121,11 +136,13 @@ export function SessionPage() {
 
   useEffect(() => {
     setExited(false);
+    setAttachments([]);
     gotScrollbackRef.current = false;
     api.sessions.get(id!).then((s) => {
       setSession(s);
       if (s.status === "exited") setExited(true);
     }).catch(() => navigate("/"));
+    api.sessions.attachments(id!).then(mergeAttachments).catch(() => {});
   }, [id, navigate]);
 
   // Show persisted lastOutput for exited sessions when no live scrollback arrived
@@ -368,6 +385,16 @@ export function SessionPage() {
               style={{ display: activeTab === "git" ? "" : "none" }}
             >
               <GitPanel embedded workDir={session?.workDir} />
+            </div>
+            <div
+              className="absolute inset-0"
+              style={{ display: activeTab === "attachments" ? "" : "none" }}
+            >
+              <AttachmentsTab
+                sessionId={id!}
+                attachments={attachments}
+                onDelete={(path) => setAttachments((prev) => prev.filter((a) => a.path !== path))}
+              />
             </div>
           </>
         )}

@@ -64,8 +64,8 @@ func init() {
 	}
 	extPattern := strings.Join(quoted, "|")
 
-	// Unquoted path: /abs, ./rel, ~/home — no whitespace allowed in path (case-insensitive)
-	mediaPathUnquotedRe = regexp.MustCompile(`(?i)(?:(?:/|\.{1,2}/|~/)[^\s"'` + "`" + `<>|;(){}]+(?:` + extPattern + `))`)
+	// Unquoted path: /abs, ./rel, ~/home, C:\ — no whitespace allowed in path (case-insensitive)
+	mediaPathUnquotedRe = regexp.MustCompile(`(?i)(?:(?:/|\.{1,2}[/\\]|~/|[A-Za-z]:[/\\])[^\s"'` + "`" + `<>|;(){}]+(?:` + extPattern + `))`)
 	// Quoted path: "path with spaces.png" or 'path with spaces.png' (case-insensitive)
 	mediaPathQuotedRe = regexp.MustCompile(`(?i)["']([^"']+(?:` + extPattern + `))["']`)
 }

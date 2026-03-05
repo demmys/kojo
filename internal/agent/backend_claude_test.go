@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,4 +106,310 @@ func TestHasExistingSession(t *testing.T) {
 			t.Error("expected true when CLAUDE_CONFIG_DIR is set and session exists there")
 		}
 	})
+}
+
+// writeSessionJSONL is a test helper that writes session entries as JSONL.
+func writeSessionJSONL(t *testing.T, path string, entries []map[string]any) {
+	t.Helper()
+	var lines []string
+	for _, e := range entries {
+		data, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(data))
+	}
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644)
+}
+
+// setupRecoverTest sets up a temp environment for recoverFromSession tests.
+// Returns the agent ID and a function to write session JSONL.
+func setupRecoverTest(t *testing.T) (string, func([]map[string]any)) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	agentID := "ag_test_recover"
+	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	os.MkdirAll(aDir, 0o755)
+
+	// Override agentsDir by setting HOME; agentDir uses agentsDir internally.
+	absDir, _ := filepath.Abs(aDir)
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+	writer := func(entries []map[string]any) {
+		writeSessionJSONL(t, sessionFile, entries)
+	}
+
+	return agentID, writer
+}
+
+func TestRecoverFromSession(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	t.Run("returns empty for nonexistent agent", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		got := recoverFromSession("ag_nonexistent", "", logger)
+		if got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("recovers text after user message", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			{"type": "user", "message": map[string]any{
+				"role":    "user",
+				"content": "hello",
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Hi there!"},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "Hi there!" {
+			t.Errorf("expected %q, got %q", "Hi there!", got)
+		}
+	})
+
+	t.Run("skips tool_result user entries", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			// Real user message
+			{"type": "user", "message": map[string]any{
+				"role":    "user",
+				"content": "do something",
+			}},
+			// Assistant with text + tool_use
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Sure, let me "},
+				},
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "tool_use", "name": "Edit"},
+				},
+			}},
+			// Tool result (user type but should NOT reset)
+			{"type": "user", "message": map[string]any{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+				},
+			}},
+			// Assistant continuation after tool
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Done!"},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "Sure, let me Done!" {
+			t.Errorf("expected %q, got %q", "Sure, let me Done!", got)
+		}
+	})
+
+	t.Run("uses last real user message", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			{"type": "user", "message": map[string]any{
+				"role": "user", "content": "first",
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "old response"},
+				},
+			}},
+			{"type": "user", "message": map[string]any{
+				"role": "user", "content": "second",
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "new response"},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "new response" {
+			t.Errorf("expected %q, got %q", "new response", got)
+		}
+	})
+
+	t.Run("returns empty when no assistant text after user", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			{"type": "user", "message": map[string]any{
+				"role": "user", "content": "hello",
+			}},
+			// Only tool_use, no text
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "tool_use", "name": "Read"},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("ignores thinking blocks", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			{"type": "user", "message": map[string]any{
+				"role": "user", "content": "think about it",
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "thinking", "thinking": "let me think..."},
+				},
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Here is my answer"},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "Here is my answer" {
+			t.Errorf("expected %q, got %q", "Here is my answer", got)
+		}
+	})
+
+	t.Run("concatenates multi-turn text", func(t *testing.T) {
+		agentID, write := setupRecoverTest(t)
+		write([]map[string]any{
+			{"type": "user", "message": map[string]any{
+				"role": "user", "content": "go",
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Part 1. "},
+				},
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "tool_use", "name": "Edit"},
+				},
+			}},
+			{"type": "user", "message": map[string]any{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+				},
+			}},
+			{"type": "assistant", "message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{
+					{"type": "text", "text": "Part 2."},
+				},
+			}},
+		})
+
+		got := recoverFromSession(agentID, "", logger)
+		if got != "Part 1. Part 2." {
+			t.Errorf("expected %q, got %q", "Part 1. Part 2.", got)
+		}
+	})
+}
+
+func TestFindSessionFile(t *testing.T) {
+	t.Run("prefers exact sessionID match", func(t *testing.T) {
+		dir := t.TempDir()
+		// Create two session files
+		os.WriteFile(filepath.Join(dir, "old-session.jsonl"), []byte("{}"), 0o644)
+		target := filepath.Join(dir, "target-id.jsonl")
+		os.WriteFile(target, []byte("{}"), 0o644)
+
+		got := findSessionFile(dir, "target-id")
+		if got != target {
+			t.Errorf("expected %q, got %q", target, got)
+		}
+	})
+
+	t.Run("falls back to newest when sessionID not found", func(t *testing.T) {
+		dir := t.TempDir()
+		old := filepath.Join(dir, "old.jsonl")
+		os.WriteFile(old, []byte("{}"), 0o644)
+
+		// Touch newer file
+		newer := filepath.Join(dir, "newer.jsonl")
+		os.WriteFile(newer, []byte("{}"), 0o644)
+
+		got := findSessionFile(dir, "nonexistent")
+		// Should pick the newest file (both are created near-simultaneously,
+		// but newer was written last)
+		if got == "" {
+			t.Error("expected a file, got empty")
+		}
+	})
+
+	t.Run("returns empty for nonexistent dir", func(t *testing.T) {
+		got := findSessionFile("/nonexistent/dir", "")
+		if got != "" {
+			t.Errorf("expected empty, got %q", got)
+		}
+	})
+}
+
+func TestRecoverFromSession_scannerError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// Create a session file with a line exceeding 2MB scanner buffer.
+	// recoverFromSession should return "" instead of partial data.
+	agentID, write := setupRecoverTest(t)
+	_ = write
+
+	home := os.Getenv("HOME")
+	aDir := filepath.Join(home, ".config", "kojo", "agents", agentID)
+	absDir, _ := filepath.Abs(aDir)
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	sessionFile := filepath.Join(projectDir, "session.jsonl")
+
+	// Write a valid user message, then a huge line that exceeds buffer
+	userLine := `{"type":"user","message":{"role":"user","content":"hello"}}`
+	assistantLine := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"old text"}]}}`
+	hugeLine := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + strings.Repeat("x", 3*1024*1024) + `"}]}}`
+
+	os.MkdirAll(filepath.Dir(sessionFile), 0o755)
+	os.WriteFile(sessionFile, []byte(userLine+"\n"+assistantLine+"\n"+hugeLine+"\n"), 0o644)
+
+	got := recoverFromSession(agentID, "", logger)
+	if got != "" {
+		t.Errorf("expected empty on scanner error, got %d chars", len(got))
+	}
 }

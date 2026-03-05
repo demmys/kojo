@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ClaudeBackend implements ChatBackend using the Claude CLI with stream-json output.
@@ -110,6 +111,8 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		var fullText strings.Builder
+		var lastAssistantText string
+		var streamSessionID string
 		var toolUses []ToolUse
 		var usage *Usage
 
@@ -133,6 +136,18 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				}
 
 			case "assistant":
+				// Extract text from content blocks as fallback when
+				// content_block_delta events are not emitted.
+				var atext strings.Builder
+				for _, block := range event.Message.Content {
+					if block.Type == "text" && block.Text != "" {
+						atext.WriteString(block.Text)
+					}
+				}
+				if atext.Len() > 0 {
+					lastAssistantText = atext.String()
+				}
+
 				if event.Message.StopReason != "" {
 					if event.Message.Usage.OutputTokens > 0 {
 						usage = &Usage{
@@ -163,6 +178,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				// If it was a tool use block, we'll get the result next
 
 			case "result":
+				if event.SessionID != "" {
+					streamSessionID = event.SessionID
+				}
 				if event.Result != "" {
 					if fullText.Len() == 0 {
 						fullText.WriteString(event.Result)
@@ -206,7 +224,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// Check process exit status
 		if err := cmd.Wait(); err != nil {
 			b.logger.Warn("claude process exited with error", "err", err, "stderr", stderrBuf.String())
-			if fullText.Len() == 0 && len(toolUses) == 0 {
+			if fullText.Len() == 0 && lastAssistantText == "" && len(toolUses) == 0 {
 				errMsg := strings.TrimSpace(stderrBuf.String())
 				if errMsg == "" {
 					errMsg = err.Error()
@@ -216,8 +234,34 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			}
 		}
 
+		// Determine final text with fallback chain
+		finalText := fullText.String()
+
+		// Fallback: text extracted from assistant event content blocks
+		if finalText == "" && lastAssistantText != "" {
+			finalText = lastAssistantText
+			b.logger.Info("used assistant event text as fallback", "agent", agent.ID, "len", len(finalText))
+		}
+
+		// Last resort: recover from Claude session JSONL when the stream
+		// produced no usable text. Only used as fallback, never overrides
+		// text that was successfully captured from the stream.
+		if finalText == "" {
+			if sessionText := recoverFromSession(agent.ID, streamSessionID, b.logger); sessionText != "" {
+				b.logger.Info("recovered text from session log",
+					"agent", agent.ID,
+					"sessionLen", len(sessionText))
+				finalText = sessionText
+			}
+		}
+
+		// Send recovered text if nothing was streamed to client
+		if finalText != "" && fullText.Len() == 0 {
+			send(ChatEvent{Type: "text", Delta: finalText})
+		}
+
 		msg := newAssistantMessage()
-		msg.Content = fullText.String()
+		msg.Content = finalText
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 
@@ -236,7 +280,8 @@ type claudeStreamEvent struct {
 
 	// "assistant" event
 	Message struct {
-		StopReason string `json:"stop_reason,omitempty"`
+		StopReason string               `json:"stop_reason,omitempty"`
+		Content    []claudeContentBlock `json:"content,omitempty"`
 		Usage      struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
@@ -265,6 +310,12 @@ type claudeStreamEvent struct {
 	Name    string `json:"name,omitempty"`
 	Input   string `json:"input,omitempty"`
 	Content string `json:"content,omitempty"`
+}
+
+// claudeContentBlock represents a content block in a Claude assistant message.
+type claudeContentBlock struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
 }
 
 // limitedWriter wraps a bytes.Buffer and stops writing after limit bytes.
@@ -341,4 +392,153 @@ func agentIDToUUID(agentID string) string {
 	h[6] = (h[6] & 0x0f) | 0x30 // version 3
 	h[8] = (h[8] & 0x3f) | 0x80 // variant RFC4122
 	return fmt.Sprintf("%x-%x-%x-%x-%x", h[0:4], h[4:6], h[6:8], h[8:10], h[10:16])
+}
+
+// recoverFromSession reads the Claude session JSONL for the agent and
+// returns the text that Claude actually generated for the last user message.
+// If sessionID is non-empty, the matching session file is used; otherwise
+// the most recently modified session file is selected as a fallback.
+func recoverFromSession(agentID string, sessionID string, logger *slog.Logger) string {
+	dir := agentDir(agentID)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return ""
+	}
+
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+
+	sessionFile := findSessionFile(projectDir, sessionID)
+	if sessionFile == "" {
+		return ""
+	}
+
+	f, err := os.Open(sessionFile)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	// Walk session entries, keeping only the assistant text that appears
+	// after the last real user message (tool_result entries are skipped).
+	// Instead of storing all entries, we just reset on real user messages
+	// and accumulate assistant text.
+	var texts []string
+	foundUser := false
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	for scanner.Scan() {
+		var raw struct {
+			Type    string          `json:"type"`
+			Message json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
+			continue
+		}
+
+		switch raw.Type {
+		case "assistant":
+			var msg struct {
+				Content []claudeContentBlock `json:"content"`
+			}
+			if json.Unmarshal(raw.Message, &msg) != nil {
+				continue
+			}
+			var text strings.Builder
+			for _, block := range msg.Content {
+				if block.Type == "text" && block.Text != "" {
+					text.WriteString(block.Text)
+				}
+			}
+			if text.Len() > 0 {
+				texts = append(texts, text.String())
+			}
+
+		case "user":
+			if isRealUserEntry(raw.Message) {
+				// New user turn — reset collected assistant text.
+				texts = nil
+				foundUser = true
+			}
+		}
+	}
+
+	// If the scanner hit an error (e.g. oversized line), discard
+	// partial results to avoid returning truncated/stale text.
+	if scanner.Err() != nil {
+		logger.Warn("session JSONL scanner error", "err", scanner.Err())
+		return ""
+	}
+
+	if !foundUser {
+		return ""
+	}
+
+	return strings.Join(texts, "")
+}
+
+// findSessionFile locates the Claude session JSONL in projectDir.
+// When sessionID is provided, it looks for "<sessionID>.jsonl" first.
+// Falls back to the most recently modified .jsonl file.
+func findSessionFile(projectDir string, sessionID string) string {
+	// Try exact match first.
+	if sessionID != "" {
+		path := filepath.Join(projectDir, sessionID+".jsonl")
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
+	// Fallback: newest .jsonl by modification time.
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return ""
+	}
+	var best string
+	var bestMod time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(bestMod) {
+			bestMod = info.ModTime()
+			best = filepath.Join(projectDir, e.Name())
+		}
+	}
+	return best
+}
+
+// isRealUserEntry returns true if the session JSONL "user" entry
+// represents a real user message (not a tool_result feedback).
+func isRealUserEntry(msgRaw json.RawMessage) bool {
+	var msg struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(msgRaw, &msg) != nil {
+		return false
+	}
+	// Try parsing content as an array of typed blocks.
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(msg.Content, &blocks) != nil {
+		// Not an array — plain string content is a real user message.
+		return true
+	}
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			return false
+		}
+	}
+	return true
 }

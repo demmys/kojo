@@ -43,7 +43,7 @@ export const ChatMessage = memo(function ChatMessage({
             : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
         } px-3.5 py-2.5`}
       >
-        <MessageContent content={message.content} isUser={isUser} />
+        <MessageContent content={message.content} isUser={isUser} timestamp={message.timestamp} />
 
         {/* Tool uses */}
         {message.toolUses && message.toolUses.length > 0 && (
@@ -61,14 +61,6 @@ export const ChatMessage = memo(function ChatMessage({
           </div>
         )}
 
-        {/* Timestamp */}
-        <div
-          className={`text-[10px] mt-1 ${
-            isUser ? "text-blue-200/70" : "text-neutral-500"
-          }`}
-        >
-          {formatTime(message.timestamp)}
-        </div>
       </div>
     </div>
   );
@@ -139,7 +131,7 @@ function actionBtnClass(isUser: boolean): string {
 }
 
 /** Renders text with markdown or plain text, plus copy/toggle buttons */
-function MessageContent({ content, isUser }: { content: string; isUser: boolean }) {
+function MessageContent({ content, isUser, timestamp }: { content: string; isUser: boolean; timestamp: string }) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
   const [viewMode, setViewMode] = useState<"markdown" | "plain">("markdown");
   const [copied, setCopied] = useState(false);
@@ -158,14 +150,20 @@ function MessageContent({ content, isUser }: { content: string; isUser: boolean 
   }, [content]);
 
   const btnCls = actionBtnClass(isUser);
+  const formattedTime = formatTime(timestamp);
 
-  // Action buttons (copy + toggle)
+  // Action buttons (copy + toggle) + timestamp
   const actionButtons = (
     <div
       className={`flex items-center gap-0.5 mt-1.5 ${
         isUser ? "justify-end" : "justify-start"
       }`}
     >
+      {formattedTime && (
+        <span className={`text-[10px] mr-1 ${isUser ? "text-blue-200/70" : "text-neutral-500"}`}>
+          {formattedTime}
+        </span>
+      )}
       {/* Copy button */}
       <button onClick={handleCopy} className={btnCls} title="Copy">
         {copied ? (

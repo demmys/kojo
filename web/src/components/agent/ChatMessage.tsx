@@ -1,7 +1,8 @@
-import { useState, useCallback, useMemo } from "react";
+import { memo, useState, useCallback, useMemo } from "react";
 import type { AgentMessage } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
+import { MarkdownRenderer } from "./MarkdownRenderer";
 
 // File extensions that can be previewed
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
@@ -15,7 +16,11 @@ interface ChatMessageProps {
   agentId: string;
 }
 
-export function ChatMessage({ message, agentName, agentId }: ChatMessageProps) {
+export const ChatMessage = memo(function ChatMessage({
+  message,
+  agentName,
+  agentId,
+}: ChatMessageProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
 
@@ -38,7 +43,7 @@ export function ChatMessage({ message, agentName, agentId }: ChatMessageProps) {
             : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
         } px-3.5 py-2.5`}
       >
-        <MessageContent content={message.content} />
+        <MessageContent content={message.content} isUser={isUser} />
 
         {/* Tool uses */}
         {message.toolUses && message.toolUses.length > 0 && (
@@ -52,7 +57,7 @@ export function ChatMessage({ message, agentName, agentId }: ChatMessageProps) {
         {/* Usage */}
         {message.usage && (
           <div className="text-[10px] text-neutral-500 mt-1 font-mono">
-            {message.usage.inputTokens.toLocaleString()}→{message.usage.outputTokens.toLocaleString()} tokens
+            {message.usage.inputTokens.toLocaleString()}&rarr;{message.usage.outputTokens.toLocaleString()} tokens
           </div>
         )}
 
@@ -67,9 +72,9 @@ export function ChatMessage({ message, agentName, agentId }: ChatMessageProps) {
       </div>
     </div>
   );
-}
+});
 
-/** System / error messages — centered, distinct styling */
+/** System / error messages -- centered, distinct styling */
 function SystemMessage({ message }: { message: AgentMessage }) {
   const isError = message.content.startsWith("\u26a0\ufe0f Error:");
   const content = isError
@@ -125,58 +130,151 @@ function SystemMessage({ message }: { message: AgentMessage }) {
   );
 }
 
-/** Renders text with clickable media file paths */
-function MessageContent({ content }: { content: string }) {
+function actionBtnClass(isUser: boolean): string {
+  return `flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+    isUser
+      ? "text-blue-200/50 hover:text-blue-100 hover:bg-blue-500/20"
+      : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50"
+  }`;
+}
+
+/** Renders text with markdown or plain text, plus copy/toggle buttons */
+function MessageContent({ content, isUser }: { content: string; isUser: boolean }) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
+  const [viewMode, setViewMode] = useState<"markdown" | "plain">("markdown");
+  const [copied, setCopied] = useState(false);
 
   const parts = useMemo(() => splitMediaPaths(content), [content]);
+  const hasMedia = parts.length > 1 || (parts.length === 1 && parts[0].type === "media");
 
-  if (parts.length === 1 && parts[0].type === "text") {
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(content).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      },
+      () => {/* clipboard not available */},
+    );
+  }, [content]);
+
+  const btnCls = actionBtnClass(isUser);
+
+  // Action buttons (copy + toggle)
+  const actionButtons = (
+    <div
+      className={`flex items-center gap-0.5 mt-1.5 ${
+        isUser ? "justify-end" : "justify-start"
+      }`}
+    >
+      {/* Copy button */}
+      <button onClick={handleCopy} className={btnCls} title="Copy">
+        {copied ? (
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+          </svg>
+        ) : (
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0013.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v0a.75.75 0 01-.75.75H9.75a.75.75 0 01-.75-.75v0c0-.212.03-.418.084-.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 01-2.25 2.25H6.75A2.25 2.25 0 014.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 011.927-.184" />
+          </svg>
+        )}
+        {copied ? "Copied" : "Copy"}
+      </button>
+
+      {/* Plain/Markdown toggle */}
+      <button
+        onClick={() => setViewMode(viewMode === "markdown" ? "plain" : "markdown")}
+        className={btnCls}
+        title={viewMode === "markdown" ? "Show plain text" : "Show rendered"}
+      >
+        {viewMode === "markdown" ? (
+          <>
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5" />
+            </svg>
+            Raw
+          </>
+        ) : (
+          <>
+            <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+            </svg>
+            Render
+          </>
+        )}
+      </button>
+    </div>
+  );
+
+  // Plain text mode or media-containing messages
+  if (viewMode === "plain" || hasMedia) {
     return (
-      <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-        {content}
-      </div>
+      <>
+        {hasMedia ? (
+          <MediaTextContent parts={parts} onPreview={setPreview} />
+        ) : (
+          <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+            {content}
+          </div>
+        )}
+        {actionButtons}
+        {preview && (
+          <MediaOverlay
+            path={preview.path}
+            type={preview.type}
+            onClose={() => setPreview(null)}
+          />
+        )}
+      </>
     );
   }
 
+  // Markdown mode
   return (
     <>
-      <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-        {parts.map((part, i) => {
-          if (part.type === "text") return <span key={i}>{part.value}</span>;
-          const isImage = IMAGE_EXTS.test(part.value);
-          return (
-            <button
-              key={i}
-              onClick={() =>
-                setPreview({ path: part.value, type: isImage ? "image" : "video" })
-              }
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors"
-              title={`Preview ${part.value}`}
-            >
-              {isImage ? (
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
-                </svg>
-              ) : (
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
-                </svg>
-              )}
-              {part.value.split("/").pop()}
-            </button>
-          );
-        })}
+      <div className={isUser ? "md-content-user" : ""}>
+        <MarkdownRenderer content={content} />
       </div>
-
-      {preview && (
-        <MediaOverlay
-          path={preview.path}
-          type={preview.type}
-          onClose={() => setPreview(null)}
-        />
-      )}
+      {actionButtons}
     </>
+  );
+}
+
+/** Text with clickable media file paths */
+function MediaTextContent({
+  parts,
+  onPreview,
+}: {
+  parts: Array<{ type: "text" | "media"; value: string }>;
+  onPreview: (p: { path: string; type: "image" | "video" }) => void;
+}) {
+  return (
+    <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+      {parts.map((part, i) => {
+        if (part.type === "text") return <span key={i}>{part.value}</span>;
+        const isImage = IMAGE_EXTS.test(part.value);
+        return (
+          <button
+            key={i}
+            onClick={() =>
+              onPreview({ path: part.value, type: isImage ? "image" : "video" })
+            }
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 bg-neutral-700/50 hover:bg-neutral-600/50 rounded text-xs font-mono text-blue-300 hover:text-blue-200 transition-colors"
+            title={`Preview ${part.value}`}
+          >
+            {isImage ? (
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0022.5 18.75V5.25A2.25 2.25 0 0020.25 3H3.75A2.25 2.25 0 001.5 5.25v13.5A2.25 2.25 0 003.75 21z" />
+              </svg>
+            ) : (
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" />
+              </svg>
+            )}
+            {part.value.split("/").pop()}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -288,8 +386,8 @@ export function StreamingMessage({
           </div>
         )}
         {text && (
-          <div className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-            {text}
+          <div className="relative">
+            <MarkdownRenderer content={text} />
             <span className="inline-block w-0.5 h-4 bg-neutral-400 animate-pulse ml-0.5 align-text-bottom" />
           </div>
         )}

@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 
 const cronTimeout = 10 * time.Minute
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
+const cronLockFile = ".cron_last"
 const cronPrompt = "定期チェックの時間です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。"
 
 // cronScheduler manages periodic agent executions.
@@ -18,7 +21,6 @@ type cronScheduler struct {
 	mu      sync.Mutex
 	c       *cron.Cron
 	entries map[string]cron.EntryID // agent ID -> cron entry
-	lastRun map[string]time.Time   // agent ID -> last run start time
 	mgr     *Manager
 	logger  *slog.Logger
 }
@@ -28,7 +30,6 @@ func newCronScheduler(mgr *Manager, logger *slog.Logger) *cronScheduler {
 	return &cronScheduler{
 		c:       cron.New(cron.WithChain(cron.SkipIfStillRunning(cronLogger))),
 		entries: make(map[string]cron.EntryID),
-		lastRun: make(map[string]time.Time),
 		mgr:     mgr,
 		logger:  logger,
 	}
@@ -61,7 +62,6 @@ func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 	}
 
 	if cronExpr == "" {
-		delete(cs.lastRun, agentID)
 		return nil
 	}
 
@@ -84,19 +84,57 @@ func (cs *cronScheduler) Remove(agentID string) {
 		cs.c.Remove(entryID)
 		delete(cs.entries, agentID)
 	}
-	delete(cs.lastRun, agentID)
+}
+
+// cronLockPath returns the path to the lock file for an agent's cron job.
+func cronLockPath(agentID string) string {
+	return filepath.Join(agentDir(agentID), cronLockFile)
+}
+
+// acquireCronLock atomically creates a lock file using O_CREATE|O_EXCL.
+// Returns true if the lock was acquired (this process should run the job).
+// If a lock file already exists but is older than cronMinInterval, it is
+// treated as stale (previous run completed or crashed) and reclaimed.
+// Fail-closed: any unexpected error returns false.
+func acquireCronLock(agentID string) bool {
+	dir := agentDir(agentID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false
+	}
+	p := cronLockPath(agentID)
+
+	// Fast path: atomically create lock file (OS guarantees only one succeeds)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err == nil {
+		f.Close()
+		return true
+	}
+
+	// File exists — check if it's stale
+	info, err := os.Stat(p)
+	if err != nil {
+		return false
+	}
+	if time.Since(info.ModTime()) < cronMinInterval {
+		return false // recent lock, another process is handling it
+	}
+
+	// Stale lock — reclaim: remove and retry atomically
+	os.Remove(p)
+	f, err = os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return false // another process reclaimed it first
+	}
+	f.Close()
+	return true
 }
 
 func (cs *cronScheduler) runCronJob(agentID string) {
-	// Guard against duplicate fires (e.g. macOS wake-from-sleep timer drift)
-	cs.mu.Lock()
-	if last, ok := cs.lastRun[agentID]; ok && time.Since(last) < cronMinInterval {
-		cs.mu.Unlock()
-		cs.logger.Debug("cron job skipped (too soon)", "agent", agentID, "lastRun", last)
+	// Cross-process guard: atomic lock file prevents duplicate execution
+	if !acquireCronLock(agentID) {
+		cs.logger.Debug("cron job skipped (lock held)", "agent", agentID)
 		return
 	}
-	cs.lastRun[agentID] = time.Now()
-	cs.mu.Unlock()
 
 	cs.logger.Info("cron job triggered", "agent", agentID)
 

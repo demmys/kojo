@@ -10,6 +10,7 @@ import (
 )
 
 const cronTimeout = 10 * time.Minute
+const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 const cronPrompt = "定期チェックの時間です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。"
 
 // cronScheduler manages periodic agent executions.
@@ -17,14 +18,17 @@ type cronScheduler struct {
 	mu      sync.Mutex
 	c       *cron.Cron
 	entries map[string]cron.EntryID // agent ID -> cron entry
+	lastRun map[string]time.Time   // agent ID -> last run start time
 	mgr     *Manager
 	logger  *slog.Logger
 }
 
 func newCronScheduler(mgr *Manager, logger *slog.Logger) *cronScheduler {
+	cronLogger := cron.PrintfLogger(slog.NewLogLogger(logger.Handler(), slog.LevelDebug))
 	return &cronScheduler{
-		c:       cron.New(),
+		c:       cron.New(cron.WithChain(cron.SkipIfStillRunning(cronLogger))),
 		entries: make(map[string]cron.EntryID),
+		lastRun: make(map[string]time.Time),
 		mgr:     mgr,
 		logger:  logger,
 	}
@@ -57,6 +61,7 @@ func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 	}
 
 	if cronExpr == "" {
+		delete(cs.lastRun, agentID)
 		return nil
 	}
 
@@ -79,9 +84,20 @@ func (cs *cronScheduler) Remove(agentID string) {
 		cs.c.Remove(entryID)
 		delete(cs.entries, agentID)
 	}
+	delete(cs.lastRun, agentID)
 }
 
 func (cs *cronScheduler) runCronJob(agentID string) {
+	// Guard against duplicate fires (e.g. macOS wake-from-sleep timer drift)
+	cs.mu.Lock()
+	if last, ok := cs.lastRun[agentID]; ok && time.Since(last) < cronMinInterval {
+		cs.mu.Unlock()
+		cs.logger.Debug("cron job skipped (too soon)", "agent", agentID, "lastRun", last)
+		return
+	}
+	cs.lastRun[agentID] = time.Now()
+	cs.mu.Unlock()
+
 	cs.logger.Info("cron job triggered", "agent", agentID)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cronTimeout)

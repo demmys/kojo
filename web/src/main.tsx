@@ -5,6 +5,9 @@ import { Dashboard } from "./components/Dashboard";
 import { SessionPage } from "./components/SessionPage";
 import { NewSession } from "./components/NewSession";
 import { FileBrowser } from "./components/FileBrowser";
+import { AgentChat } from "./components/agent/AgentChat";
+import { AgentCreate } from "./components/agent/AgentCreate";
+import { AgentSettings } from "./components/agent/AgentSettings";
 import "./index.css";
 
 createRoot(document.getElementById("root")!).render(
@@ -19,6 +22,9 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/session/:id/attachments" element={<SessionPage />} />
         <Route path="/new" element={<NewSession />} />
         <Route path="/files" element={<FileBrowser />} />
+        <Route path="/agents/new" element={<AgentCreate />} />
+        <Route path="/agents/:id" element={<AgentChat />} />
+        <Route path="/agents/:id/settings" element={<AgentSettings />} />
       </Routes>
     </BrowserRouter>
   </StrictMode>,

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { timeAgo } from "../lib/utils";
+import { AgentList } from "./agent/AgentList";
 
 interface SessionGroup {
   key: string;
@@ -55,6 +56,8 @@ export function Dashboard() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get("tab") === "agents" ? "agents" : "sessions";
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
 
   useEffect(() => {
@@ -92,12 +95,35 @@ export function Dashboard() {
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
         <h1 className="text-lg font-bold">kojo</h1>
         <Link
-          to="/new"
+          to={tab === "agents" ? "/agents/new" : "/new"}
           className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
         >
           + New
         </Link>
       </header>
+      {/* Tab bar */}
+      <div className="flex border-b border-neutral-800">
+        <button
+          onClick={() => setSearchParams({})}
+          className={`flex-1 py-2.5 text-sm font-medium text-center ${
+            tab === "sessions"
+              ? "text-neutral-200 border-b-2 border-neutral-400"
+              : "text-neutral-500 hover:text-neutral-400"
+          }`}
+        >
+          Sessions
+        </button>
+        <button
+          onClick={() => setSearchParams({ tab: "agents" })}
+          className={`flex-1 py-2.5 text-sm font-medium text-center ${
+            tab === "agents"
+              ? "text-neutral-200 border-b-2 border-neutral-400"
+              : "text-neutral-500 hover:text-neutral-400"
+          }`}
+        >
+          Agents
+        </button>
+      </div>
       {pushState === "default" && (
         <div className="mx-4 mt-3 p-3 bg-neutral-900 border border-neutral-800 rounded-lg flex items-center gap-3">
           <span className="text-sm flex-1">Enable notifications when sessions finish?</span>
@@ -111,6 +137,10 @@ export function Dashboard() {
         </div>
       )}
       <main className="p-4 space-y-3">
+        {tab === "agents" ? (
+          <AgentList />
+        ) : (
+        <>
         {!hasAny && (
           <p className="text-neutral-500 text-center py-12">No sessions</p>
         )}
@@ -204,6 +234,8 @@ export function Dashboard() {
           </div>
           );
         }
+        )}
+        </>
         )}
       </main>
     </div>

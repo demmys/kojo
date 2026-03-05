@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -237,15 +238,17 @@ func (b *Browser) validatePath(path string) error {
 	allowedRoots := []string{
 		homeResolved + string(filepath.Separator),
 	}
+	// allow os.TempDir() (e.g. /var/folders/.../T/ on macOS)
 	if tmpDir := os.TempDir(); tmpDir != "" {
 		if tmpResolved, err := filepath.EvalSymlinks(tmpDir); err == nil && tmpResolved != "" {
 			allowedRoots = append(allowedRoots, tmpResolved+string(filepath.Separator))
 		}
 	}
-
-	// exact match on root itself
-	if resolved == homeResolved {
-		return nil
+	// on macOS, /tmp is a symlink to /private/tmp which differs from os.TempDir()
+	if runtime.GOOS == "darwin" {
+		if tmpResolved, err := filepath.EvalSymlinks("/tmp"); err == nil && tmpResolved != "" {
+			allowedRoots = append(allowedRoots, tmpResolved+string(filepath.Separator))
+		}
 	}
 
 	for _, root := range allowedRoots {
@@ -254,7 +257,7 @@ func (b *Browser) validatePath(path string) error {
 		}
 	}
 
-	return fmt.Errorf("access denied: path must be under home directory")
+	return fmt.Errorf("access denied: path must be under home or temp directory")
 }
 
 func isBinary(data []byte) bool {

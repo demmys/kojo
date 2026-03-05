@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
 	"github.com/loppo-llc/kojo/internal/session"
@@ -71,6 +72,8 @@ func main() {
 		notifyMgr = nm
 	}
 
+	agentMgr := agent.NewManager(logger)
+
 	srv := server.New(server.Config{
 		Addr:          fmt.Sprintf(":%d", *port),
 		DevMode:       *dev,
@@ -78,6 +81,7 @@ func main() {
 		StaticFS:      staticFS,
 		Version:       version,
 		NotifyManager: notifyMgr,
+		AgentManager:  agentMgr,
 	})
 
 	// graceful shutdown

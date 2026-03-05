@@ -17,6 +17,7 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
@@ -25,6 +26,7 @@ import (
 
 type Server struct {
 	sessions *session.Manager
+	agents   *agent.Manager
 	files    *filebrowser.Browser
 	git      *gitpkg.Manager
 	notify   *notify.Manager
@@ -41,6 +43,7 @@ type Config struct {
 	StaticFS      fs.FS // embedded web/dist files for production
 	Version       string
 	NotifyManager *notify.Manager
+	AgentManager  *agent.Manager
 }
 
 func New(cfg Config) *Server {
@@ -51,6 +54,7 @@ func New(cfg Config) *Server {
 
 	s := &Server{
 		sessions: session.NewManager(logger),
+		agents:   cfg.AgentManager,
 		files:    filebrowser.New(logger),
 		git:      gitpkg.New(logger),
 		notify:   cfg.NotifyManager,
@@ -111,6 +115,23 @@ func New(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/push/vapid", s.handleVAPIDKey)
 	mux.HandleFunc("POST /api/v1/push/subscribe", s.handlePushSubscribe)
 	mux.HandleFunc("POST /api/v1/push/unsubscribe", s.handlePushUnsubscribe)
+
+	// Agent routes
+	if s.agents != nil {
+		mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
+		mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
+		mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
+		mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+		mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
+		mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
+		mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)
+		mux.HandleFunc("GET /api/v1/agents/{id}/messages", s.handleGetMessages)
+		mux.HandleFunc("POST /api/v1/agents/{id}/avatar/generated", s.handleUploadGeneratedAvatar)
+		mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
+		mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
+		mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
+		mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
+	}
 
 	// Static files / dev proxy
 	if cfg.DevMode {
@@ -186,6 +207,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down...")
 	s.sessions.StopAll()
 	s.sessions.SaveAll()
+	if s.agents != nil {
+		s.agents.Shutdown()
+	}
 	cleanupUploads()
 	return s.httpSrv.Shutdown(ctx)
 }

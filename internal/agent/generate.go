@@ -1,13 +1,16 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const geminiModel = "gemini-2.5-flash"
@@ -60,6 +63,67 @@ func GenerateName(persona string, userPrompt string) (string, error) {
 	name := strings.TrimSpace(result)
 	name = strings.Trim(name, "\"「」")
 	return name, nil
+}
+
+// SummarizePersona generates a concise summary of a persona using Gemini API.
+func SummarizePersona(persona string) (string, error) {
+	apiKey, err := loadGeminiAPIKey()
+	if err != nil {
+		return "", err
+	}
+
+	prompt := summarizePrompt + persona
+
+	result, err := callGemini(apiKey, prompt)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(result), nil
+}
+
+const summarizePrompt = "以下のペルソナ設定を、核心的な性格・口調・行動パターンだけに絞って200文字以内で要約して。要約のみ出力。\n\n"
+
+// SummarizeWithCLI generates a persona summary using the agent's own CLI tool.
+// Supports "claude" (stdin to -p) and "codex" (exec -o).
+func SummarizeWithCLI(tool string, persona string) (string, error) {
+	prompt := summarizePrompt + persona
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	switch tool {
+	case "claude":
+		// Pass prompt via stdin to avoid exposing persona in process args
+		cmd := exec.CommandContext(ctx, "claude", "-p")
+		cmd.Stdin = strings.NewReader(prompt)
+		output, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("claude summarize: %w", err)
+		}
+		return strings.TrimSpace(string(output)), nil
+
+	case "codex":
+		outFile, err := os.CreateTemp("", "kojo-summary-*.txt")
+		if err != nil {
+			return "", err
+		}
+		outPath := outFile.Name()
+		outFile.Close()
+		defer os.Remove(outPath)
+
+		// codex requires prompt as positional arg (no stdin mode)
+		cmd := exec.CommandContext(ctx, "codex", "exec", "--ephemeral", "--skip-git-repo-check", "-o", outPath, prompt)
+		if err := cmd.Run(); err != nil {
+			return "", fmt.Errorf("codex summarize: %w", err)
+		}
+		data, err := os.ReadFile(outPath)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(data)), nil
+
+	default:
+		return "", fmt.Errorf("unsupported tool for CLI summarization: %s", tool)
+	}
 }
 
 // loadGeminiAPIKey reads the API key from nanobanana credentials file.

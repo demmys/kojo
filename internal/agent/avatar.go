@@ -125,6 +125,21 @@ func GenerateAvatarWithAI(agentID string, persona string, name string, prompt st
 	return "", fmt.Errorf("no image file found in output")
 }
 
+// GenerateSVGAvatarFile creates an SVG avatar file in a temp directory and returns its path.
+// Used as fallback when AI avatar generation is unavailable.
+func GenerateSVGAvatarFile(name string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "kojo-avatar-*")
+	if err != nil {
+		return "", err
+	}
+	svg := generateSVGAvatar(name)
+	p := filepath.Join(tmpDir, "avatar.svg")
+	if err := os.WriteFile(p, []byte(svg), 0o644); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
 // generateSVGAvatar creates a fallback SVG avatar using name-derived gradient and initials.
 func generateSVGAvatar(name string) string {
 	hash := md5.Sum([]byte(name))

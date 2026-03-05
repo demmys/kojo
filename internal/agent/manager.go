@@ -101,8 +101,37 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	return a, nil
 }
 
+// syncPersona reads persona.md and updates Agent.Persona if it has changed.
+// This makes persona.md the single source of truth — the agent can edit it
+// to evolve its personality, and the change is reflected in settings.
+func (m *Manager) syncPersona(agentID string) {
+	m.mu.Lock()
+	a, exists := m.agents[agentID]
+	if !exists {
+		m.mu.Unlock()
+		return
+	}
+	// Read file under lock to prevent race with Update's writePersonaFile
+	content, ok := readPersonaFile(agentID)
+	if !ok || a.Persona == content {
+		m.mu.Unlock()
+		return
+	}
+	a.Persona = content
+	tool := a.Tool
+	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
+
+	// Pre-generate persona summary in background so it's cached for next chat
+	if len([]rune(content)) > maxPersonaSummaryRunes {
+		go getPersonaSummary(agentID, content, tool, m.logger)
+	}
+}
+
 // Get returns a deep copy of an agent by ID.
 func (m *Manager) Get(id string) (*Agent, bool) {
+	m.syncPersona(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.agents[id]
@@ -114,6 +143,18 @@ func (m *Manager) Get(id string) (*Agent, bool) {
 
 // List returns deep copies of all agents.
 func (m *Manager) List() []*Agent {
+	// Collect IDs first, then sync persona outside the main lock
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+
+	for _, id := range ids {
+		m.syncPersona(id)
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := make([]*Agent, 0, len(m.agents))
@@ -132,12 +173,16 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		return nil, fmt.Errorf("agent not found: %s", id)
 	}
 
+	// Write persona.md first — if it fails, no in-memory state is modified
+	if cfg.Persona != nil {
+		if err := writePersonaFile(a.ID, *cfg.Persona); err != nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("write persona.md: %w", err)
+		}
+		a.Persona = *cfg.Persona
+	}
 	if cfg.Name != nil {
 		a.Name = *cfg.Name
-	}
-	personaChanged := cfg.Persona != nil
-	if personaChanged {
-		a.Persona = *cfg.Persona
 	}
 	if cfg.Model != nil {
 		a.Model = *cfg.Model
@@ -155,10 +200,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// Take a copy for return and post-lock operations
 	cp := copyAgent(a)
 	m.mu.Unlock()
-
-	if personaChanged {
-		ensureAgentDir(cp)
-	}
 
 	if oldCron != newCron {
 		if err := m.cron.Schedule(id, newCron); err != nil {
@@ -204,6 +245,9 @@ func (m *Manager) Delete(id string) error {
 // The role parameter controls how the input message is stored in the transcript
 // ("user" for interactive chat, "system" for cron-triggered messages).
 func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string) (<-chan ChatEvent, error) {
+	// Sync persona.md → Agent.Persona before chat
+	m.syncPersona(agentID)
+
 	m.mu.Lock()
 	a, ok := m.agents[agentID]
 	if !ok {
@@ -289,6 +333,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 					if err := appendMessage(agentID, event.Message); err != nil {
 						m.logger.Warn("failed to save assistant message", "err", err)
 					}
+
+					// Sync persona.md → Agent.Persona (agent may have edited it)
+					m.syncPersona(agentID)
 
 					// Update last message preview
 					m.mu.Lock()

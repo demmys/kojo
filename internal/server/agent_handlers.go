@@ -222,7 +222,13 @@ func (s *Server) handleGenerateAvatar(w http.ResponseWriter, r *http.Request) {
 
 	avatarPath, err := agent.GenerateAvatarWithAI("", req.Persona, req.Name, req.Prompt, s.logger)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		s.logger.Warn("AI avatar generation failed, using SVG fallback", "err", err)
+		svgPath, svgErr := agent.GenerateSVGAvatarFile(req.Name)
+		if svgErr != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", svgErr.Error())
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, map[string]any{"avatarPath": svgPath, "fallback": true})
 		return
 	}
 
@@ -284,7 +290,7 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 
 	// Only allow image extensions
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" {
+	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".svg" {
 		writeError(w, http.StatusBadRequest, "bad_request", "unsupported file type")
 		return
 	}
@@ -347,7 +353,7 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 
 	// Only allow image extensions
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" {
+	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".svg" {
 		writeError(w, http.StatusBadRequest, "bad_request", "unsupported image format")
 		return
 	}

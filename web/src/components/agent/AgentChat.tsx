@@ -5,6 +5,8 @@ import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
 
+const PAGE_SIZE = 30;
+
 export function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -15,23 +17,62 @@ export function AgentChat() {
   const [streamText, setStreamText] = useState("");
   const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
+  const [hasMore, setHasMore] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const loadingMoreRef = useRef(false);
+  const suppressAutoScrollRef = useRef(false);
 
-  // Load agent and messages
+  // Load agent and initial messages
   useEffect(() => {
     if (!id) return;
     agentApi.get(id).then(setAgent).catch(() => navigate("/agents"));
-    agentApi.messages(id, 100).then(setMessages).catch(console.error);
+    agentApi.messages(id, PAGE_SIZE).then((r) => {
+      setMessages(r.messages);
+      setHasMore(r.hasMore);
+    }).catch(console.error);
   }, [id, navigate]);
 
   const scrollToBottom = useCallback(() => {
+    if (suppressAutoScrollRef.current) return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
   useEffect(() => {
     scrollToBottom();
   }, [messages, scrollToBottom]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!id || loadingMoreRef.current || !hasMore || messages.length === 0) return;
+    loadingMoreRef.current = true;
+
+    const oldestId = messages[0].id;
+    const container = scrollContainerRef.current;
+    const prevScrollHeight = container?.scrollHeight ?? 0;
+    const prevScrollTop = container?.scrollTop ?? 0;
+
+    try {
+      const r = await agentApi.messages(id, PAGE_SIZE, oldestId);
+      setHasMore(r.hasMore);
+      if (r.messages.length > 0) {
+        suppressAutoScrollRef.current = true;
+        setMessages((prev) => [...r.messages, ...prev]);
+        // Restore scroll position after prepending
+        requestAnimationFrame(() => {
+          if (container) {
+            const delta = container.scrollHeight - prevScrollHeight;
+            container.scrollTop = prevScrollTop + delta;
+          }
+          suppressAutoScrollRef.current = false;
+        });
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      loadingMoreRef.current = false;
+    }
+  }, [id, hasMore, messages]);
 
   const resetStream = useCallback(() => {
     setStreaming(false);
@@ -81,8 +122,15 @@ export function AgentChat() {
                 : [...prev, event.message!],
             );
           } else if (id) {
-            // Background chat finished — reload messages from transcript
-            agentApi.messages(id, 100).then(setMessages).catch(console.error);
+            // Background chat finished — reload recent and merge with older loaded messages
+            agentApi.messages(id, PAGE_SIZE).then((r) => {
+              setMessages((prev) => {
+                const newIds = new Set(r.messages.map((m) => m.id));
+                const older = prev.filter((m) => !newIds.has(m.id));
+                return [...older, ...r.messages];
+              });
+              // Don't overwrite hasMore — older pages are already loaded
+            }).catch(console.error);
           }
           resetStream();
           break;
@@ -93,7 +141,7 @@ export function AgentChat() {
             {
               id: "error_" + Date.now(),
               role: "system",
-              content: `⚠️ Error: ${errorMsg}`,
+              content: `\u26a0\ufe0f Error: ${errorMsg}`,
               timestamp: new Date().toISOString(),
             },
           ]);
@@ -187,7 +235,26 @@ export function AgentChat() {
       </header>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        {/* Load more button */}
+        {hasMore && (
+          <div className="flex justify-center pt-1 pb-3">
+            <button
+              onClick={loadOlderMessages}
+              disabled={loadingMoreRef.current}
+              className="group relative px-4 py-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-50"
+            >
+              <span className="absolute inset-x-0 top-1/2 h-px bg-neutral-800" />
+              <span className="relative inline-flex items-center gap-1.5 bg-neutral-950 px-3">
+                <svg className="w-3 h-3 transition-transform group-hover:-translate-y-0.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M8 12V4M4 7l4-4 4 4" />
+                </svg>
+                older messages
+              </span>
+            </button>
+          </div>
+        )}
+
         {messages.length === 0 && !streaming && (
           <div className="text-center text-neutral-600 py-16">
             <p className="text-lg mb-1">{agent.name}</p>

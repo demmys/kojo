@@ -35,13 +35,21 @@ func appendMessage(agentID string, msg *Message) error {
 // loadMessages reads the last N messages from the agent's JSONL transcript.
 // If limit <= 0, all messages are returned.
 func loadMessages(agentID string, limit int) ([]*Message, error) {
+	msgs, _, err := loadMessagesPaginated(agentID, limit, "")
+	return msgs, err
+}
+
+// loadMessagesPaginated reads messages with cursor-based pagination.
+// If before is non-empty, returns the last `limit` messages before that ID.
+// Returns the messages and whether there are more older messages.
+func loadMessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
 	path := filepath.Join(agentDir(agentID), messagesFile)
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
 	defer f.Close()
 
@@ -56,11 +64,27 @@ func loadMessages(agentID string, limit int) ([]*Message, error) {
 		all = append(all, &msg)
 	}
 	if err := scanner.Err(); err != nil {
-		return all, err
+		return all, false, err
 	}
 
+	// If before cursor is set, slice up to that message
+	if before != "" {
+		idx := -1
+		for i, m := range all {
+			if m.ID == before {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			all = all[:idx]
+		}
+	}
+
+	hasMore := false
 	if limit > 0 && len(all) > limit {
+		hasMore = true
 		all = all[len(all)-limit:]
 	}
-	return all, nil
+	return all, hasMore, nil
 }

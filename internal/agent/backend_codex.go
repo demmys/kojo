@@ -49,15 +49,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		args = append(args, "-m", agent.Model)
 	}
 
-	// Prepend system prompt to user message since codex doesn't have --system-prompt
+	// Prepend system prompt to user message since codex doesn't have --system-prompt.
+	// Pass via stdin to avoid exposing the full prompt in process args (visible in ps).
 	fullMessage := userMessage
 	if systemPrompt != "" {
 		fullMessage = systemPrompt + "\n\n---\n\n" + userMessage
 	}
-	args = append(args, fullMessage)
+
+	// "-" tells codex to read the prompt from stdin
+	args = append(args, "-")
 
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(fullMessage)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

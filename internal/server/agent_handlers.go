@@ -146,7 +146,9 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		limit = 500
 	}
 
-	msgs, err := s.agents.Messages(id, limit)
+	before := r.URL.Query().Get("before")
+
+	msgs, hasMore, err := s.agents.MessagesPaginated(id, limit, before)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
@@ -154,7 +156,7 @@ func (s *Server) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	if msgs == nil {
 		msgs = []*agent.Message{}
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs})
+	writeJSONResponse(w, http.StatusOK, map[string]any{"messages": msgs, "hasMore": hasMore})
 }
 
 // --- Generate Handlers ---

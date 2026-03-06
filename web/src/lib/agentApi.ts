@@ -113,10 +113,13 @@ export const agentApi = {
   uploadGeneratedAvatar: (id: string, avatarPath: string) =>
     post<{ ok: boolean }>(`/api/v1/agents/${id}/avatar/generated`, { avatarPath }),
 
-  messages: (id: string, limit = 50) =>
-    get<{ messages: AgentMessage[] }>(
-      `/api/v1/agents/${id}/messages?limit=${limit}`,
-    ).then((r) => r.messages ?? []),
+  messages: (id: string, limit = 30, before?: string) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before) params.set("before", before);
+    return get<{ messages: AgentMessage[]; hasMore: boolean }>(
+      `/api/v1/agents/${id}/messages?${params}`,
+    ).then((r) => ({ messages: r.messages ?? [], hasMore: r.hasMore ?? false }));
+  },
 
   generatePersona: (currentPersona: string, prompt: string) =>
     post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),

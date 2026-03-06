@@ -36,16 +36,18 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	dir := agentDir(agent.ID)
 	os.MkdirAll(dir, 0o755)
 
-	// Prepend system prompt to user message since gemini uses -p for prompt
-	fullMessage := userMessage
-	if systemPrompt != "" {
-		fullMessage = systemPrompt + "\n\n---\n\n" + userMessage
-	}
-
+	// gemini -p triggers headless mode and appends to stdin content.
+	// Pass system prompt via stdin to avoid exposing it in process args (visible in ps).
+	// The user message goes in -p (short, safe to expose).
 	args := []string{
-		"-p", fullMessage,
+		"-p", userMessage,
 		"-o", "stream-json",
 		"-y", // auto-approve all tool calls
+	}
+
+	var stdinContent string
+	if systemPrompt != "" {
+		stdinContent = systemPrompt + "\n\n---\n\n"
 	}
 
 	if agent.Model != "" {
@@ -54,6 +56,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, geminiPath, args...)
 	cmd.Dir = dir
+	if stdinContent != "" {
+		cmd.Stdin = strings.NewReader(stdinContent)
+	}
 
 	// Clear Gemini-specific env vars to avoid nested detection
 	env := os.Environ()

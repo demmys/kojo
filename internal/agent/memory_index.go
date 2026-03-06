@@ -14,10 +14,15 @@ import (
 )
 
 const (
-	indexDir     = "index"
-	indexDBFile  = "memory.db"
-	maxResults   = 10
-	maxContextLen = 4000
+	indexDir        = "index"
+	indexDBFile     = "memory.db"
+	maxResults      = 6
+	maxContextLen   = 3000
+	maxSnippetRunes = 500
+
+	hybridVectorWeight = 0.7
+	hybridTextWeight   = 0.3
+	hybridMinScore     = 0.15
 )
 
 // MemoryIndex provides FTS5-based keyword search across agent memory.
@@ -70,6 +75,34 @@ func OpenMemoryIndex(agentID string, logger *slog.Logger) (*MemoryIndex, error) 
 		return nil, fmt.Errorf("create meta table: %w", err)
 	}
 
+	// Chunks table for vector search
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS chunks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source TEXT NOT NULL,
+			content TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			timestamp TEXT,
+			embedding BLOB
+		)
+	`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create chunks table: %w", err)
+	}
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(content_hash)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source)`)
+
+	// Embedding cache persists across re-indexes
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS embedding_cache (
+			content_hash TEXT PRIMARY KEY,
+			embedding BLOB NOT NULL
+		)
+	`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create embedding_cache table: %w", err)
+	}
+
 	return &MemoryIndex{db: db, logger: logger}, nil
 }
 
@@ -95,21 +128,31 @@ func (idx *MemoryIndex) IndexMessages(agentID string) error {
 	if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'"); err != nil {
 		return err
 	}
+	idx.db.Exec("DELETE FROM chunks WHERE source = 'message'")
 
-	stmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer ftsStmt.Close()
+
+	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer chunkStmt.Close()
 
 	for _, msg := range msgs {
 		if msg.Content == "" {
 			continue
 		}
 		text := msg.Role + ": " + msg.Content
-		if _, err := stmt.Exec("message", text, msg.Timestamp); err != nil {
+		if _, err := ftsStmt.Exec("message", text, msg.Timestamp); err != nil {
 			idx.logger.Debug("failed to index message", "id", msg.ID, "err", err)
 		}
+		hash := contentHash(text)
+		cached := idx.getCachedEmbedding(hash)
+		chunkStmt.Exec("message", text, hash, msg.Timestamp, cached)
 	}
 
 	// Update message_count to stay in sync with incremental indexing
@@ -129,24 +172,33 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 	if _, err := idx.db.Exec("DELETE FROM memory_fts WHERE source IN ('memory', 'daily')"); err != nil {
 		return err
 	}
+	idx.db.Exec("DELETE FROM chunks WHERE source IN ('memory', 'daily')")
 
-	stmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer ftsStmt.Close()
+
+	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
+	if err != nil {
+		return err
+	}
+	defer chunkStmt.Close()
 
 	// Index MEMORY.md
 	memoryPath := filepath.Join(dir, "MEMORY.md")
 	if data, err := os.ReadFile(memoryPath); err == nil && len(data) > 0 {
-		// Split by sections for better granularity
 		sections := splitSections(string(data))
 		now := time.Now().UTC().Format(time.RFC3339)
 		for _, section := range sections {
 			if strings.TrimSpace(section) == "" {
 				continue
 			}
-			stmt.Exec("memory", section, now)
+			ftsStmt.Exec("memory", section, now)
+			hash := contentHash(section)
+			cached := idx.getCachedEmbedding(hash)
+			chunkStmt.Exec("memory", section, hash, now, cached)
 		}
 	}
 
@@ -162,9 +214,11 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 			if err != nil || len(data) == 0 {
 				continue
 			}
-			// Use filename date as timestamp
 			date := strings.TrimSuffix(entry.Name(), ".md")
-			stmt.Exec("daily", string(data), date)
+			ftsStmt.Exec("daily", string(data), date)
+			hash := contentHash(string(data))
+			cached := idx.getCachedEmbedding(hash)
+			chunkStmt.Exec("daily", string(data), hash, date, cached)
 		}
 	}
 
@@ -216,8 +270,8 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 	// If messages were truncated/rebuilt (count shrank), do a full reindex
 	if len(msgs) < lastCount {
 		idx.db.Exec("DELETE FROM memory_fts WHERE source = 'message'")
+		idx.db.Exec("DELETE FROM chunks WHERE source = 'message'")
 		lastCount = 0
-		// Update count even if no messages remain
 		if len(msgs) == 0 {
 			idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", "0")
 			return
@@ -228,22 +282,29 @@ func (idx *MemoryIndex) IndexNewMessages(agentID string) {
 		return // no new messages
 	}
 
-	// Only insert new messages (after the already-processed ones)
-	stmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
+	ftsStmt, err := idx.db.Prepare("INSERT INTO memory_fts(source, content, timestamp) VALUES(?, ?, ?)")
 	if err != nil {
 		return
 	}
-	defer stmt.Close()
+	defer ftsStmt.Close()
+
+	chunkStmt, err := idx.db.Prepare("INSERT INTO chunks(source, content, content_hash, timestamp, embedding) VALUES(?, ?, ?, ?, ?)")
+	if err != nil {
+		return
+	}
+	defer chunkStmt.Close()
 
 	for _, msg := range msgs[lastCount:] {
 		if msg.Content == "" {
 			continue
 		}
 		text := msg.Role + ": " + msg.Content
-		stmt.Exec("message", text, msg.Timestamp)
+		ftsStmt.Exec("message", text, msg.Timestamp)
+		hash := contentHash(text)
+		cached := idx.getCachedEmbedding(hash)
+		chunkStmt.Exec("message", text, hash, msg.Timestamp, cached)
 	}
 
-	// Store total message count (not indexed count) to avoid offset drift
 	idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, "message_count", fmt.Sprintf("%d", len(msgs)))
 	idx.updateMeta("message")
 }
@@ -305,7 +366,7 @@ func (idx *MemoryIndex) Search(query string, limit int) ([]SearchResult, error) 
 	}
 
 	rows, err := idx.db.Query(`
-		SELECT source, snippet(memory_fts, 1, '', '', '...', 64), timestamp,
+		SELECT source, content, snippet(memory_fts, 1, '', '', '...', 64), timestamp,
 			   rank
 		FROM memory_fts
 		WHERE memory_fts MATCH ?
@@ -320,9 +381,11 @@ func (idx *MemoryIndex) Search(query string, limit int) ([]SearchResult, error) 
 	var results []SearchResult
 	for rows.Next() {
 		var r SearchResult
-		if err := rows.Scan(&r.Source, &r.Snippet, &r.Timestamp, &r.Score); err != nil {
+		var fullContent string
+		if err := rows.Scan(&r.Source, &fullContent, &r.Snippet, &r.Timestamp, &r.Score); err != nil {
 			continue
 		}
+		r.ContentHash = contentHash(fullContent)
 		results = append(results, r)
 	}
 	return results, rows.Err()
@@ -330,17 +393,26 @@ func (idx *MemoryIndex) Search(query string, limit int) ([]SearchResult, error) 
 
 // SearchResult represents a single search hit.
 type SearchResult struct {
-	Source    string  `json:"source"`    // "message", "memory", "daily"
-	Snippet  string  `json:"snippet"`   // text snippet with context
-	Timestamp string `json:"timestamp"`
-	Score     float64 `json:"score"`
+	Source      string  `json:"source"`      // "message", "memory", "daily"
+	Snippet     string  `json:"snippet"`     // text snippet with context
+	ContentHash string  `json:"contentHash"` // for dedup/merge across search methods
+	Timestamp   string  `json:"timestamp"`
+	Score       float64 `json:"score"`
 }
 
 // BuildContextFromQuery searches the index and returns formatted context for injection into system prompt.
+// Uses hybrid search (FTS5 + vector) when embeddings are available, falls back to FTS5 only.
 func (idx *MemoryIndex) BuildContextFromQuery(query string) string {
-	results, err := idx.Search(query, maxResults)
-	if err != nil || len(results) == 0 {
-		return ""
+	// Try hybrid search first
+	results := idx.hybridSearch(query, maxResults)
+
+	// Fallback to FTS5 only
+	if len(results) == 0 {
+		var err error
+		results, err = idx.Search(query, maxResults)
+		if err != nil || len(results) == 0 {
+			return ""
+		}
 	}
 
 	var sb strings.Builder
@@ -348,7 +420,11 @@ func (idx *MemoryIndex) BuildContextFromQuery(query string) string {
 
 	totalLen := 0
 	for _, r := range results {
-		entry := fmt.Sprintf("- [%s] %s\n", r.Source, r.Snippet)
+		snippet := r.Snippet
+		if runes := []rune(snippet); len(runes) > maxSnippetRunes {
+			snippet = string(runes[:maxSnippetRunes]) + "…"
+		}
+		entry := fmt.Sprintf("- [%s] %s\n", r.Source, snippet)
 		if totalLen+len(entry) > maxContextLen {
 			break
 		}
@@ -357,6 +433,273 @@ func (idx *MemoryIndex) BuildContextFromQuery(query string) string {
 	}
 
 	return sb.String()
+}
+
+// hybridSearch combines FTS5 BM25 results with vector cosine similarity.
+// Returns nil if vector search is unavailable (no API key or no embeddings).
+func (idx *MemoryIndex) hybridSearch(query string, limit int) []SearchResult {
+	apiKey, err := loadGeminiAPIKey()
+	if err != nil {
+		return nil // no API key, skip vector search
+	}
+
+	// Generate query embedding
+	queryEmb, err := getEmbedding(apiKey, query)
+	if err != nil {
+		idx.logger.Debug("query embedding failed", "err", err)
+		return nil
+	}
+
+	// Embed any pending chunks while we're at it
+	idx.embedPendingChunks(apiKey)
+
+	// Vector search: brute force cosine similarity
+	vecResults := idx.vectorSearch(queryEmb, limit*4) // get extra candidates
+
+	// FTS5 search
+	ftsResults, _ := idx.Search(query, limit*4)
+
+	if len(vecResults) == 0 && len(ftsResults) == 0 {
+		return nil
+	}
+
+	// Normalize and merge
+	type scored struct {
+		result SearchResult
+		vec    float64
+		bm25   float64
+	}
+
+	byHash := make(map[string]*scored)
+
+	// Normalize vector scores (already 0-1 from cosine similarity)
+	for _, r := range vecResults {
+		byHash[r.ContentHash] = &scored{result: r, vec: r.Score}
+	}
+
+	// Normalize BM25 scores (rank is negative, more negative = better)
+	var maxRank float64
+	for _, r := range ftsResults {
+		if -r.Score > maxRank {
+			maxRank = -r.Score
+		}
+	}
+	for _, r := range ftsResults {
+		norm := 0.0
+		if maxRank > 0 {
+			norm = -r.Score / maxRank
+		}
+		if s, ok := byHash[r.ContentHash]; ok {
+			s.bm25 = norm
+		} else {
+			byHash[r.ContentHash] = &scored{result: r, bm25: norm}
+		}
+	}
+
+	// Compute hybrid scores and filter
+	type ranked struct {
+		result SearchResult
+		score  float64
+	}
+	var merged []ranked
+	for _, s := range byHash {
+		score := hybridVectorWeight*s.vec + hybridTextWeight*s.bm25
+		if score < hybridMinScore {
+			continue
+		}
+		r := s.result
+		r.Score = score
+		merged = append(merged, ranked{result: r, score: score})
+	}
+
+	// Sort by score descending
+	for i := 0; i < len(merged); i++ {
+		for j := i + 1; j < len(merged); j++ {
+			if merged[j].score > merged[i].score {
+				merged[i], merged[j] = merged[j], merged[i]
+			}
+		}
+	}
+
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	results := make([]SearchResult, len(merged))
+	for i, m := range merged {
+		results[i] = m.result
+	}
+	return results
+}
+
+// vectorSearch performs brute-force cosine similarity search against stored embeddings.
+func (idx *MemoryIndex) vectorSearch(queryEmb []float32, limit int) []SearchResult {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	rows, err := idx.db.Query("SELECT source, content, timestamp, embedding FROM chunks WHERE embedding IS NOT NULL AND LENGTH(embedding) > 0")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type hit struct {
+		result SearchResult
+		score  float64
+	}
+	var hits []hit
+
+	for rows.Next() {
+		var source, content, ts string
+		var embBlob []byte
+		if err := rows.Scan(&source, &content, &ts, &embBlob); err != nil {
+			continue
+		}
+		emb := decodeEmbedding(embBlob)
+		score := cosineSimilarity(queryEmb, emb)
+		if score < 0.1 { // skip very low similarity
+			continue
+		}
+		// Truncate content for snippet
+		snippet := content
+		if runes := []rune(snippet); len(runes) > maxSnippetRunes {
+			snippet = string(runes[:maxSnippetRunes]) + "…"
+		}
+		hits = append(hits, hit{
+			result: SearchResult{Source: source, Snippet: snippet, ContentHash: contentHash(content), Timestamp: ts, Score: score},
+			score:  score,
+		})
+	}
+
+	// Sort by score descending
+	for i := 0; i < len(hits); i++ {
+		for j := i + 1; j < len(hits); j++ {
+			if hits[j].score > hits[i].score {
+				hits[i], hits[j] = hits[j], hits[i]
+			}
+		}
+	}
+
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+
+	results := make([]SearchResult, len(hits))
+	for i, h := range hits {
+		results[i] = h.result
+	}
+	return results
+}
+
+// embedPendingChunks batch-embeds chunks that don't have embeddings yet.
+func (idx *MemoryIndex) embedPendingChunks(apiKey string) {
+	idx.mu.Lock()
+
+	rows, err := idx.db.Query("SELECT id, content, content_hash FROM chunks WHERE embedding IS NULL LIMIT 100")
+	if err != nil {
+		idx.mu.Unlock()
+		return
+	}
+
+	type pending struct {
+		id   int64
+		text string
+		hash string
+	}
+	var items []pending
+	for rows.Next() {
+		var p pending
+		if rows.Scan(&p.id, &p.text, &p.hash) == nil {
+			items = append(items, p)
+		}
+	}
+	rows.Close()
+
+	if len(items) == 0 {
+		idx.mu.Unlock()
+		return
+	}
+
+	// Mark selected rows as in-progress (empty blob) to prevent duplicate
+	// API calls from concurrent goroutines picking up the same rows.
+	markStmt, _ := idx.db.Prepare("UPDATE chunks SET embedding = X'' WHERE id = ?")
+	if markStmt != nil {
+		for _, p := range items {
+			markStmt.Exec(p.id)
+		}
+		markStmt.Close()
+	}
+	idx.mu.Unlock()
+
+	texts := make([]string, len(items))
+	for i, p := range items {
+		texts[i] = p.text
+	}
+
+	// Network call outside lock
+	embeddings, err := getBatchEmbeddings(apiKey, texts)
+	if err != nil {
+		idx.logger.Debug("batch embedding failed", "err", err)
+		// Revert marks so they can be retried
+		idx.mu.Lock()
+		revert, _ := idx.db.Prepare("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0")
+		if revert != nil {
+			for _, p := range items {
+				revert.Exec(p.id)
+			}
+			revert.Close()
+		}
+		idx.mu.Unlock()
+		return
+	}
+
+	// Re-acquire lock for DB writes
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	updateStmt, err := idx.db.Prepare("UPDATE chunks SET embedding = ? WHERE id = ?")
+	if err != nil {
+		// Can't write — revert all markers
+		for _, p := range items {
+			idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id)
+		}
+		return
+	}
+	defer updateStmt.Close()
+
+	cacheStmt, _ := idx.db.Prepare("INSERT OR REPLACE INTO embedding_cache(content_hash, embedding) VALUES(?, ?)")
+	if cacheStmt != nil {
+		defer cacheStmt.Close()
+	}
+
+	written := make(map[int64]bool, len(embeddings))
+	for i, emb := range embeddings {
+		if i >= len(items) {
+			break
+		}
+		blob := encodeEmbedding(emb)
+		if _, err := updateStmt.Exec(blob, items[i].id); err != nil {
+			continue
+		}
+		if cacheStmt != nil {
+			cacheStmt.Exec(items[i].hash, blob)
+		}
+		written[items[i].id] = true
+	}
+
+	// Revert any in-progress markers that weren't written (partial response or write failure)
+	for _, p := range items {
+		if !written[p.id] {
+			idx.db.Exec("UPDATE chunks SET embedding = NULL WHERE id = ? AND LENGTH(embedding) = 0", p.id)
+		}
+	}
+}
+
+// getCachedEmbedding returns a cached embedding blob for the given hash, or nil.
+func (idx *MemoryIndex) getCachedEmbedding(hash string) []byte {
+	var blob []byte
+	idx.db.QueryRow("SELECT embedding FROM embedding_cache WHERE content_hash = ?", hash).Scan(&blob)
+	return blob
 }
 
 func (idx *MemoryIndex) updateMeta(source string) {

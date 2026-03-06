@@ -288,7 +288,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	// Build system prompt
-	systemPrompt := buildSystemPrompt(&agentCopy, userMessage, m.logger)
+	systemPrompt := buildSystemPrompt(&agentCopy, m.logger)
 
 	// Start chat
 	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt)
@@ -379,6 +379,11 @@ func (m *Manager) IsBusy(agentID string) bool {
 // Messages returns recent messages for an agent.
 func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 	return loadMessages(agentID, limit)
+}
+
+// MessagesPaginated returns messages with cursor-based pagination.
+func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
+	return loadMessagesPaginated(agentID, limit, before)
 }
 
 // Shutdown stops all cron jobs and cancels active chats.

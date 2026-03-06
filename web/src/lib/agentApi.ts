@@ -41,6 +41,15 @@ export interface ToolUse {
   output: string;
 }
 
+export interface Credential {
+  id: string;
+  label: string;
+  username: string;
+  password: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ChatEvent {
   type: "status" | "text" | "tool_use" | "tool_result" | "done" | "error";
   status?: string;
@@ -138,4 +147,32 @@ export const agentApi = {
 
   previewAvatarUrl: (path: string) =>
     `${BASE}/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`,
+
+  credentials: {
+    list: (agentId: string) =>
+      get<{ credentials: Credential[] }>(
+        `/api/v1/agents/${agentId}/credentials`,
+      ).then((r) => r.credentials ?? []),
+
+    add: (agentId: string, label: string, username: string, password: string) =>
+      post<Credential>(`/api/v1/agents/${agentId}/credentials`, {
+        label,
+        username,
+        password,
+      }),
+
+    update: (
+      agentId: string,
+      credId: string,
+      data: Partial<{ label: string; username: string; password: string }>,
+    ) => patch<Credential>(`/api/v1/agents/${agentId}/credentials/${credId}`, data),
+
+    delete: (agentId: string, credId: string) =>
+      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/credentials/${credId}`),
+
+    revealPassword: (agentId: string, credId: string) =>
+      get<{ password: string }>(
+        `/api/v1/agents/${agentId}/credentials/${credId}/password`,
+      ).then((r) => r.password),
+  },
 };

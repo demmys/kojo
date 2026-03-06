@@ -77,11 +77,16 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	env := os.Environ()
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
-		if strings.HasPrefix(e, "CLAUDE_CODE") || strings.HasPrefix(e, "CLAUDECODE") {
+		if strings.HasPrefix(e, "CLAUDE_CODE") || strings.HasPrefix(e, "CLAUDECODE") ||
+			strings.HasPrefix(e, "AGENT_BROWSER_SESSION") {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
+	filtered = append(filtered,
+		"AGENT_BROWSER_SESSION="+agent.ID,
+		"AGENT_BROWSER_SESSION_NAME="+agent.ID,
+	)
 	cmd.Env = filtered
 	cmd.Dir = dir
 

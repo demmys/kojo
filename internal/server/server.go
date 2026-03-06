@@ -131,6 +131,11 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
 		mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
 		mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
+		mux.HandleFunc("GET /api/v1/agents/{id}/credentials", s.handleListCredentials)
+		mux.HandleFunc("POST /api/v1/agents/{id}/credentials", s.handleAddCredential)
+		mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
+		mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
+		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/password", s.handleRevealCredentialPassword)
 		mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
 	}
 

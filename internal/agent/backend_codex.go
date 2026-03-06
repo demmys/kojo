@@ -62,6 +62,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(fullMessage)
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, e := range env {
+		if strings.HasPrefix(e, "AGENT_BROWSER_SESSION") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	filtered = append(filtered,
+		"AGENT_BROWSER_SESSION="+agent.ID,
+		"AGENT_BROWSER_SESSION_NAME="+agent.ID,
+	)
+	cmd.Env = filtered
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

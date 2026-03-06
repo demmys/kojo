@@ -308,6 +308,120 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUploadGeneratedAvatar copies a generated avatar to the agent's directory.
+// --- Credential Handlers ---
+
+func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	creds, err := agent.ListCredentials(id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	if creds == nil {
+		creds = []*agent.Credential{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"credentials": creds})
+}
+
+func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
+	var req struct {
+		Label    string `json:"label"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.Label == "" || req.Username == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "label, username, and password are required")
+		return
+	}
+	cred, err := agent.AddCredential(id, req.Label, req.Username, req.Password)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, cred)
+}
+
+func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	credID := r.PathValue("credId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
+	var req struct {
+		Label    *string `json:"label"`
+		Username *string `json:"username"`
+		Password *string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	cred, err := agent.UpdateCredential(id, credID, req.Label, req.Username, req.Password)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, cred)
+}
+
+func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	credID := r.PathValue("credId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	if err := agent.DeleteCredential(id, credID); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRevealCredentialPassword(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	credID := r.PathValue("credId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	password, err := agent.RevealPassword(id, credID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSONResponse(w, http.StatusOK, map[string]string{"password": password})
+}
+
 func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.agents.Get(id); !ok {

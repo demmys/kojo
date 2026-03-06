@@ -273,6 +273,15 @@ export function AgentSettings() {
 
         <div className="border-t border-neutral-800 pt-5">
           <button
+            onClick={() => navigate(`/agents/${id}/credentials`)}
+            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
+          >
+            Credentials
+          </button>
+        </div>
+
+        <div className="border-t border-neutral-800 pt-5">
+          <button
             onClick={handleDelete}
             disabled={deleting}
             className="w-full py-3 bg-red-950 hover:bg-red-900 border border-red-800 rounded-lg text-sm font-medium text-red-300 disabled:opacity-40"

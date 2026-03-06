@@ -216,7 +216,7 @@ export function AgentChat() {
         >
           &larr;
         </button>
-        <AgentAvatar agentId={agent.id} name={agent.name} size="md" />
+        <AgentAvatar agentId={agent.id} name={agent.name} size="md" cacheBust={agent.avatarHash} />
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{agent.name}</div>
           <div className="text-xs text-neutral-500">
@@ -267,6 +267,7 @@ export function AgentChat() {
             message={msg}
             agentName={agent.name}
             agentId={agent.id}
+            avatarHash={agent.avatarHash}
           />
         ))}
         {streaming && (
@@ -276,6 +277,7 @@ export function AgentChat() {
             agentName={agent.name}
             agentId={agent.id}
             status={streamStatus}
+            avatarHash={agent.avatarHash}
           />
         )}
         <div ref={messagesEndRef} />

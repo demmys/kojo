@@ -12,8 +12,21 @@ import (
 	"strings"
 )
 
-// avatarFileName returns the expected avatar file path for an agent.
-// Checks for common image extensions.
+// avatarMeta returns whether an avatar file exists and a modtime-derived hash.
+// Single pass: one avatarFilePath lookup + one Stat.
+func avatarMeta(agentID string) (exists bool, hash string) {
+	p := avatarFilePath(agentID)
+	if p == "" {
+		return false, ""
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%x", fi.ModTime().UnixNano())
+}
+
+// avatarFilePath returns the path to the agent's avatar file, or "".
 func avatarFilePath(agentID string) string {
 	dir := agentDir(agentID)
 	for _, ext := range []string{".png", ".jpg", ".jpeg", ".webp", ".svg"} {
@@ -23,11 +36,6 @@ func avatarFilePath(agentID string) string {
 		}
 	}
 	return ""
-}
-
-// hasAvatar returns true if the agent has a custom avatar file.
-func hasAvatar(agentID string) bool {
-	return avatarFilePath(agentID) != ""
 }
 
 // ServeAvatar serves the agent's avatar image, falling back to a generated SVG.

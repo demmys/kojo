@@ -10,6 +10,7 @@ export interface AgentInfo {
   createdAt: string;
   updatedAt: string;
   hasAvatar: boolean;
+  avatarHash?: string;
   lastMessage?: {
     content: string;
     role: string;

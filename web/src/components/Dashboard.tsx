@@ -147,7 +147,7 @@ export function Dashboard() {
                   onClick={() => navigate(`/agents/${agent.id}`)}
                   className="w-full flex items-center gap-3 p-3 bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 text-left transition-colors"
                 >
-                  <AgentAvatar agentId={agent.id} name={agent.name} size="lg" />
+                  <AgentAvatar agentId={agent.id} name={agent.name} size="lg" cacheBust={agent.avatarHash} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between">
                       <span className="font-medium text-sm truncate">{agent.name}</span>

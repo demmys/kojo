@@ -19,6 +19,8 @@ type Agent struct {
 
 	// HasAvatar indicates whether a custom avatar file exists.
 	HasAvatar bool `json:"hasAvatar"`
+	// AvatarHash is derived from the avatar file's modtime for cache busting.
+	AvatarHash string `json:"avatarHash,omitempty"`
 
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`

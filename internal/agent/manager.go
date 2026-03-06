@@ -45,7 +45,10 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger.Warn("failed to load agents", "err", err)
 	}
 	for _, a := range agents {
-		a.HasAvatar = hasAvatar(a.ID)
+		a.HasAvatar, a.AvatarHash = avatarMeta(a.ID)
+		if !a.HasAvatar {
+			a.AvatarHash = a.UpdatedAt
+		}
 		// Load last message preview
 		if msgs, err := loadMessages(a.ID, 1); err == nil && len(msgs) > 0 {
 			last := msgs[len(msgs)-1]
@@ -83,7 +86,10 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	a.HasAvatar = hasAvatar(a.ID)
+	a.HasAvatar, a.AvatarHash = avatarMeta(a.ID)
+	if !a.HasAvatar {
+		a.AvatarHash = a.UpdatedAt
+	}
 
 	m.mu.Lock()
 	m.agents[a.ID] = a
@@ -132,11 +138,17 @@ func (m *Manager) syncPersona(agentID string) {
 // Get returns a deep copy of an agent by ID.
 func (m *Manager) Get(id string) (*Agent, bool) {
 	m.syncPersona(id)
+	has, hash := avatarMeta(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.agents[id]
 	if !ok {
 		return nil, false
+	}
+	a.HasAvatar = has
+	a.AvatarHash = hash
+	if !has {
+		a.AvatarHash = a.UpdatedAt
 	}
 	return copyAgent(a), true
 }
@@ -155,10 +167,25 @@ func (m *Manager) List() []*Agent {
 		m.syncPersona(id)
 	}
 
+	// Compute avatar info outside lock (disk I/O)
+	type avInfo struct{ has bool; hash string }
+	avMap := make(map[string]avInfo, len(ids))
+	for _, id := range ids {
+		has, hash := avatarMeta(id)
+		avMap[id] = avInfo{has, hash}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := make([]*Agent, 0, len(m.agents))
 	for _, a := range m.agents {
+		if info, ok := avMap[a.ID]; ok {
+			a.HasAvatar = info.has
+			a.AvatarHash = info.hash
+			if !info.has {
+				a.AvatarHash = a.UpdatedAt
+			}
+		}
 		list = append(list, copyAgent(a))
 	}
 	return list
@@ -166,6 +193,7 @@ func (m *Manager) List() []*Agent {
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
+	has, hash := avatarMeta(id)
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	if !ok {
@@ -196,6 +224,11 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	newCron := a.CronExpr
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	a.HasAvatar = has
+	a.AvatarHash = hash
+	if !has {
+		a.AvatarHash = a.UpdatedAt
+	}
 
 	// Take a copy for return and post-lock operations
 	cp := copyAgent(a)

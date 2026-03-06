@@ -14,12 +14,14 @@ interface ChatMessageProps {
   message: AgentMessage;
   agentName: string;
   agentId: string;
+  avatarHash?: string;
 }
 
 export const ChatMessage = memo(function ChatMessage({
   message,
   agentName,
   agentId,
+  avatarHash,
 }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
@@ -32,7 +34,7 @@ export const ChatMessage = memo(function ChatMessage({
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}>
       {/* Avatar */}
       {!isUser && (
-        <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" />
+        <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
       )}
 
       {/* Bubble */}
@@ -363,6 +365,7 @@ interface StreamingMessageProps {
   agentName: string;
   agentId: string;
   status: string;
+  avatarHash?: string;
 }
 
 export function StreamingMessage({
@@ -371,10 +374,11 @@ export function StreamingMessage({
   agentName,
   agentId,
   status,
+  avatarHash,
 }: StreamingMessageProps) {
   return (
     <div className="flex gap-3 flex-row">
-      <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" />
+      <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
       <div className="max-w-[80%] bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm px-3.5 py-2.5">
         {status === "thinking" && !text && toolUses.length === 0 && (
           <div className="flex items-center gap-1.5 py-1">

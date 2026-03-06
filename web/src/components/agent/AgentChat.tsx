@@ -12,7 +12,7 @@ export function AgentChat() {
   const navigate = useNavigate();
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string }>>([]);
@@ -23,6 +23,19 @@ export function AgentChat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
+
+  // Restore draft and textarea height on mount / id change
+  useEffect(() => {
+    const draft = sessionStorage.getItem(`agent-draft:${id}`) ?? "";
+    setInput(draft);
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "auto";
+        textareaRef.current.style.height =
+          Math.min(textareaRef.current.scrollHeight, 150) + "px";
+      }
+    });
+  }, [id]);
 
   // Load agent and initial messages
   useEffect(() => {
@@ -176,6 +189,7 @@ export function AgentChat() {
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
+    if (id) sessionStorage.setItem(`agent-draft:${id}`, "");
     setStreaming(true);
     setStreamText("");
     setStreamTools([]);
@@ -289,7 +303,10 @@ export function AgentChat() {
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              if (id) sessionStorage.setItem(`agent-draft:${id}`, e.target.value);
+            }}
             onInput={handleTextareaInput}
             onKeyDown={handleKeyDown}
             placeholder="Message..."

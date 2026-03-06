@@ -58,6 +58,12 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	dir := agentDir(agent.ID)
 	os.MkdirAll(dir, 0o755)
 
+	// Prevent user's persona autoload hook from overriding the agent's persona.
+	// The SessionStart hook writes to CLAUDE.local.md in the working directory,
+	// which overrides --system-prompt. Remove it and create .claude/settings.local.json
+	// so the hook sees a local persona override and skips writing.
+	disablePersonaHook(dir, b.logger)
+
 	if hasExistingSession(dir) {
 		args = append(args, "--continue")
 	} else {
@@ -516,6 +522,25 @@ func findSessionFile(projectDir string, sessionID string) string {
 		}
 	}
 	return best
+}
+
+// disablePersonaHook removes any CLAUDE.local.md written by the user's
+// persona autoload hook and writes .claude/settings.local.json with a
+// dummy persona name so the hook won't recreate the file on session start.
+func disablePersonaHook(dir string, logger *slog.Logger) {
+	if err := os.Remove(filepath.Join(dir, "CLAUDE.local.md")); err != nil && !os.IsNotExist(err) {
+		logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
+	}
+
+	claudeDir := filepath.Join(dir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		logger.Warn("failed to create .claude dir in agent dir", "dir", dir, "err", err)
+		return
+	}
+	settingsPath := filepath.Join(claudeDir, "settings.local.json")
+	if err := os.WriteFile(settingsPath, []byte("{\"persona\":\"agent-managed\"}\n"), 0o644); err != nil {
+		logger.Warn("failed to write .claude/settings.local.json", "dir", dir, "err", err)
+	}
 }
 
 // isRealUserEntry returns true if the session JSONL "user" entry

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,12 @@ type Manager struct {
 	// busy tracks which agents have an active chat.
 	busy   map[string]context.CancelFunc
 	busyMu sync.Mutex
+
+	// resetting tracks agents currently being reset (blocks new chats).
+	resetting map[string]bool
+
+	// cronPaused globally pauses all cron jobs when true.
+	cronPaused bool
 }
 
 // NewManager creates a new agent manager.
@@ -33,12 +40,14 @@ func NewManager(logger *slog.Logger) *Manager {
 			"codex":  NewCodexBackend(logger),
 			"gemini": NewGeminiBackend(logger),
 		},
-		store:  newStore(logger),
-		logger: logger,
-		busy:   make(map[string]context.CancelFunc),
+		store:     newStore(logger),
+		logger:    logger,
+		busy:      make(map[string]context.CancelFunc),
+		resetting: make(map[string]bool),
 	}
 
 	m.cron = newCronScheduler(m, logger)
+	m.cronPaused = m.store.LoadCronPaused()
 
 	// Load persisted agents
 	agents, err := m.store.Load()
@@ -65,8 +74,8 @@ func NewManager(logger *slog.Logger) *Manager {
 	// Start cron schedules
 	m.cron.Start()
 	for _, a := range m.agents {
-		if a.CronExpr != "" {
-			if err := m.cron.Schedule(a.ID, a.CronExpr); err != nil {
+		if expr := intervalToCron(a.IntervalMinutes, a.ID); expr != "" {
+			if err := m.cron.Schedule(a.ID, expr); err != nil {
 				logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
 			}
 		}
@@ -81,7 +90,10 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("name is required")
 	}
 
-	a := newAgent(cfg)
+	a, err := newAgent(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := ensureAgentDir(a); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
@@ -98,8 +110,8 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 
 	m.save()
 
-	if a.CronExpr != "" {
-		if err := m.cron.Schedule(a.ID, a.CronExpr); err != nil {
+	if expr := intervalToCron(a.IntervalMinutes, a.ID); expr != "" {
+		if err := m.cron.Schedule(a.ID, expr); err != nil {
 			m.logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
 		}
 	}
@@ -219,11 +231,15 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Tool != nil {
 		a.Tool = *cfg.Tool
 	}
-	oldCron := a.CronExpr
-	if cfg.CronExpr != nil {
-		a.CronExpr = *cfg.CronExpr
+	oldInterval := a.IntervalMinutes
+	if cfg.IntervalMinutes != nil {
+		if !ValidInterval(*cfg.IntervalMinutes) {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("unsupported interval: %d minutes", *cfg.IntervalMinutes)
+		}
+		a.IntervalMinutes = *cfg.IntervalMinutes
 	}
-	newCron := a.CronExpr
+	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	a.HasAvatar = has
 	a.AvatarHash = hash
@@ -235,14 +251,102 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	cp := copyAgent(a)
 	m.mu.Unlock()
 
-	if oldCron != newCron {
-		if err := m.cron.Schedule(id, newCron); err != nil {
+	if oldInterval != newInterval {
+		expr := intervalToCron(newInterval, id)
+		if err := m.cron.Schedule(id, expr); err != nil {
 			m.logger.Warn("failed to update cron", "agent", id, "err", err)
 		}
 	}
 
 	m.save()
 	return cp, nil
+}
+
+// ResetData removes conversation logs and memory but keeps settings, persona, avatar, and credentials.
+func (m *Manager) ResetData(id string) error {
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	name := a.Name
+	m.mu.Unlock()
+
+	// Mark agent as resetting to block new chats/deletes/concurrent resets
+	m.busyMu.Lock()
+	if m.resetting[id] {
+		m.busyMu.Unlock()
+		return fmt.Errorf("agent is busy, try again later")
+	}
+	m.resetting[id] = true
+	if cancel, busy := m.busy[id]; busy {
+		cancel()
+	}
+	m.busyMu.Unlock()
+
+	defer func() {
+		m.busyMu.Lock()
+		delete(m.resetting, id)
+		m.busyMu.Unlock()
+	}()
+
+	// Wait for the chat goroutine to finish (max 5s)
+	for i := 0; i < 50; i++ {
+		m.busyMu.Lock()
+		_, busy := m.busy[id]
+		m.busyMu.Unlock()
+		if !busy {
+			break
+		}
+		if i == 49 {
+			return fmt.Errorf("agent is busy, try again later")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	dir := agentDir(id)
+
+	// Remove conversation log
+	os.Remove(filepath.Join(dir, messagesFile))
+
+	// Remove memory files
+	os.RemoveAll(filepath.Join(dir, "memory"))
+	os.Remove(filepath.Join(dir, "MEMORY.md"))
+
+	// Remove FTS index
+	os.RemoveAll(filepath.Join(dir, indexDir))
+
+	// Remove persona summary cache (will be regenerated)
+	os.Remove(filepath.Join(dir, "persona_summary.md"))
+
+	// Remove cron lock file
+	os.Remove(filepath.Join(dir, cronLockFile))
+
+	// Remove CLI local state so next chat starts fresh
+	os.RemoveAll(filepath.Join(dir, ".claude"))
+	os.RemoveAll(filepath.Join(dir, ".gemini"))
+
+	// Clear global CLI session stores
+	clearClaudeSession(id)
+	clearGeminiSession(id)
+
+	// Recreate empty memory directory and MEMORY.md
+	os.MkdirAll(filepath.Join(dir, "memory"), 0o755)
+	initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", name)
+	os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte(initial), 0o644)
+
+	// Clear last message preview
+	m.mu.Lock()
+	if a, ok := m.agents[id]; ok {
+		a.LastMessage = nil
+		a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	m.mu.Unlock()
+
+	m.save()
+	m.logger.Info("agent data reset", "id", id)
+	return nil
 }
 
 // Delete removes an agent and its data.
@@ -254,8 +358,14 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("agent not found: %s", id)
 	}
 
-	// Abort any running chat
+	// Block if agent is being reset
 	m.busyMu.Lock()
+	if m.resetting[id] {
+		m.busyMu.Unlock()
+		m.mu.Unlock()
+		return fmt.Errorf("agent is busy, try again later")
+	}
+	// Abort any running chat
 	if cancel, busy := m.busy[id]; busy {
 		cancel()
 	}
@@ -292,8 +402,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	agentCopy := *a
 	m.mu.Unlock()
 
-	// Check if agent is busy
+	// Check if agent is busy or being reset
 	m.busyMu.Lock()
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		return nil, fmt.Errorf("agent is being reset")
+	}
 	if _, busy := m.busy[agentID]; busy {
 		m.busyMu.Unlock()
 		return nil, fmt.Errorf("agent is busy")
@@ -406,6 +520,22 @@ func (m *Manager) Abort(agentID string) {
 		cancel()
 	}
 	m.busyMu.Unlock()
+}
+
+// CronPaused returns whether all cron jobs are globally paused.
+func (m *Manager) CronPaused() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cronPaused
+}
+
+// SetCronPaused sets the global cron pause state and persists it.
+func (m *Manager) SetCronPaused(paused bool) {
+	m.mu.Lock()
+	m.cronPaused = paused
+	m.mu.Unlock()
+	m.store.SaveCronPaused(paused)
+	m.logger.Info("cron pause toggled", "paused", paused)
 }
 
 // IsBusy returns true if the agent has an active chat.

@@ -529,6 +529,31 @@ func findSessionFile(projectDir string, sessionID string) string {
 	return best
 }
 
+// clearClaudeSession removes Claude session JSONL files from the global
+// config store for the given agent, forcing the next chat to start fresh.
+func clearClaudeSession(agentID string) {
+	dir := agentDir(agentID)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			os.Remove(filepath.Join(projectDir, e.Name()))
+		}
+	}
+}
+
 // disablePersonaHook removes any CLAUDE.local.md written by the user's
 // persona autoload hook and writes .claude/settings.local.json with a
 // dummy persona name so the hook won't recreate the file on session start.

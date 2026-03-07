@@ -16,7 +16,7 @@ const cronMinInterval = 50 * time.Second // minimum interval between runs for sa
 const cronLockFile = ".cron_last"
 func cronPrompt() string {
 	now := time.Now()
-	return now.Format("2006年1月2日 15:04") + "です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。必要なら、記録の整理や関連ファイルの更新など、短時間で安全に完了する作業があれば実行に移してください。"
+	return "[system message] " + now.Format("2006年1月2日 15:04") + "です。最近の記憶を振り返り、気づいたことや考えたことがあれば記録してください。必要なら、記録の整理や関連ファイルの更新など、短時間で安全に完了する作業があれば実行に移してください。"
 }
 
 // cronScheduler manages periodic agent executions.
@@ -54,6 +54,7 @@ func (cs *cronScheduler) Stop() {
 
 // Schedule adds or updates a cron schedule for an agent.
 // If cronExpr is empty, any existing schedule is removed.
+// The cronExpr is generated internally by intervalToCron.
 func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -133,6 +134,12 @@ func acquireCronLock(agentID string) bool {
 }
 
 func (cs *cronScheduler) runCronJob(agentID string) {
+	// Check global pause
+	if cs.mgr.CronPaused() {
+		cs.logger.Debug("cron job skipped (globally paused)", "agent", agentID)
+		return
+	}
+
 	// Cross-process guard: atomic lock file prevents duplicate execution
 	if !acquireCronLock(agentID) {
 		cs.logger.Debug("cron job skipped (lock held)", "agent", agentID)

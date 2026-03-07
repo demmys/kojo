@@ -118,10 +118,13 @@ func New(cfg Config) *Server {
 
 	// Agent routes
 	if s.agents != nil {
+		mux.HandleFunc("GET /api/v1/agents/cron-paused", s.handleGetCronPaused)
+		mux.HandleFunc("PUT /api/v1/agents/cron-paused", s.handleSetCronPaused)
 		mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
 		mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
 		mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
 		mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+		mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 		mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
 		mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)
 		mux.HandleFunc("POST /api/v1/agents/{id}/avatar", s.handleUploadAvatar)

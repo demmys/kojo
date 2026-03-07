@@ -54,6 +54,7 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
 export function Dashboard() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [cronPaused, setCronPaused] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const navigate = useNavigate();
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
@@ -69,6 +70,13 @@ export function Dashboard() {
     const loadAgents = () => agentApi.list().then(setAgents).catch(console.error);
     loadAgents();
     const interval = setInterval(loadAgents, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const loadPaused = () => agentApi.cronPaused().then(setCronPaused).catch(console.error);
+    loadPaused();
+    const interval = setInterval(loadPaused, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -136,6 +144,29 @@ export function Dashboard() {
         <section>
             <div className="flex items-center justify-between mb-2">
               <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Agents</h2>
+              {agents.some((a) => a.intervalMinutes > 0) && (
+                <button
+                  onClick={() => {
+                    const next = !cronPaused;
+                    setCronPaused(next);
+                    agentApi.setCronPaused(next).catch(() => setCronPaused(!next));
+                  }}
+                  className="flex items-center gap-1.5"
+                >
+                  <span className={`relative inline-flex h-3 w-6 shrink-0 items-center rounded-full transition-colors duration-200 ${
+                    cronPaused ? "bg-neutral-700" : "bg-emerald-600/60"
+                  }`}>
+                    <span className={`inline-block h-2 w-2 rounded-full bg-white transition-transform duration-200 ${
+                      cronPaused ? "translate-x-0.5" : "translate-x-[14px]"
+                    }`} />
+                  </span>
+                  <span className={`text-[10px] transition-colors ${
+                    cronPaused ? "text-neutral-500" : "text-neutral-500"
+                  }`}>
+                    {cronPaused ? "cron paused" : "cron running"}
+                  </span>
+                </button>
+              )}
             </div>
             {sortedAgents.length === 0 && (
               <p className="text-neutral-500 text-center py-8 text-sm">No agents yet</p>

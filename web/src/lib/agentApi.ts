@@ -1,12 +1,23 @@
 const BASE = "";
 
+export const INTERVAL_PRESETS = [
+  { label: "Off", value: 0 },
+  { label: "10m", value: 10 },
+  { label: "30m", value: 30 },
+  { label: "1h", value: 60 },
+  { label: "3h", value: 180 },
+  { label: "6h", value: 360 },
+  { label: "12h", value: 720 },
+  { label: "24h", value: 1440 },
+] as const;
+
 export interface AgentInfo {
   id: string;
   name: string;
   persona: string;
   model: string;
   tool: string;
-  cronExpr: string;
+  intervalMinutes: number;
   createdAt: string;
   updatedAt: string;
   hasAvatar: boolean;
@@ -23,7 +34,7 @@ export interface AgentConfig {
   persona: string;
   model?: string;
   tool?: string;
-  cronExpr?: string;
+  intervalMinutes?: number;
 }
 
 export interface AgentMessage {
@@ -95,9 +106,25 @@ async function patch<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+async function put<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 export const agentApi = {
   list: () =>
     get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents ?? []),
+
+  cronPaused: () =>
+    get<{ paused: boolean }>("/api/v1/agents/cron-paused").then((r) => r.paused),
+
+  setCronPaused: (paused: boolean) =>
+    put<{ paused: boolean }>("/api/v1/agents/cron-paused", { paused }),
 
   get: (id: string) => get<AgentInfo>(`/api/v1/agents/${id}`),
 
@@ -107,6 +134,8 @@ export const agentApi = {
     patch<AgentInfo>(`/api/v1/agents/${id}`, cfg),
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
+
+  resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
 
   avatarUrl: (id: string) => `/api/v1/agents/${id}/avatar`,
 

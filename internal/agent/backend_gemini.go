@@ -276,6 +276,37 @@ func hasGeminiSession(dir string) bool {
 	return false
 }
 
+// clearGeminiSession removes Gemini session chat files from the global
+// store for the given agent, forcing the next chat to start fresh.
+func clearGeminiSession(agentID string) {
+	dir := agentDir(agentID)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	projectsPath := filepath.Join(home, ".gemini", "projects.json")
+	data, err := os.ReadFile(projectsPath)
+	if err != nil {
+		return
+	}
+	var projects struct {
+		Projects map[string]string `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &projects); err != nil {
+		return
+	}
+	projectName, ok := projects.Projects[absDir]
+	if !ok {
+		return
+	}
+	chatsDir := filepath.Join(home, ".gemini", "tmp", projectName, "chats")
+	os.RemoveAll(chatsDir)
+}
+
 // geminiStreamEvent represents a Gemini CLI stream-json event.
 type geminiStreamEvent struct {
 	Type      string `json:"type"`

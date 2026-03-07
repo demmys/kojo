@@ -13,6 +13,24 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 )
 
+// --- Cron Pause ---
+
+func (s *Server) handleGetCronPaused(w http.ResponseWriter, r *http.Request) {
+	writeJSONResponse(w, http.StatusOK, map[string]any{"paused": s.agents.CronPaused()})
+}
+
+func (s *Server) handleSetCronPaused(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Paused bool `json:"paused"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	s.agents.SetCronPaused(body.Paused)
+	writeJSONResponse(w, http.StatusOK, map[string]any{"paused": body.Paused})
+}
+
 // --- Agent CRUD Handlers ---
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
@@ -63,13 +81,30 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, a)
 }
 
+func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.agents.ResetData(id); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else if strings.Contains(err.Error(), "busy") {
+			writeError(w, http.StatusConflict, "conflict", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.agents.Delete(id); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else if strings.Contains(err.Error(), "busy") {
+			writeError(w, http.StatusConflict, "conflict", err.Error())
 		} else {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
 		return
 	}

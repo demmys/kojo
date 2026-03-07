@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
-import { agentApi, type AgentInfo } from "../../lib/agentApi";
+import { agentApi, INTERVAL_PRESETS, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
 
 export function AgentSettings() {
@@ -11,9 +11,10 @@ export function AgentSettings() {
   const [persona, setPersona] = useState("");
   const [model, setModel] = useState("");
   const [tool, setTool] = useState("");
-  const [cronExpr, setCronExpr] = useState("");
+  const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
@@ -30,7 +31,7 @@ export function AgentSettings() {
       setPersona(a.persona);
       setModel(a.model);
       setTool(a.tool);
-      setCronExpr(a.cronExpr);
+      setIntervalMinutes(a.intervalMinutes);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -44,7 +45,7 @@ export function AgentSettings() {
         persona: persona.trim(),
         model: model.trim(),
         tool: tool.trim(),
-        cronExpr: cronExpr.trim(),
+        intervalMinutes,
       });
       setAgent(updated);
       setSuccess(true);
@@ -53,6 +54,21 @@ export function AgentSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleResetData = async () => {
+    if (!confirm("Reset conversation logs and memory? Settings, persona, avatar, and credentials will be kept.")) return;
+    setResetting(true);
+    setError("");
+    try {
+      await agentApi.resetData(id!);
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -238,18 +254,30 @@ export function AgentSettings() {
           </div>
         </div>
 
-        {/* Cron */}
+        {/* Interval */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">
-            Cron Schedule
+            Interval
           </label>
-          <input
-            type="text"
-            value={cronExpr}
-            onChange={(e) => setCronExpr(e.target.value)}
-            placeholder="0 9 * * *"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
+          <div className="flex gap-2 flex-wrap">
+            {INTERVAL_PRESETS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setIntervalMinutes(opt.value)}
+                className={`px-3 py-1.5 rounded text-sm ${
+                  intervalMinutes === opt.value
+                    ? "bg-neutral-700 border border-neutral-500"
+                    : "bg-neutral-900 border border-neutral-800"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs text-neutral-600">
+            Timing is automatically staggered per agent.
+          </p>
         </div>
 
         {error && (
@@ -280,7 +308,17 @@ export function AgentSettings() {
           </button>
         </div>
 
-        <div className="border-t border-neutral-800 pt-5">
+        <div className="border-t border-neutral-800 pt-5 space-y-3">
+          <button
+            onClick={handleResetData}
+            disabled={resetting}
+            className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
+          >
+            {resetting ? "Resetting..." : "Reset Data"}
+          </button>
+          <p className="text-xs text-neutral-600">
+            Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
+          </p>
           <button
             onClick={handleDelete}
             disabled={deleting}

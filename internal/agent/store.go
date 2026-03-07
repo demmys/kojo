@@ -5,11 +5,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"sync"
 )
 
 const agentsFile = "agents.json"
+const cronPausedFile = "cron_paused"
 
 // store persists agent metadata to disk using atomic rename.
 type store struct {
@@ -56,11 +59,11 @@ func (st *store) Save(agents []*Agent) {
 // Load reads persisted agents from agents.json.
 func (st *store) Load() ([]*Agent, error) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 
 	path := filepath.Join(st.dir, agentsFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		st.mu.Unlock()
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
@@ -69,9 +72,64 @@ func (st *store) Load() ([]*Agent, error) {
 
 	var agents []*Agent
 	if err := json.Unmarshal(data, &agents); err != nil {
+		st.mu.Unlock()
 		return nil, err
 	}
+	st.mu.Unlock()
+
+	// Migrate legacy cronExpr → intervalMinutes and validate
+	needsSave := false
+	for _, a := range agents {
+		if a.LegacyCronExpr != "" && a.IntervalMinutes == 0 {
+			a.IntervalMinutes = parseLegacyCron(a.LegacyCronExpr, st.logger)
+			needsSave = true
+		}
+		a.LegacyCronExpr = ""
+
+		// Validate loaded intervalMinutes — clamp invalid values to 0
+		if !ValidInterval(a.IntervalMinutes) {
+			st.logger.Warn("invalid intervalMinutes in stored data, disabling", "agent", a.ID, "value", a.IntervalMinutes)
+			a.IntervalMinutes = 0
+			needsSave = true
+		}
+	}
+	if needsSave {
+		st.Save(agents)
+	}
+
 	return agents, nil
+}
+
+// parseLegacyCron attempts to extract an interval from a legacy cron expression.
+// Recognizes "*/N * * * *". Returns 0 (disabled) for unrecognizable expressions
+// to avoid accidental over-execution.
+var legacyCronRe = regexp.MustCompile(`^\*/(\d+)\s+\*\s+\*\s+\*\s+\*$`)
+
+func parseLegacyCron(expr string, logger *slog.Logger) int {
+	if m := legacyCronRe.FindStringSubmatch(expr); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && ValidInterval(n) {
+			return n
+		}
+	}
+	logger.Warn("unrecognized legacy cronExpr, disabling schedule", "cronExpr", expr)
+	return 0
+}
+
+// LoadCronPaused returns true if the cron_paused marker file exists.
+func (st *store) LoadCronPaused() bool {
+	_, err := os.Stat(filepath.Join(st.dir, cronPausedFile))
+	return err == nil
+}
+
+// SaveCronPaused creates or removes the cron_paused marker file.
+func (st *store) SaveCronPaused(paused bool) {
+	path := filepath.Join(st.dir, cronPausedFile)
+	if paused {
+		os.MkdirAll(st.dir, 0o755)
+		os.WriteFile(path, nil, 0o644)
+	} else {
+		os.Remove(path)
+	}
 }
 
 // agentsDir returns the base directory for all agent data.

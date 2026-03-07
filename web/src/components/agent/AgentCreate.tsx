@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
-import { agentApi } from "../../lib/agentApi";
+import { agentApi, INTERVAL_PRESETS } from "../../lib/agentApi";
 import { api, type ServerInfo } from "../../lib/api";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
@@ -12,7 +12,7 @@ export function AgentCreate() {
   const [persona, setPersona] = useState("");
   const [model, setModel] = useState("sonnet");
   const [tool, setTool] = useState("claude");
-  const [cronExpr, setCronExpr] = useState("*/30 * * * *");
+  const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -204,7 +204,7 @@ export function AgentCreate() {
         persona: persona.trim(),
         model,
         tool,
-        cronExpr: cronExpr.trim(),
+        intervalMinutes,
       });
 
       // Upload avatar (best-effort — agent is already created)
@@ -427,18 +427,30 @@ export function AgentCreate() {
           />
         </div>
 
-        {/* Cron */}
+        {/* Interval */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">
-            Cron Schedule (optional)
+            Interval
           </label>
-          <input
-            type="text"
-            value={cronExpr}
-            onChange={(e) => setCronExpr(e.target.value)}
-            placeholder="*/30 * * * * (every 30 min)"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          />
+          <div className="flex gap-2 flex-wrap">
+            {INTERVAL_PRESETS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setIntervalMinutes(opt.value)}
+                className={`px-3 py-1.5 rounded text-sm ${
+                  intervalMinutes === opt.value
+                    ? "bg-neutral-700 border border-neutral-500"
+                    : "bg-neutral-900 border border-neutral-800"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-xs text-neutral-600">
+            Timing is automatically staggered per agent.
+          </p>
         </div>
 
         {error && (

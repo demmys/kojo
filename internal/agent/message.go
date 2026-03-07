@@ -11,6 +11,7 @@ type Message struct {
 	ID        string     `json:"id"`
 	Role      string     `json:"role"` // "user", "assistant", "system"
 	Content   string     `json:"content"`
+	Thinking  string     `json:"thinking,omitempty"` // intermediate reasoning (shown collapsed in UI)
 	ToolUses  []ToolUse  `json:"toolUses,omitempty"`
 	Timestamp string     `json:"timestamp"` // RFC3339
 	Usage     *Usage     `json:"usage,omitempty"`
@@ -32,7 +33,7 @@ type Usage struct {
 
 // ChatEvent is streamed from backend to WebSocket during a chat.
 type ChatEvent struct {
-	Type         string   `json:"type"` // "status", "text", "tool_use", "tool_result", "done", "error"
+	Type         string   `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error"
 	Status       string   `json:"status,omitempty"`
 	Delta        string   `json:"delta,omitempty"`
 	ToolName     string   `json:"toolName,omitempty"`

@@ -45,6 +45,7 @@ export const ChatMessage = memo(function ChatMessage({
             : "bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm"
         } px-3.5 py-2.5`}
       >
+        {!isUser && message.thinking && <ThinkingBlock text={message.thinking} />}
         <MessageContent content={message.content} isUser={isUser} timestamp={message.timestamp} />
 
         {/* Tool uses */}
@@ -358,9 +359,49 @@ function splitMediaPaths(text: string): Array<{ type: "text" | "media"; value: s
   return parts.length > 0 ? parts : [{ type: "text", value: text }];
 }
 
+/** Collapsible thinking/reasoning block */
+function ThinkingBlock({ text, streaming = false }: { text: string; streaming?: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (!text) return null;
+
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1.5 text-[11px] text-neutral-500 hover:text-neutral-400 transition-colors"
+      >
+        <svg
+          className={`w-3 h-3 transition-transform ${expanded ? "rotate-90" : ""}`}
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+          strokeWidth={2}
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+        </svg>
+        {streaming ? (
+          <span className="flex items-center gap-1">
+            <span className="w-1 h-1 bg-neutral-500 rounded-full animate-pulse" />
+            Thinking…
+          </span>
+        ) : (
+          "Thought"
+        )}
+      </button>
+      {expanded && (
+        <div className="mt-1 pl-4 border-l border-neutral-700/50 text-xs text-neutral-500 leading-relaxed whitespace-pre-wrap">
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Streaming bubble for assistant response in progress */
 interface StreamingMessageProps {
   text: string;
+  thinking: string;
   toolUses: Array<{ name: string; input: string; output: string | null }>;
   agentName: string;
   agentId: string;
@@ -370,6 +411,7 @@ interface StreamingMessageProps {
 
 export function StreamingMessage({
   text,
+  thinking,
   toolUses,
   agentName,
   agentId,
@@ -390,7 +432,7 @@ export function StreamingMessage({
     <div className="flex gap-3 flex-row">
       <AgentAvatar agentId={agentId} name={agentName} size="sm" className="mt-1" cacheBust={avatarHash} />
       <div className="max-w-[80%] bg-neutral-800/80 text-neutral-200 rounded-2xl rounded-tl-sm px-3.5 py-2.5">
-        {status === "thinking" && !text && toolUses.length === 0 && (
+        {status === "thinking" && !text && !thinking && toolUses.length === 0 && (
           <div className="flex items-center gap-1.5 py-1">
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
             <span className="w-1.5 h-1.5 bg-neutral-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
@@ -398,6 +440,7 @@ export function StreamingMessage({
             <ElapsedTimer startTime={startTimeRef.current} threshold={3} className="text-xs text-neutral-500 ml-2" />
           </div>
         )}
+        {thinking && <ThinkingBlock text={thinking} streaming={!text} />}
         {text && (
           <div className="relative">
             <MarkdownRenderer content={text} />

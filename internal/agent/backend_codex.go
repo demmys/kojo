@@ -103,8 +103,23 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		var fullText strings.Builder
+		var thinking strings.Builder
 		var toolUses []ToolUse
 		var usage *Usage
+
+		// Buffer agent_message texts. When a tool_call follows, the buffered
+		// texts are emitted as "thinking" events (intermediate reasoning).
+		// Texts remaining after the last tool call are the final response.
+		var pendingTexts []string
+		turnCompleted := false
+
+		flushAsThinking := func() {
+			for _, t := range pendingTexts {
+				thinking.WriteString(t)
+				send(ChatEvent{Type: "thinking", Delta: t})
+			}
+			pendingTexts = nil
+		}
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -129,13 +144,15 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				// Turn started, keep thinking
 
 			case "item.completed":
-				if event.Item.Type == "agent_message" && event.Item.Text != "" {
-					fullText.WriteString(event.Item.Text)
-					if !send(ChatEvent{Type: "text", Delta: event.Item.Text}) {
-						cmd.Wait()
-						return
-					}
+				if event.Item.Type == "reasoning" && event.Item.Text != "" {
+					// Dedicated reasoning items go directly to thinking
+					thinking.WriteString(event.Item.Text)
+					send(ChatEvent{Type: "thinking", Delta: event.Item.Text})
+				} else if event.Item.Type == "agent_message" && event.Item.Text != "" {
+					pendingTexts = append(pendingTexts, event.Item.Text)
 				} else if event.Item.Type == "tool_call" {
+					// Buffered texts before a tool call are intermediate thinking
+					flushAsThinking()
 					tu := ToolUse{
 						ID:    event.Item.ID,
 						Name:  event.Item.Name,
@@ -147,6 +164,8 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 						return
 					}
 				} else if event.Item.Type == "tool_call_output" {
+					// Texts between tool calls are also thinking
+					flushAsThinking()
 					if !send(ChatEvent{Type: "tool_result", ToolName: event.Item.Name, ToolOutput: truncate(event.Item.Output, 2000)}) {
 						cmd.Wait()
 						return
@@ -173,6 +192,17 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				}
 
 			case "turn.completed":
+				turnCompleted = true
+				// Remaining buffered texts are the final response
+				for _, t := range pendingTexts {
+					fullText.WriteString(t)
+					if !send(ChatEvent{Type: "text", Delta: t}) {
+						cmd.Wait()
+						return
+					}
+				}
+				pendingTexts = nil
+
 				if event.Usage.OutputTokens > 0 {
 					usage = &Usage{
 						InputTokens:  event.Usage.InputTokens,
@@ -186,6 +216,20 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			b.logger.Warn("codex stream scanner error", "err", err)
 		}
 
+		// Flush remaining buffered texts
+		for _, t := range pendingTexts {
+			if turnCompleted {
+				// turn.completed was received — remaining texts are final response
+				fullText.WriteString(t)
+				send(ChatEvent{Type: "text", Delta: t})
+			} else {
+				// Abnormal exit — treat as thinking to avoid leaking reasoning into content
+				thinking.WriteString(t)
+				send(ChatEvent{Type: "thinking", Delta: t})
+			}
+		}
+		pendingTexts = nil
+
 		if err := cmd.Wait(); err != nil {
 			b.logger.Warn("codex process exited with error", "err", err)
 			if fullText.Len() == 0 && len(toolUses) == 0 {
@@ -196,6 +240,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 		msg := newAssistantMessage()
 		msg.Content = fullText.String()
+		msg.Thinking = thinking.String()
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 

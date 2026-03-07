@@ -15,6 +15,7 @@ export function AgentChat() {
   const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
+  const [streamThinking, setStreamThinking] = useState("");
   const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string | null }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
   const [hasMore, setHasMore] = useState(false);
@@ -90,6 +91,7 @@ export function AgentChat() {
   const resetStream = useCallback(() => {
     setStreaming(false);
     setStreamText("");
+    setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("");
   }, []);
@@ -105,6 +107,9 @@ export function AgentChat() {
           break;
         case "text":
           setStreamText((prev) => prev + (event.delta ?? ""));
+          break;
+        case "thinking":
+          setStreamThinking((prev) => prev + (event.delta ?? ""));
           break;
         case "tool_use":
           if (event.toolName) {
@@ -192,6 +197,7 @@ export function AgentChat() {
     if (id) sessionStorage.setItem(`agent-draft:${id}`, "");
     setStreaming(true);
     setStreamText("");
+    setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("thinking");
     sendMessage(text);
@@ -287,6 +293,7 @@ export function AgentChat() {
         {streaming && (
           <StreamingMessage
             text={streamText}
+            thinking={streamThinking}
             toolUses={streamTools}
             agentName={agent.name}
             agentId={agent.id}

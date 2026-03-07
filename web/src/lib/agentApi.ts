@@ -30,6 +30,7 @@ export interface AgentMessage {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  thinking?: string;
   toolUses?: ToolUse[];
   timestamp: string;
   usage?: { inputTokens: number; outputTokens: number };
@@ -51,7 +52,7 @@ export interface Credential {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "tool_use" | "tool_result" | "done" | "error";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error";
   status?: string;
   delta?: string;
   toolName?: string;

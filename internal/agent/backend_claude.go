@@ -337,6 +337,21 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+// claudeEncodePath encodes a directory path using Claude's project path scheme:
+// "/" (or separator), ".", "_" are all replaced with "-".
+func claudeEncodePath(dir string) string {
+	return strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(dir)
+}
+
+// claudeProjectDir returns the Claude project directory for the given absolute path.
+func claudeProjectDir(absDir string) string {
+	return filepath.Join(claudeConfigDir(), "projects", claudeEncodePath(absDir))
+}
+
 // claudeConfigDir returns the Claude configuration root, respecting
 // CLAUDE_CONFIG_DIR if set, otherwise falling back to ~/.claude.
 func claudeConfigDir() string {
@@ -357,14 +372,7 @@ func hasExistingSession(agentDir string) bool {
 	if err != nil {
 		return false
 	}
-	// Claude stores sessions in <config>/projects/<encoded-path>/
-	// The path encoding replaces "/", ".", and "_" with "-".
-	encoded := strings.NewReplacer(
-		string(filepath.Separator), "-",
-		".", "-",
-		"_", "-",
-	).Replace(absDir)
-	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+	projectDir := claudeProjectDir(absDir)
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
 		return false
@@ -397,12 +405,7 @@ func recoverFromSession(agentID string, sessionID string, logger *slog.Logger) s
 		return ""
 	}
 
-	encoded := strings.NewReplacer(
-		string(filepath.Separator), "-",
-		".", "-",
-		"_", "-",
-	).Replace(absDir)
-	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+	projectDir := claudeProjectDir(absDir)
 
 	sessionFile := findSessionFile(projectDir, sessionID)
 	if sessionFile == "" {
@@ -518,12 +521,7 @@ func clearClaudeSession(agentID string) {
 	if err != nil {
 		return
 	}
-	encoded := strings.NewReplacer(
-		string(filepath.Separator), "-",
-		".", "-",
-		"_", "-",
-	).Replace(absDir)
-	projectDir := filepath.Join(claudeConfigDir(), "projects", encoded)
+	projectDir := claudeProjectDir(absDir)
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
 		return

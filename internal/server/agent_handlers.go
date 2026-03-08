@@ -307,39 +307,9 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	absPath, err := filepath.EvalSymlinks(avatarPath)
+	absPath, err := agent.ValidateTempAvatarPath(avatarPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid avatar path")
-		return
-	}
-	tempDir, err := filepath.EvalSymlinks(os.TempDir())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "cannot resolve temp dir")
-		return
-	}
-	if !strings.HasPrefix(absPath, tempDir+string(filepath.Separator)) {
-		writeError(w, http.StatusBadRequest, "bad_request", "avatar path must be in temp directory")
-		return
-	}
-
-	// Only allow files inside kojo-avatar-* directories
-	rel, _ := filepath.Rel(tempDir, absPath)
-	parts := strings.SplitN(rel, string(filepath.Separator), 2)
-	if len(parts) < 2 || !strings.HasPrefix(parts[0], "kojo-avatar-") {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid avatar path")
-		return
-	}
-
-	ext := strings.ToLower(filepath.Ext(absPath))
-	if !agent.IsAllowedImageExt(ext) {
-		writeError(w, http.StatusBadRequest, "bad_request", "unsupported file type")
-		return
-	}
-
-	// Must be a regular file (not dir, symlink, FIFO, device, etc.)
-	fi, err := os.Stat(absPath)
-	if err != nil || !fi.Mode().IsRegular() {
-		writeError(w, http.StatusNotFound, "not_found", "file not found")
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 

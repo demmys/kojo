@@ -569,13 +569,9 @@ func (idx *MemoryIndex) vectorSearch(queryEmb []float32, limit int) []SearchResu
 	}
 
 	// Sort by score descending
-	for i := 0; i < len(hits); i++ {
-		for j := i + 1; j < len(hits); j++ {
-			if hits[j].score > hits[i].score {
-				hits[i], hits[j] = hits[j], hits[i]
-			}
-		}
-	}
+	sort.Slice(hits, func(i, j int) bool {
+		return hits[i].score > hits[j].score
+	})
 
 	if len(hits) > limit {
 		hits = hits[:limit]

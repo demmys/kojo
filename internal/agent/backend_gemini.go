@@ -154,7 +154,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					cmd.Wait()
 					return
 				}
-				matchToolOutput(toolUses, event.ToolID, event.ToolName, truncate(output, 2000))
+				matchToolOutput(toolUses, event.ToolID, "", truncate(output, 2000))
 
 			case "result":
 				if event.Stats.OutputTokens > 0 {

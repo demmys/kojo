@@ -17,6 +17,7 @@ type Manager struct {
 	agents   map[string]*Agent
 	backends map[string]ChatBackend
 	store    *store
+	creds    *CredentialStore
 	cron     *cronScheduler
 	logger   *slog.Logger
 
@@ -39,6 +40,11 @@ type Manager struct {
 
 // NewManager creates a new agent manager.
 func NewManager(logger *slog.Logger) *Manager {
+	creds, err := NewCredentialStore()
+	if err != nil {
+		logger.Warn("failed to open credential store", "err", err)
+	}
+
 	m := &Manager{
 		agents: make(map[string]*Agent),
 		backends: map[string]ChatBackend{
@@ -47,6 +53,7 @@ func NewManager(logger *slog.Logger) *Manager {
 			"gemini": NewGeminiBackend(logger),
 		},
 		store:     newStore(logger),
+		creds:     creds,
 		logger:    logger,
 		busy:       make(map[string]context.CancelFunc),
 		resetting:  make(map[string]bool),
@@ -492,6 +499,16 @@ func (m *Manager) ResetData(id string) error {
 	return nil
 }
 
+// Credentials returns the credential store. Returns nil if the store failed to initialize.
+func (m *Manager) Credentials() *CredentialStore {
+	return m.creds
+}
+
+// HasCredentials returns true if the credential store is available.
+func (m *Manager) HasCredentials() bool {
+	return m.creds != nil
+}
+
 // Delete removes an agent and its data.
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
@@ -513,6 +530,14 @@ func (m *Manager) Delete(id string) error {
 		cancel()
 	}
 	m.busyMu.Unlock()
+
+	// Remove credentials from encrypted store BEFORE removing agent from memory
+	if m.creds != nil {
+		if err := m.creds.DeleteAllForAgent(id); err != nil {
+			m.mu.Unlock()
+			return fmt.Errorf("delete credentials: %w", err)
+		}
+	}
 
 	delete(m.agents, id)
 	m.mu.Unlock()
@@ -590,7 +615,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		apiBase = m.groupdms.APIBase()
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups)
+	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
 	// Start chat
 	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt)

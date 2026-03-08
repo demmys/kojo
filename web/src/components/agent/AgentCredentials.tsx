@@ -31,7 +31,7 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
       setRemaining((prev) => {
         if (prev <= 1) {
           fetchCode();
-          return prev; // Will be updated by fetchCode
+          return prev;
         }
         return prev - 1;
       });
@@ -41,7 +41,6 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
 
   const handleCopy = async () => {
     if (!code) return;
-    // Refetch to get the freshest code
     const r = await agentApi.credentials.getTOTPCode(agentId, credId);
     await navigator.clipboard.writeText(r.code);
     setCode(r.code);
@@ -78,17 +77,17 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
   );
 }
 
+/** QR/URI import modal — returns a single OTPEntry to apply to the credential being edited. */
 function QRImportModal({
   agentId,
-  onImport,
+  onSelect,
   onClose,
 }: {
   agentId: string;
-  onImport: (entries: OTPEntry[]) => void;
+  onSelect: (entry: OTPEntry) => void;
   onClose: () => void;
 }) {
   const [entries, setEntries] = useState<OTPEntry[]>([]);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<"upload" | "uri">("upload");
@@ -100,8 +99,11 @@ function QRImportModal({
     setError("");
     try {
       const result = await agentApi.credentials.parseQR(agentId, file);
-      setEntries(result);
-      setSelected(new Set(result.map((_, i) => i)));
+      if (result.length === 1) {
+        onSelect(result[0]);
+      } else {
+        setEntries(result);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -115,8 +117,11 @@ function QRImportModal({
     setError("");
     try {
       const result = await agentApi.credentials.parseOTPURI(agentId, uri.trim());
-      setEntries(result);
-      setSelected(new Set(result.map((_, i) => i)));
+      if (result.length === 1) {
+        onSelect(result[0]);
+      } else {
+        setEntries(result);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -124,24 +129,11 @@ function QRImportModal({
     }
   };
 
-  const toggleEntry = (i: number) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(i)) next.delete(i);
-      else next.add(i);
-      return next;
-    });
-  };
-
-  const handleImport = () => {
-    onImport(entries.filter((_, i) => selected.has(i)));
-  };
-
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
       <div className="bg-neutral-900 border border-neutral-700 rounded-lg w-full max-w-md max-h-[80vh] flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800">
-          <h2 className="text-sm font-bold">Import from QR / URI</h2>
+          <h2 className="text-sm font-bold">Import TOTP</h2>
           <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300">
             &times;
           </button>
@@ -211,36 +203,22 @@ function QRImportModal({
           ) : (
             <>
               <div className="text-xs text-neutral-500">
-                {entries.length} entries found &mdash; select to import
+                {entries.length} entries found &mdash; select one
               </div>
               {entries.map((entry, i) => (
-                <label
+                <button
                   key={i}
-                  className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer ${
-                    selected.has(i) ? "border-blue-700 bg-blue-950/30" : "border-neutral-800 bg-neutral-950"
-                  }`}
+                  onClick={() => onSelect(entry)}
+                  className="w-full flex items-start gap-3 p-3 rounded-lg border border-neutral-800 bg-neutral-950 hover:border-neutral-600 text-left"
                 >
-                  <input
-                    type="checkbox"
-                    checked={selected.has(i)}
-                    onChange={() => toggleEntry(i)}
-                    className="mt-0.5"
-                  />
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium text-neutral-300 truncate">
                       {entry.issuer || entry.label || "Unknown"}
                     </div>
                     <div className="text-xs text-neutral-500 font-mono truncate">{entry.username}</div>
                   </div>
-                </label>
+                </button>
               ))}
-              <button
-                onClick={handleImport}
-                disabled={selected.size === 0}
-                className="w-full py-2 bg-blue-700 hover:bg-blue-600 rounded text-sm font-medium disabled:opacity-40"
-              >
-                Import {selected.size} credential{selected.size !== 1 ? "s" : ""}
-              </button>
             </>
           )}
 
@@ -253,6 +231,137 @@ function QRImportModal({
   );
 }
 
+/** Inline edit form for a single credential. */
+function CredentialEdit({
+  agentId,
+  credential,
+  onSave,
+  onCancel,
+}: {
+  agentId: string;
+  credential: Credential;
+  onSave: (updated: Credential) => void;
+  onCancel: () => void;
+}) {
+  const [label, setLabel] = useState(credential.label);
+  const [username, setUsername] = useState(credential.username);
+  const [password, setPassword] = useState("");
+  const [totpSecret, setTotpSecret] = useState("");
+  const [totpAlgorithm, setTotpAlgorithm] = useState("");
+  const [totpDigits, setTotpDigits] = useState(0);
+  const [totpPeriod, setTotpPeriod] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [showQR, setShowQR] = useState(false);
+
+  const hasTOTP = !!credential.totpSecret;
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      const data: Record<string, unknown> = {};
+      if (label.trim() !== credential.label) data.label = label.trim();
+      if (username.trim() !== credential.username) data.username = username.trim();
+      if (password) data.password = password;
+      if (totpSecret.trim()) {
+        data.totpSecret = totpSecret.trim();
+        if (totpAlgorithm) data.totpAlgorithm = totpAlgorithm;
+        if (totpDigits) data.totpDigits = totpDigits;
+        if (totpPeriod) data.totpPeriod = totpPeriod;
+      }
+
+      if (Object.keys(data).length === 0) {
+        onCancel();
+        return;
+      }
+
+      const updated = await agentApi.credentials.update(agentId, credential.id, data);
+      onSave(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleQRSelect = (entry: OTPEntry) => {
+    setTotpSecret(entry.totpSecret);
+    setTotpAlgorithm(entry.algorithm || "");
+    setTotpDigits(entry.digits || 0);
+    setTotpPeriod(entry.period || 0);
+    setShowQR(false);
+  };
+
+  return (
+    <div className="p-4 bg-neutral-900 border border-neutral-700 rounded-lg space-y-3">
+      <input
+        type="text"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        placeholder="Label"
+        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+        autoFocus
+      />
+      <input
+        type="text"
+        value={username}
+        onChange={(e) => setUsername(e.target.value)}
+        placeholder="Username / ID"
+        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+      />
+      <input
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="New password (leave empty to keep)"
+        className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+      />
+      <div className="flex gap-2">
+        <input
+          type="password"
+          value={totpSecret}
+          onChange={(e) => setTotpSecret(e.target.value)}
+          placeholder={hasTOTP ? "New TOTP secret (leave empty to keep)" : "TOTP Secret (optional)"}
+          className="flex-1 px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+        />
+        <button
+          onClick={() => setShowQR(true)}
+          className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap"
+        >
+          QR
+        </button>
+      </div>
+      {error && (
+        <div className="p-2 bg-red-950 border border-red-800 rounded text-xs text-red-300">{error}</div>
+      )}
+      <div className="flex gap-2">
+        <button
+          onClick={handleSave}
+          disabled={saving || !label.trim() || !username.trim()}
+          className="flex-1 py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-sm font-medium disabled:opacity-40"
+        >
+          {saving ? "Saving..." : "Save"}
+        </button>
+        <button
+          onClick={onCancel}
+          className="px-4 py-2 text-neutral-500 hover:text-neutral-300 rounded text-sm"
+        >
+          Cancel
+        </button>
+      </div>
+
+      {showQR && (
+        <QRImportModal
+          agentId={agentId}
+          onSelect={handleQRSelect}
+          onClose={() => setShowQR(false)}
+        />
+      )}
+    </div>
+  );
+}
+
 export function AgentCredentials() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -261,11 +370,15 @@ export function AgentCredentials() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [totpSecret, setTotpSecret] = useState("");
+  const [addTotpAlgorithm, setAddTotpAlgorithm] = useState("");
+  const [addTotpDigits, setAddTotpDigits] = useState(0);
+  const [addTotpPeriod, setAddTotpPeriod] = useState(0);
   const [error, setError] = useState("");
   const [adding, setAdding] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
-  const [showQRImport, setShowQRImport] = useState(false);
+  const [showAddQR, setShowAddQR] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -285,13 +398,23 @@ export function AgentCredentials() {
         label.trim(),
         username.trim(),
         password,
-        totpSecret.trim() ? { secret: totpSecret.trim() } : undefined,
+        totpSecret.trim()
+          ? {
+              secret: totpSecret.trim(),
+              algorithm: addTotpAlgorithm || undefined,
+              digits: addTotpDigits || undefined,
+              period: addTotpPeriod || undefined,
+            }
+          : undefined,
       );
       setCredentials((prev) => [...prev, cred]);
       setLabel("");
       setUsername("");
       setPassword("");
       setTotpSecret("");
+      setAddTotpAlgorithm("");
+      setAddTotpDigits(0);
+      setAddTotpPeriod(0);
       setShowForm(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -322,34 +445,17 @@ export function AgentCredentials() {
     }
   };
 
-  const handleQRImport = async (entries: OTPEntry[]) => {
-    if (!id) return;
-    setShowQRImport(false);
-    setError("");
-    const newCreds: Credential[] = [];
-    for (const entry of entries) {
-      try {
-        const cred = await agentApi.credentials.add(
-          id,
-          entry.issuer || entry.label || "Unknown",
-          entry.username,
-          "",
-          {
-            secret: entry.totpSecret,
-            algorithm: entry.algorithm || undefined,
-            digits: entry.digits || undefined,
-            period: entry.period || undefined,
-          },
-        );
-        newCreds.push(cred);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        break;
-      }
-    }
-    if (newCreds.length > 0) {
-      setCredentials((prev) => [...prev, ...newCreds]);
-    }
+  const handleEditSave = (updated: Credential) => {
+    setCredentials((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    setEditingId(null);
+  };
+
+  const handleAddQRSelect = (entry: OTPEntry) => {
+    setTotpSecret(entry.totpSecret);
+    setAddTotpAlgorithm(entry.algorithm || "");
+    setAddTotpDigits(entry.digits || 0);
+    setAddTotpPeriod(entry.period || 0);
+    setShowAddQR(false);
   };
 
   return (
@@ -364,20 +470,12 @@ export function AgentCredentials() {
           </button>
           <h1 className="text-lg font-bold">Credentials</h1>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setShowQRImport(true)}
-            className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-          >
-            QR Import
-          </button>
-          <button
-            onClick={() => setShowForm((v) => !v)}
-            className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
-          >
-            {showForm ? "Cancel" : "+ Add"}
-          </button>
-        </div>
+        <button
+          onClick={() => { setShowForm((v) => !v); setEditingId(null); }}
+          className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm"
+        >
+          {showForm ? "Cancel" : "+ Add"}
+        </button>
       </header>
 
       <main className="p-4 space-y-3 max-w-md mx-auto">
@@ -406,13 +504,21 @@ export function AgentCredentials() {
               placeholder="Password"
               className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
             />
-            <input
-              type="password"
-              value={totpSecret}
-              onChange={(e) => setTotpSecret(e.target.value)}
-              placeholder="TOTP Secret (optional)"
-              className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            />
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={totpSecret}
+                onChange={(e) => setTotpSecret(e.target.value)}
+                placeholder="TOTP Secret (optional)"
+                className="flex-1 px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+              />
+              <button
+                onClick={() => setShowAddQR(true)}
+                className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs whitespace-nowrap"
+              >
+                QR
+              </button>
+            </div>
             <button
               onClick={handleAdd}
               disabled={
@@ -426,47 +532,63 @@ export function AgentCredentials() {
         )}
 
         {/* Credential list */}
-        {credentials.map((cred) => (
-          <div
-            key={cred.id}
-            className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg"
-          >
-            <div className="text-sm font-medium text-neutral-300">
-              {cred.label}
-            </div>
-            <div className="text-xs text-neutral-500 mt-1 font-mono">
-              {cred.username}
-            </div>
-            <div className="flex items-center justify-between mt-2">
-              <span className="text-xs text-neutral-600 tracking-widest select-none">
-                ••••••••
-              </span>
-              <div className="flex gap-1">
-                <button
-                  onClick={() => handleCopy(cred.id)}
-                  className={`text-xs px-2 py-1 rounded ${
-                    copied === cred.id
-                      ? "text-green-400 bg-green-950"
-                      : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800"
-                  }`}
-                >
-                  {copied === cred.id ? "Copied" : "Copy PW"}
-                </button>
-                <button
-                  onClick={() => handleDelete(cred.id)}
-                  className="text-xs text-neutral-600 hover:text-red-400 px-2 py-1 rounded hover:bg-neutral-800"
-                >
-                  Delete
-                </button>
+        {credentials.map((cred) =>
+          editingId === cred.id && id ? (
+            <CredentialEdit
+              key={cred.id}
+              agentId={id}
+              credential={cred}
+              onSave={handleEditSave}
+              onCancel={() => setEditingId(null)}
+            />
+          ) : (
+            <div
+              key={cred.id}
+              className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg"
+            >
+              <div className="text-sm font-medium text-neutral-300">
+                {cred.label}
               </div>
-            </div>
-            {cred.totpSecret && id && (
-              <div className="mt-2 pt-2 border-t border-neutral-800">
-                <TOTPDisplay agentId={id} credId={cred.id} />
+              <div className="text-xs text-neutral-500 mt-1 font-mono">
+                {cred.username}
               </div>
-            )}
-          </div>
-        ))}
+              <div className="flex items-center justify-between mt-2">
+                <span className="text-xs text-neutral-600 tracking-widest select-none">
+                  ••••••••
+                </span>
+                <div className="flex gap-1">
+                  <button
+                    onClick={() => handleCopy(cred.id)}
+                    className={`text-xs px-2 py-1 rounded ${
+                      copied === cred.id
+                        ? "text-green-400 bg-green-950"
+                        : "text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800"
+                    }`}
+                  >
+                    {copied === cred.id ? "Copied" : "Copy PW"}
+                  </button>
+                  <button
+                    onClick={() => { setEditingId(cred.id); setShowForm(false); }}
+                    className="text-xs text-neutral-500 hover:text-neutral-300 px-2 py-1 rounded hover:bg-neutral-800"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    onClick={() => handleDelete(cred.id)}
+                    className="text-xs text-neutral-600 hover:text-red-400 px-2 py-1 rounded hover:bg-neutral-800"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+              {cred.totpSecret && id && (
+                <div className="mt-2 pt-2 border-t border-neutral-800">
+                  <TOTPDisplay agentId={id} credId={cred.id} />
+                </div>
+              )}
+            </div>
+          ),
+        )}
 
         {credentials.length === 0 && !showForm && (
           <div className="text-sm text-neutral-600 text-center py-12">
@@ -481,11 +603,11 @@ export function AgentCredentials() {
         )}
       </main>
 
-      {showQRImport && id && (
+      {showAddQR && id && (
         <QRImportModal
           agentId={id}
-          onImport={handleQRImport}
-          onClose={() => setShowQRImport(false)}
+          onSelect={handleAddQRSelect}
+          onClose={() => setShowAddQR(false)}
         />
       )}
     </div>

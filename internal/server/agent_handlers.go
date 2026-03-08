@@ -350,13 +350,24 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 // handleUploadGeneratedAvatar copies a generated avatar to the agent's directory.
 // --- Credential Handlers ---
 
+func (s *Server) requireCredentialStore(w http.ResponseWriter) bool {
+	if !s.agents.HasCredentials() {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store is not available")
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, ok := s.agents.Get(id); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	creds, err := agent.ListCredentials(id)
+	if !s.requireCredentialStore(w) {
+		return
+	}
+	creds, err := s.agents.Credentials().ListCredentials(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
@@ -395,6 +406,9 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "password or totpSecret is required")
 		return
 	}
+	if !s.requireCredentialStore(w) {
+		return
+	}
 	var totp *agent.TOTPParams
 	if req.TOTPSecret != "" {
 		totp = &agent.TOTPParams{
@@ -404,7 +418,7 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 			Period:    req.TOTPPeriod,
 		}
 	}
-	cred, err := agent.AddCredential(id, req.Label, req.Username, req.Password, totp)
+	cred, err := s.agents.Credentials().AddCredential(id, req.Label, req.Username, req.Password, totp)
 	if err != nil {
 		if strings.Contains(err.Error(), "TOTP") || strings.Contains(err.Error(), "base32") {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
@@ -458,7 +472,10 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 			Period:    period,
 		}
 	}
-	cred, err := agent.UpdateCredential(id, credID, req.Label, req.Username, req.Password, totp)
+	if !s.requireCredentialStore(w) {
+		return
+	}
+	cred, err := s.agents.Credentials().UpdateCredential(id, credID, req.Label, req.Username, req.Password, totp)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -479,7 +496,10 @@ func (s *Server) handleDeleteCredential(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	if err := agent.DeleteCredential(id, credID); err != nil {
+	if !s.requireCredentialStore(w) {
+		return
+	}
+	if err := s.agents.Credentials().DeleteCredential(id, credID); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else {
@@ -497,7 +517,10 @@ func (s *Server) handleRevealCredentialPassword(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	password, err := agent.RevealPassword(id, credID)
+	if !s.requireCredentialStore(w) {
+		return
+	}
+	password, err := s.agents.Credentials().RevealPassword(id, credID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -517,7 +540,10 @@ func (s *Server) handleGetTOTPCode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
 		return
 	}
-	code, remaining, err := agent.GetTOTPCode(id, credID)
+	if !s.requireCredentialStore(w) {
+		return
+	}
+	code, remaining, err := s.agents.Credentials().GetTOTPCode(id, credID)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no TOTP") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())

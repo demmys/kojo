@@ -229,7 +229,15 @@ export const agentApi = {
     update: (
       agentId: string,
       credId: string,
-      data: Partial<{ label: string; username: string; password: string; totpSecret: string }>,
+      data: Partial<{
+        label: string;
+        username: string;
+        password: string;
+        totpSecret: string;
+        totpAlgorithm: string;
+        totpDigits: number;
+        totpPeriod: number;
+      }>,
     ) => patch<Credential>(`/api/v1/agents/${agentId}/credentials/${credId}`, data),
 
     delete: (agentId: string, credId: string) =>

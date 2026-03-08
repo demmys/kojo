@@ -601,43 +601,13 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Validate the path is in temp directory (security: EvalSymlinks + separator-aware prefix)
-	absPath, err := filepath.EvalSymlinks(req.AvatarPath)
+	absPath, err := agent.ValidateTempAvatarPath(req.AvatarPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid avatar path")
-		return
-	}
-	// EvalSymlinks on tempDir too, to handle macOS /var → /private/var
-	tempDir, err := filepath.EvalSymlinks(os.TempDir())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "cannot resolve temp dir")
-		return
-	}
-	if !strings.HasPrefix(absPath, tempDir+string(filepath.Separator)) {
-		writeError(w, http.StatusBadRequest, "bad_request", "avatar path must be in temp directory")
-		return
-	}
-
-	// Only allow files inside kojo-avatar-* directories
-	rel, _ := filepath.Rel(tempDir, absPath)
-	parts := strings.SplitN(rel, string(filepath.Separator), 2)
-	if len(parts) < 2 || !strings.HasPrefix(parts[0], "kojo-avatar-") {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid avatar path")
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
 
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if !agent.IsAllowedImageExt(ext) {
-		writeError(w, http.StatusBadRequest, "bad_request", "unsupported image format")
-		return
-	}
-
-	// Must be a regular file
-	fi, err := os.Stat(absPath)
-	if err != nil || !fi.Mode().IsRegular() {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid avatar file")
-		return
-	}
 
 	src, err := os.Open(absPath)
 	if err != nil {

@@ -69,20 +69,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		cmd.Stdin = strings.NewReader(stdinContent)
 	}
 
-	// Clear Gemini-specific env vars to avoid nested detection
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, e := range env {
-		if strings.HasPrefix(e, "GEMINI_CLI") || strings.HasPrefix(e, "AGENT_BROWSER_SESSION") {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	filtered = append(filtered,
-		"AGENT_BROWSER_SESSION="+agent.ID,
-		"AGENT_BROWSER_SESSION_NAME="+agent.ID,
-	)
-	cmd.Env = filtered
+	cmd.Env = filterEnv([]string{"GEMINI_CLI", "AGENT_BROWSER_SESSION"}, agent.ID)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -167,13 +154,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					cmd.Wait()
 					return
 				}
-				// Match by tool_id for accurate pairing
-				for i := len(toolUses) - 1; i >= 0; i-- {
-					if toolUses[i].ID == event.ToolID && toolUses[i].Output == "" {
-						toolUses[i].Output = truncate(output, 2000)
-						break
-					}
-				}
+				matchToolOutput(toolUses, event.ToolID, event.ToolName, truncate(output, 2000))
 
 			case "result":
 				if event.Stats.OutputTokens > 0 {

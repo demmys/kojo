@@ -73,21 +73,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 
-	// Clear CLAUDE_CODE environment variables to avoid nested detection
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, e := range env {
-		if strings.HasPrefix(e, "CLAUDE_CODE") || strings.HasPrefix(e, "CLAUDECODE") ||
-			strings.HasPrefix(e, "AGENT_BROWSER_SESSION") {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	filtered = append(filtered,
-		"AGENT_BROWSER_SESSION="+agent.ID,
-		"AGENT_BROWSER_SESSION_NAME="+agent.ID,
-	)
-	cmd.Env = filtered
+	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION"}, agent.ID)
 	cmd.Dir = dir
 
 	// Capture stderr for error diagnostics (limit to 4KB to prevent memory issues)
@@ -218,12 +204,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					cmd.Wait()
 					return
 				}
-				for i := len(toolUses) - 1; i >= 0; i-- {
-					if toolUses[i].Name == event.Name && toolUses[i].Output == "" {
-						toolUses[i].Output = truncate(event.Content, 2000)
-						break
-					}
-				}
+				matchToolOutput(toolUses, "", event.Name, truncate(event.Content, 2000))
 			}
 		}
 

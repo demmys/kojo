@@ -62,19 +62,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(fullMessage)
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, e := range env {
-		if strings.HasPrefix(e, "AGENT_BROWSER_SESSION") {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	filtered = append(filtered,
-		"AGENT_BROWSER_SESSION="+agent.ID,
-		"AGENT_BROWSER_SESSION_NAME="+agent.ID,
-	)
-	cmd.Env = filtered
+	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION"}, agent.ID)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -170,25 +158,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 						cmd.Wait()
 						return
 					}
-					// Match by item ID for accurate pairing, fall back to name
-					matched := false
-					if event.Item.ID != "" {
-						for i := len(toolUses) - 1; i >= 0; i-- {
-							if toolUses[i].ID == event.Item.ID && toolUses[i].Output == "" {
-								toolUses[i].Output = truncate(event.Item.Output, 2000)
-								matched = true
-								break
-							}
-						}
-					}
-					if !matched {
-						for i := len(toolUses) - 1; i >= 0; i-- {
-							if toolUses[i].Name == event.Item.Name && toolUses[i].Output == "" {
-								toolUses[i].Output = truncate(event.Item.Output, 2000)
-								break
-							}
-						}
-					}
+					matchToolOutput(toolUses, event.Item.ID, event.Item.Name, truncate(event.Item.Output, 2000))
 				}
 
 			case "turn.completed":

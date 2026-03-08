@@ -1,6 +1,10 @@
 package agent
 
-import "context"
+import (
+	"context"
+	"os"
+	"strings"
+)
 
 // ChatBackend abstracts a CLI tool for agent chat.
 type ChatBackend interface {
@@ -13,4 +17,47 @@ type ChatBackend interface {
 
 	// Available returns true if the CLI tool is installed and accessible.
 	Available() bool
+}
+
+// filterEnv returns a copy of os.Environ() with entries matching any of the
+// given prefixes removed, and AGENT_BROWSER_SESSION vars set to agentID.
+func filterEnv(removePrefixes []string, agentID string) []string {
+	env := os.Environ()
+	filtered := make([]string, 0, len(env))
+	for _, e := range env {
+		skip := false
+		for _, prefix := range removePrefixes {
+			if strings.HasPrefix(e, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, e)
+		}
+	}
+	filtered = append(filtered,
+		"AGENT_BROWSER_SESSION="+agentID,
+		"AGENT_BROWSER_SESSION_NAME="+agentID,
+	)
+	return filtered
+}
+
+// matchToolOutput pairs a tool result with the most recent matching ToolUse
+// that has no output yet. It tries to match by ID first, then falls back to name.
+func matchToolOutput(toolUses []ToolUse, id, name, output string) {
+	if id != "" {
+		for i := len(toolUses) - 1; i >= 0; i-- {
+			if toolUses[i].ID == id && toolUses[i].Output == "" {
+				toolUses[i].Output = output
+				return
+			}
+		}
+	}
+	for i := len(toolUses) - 1; i >= 0; i-- {
+		if toolUses[i].Name == name && toolUses[i].Output == "" {
+			toolUses[i].Output = output
+			return
+		}
+	}
 }

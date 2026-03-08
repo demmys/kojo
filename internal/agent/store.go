@@ -6,9 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"sync"
+
+	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
 const agentsFile = "agents.json"
@@ -141,16 +142,7 @@ func (st *store) SaveCronPaused(paused bool) {
 
 // agentsDir returns the base directory for all agent data.
 func agentsDir() string {
-	if runtime.GOOS == "windows" {
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			return filepath.Join(appData, "kojo", "agents")
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "kojo", "agents")
-	}
-	return filepath.Join(home, ".config", "kojo", "agents")
+	return filepath.Join(configdir.Path(), "agents")
 }
 
 // agentDir returns the data directory for a specific agent.

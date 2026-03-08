@@ -140,6 +140,15 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		return
 	}
 
+	// Check active hours
+	if a, ok := cs.mgr.Get(agentID); ok {
+		if !IsWithinActiveHours(a.ActiveStart, a.ActiveEnd) {
+			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
+				"activeStart", a.ActiveStart, "activeEnd", a.ActiveEnd)
+			return
+		}
+	}
+
 	// Cross-process guard: atomic lock file prevents duplicate execution
 	if !acquireCronLock(agentID) {
 		cs.logger.Debug("cron job skipped (lock held)", "agent", agentID)

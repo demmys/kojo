@@ -18,6 +18,8 @@ export interface AgentInfo {
   model: string;
   tool: string;
   intervalMinutes: number;
+  activeStart?: string;
+  activeEnd?: string;
   createdAt: string;
   updatedAt: string;
   publicProfile: string;
@@ -37,6 +39,8 @@ export interface AgentConfig {
   model?: string;
   tool?: string;
   intervalMinutes?: number;
+  activeStart?: string;
+  activeEnd?: string;
 }
 
 export interface AgentUpdateParams extends Partial<AgentConfig> {

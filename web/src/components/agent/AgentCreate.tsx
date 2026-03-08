@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
-import { agentApi, INTERVAL_PRESETS } from "../../lib/agentApi";
+import { agentApi } from "../../lib/agentApi";
+import { ScheduleEditor } from "./ScheduleEditor";
 import { api, type ServerInfo } from "../../lib/api";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
@@ -13,6 +14,8 @@ export function AgentCreate() {
   const [model, setModel] = useState("sonnet");
   const [tool, setTool] = useState("claude");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [activeStart, setActiveStart] = useState("");
+  const [activeEnd, setActiveEnd] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -205,6 +208,8 @@ export function AgentCreate() {
         model,
         tool,
         intervalMinutes,
+        activeStart: activeStart || undefined,
+        activeEnd: activeEnd || undefined,
       });
 
       // Upload avatar (best-effort — agent is already created)
@@ -427,31 +432,15 @@ export function AgentCreate() {
           />
         </div>
 
-        {/* Interval */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">
-            Interval
-          </label>
-          <div className="flex gap-2 flex-wrap">
-            {INTERVAL_PRESETS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => setIntervalMinutes(opt.value)}
-                className={`px-3 py-1.5 rounded text-sm ${
-                  intervalMinutes === opt.value
-                    ? "bg-neutral-700 border border-neutral-500"
-                    : "bg-neutral-900 border border-neutral-800"
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-xs text-neutral-600">
-            Timing is automatically staggered per agent.
-          </p>
-        </div>
+        {/* Schedule */}
+        <ScheduleEditor
+          intervalMinutes={intervalMinutes}
+          onIntervalChange={setIntervalMinutes}
+          activeStart={activeStart}
+          activeEnd={activeEnd}
+          onActiveStartChange={setActiveStart}
+          onActiveEndChange={setActiveEnd}
+        />
 
         {error && (
           <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">

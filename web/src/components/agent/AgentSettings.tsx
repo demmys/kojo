@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
-import { agentApi, INTERVAL_PRESETS, type AgentInfo } from "../../lib/agentApi";
+import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
+import { ScheduleEditor } from "./ScheduleEditor";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -14,6 +15,8 @@ export function AgentSettings() {
   const [model, setModel] = useState("");
   const [tool, setTool] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [activeStart, setActiveStart] = useState("");
+  const [activeEnd, setActiveEnd] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -36,6 +39,8 @@ export function AgentSettings() {
       setModel(a.model);
       setTool(a.tool);
       setIntervalMinutes(a.intervalMinutes);
+      setActiveStart(a.activeStart ?? "");
+      setActiveEnd(a.activeEnd ?? "");
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -52,6 +57,8 @@ export function AgentSettings() {
         model: model.trim(),
         tool: tool.trim(),
         intervalMinutes,
+        activeStart,
+        activeEnd,
       });
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -295,31 +302,15 @@ export function AgentSettings() {
           </div>
         </div>
 
-        {/* Interval */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">
-            Interval
-          </label>
-          <div className="flex gap-2 flex-wrap">
-            {INTERVAL_PRESETS.map((opt) => (
-              <button
-                key={opt.value}
-                type="button"
-                onClick={() => setIntervalMinutes(opt.value)}
-                className={`px-3 py-1.5 rounded text-sm ${
-                  intervalMinutes === opt.value
-                    ? "bg-neutral-700 border border-neutral-500"
-                    : "bg-neutral-900 border border-neutral-800"
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-xs text-neutral-600">
-            Timing is automatically staggered per agent.
-          </p>
-        </div>
+        {/* Schedule */}
+        <ScheduleEditor
+          intervalMinutes={intervalMinutes}
+          onIntervalChange={setIntervalMinutes}
+          activeStart={activeStart}
+          activeEnd={activeEnd}
+          onActiveStartChange={setActiveStart}
+          onActiveEndChange={setActiveEnd}
+        />
 
         {error && (
           <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">

@@ -354,13 +354,34 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Tool != nil {
 		a.Tool = *cfg.Tool
 	}
+	// Validate before mutating
+	if cfg.IntervalMinutes != nil && !ValidInterval(*cfg.IntervalMinutes) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("unsupported interval: %d minutes", *cfg.IntervalMinutes)
+	}
+	{
+		s, e := a.ActiveStart, a.ActiveEnd
+		if cfg.ActiveStart != nil {
+			s = *cfg.ActiveStart
+		}
+		if cfg.ActiveEnd != nil {
+			e = *cfg.ActiveEnd
+		}
+		if err := ValidActiveHours(s, e); err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+	}
+
 	oldInterval := a.IntervalMinutes
 	if cfg.IntervalMinutes != nil {
-		if !ValidInterval(*cfg.IntervalMinutes) {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("unsupported interval: %d minutes", *cfg.IntervalMinutes)
-		}
 		a.IntervalMinutes = *cfg.IntervalMinutes
+	}
+	if cfg.ActiveStart != nil {
+		a.ActiveStart = *cfg.ActiveStart
+	}
+	if cfg.ActiveEnd != nil {
+		a.ActiveEnd = *cfg.ActiveEnd
 	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)

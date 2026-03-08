@@ -92,6 +92,13 @@ func (st *store) Load() ([]*Agent, error) {
 			a.IntervalMinutes = 0
 			needsSave = true
 		}
+		// Validate loaded active hours — clear invalid values
+		if err := ValidActiveHours(a.ActiveStart, a.ActiveEnd); err != nil {
+			st.logger.Warn("invalid active hours in stored data, clearing", "agent", a.ID, "start", a.ActiveStart, "end", a.ActiveEnd, "err", err)
+			a.ActiveStart = ""
+			a.ActiveEnd = ""
+			needsSave = true
+		}
 	}
 	if needsSave {
 		st.Save(agents)

@@ -9,6 +9,50 @@ import (
 	"time"
 )
 
+// ValidActiveHours validates the active hours range.
+// Both must be empty (no restriction) or both must be valid HH:MM format.
+func ValidActiveHours(start, end string) error {
+	if start == "" && end == "" {
+		return nil
+	}
+	if (start == "") != (end == "") {
+		return fmt.Errorf("both activeStart and activeEnd must be set, or both empty")
+	}
+	if _, err := time.Parse("15:04", start); err != nil {
+		return fmt.Errorf("invalid activeStart: %s", start)
+	}
+	if _, err := time.Parse("15:04", end); err != nil {
+		return fmt.Errorf("invalid activeEnd: %s", end)
+	}
+	if start == end {
+		return fmt.Errorf("activeStart and activeEnd must differ")
+	}
+	return nil
+}
+
+// IsWithinActiveHours checks if the current local time is within the active window.
+// Returns true if no restriction is set (both empty).
+// Supports overnight ranges (e.g., 22:00-06:00).
+func IsWithinActiveHours(start, end string) bool {
+	if start == "" || end == "" {
+		return true
+	}
+	now := time.Now()
+	nowMinutes := now.Hour()*60 + now.Minute()
+
+	s, _ := time.Parse("15:04", start)
+	e, _ := time.Parse("15:04", end)
+	startMin := s.Hour()*60 + s.Minute()
+	endMin := e.Hour()*60 + e.Minute()
+
+	if startMin <= endMin {
+		// Normal range: e.g., 09:00-23:00
+		return nowMinutes >= startMin && nowMinutes < endMin
+	}
+	// Overnight range: e.g., 22:00-06:00
+	return nowMinutes >= startMin || nowMinutes < endMin
+}
+
 // allowedIntervals defines the valid intervalMinutes values.
 // Sub-hourly values must divide 60; hourly values must divide 24 (in hours).
 var allowedIntervals = map[int]bool{
@@ -29,6 +73,8 @@ type Agent struct {
 	Model           string `json:"model"`           // e.g. "sonnet", "opus"
 	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
 	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
+	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
+	ActiveEnd       string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
 	CreatedAt       string `json:"createdAt"`       // RFC3339
 	UpdatedAt       string `json:"updatedAt"`       // RFC3339
 
@@ -66,11 +112,13 @@ type DirectoryEntry struct {
 
 // AgentConfig is the request body for creating an agent.
 type AgentConfig struct {
-	Name            string `json:"name"`
-	Persona         string `json:"persona"`
-	Model           string `json:"model"`
-	Tool            string `json:"tool"`
-	IntervalMinutes *int   `json:"intervalMinutes"` // nil = use default (30)
+	Name            string  `json:"name"`
+	Persona         string  `json:"persona"`
+	Model           string  `json:"model"`
+	Tool            string  `json:"tool"`
+	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
+	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
+	ActiveEnd       *string `json:"activeEnd"`       // HH:MM or empty
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -83,6 +131,8 @@ type AgentUpdateConfig struct {
 	Model                 *string `json:"model"`
 	Tool                  *string `json:"tool"`
 	IntervalMinutes       *int    `json:"intervalMinutes"`
+	ActiveStart           *string `json:"activeStart"`
+	ActiveEnd             *string `json:"activeEnd"`
 }
 
 func generateID() string {
@@ -100,6 +150,16 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidInterval(interval) {
 		return nil, fmt.Errorf("unsupported interval: %d minutes", interval)
 	}
+	var activeStart, activeEnd string
+	if cfg.ActiveStart != nil {
+		activeStart = *cfg.ActiveStart
+	}
+	if cfg.ActiveEnd != nil {
+		activeEnd = *cfg.ActiveEnd
+	}
+	if err := ValidActiveHours(activeStart, activeEnd); err != nil {
+		return nil, err
+	}
 	a := &Agent{
 		ID:              generateID(),
 		Name:            cfg.Name,
@@ -107,6 +167,8 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		Model:           cfg.Model,
 		Tool:            cfg.Tool,
 		IntervalMinutes: interval,
+		ActiveStart:     activeStart,
+		ActiveEnd:       activeEnd,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}

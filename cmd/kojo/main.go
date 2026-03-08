@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"net/netip"
+
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
@@ -73,15 +75,18 @@ func main() {
 	}
 
 	agentMgr := agent.NewManager(logger)
+	groupDMMgr := agent.NewGroupDMManager(agentMgr, logger)
+	agentMgr.SetGroupDMManager(groupDMMgr)
 
 	srv := server.New(server.Config{
-		Addr:          fmt.Sprintf(":%d", *port),
-		DevMode:       *dev,
-		Logger:        logger,
-		StaticFS:      staticFS,
-		Version:       version,
-		NotifyManager: notifyMgr,
-		AgentManager:  agentMgr,
+		Addr:           fmt.Sprintf(":%d", *port),
+		DevMode:        *dev,
+		Logger:         logger,
+		StaticFS:       staticFS,
+		Version:        version,
+		NotifyManager:  notifyMgr,
+		AgentManager:   agentMgr,
+		GroupDMManager: groupDMMgr,
 	})
 
 	// graceful shutdown
@@ -96,6 +101,7 @@ func main() {
 			os.Exit(1)
 		}
 		actualAddr := ln.Addr().String()
+		groupDMMgr.SetAPIBase("http://" + actualAddr)
 		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n    http://%s\n\n", version, actualAddr)
 		go func() {
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -118,7 +124,10 @@ func main() {
 
 		// get tailscale addresses for display
 		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n", version)
-		lc, _ := tsServer.LocalClient()
+		lc, lcErr := tsServer.LocalClient()
+		if lcErr != nil {
+			logger.Warn("could not get tailscale local client", "err", lcErr)
+		}
 		if lc != nil {
 			if status, err := lc.Status(ctx); err == nil {
 				// print DNS name (e.g. kojo.<tailnet>.ts.net)
@@ -127,19 +136,31 @@ func main() {
 					if dnsName != "" {
 						if *port == 443 {
 							fmt.Fprintf(os.Stderr, "    https://%s\n", dnsName)
+							groupDMMgr.SetAPIBase("https://" + dnsName)
 						} else {
 							fmt.Fprintf(os.Stderr, "    https://%s:%d\n", dnsName, *port)
+							groupDMMgr.SetAPIBase(fmt.Sprintf("https://%s:%d", dnsName, *port))
 						}
 					}
 				}
 				// print IP addresses
 				for _, ip := range status.TailscaleIPs {
-					fmt.Fprintf(os.Stderr, "    https://%s:%d\n", ip, *port)
+					fmt.Fprintf(os.Stderr, "    https://%s\n", net.JoinHostPort(ip.String(), strconv.Itoa(*port)))
+				}
+				// Fallback: use first Tailscale IP if DNS name wasn't set
+				if groupDMMgr.APIBase() == "" && len(status.TailscaleIPs) > 0 {
+					groupDMMgr.SetAPIBase("https://" + tsAddrForURL(status.TailscaleIPs[0], *port))
 				}
 			} else {
 				logger.Warn("could not get tailscale status", "err", err)
 				fmt.Fprintf(os.Stderr, "    https://kojo:<tailnet>.ts.net:%d  (getting status...)\n", *port)
+				groupDMMgr.SetAPIBase(fmt.Sprintf("https://kojo:%d", *port))
 			}
+		}
+		// Final fallback if no address was resolved
+		if groupDMMgr.APIBase() == "" {
+			groupDMMgr.SetAPIBase(fmt.Sprintf("https://kojo:%d", *port))
+			logger.Warn("group DM API base set to fallback", "base", groupDMMgr.APIBase())
 		}
 		fmt.Fprintln(os.Stderr)
 
@@ -165,6 +186,12 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown error", "err", err)
 	}
+}
+
+// tsAddrForURL formats a Tailscale IP + port as a URL host string,
+// wrapping IPv6 addresses in brackets.
+func tsAddrForURL(ip netip.Addr, port int) string {
+	return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
 func listenWithFallback(host string, startPort, maxAttempts int, logger *slog.Logger) (net.Listener, error) {

@@ -27,6 +27,7 @@ import (
 type Server struct {
 	sessions *session.Manager
 	agents   *agent.Manager
+	groupdms *agent.GroupDMManager
 	files    *filebrowser.Browser
 	git      *gitpkg.Manager
 	notify   *notify.Manager
@@ -37,13 +38,14 @@ type Server struct {
 }
 
 type Config struct {
-	Addr          string
-	DevMode       bool
-	Logger        *slog.Logger
-	StaticFS      fs.FS // embedded web/dist files for production
-	Version       string
-	NotifyManager *notify.Manager
-	AgentManager  *agent.Manager
+	Addr            string
+	DevMode         bool
+	Logger          *slog.Logger
+	StaticFS        fs.FS // embedded web/dist files for production
+	Version         string
+	NotifyManager   *notify.Manager
+	AgentManager    *agent.Manager
+	GroupDMManager  *agent.GroupDMManager
 }
 
 func New(cfg Config) *Server {
@@ -55,6 +57,7 @@ func New(cfg Config) *Server {
 	s := &Server{
 		sessions: session.NewManager(logger),
 		agents:   cfg.AgentManager,
+		groupdms: cfg.GroupDMManager,
 		files:    filebrowser.New(logger),
 		git:      gitpkg.New(logger),
 		notify:   cfg.NotifyManager,
@@ -140,6 +143,17 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
 		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/password", s.handleRevealCredentialPassword)
 		mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
+
+		// Group DM routes
+		if s.groupdms != nil {
+			mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)
+			mux.HandleFunc("POST /api/v1/groupdms", s.handleCreateGroupDM)
+			mux.HandleFunc("GET /api/v1/groupdms/{id}", s.handleGetGroupDM)
+			mux.HandleFunc("DELETE /api/v1/groupdms/{id}", s.handleDeleteGroupDM)
+			mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
+			mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)
+			mux.HandleFunc("GET /api/v1/agents/{id}/groups", s.handleListAgentGroups)
+		}
 	}
 
 	// Static files / dev proxy

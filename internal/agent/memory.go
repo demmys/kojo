@@ -104,7 +104,8 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 
 // buildSystemPrompt constructs the system prompt for an agent chat.
 // Memory content is NOT injected — the agent retrieves it on demand via Read/Grep tools.
-func buildSystemPrompt(a *Agent, logger *slog.Logger) string {
+// apiBase is the server URL for group DM API access (e.g. "http://127.0.0.1:8080").
+func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")
 	today := time.Now().Format("2006-01-02")
@@ -134,6 +135,41 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger) string {
 	sb.WriteString(fmt.Sprintf("Your credentials are stored in %s/credentials.json (read-only).\n", dir))
 	sb.WriteString("Read this file when you need login credentials. Do not edit it directly; credentials are managed via the settings UI.\n")
 	sb.WriteString("NEVER display passwords in chat. When asked about credentials, mention only labels and usernames.\n")
+
+	// Group DM API
+	if apiBase != "" {
+		curlFlags := "-s"
+		if strings.HasPrefix(apiBase, "https://") {
+			curlFlags = "-sk" // skip TLS verification for Tailscale self-signed certs
+		}
+
+		sb.WriteString("\n## Group DM\n\n")
+		sb.WriteString(fmt.Sprintf("Your agent ID: `%s`\n\n", a.ID))
+
+		if len(groups) > 0 {
+			sb.WriteString("You are a member of the following group conversations:\n\n")
+			for _, g := range groups {
+				var others []string
+				for _, mem := range g.Members {
+					if mem.AgentID != a.ID {
+						others = append(others, mem.AgentName)
+					}
+				}
+				sb.WriteString(fmt.Sprintf("- **%s** (ID: `%s`) — members: %s\n", g.Name, g.ID, strings.Join(others, ", ")))
+			}
+		} else {
+			sb.WriteString("You are not in any group conversations yet.\n")
+		}
+
+		sb.WriteString("\n### API\n\n")
+		sb.WriteString(fmt.Sprintf("List agents: `curl %s '%s/api/v1/agents'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("Create group: `curl %s -X POST '%s/api/v1/groupdms' -H 'Content-Type: application/json' -d '{\"name\":\"...\",\"memberIds\":[\"your-id\",\"other-agent-id\"]}'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("Read messages: `curl %s '%s/api/v1/groupdms/{groupId}/messages?limit=20'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("Send message: `curl %s -X POST '%s/api/v1/groupdms/{groupId}/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"...\"}' `\n", curlFlags, apiBase, a.ID))
+		sb.WriteString("\nWhen you receive a group DM notification (system message starting with [Group DM:]), read recent messages if needed and reply using the send API above.\n")
+		sb.WriteString("Do NOT reply to group DM notifications in your regular chat — always use the curl API.\n")
+		sb.WriteString("You can create new group conversations with other agents when collaboration would be useful.\n\n")
+	}
 
 	// Persona
 	if a.Persona != "" {

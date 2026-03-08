@@ -20,6 +20,9 @@ type Manager struct {
 	cron     *cronScheduler
 	logger   *slog.Logger
 
+	// groupdms is set after construction to avoid circular dependency.
+	groupdms *GroupDMManager
+
 	// busy tracks which agents have an active chat.
 	busy   map[string]context.CancelFunc
 	busyMu sync.Mutex
@@ -82,6 +85,12 @@ func NewManager(logger *slog.Logger) *Manager {
 	}
 
 	return m
+}
+
+// SetGroupDMManager sets the group DM manager reference.
+// Called after both managers are created to avoid circular dependency.
+func (m *Manager) SetGroupDMManager(gdm *GroupDMManager) {
+	m.groupdms = gdm
 }
 
 // Create creates a new agent.
@@ -376,6 +385,11 @@ func (m *Manager) Delete(id string) error {
 
 	m.cron.Remove(id)
 
+	// Remove agent from group DMs
+	if m.groupdms != nil {
+		m.groupdms.RemoveAgent(id)
+	}
+
 	// Remove agent data directory
 	dir := agentDir(id)
 	os.RemoveAll(dir)
@@ -435,8 +449,14 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		m.logger.Warn("failed to save input message", "err", err)
 	}
 
-	// Build system prompt
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger)
+	// Build system prompt with group DM context
+	var apiBase string
+	var groups []*GroupDM
+	if m.groupdms != nil {
+		apiBase = m.groupdms.APIBase()
+		groups = m.groupdms.GroupsForAgent(agentID)
+	}
+	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups)
 
 	// Start chat
 	backendCh, err := backend.Chat(chatCtx, &agentCopy, userMessage, systemPrompt)

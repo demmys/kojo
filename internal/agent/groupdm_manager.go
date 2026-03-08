@@ -1,0 +1,417 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+const groupdmsFile = "groups.json"
+
+// notifyTimeout is the maximum time allowed for a notification-triggered chat.
+const notifyTimeout = 10 * time.Minute
+
+// notifyCooldown is the minimum interval between notifications to the same agent
+// for the same group. This prevents sequential ping-pong loops.
+const notifyCooldown = 50 * time.Second
+
+// GroupDMManager manages group DM CRUD, message posting, and notifications.
+type GroupDMManager struct {
+	mu       sync.Mutex
+	groups   map[string]*GroupDM
+	agentMgr *Manager
+	logger   *slog.Logger
+	apiBase  string // base URL for agent-facing API (e.g. "http://127.0.0.1:8080")
+
+	// lastNotify tracks the last notification time per (groupID, agentID)
+	// to enforce cooldown and prevent ping-pong loops.
+	lastNotify   map[string]time.Time
+	lastNotifyMu sync.Mutex
+}
+
+// NewGroupDMManager creates a new GroupDMManager.
+func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
+	m := &GroupDMManager{
+		groups:     make(map[string]*GroupDM),
+		agentMgr:   agentMgr,
+		logger:     logger,
+		lastNotify: make(map[string]time.Time),
+	}
+	m.load()
+	return m
+}
+
+// SetAPIBase sets the base URL for agent-facing API docs in system prompts.
+func (m *GroupDMManager) SetAPIBase(base string) {
+	m.mu.Lock()
+	m.apiBase = base
+	m.mu.Unlock()
+}
+
+// APIBase returns the current API base URL.
+func (m *GroupDMManager) APIBase() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.apiBase
+}
+
+// Create creates a new group DM with the given members.
+func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, error) {
+	if len(memberIDs) < 2 {
+		return nil, fmt.Errorf("group requires at least 2 members")
+	}
+
+	members, err := m.resolveMembers(memberIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(members) < 2 {
+		return nil, fmt.Errorf("group requires at least 2 unique members")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	g := &GroupDM{
+		ID:        generateGroupID(),
+		Name:      name,
+		Members:   members,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if g.Name == "" {
+		g.Name = m.defaultGroupName(members)
+	}
+
+	// Ensure group directory exists
+	if err := os.MkdirAll(groupDir(g.ID), 0o755); err != nil {
+		return nil, fmt.Errorf("create group dir: %w", err)
+	}
+
+	m.mu.Lock()
+	m.groups[g.ID] = g
+	m.mu.Unlock()
+
+	m.save()
+	m.logger.Info("group DM created", "id", g.ID, "name", g.Name)
+	return m.copyGroup(g), nil
+}
+
+// Get returns a group DM by ID.
+func (m *GroupDMManager) Get(id string) (*GroupDM, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[id]
+	if !ok {
+		return nil, false
+	}
+	return m.copyGroup(g), true
+}
+
+// List returns all group DMs.
+func (m *GroupDMManager) List() []*GroupDM {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	list := make([]*GroupDM, 0, len(m.groups))
+	for _, g := range m.groups {
+		list = append(list, m.copyGroup(g))
+	}
+	return list
+}
+
+// Delete removes a group DM and its data.
+func (m *GroupDMManager) Delete(id string) error {
+	m.mu.Lock()
+	_, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("group not found: %s", id)
+	}
+	delete(m.groups, id)
+	m.mu.Unlock()
+
+	// Clean up cooldown entries for this group
+	m.cleanNotifyKeys(id)
+
+	os.RemoveAll(groupDir(id))
+	m.save()
+	m.logger.Info("group DM deleted", "id", id)
+	return nil
+}
+
+// PostMessage posts a message to a group and optionally notifies other members.
+// If notify is true, other members receive a system notification in their 1:1 chat.
+// Set notify=false for messages sent from notification-triggered chats to prevent loops.
+func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, content string, notify bool) (*GroupMessage, error) {
+	m.mu.Lock()
+	g, ok := m.groups[groupID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("group not found: %s", groupID)
+	}
+
+	// Verify sender is a member
+	var senderName string
+	isMember := false
+	for _, mem := range g.Members {
+		if mem.AgentID == agentID {
+			isMember = true
+			senderName = mem.AgentName
+			break
+		}
+	}
+	if !isMember {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("agent %s is not a member of group %s", agentID, groupID)
+	}
+
+	// Collect other members for notification
+	var recipients []GroupMember
+	for _, mem := range g.Members {
+		if mem.AgentID != agentID {
+			recipients = append(recipients, mem)
+		}
+	}
+	groupName := g.Name
+	m.mu.Unlock()
+
+	// Store message
+	msg := newGroupMessage(agentID, senderName, content)
+	if err := appendGroupMessage(groupID, msg); err != nil {
+		return nil, fmt.Errorf("store message: %w", err)
+	}
+
+	// Update timestamp after successful write
+	m.mu.Lock()
+	if g, ok := m.groups[groupID]; ok {
+		g.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	m.mu.Unlock()
+	m.save()
+
+	// Notify other members asynchronously (unless suppressed to prevent loops)
+	if notify {
+		for _, r := range recipients {
+			go m.notifyAgent(r.AgentID, groupID, groupName, senderName)
+		}
+	}
+
+	return msg, nil
+}
+
+// Messages returns paginated messages for a group.
+func (m *GroupDMManager) Messages(groupID string, limit int, before string) ([]*GroupMessage, bool, error) {
+	m.mu.Lock()
+	_, ok := m.groups[groupID]
+	m.mu.Unlock()
+	if !ok {
+		return nil, false, fmt.Errorf("group not found: %s", groupID)
+	}
+	return loadGroupMessages(groupID, limit, before)
+}
+
+// GroupsForAgent returns all groups that contain the specified agent.
+func (m *GroupDMManager) GroupsForAgent(agentID string) []*GroupDM {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var result []*GroupDM
+	for _, g := range m.groups {
+		for _, mem := range g.Members {
+			if mem.AgentID == agentID {
+				result = append(result, m.copyGroup(g))
+				break
+			}
+		}
+	}
+	return result
+}
+
+// notifyAgent sends a system message to an agent about new group activity.
+// The notification only says there's a new message — no untrusted content is injected.
+// The agent reads the actual messages via the API.
+// Enforces a per-(group, agent) cooldown to prevent ping-pong loops.
+func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName string) {
+	// Cooldown check
+	key := groupID + ":" + agentID
+	m.lastNotifyMu.Lock()
+	if last, ok := m.lastNotify[key]; ok && time.Since(last) < notifyCooldown {
+		m.lastNotifyMu.Unlock()
+		m.logger.Debug("notification skipped (cooldown)", "agent", agentID, "group", groupID)
+		return
+	}
+	m.lastNotifyMu.Unlock()
+
+	apiBase := m.APIBase()
+	curlFlags := "-s"
+	if strings.HasPrefix(apiBase, "https://") {
+		curlFlags = "-sk"
+	}
+	notification := fmt.Sprintf(
+		"[Group DM: %s] New message from %s.\n"+
+			"Read: curl %s '%s/api/v1/groupdms/%s/messages?limit=20'\n"+
+			"Reply: curl %s -X POST '%s/api/v1/groupdms/%s/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"your reply\"}'",
+		groupName, senderName,
+		curlFlags, apiBase, groupID,
+		curlFlags, apiBase, groupID, agentID,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system")
+	if err != nil {
+		// Agent might be busy — that's expected, not an error worth warning about
+		if !strings.Contains(err.Error(), "busy") {
+			m.logger.Warn("failed to notify agent", "agent", agentID, "group", groupID, "err", err)
+		}
+		return
+	}
+
+	// Record cooldown only after successful chat initiation
+	m.lastNotifyMu.Lock()
+	m.lastNotify[key] = time.Now()
+	m.lastNotifyMu.Unlock()
+
+	// Drain events
+	for range events {
+	}
+}
+
+// resolveMembers validates member IDs and resolves their names.
+func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
+	seen := make(map[string]bool, len(ids))
+	var members []GroupMember
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		a, ok := m.agentMgr.Get(id)
+		if !ok {
+			return nil, fmt.Errorf("agent not found: %s", id)
+		}
+		members = append(members, GroupMember{AgentID: a.ID, AgentName: a.Name})
+	}
+	return members, nil
+}
+
+func (m *GroupDMManager) defaultGroupName(members []GroupMember) string {
+	names := make([]string, len(members))
+	for i, mem := range members {
+		names[i] = mem.AgentName
+	}
+	return strings.Join(names, ", ")
+}
+
+func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
+	cp := *g
+	cp.Members = make([]GroupMember, len(g.Members))
+	copy(cp.Members, g.Members)
+	return &cp
+}
+
+// RemoveAgent removes an agent from all groups. Groups with fewer than 2 members are deleted.
+func (m *GroupDMManager) RemoveAgent(agentID string) {
+	m.mu.Lock()
+	var toDelete []string
+	changed := false
+	for id, g := range m.groups {
+		origLen := len(g.Members)
+		var filtered []GroupMember
+		for _, mem := range g.Members {
+			if mem.AgentID != agentID {
+				filtered = append(filtered, mem)
+			}
+		}
+		if len(filtered) == origLen {
+			continue // agent wasn't in this group
+		}
+		changed = true
+		if len(filtered) < 2 {
+			toDelete = append(toDelete, id)
+		} else {
+			g.Members = filtered
+			g.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	for _, id := range toDelete {
+		delete(m.groups, id)
+	}
+	m.mu.Unlock()
+
+	for _, id := range toDelete {
+		os.RemoveAll(groupDir(id))
+		m.cleanNotifyKeys(id)
+	}
+	m.cleanNotifyKeys(agentID)
+
+	if changed {
+		m.save()
+	}
+}
+
+// cleanNotifyKeys removes cooldown entries matching a group or agent prefix.
+func (m *GroupDMManager) cleanNotifyKeys(prefix string) {
+	m.lastNotifyMu.Lock()
+	for key := range m.lastNotify {
+		if strings.HasPrefix(key, prefix+":") || strings.HasSuffix(key, ":"+prefix) {
+			delete(m.lastNotify, key)
+		}
+	}
+	m.lastNotifyMu.Unlock()
+}
+
+// --- Persistence ---
+
+func (m *GroupDMManager) save() {
+	m.mu.Lock()
+	groups := make([]*GroupDM, 0, len(m.groups))
+	for _, g := range m.groups {
+		groups = append(groups, m.copyGroup(g))
+	}
+	m.mu.Unlock()
+
+	dir := groupdmsDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		m.logger.Warn("failed to create groupdms dir", "err", err)
+		return
+	}
+
+	data, err := json.MarshalIndent(groups, "", "  ")
+	if err != nil {
+		m.logger.Warn("failed to marshal groups", "err", err)
+		return
+	}
+
+	path := filepath.Join(dir, groupdmsFile)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		m.logger.Warn("failed to write tmp groups file", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		m.logger.Warn("failed to rename groups file", "err", err)
+		os.Remove(tmp)
+	}
+}
+
+func (m *GroupDMManager) load() {
+	path := filepath.Join(groupdmsDir(), groupdmsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var groups []*GroupDM
+	if err := json.Unmarshal(data, &groups); err != nil {
+		m.logger.Warn("failed to unmarshal groups", "err", err)
+		return
+	}
+	for _, g := range groups {
+		m.groups[g.ID] = g
+	}
+}

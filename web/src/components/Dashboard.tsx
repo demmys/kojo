@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, type AgentInfo } from "../lib/agentApi";
+import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { timeAgo } from "../lib/utils";
@@ -54,6 +55,7 @@ function groupSessions(sessions: SessionInfo[]): SessionGroup[] {
 export function Dashboard() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
   const [cronPaused, setCronPaused] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const navigate = useNavigate();
@@ -70,6 +72,13 @@ export function Dashboard() {
     const loadAgents = () => agentApi.list().then(setAgents).catch(console.error);
     loadAgents();
     const interval = setInterval(loadAgents, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const loadGroups = () => groupdmApi.list().then(setGroupDMs).catch(console.error);
+    loadGroups();
+    const interval = setInterval(loadGroups, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -206,6 +215,44 @@ export function Dashboard() {
               ))}
             </div>
           </section>
+
+        {/* Group DMs Section */}
+        <section>
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Group DMs</h2>
+          </div>
+          {groupDMs.length === 0 && (
+            <p className="text-neutral-500 text-center py-8 text-sm">No group DMs</p>
+          )}
+          <div className="space-y-2">
+            {[...groupDMs]
+              .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+              .map((g) => (
+                <button
+                  key={g.id}
+                  onClick={() => navigate(`/groupdms/${g.id}`)}
+                  className="w-full flex items-center gap-3 p-3 bg-neutral-900 hover:bg-neutral-800 rounded-lg border border-neutral-800 text-left transition-colors"
+                >
+                  <div className="flex -space-x-1.5 shrink-0">
+                    {g.members.slice(0, 3).map((m) => (
+                      <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="sm" />
+                    ))}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-sm truncate">{g.name}</span>
+                      <span className="text-[10px] text-neutral-600 shrink-0 ml-2">
+                        {timeAgo(g.updatedAt)}
+                      </span>
+                    </div>
+                    <div className="text-xs text-neutral-500 truncate mt-0.5">
+                      {g.members.map((m) => m.agentName).join(", ")}
+                    </div>
+                  </div>
+                </button>
+              ))}
+          </div>
+        </section>
 
         {/* Sessions Section */}
         <section>

@@ -12,6 +12,16 @@ import (
 	"strings"
 )
 
+// allowedImageExts is the set of image extensions accepted for avatars.
+var allowedImageExts = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".svg": true,
+}
+
+// isAllowedImageExt returns true if ext (case-insensitive) is an accepted avatar image extension.
+func isAllowedImageExt(ext string) bool {
+	return allowedImageExts[strings.ToLower(ext)]
+}
+
 // avatarMeta returns whether an avatar file exists and a modtime-derived hash.
 // Single pass: one avatarFilePath lookup + one Stat.
 func avatarMeta(agentID string) (exists bool, hash string) {
@@ -71,6 +81,37 @@ func SaveAvatar(agentID string, src io.Reader, ext string) error {
 
 	_, err = io.Copy(dst, src)
 	return err
+}
+
+// ValidateTempAvatarPath validates that a path points to an image file inside
+// a kojo-avatar-* temp directory. Returns the resolved absolute path or an error.
+// Used by handlers that accept user-supplied avatar paths.
+func ValidateTempAvatarPath(avatarPath string) (string, error) {
+	absPath, err := filepath.EvalSymlinks(avatarPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid avatar path")
+	}
+	tempDir, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve temp dir")
+	}
+	if !strings.HasPrefix(absPath, tempDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("avatar path must be in temp directory")
+	}
+	rel, _ := filepath.Rel(tempDir, absPath)
+	parts := strings.SplitN(rel, string(filepath.Separator), 2)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "kojo-avatar-") {
+		return "", fmt.Errorf("invalid avatar path")
+	}
+	ext := strings.ToLower(filepath.Ext(absPath))
+	if !isAllowedImageExt(ext) {
+		return "", fmt.Errorf("unsupported image format")
+	}
+	fi, err := os.Stat(absPath)
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("file not found")
+	}
+	return absPath, nil
 }
 
 // GenerateAvatarWithAI generates an avatar using nanobanana.sh.

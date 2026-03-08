@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -513,13 +514,9 @@ func (idx *MemoryIndex) hybridSearch(query string, limit int) []SearchResult {
 	}
 
 	// Sort by score descending
-	for i := 0; i < len(merged); i++ {
-		for j := i + 1; j < len(merged); j++ {
-			if merged[j].score > merged[i].score {
-				merged[i], merged[j] = merged[j], merged[i]
-			}
-		}
-	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].score > merged[j].score
+	})
 
 	if len(merged) > limit {
 		merged = merged[:limit]

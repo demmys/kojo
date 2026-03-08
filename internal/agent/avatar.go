@@ -17,8 +17,8 @@ var allowedImageExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".svg": true,
 }
 
-// isAllowedImageExt returns true if ext (case-insensitive) is an accepted avatar image extension.
-func isAllowedImageExt(ext string) bool {
+// IsAllowedImageExt returns true if ext (case-insensitive) is an accepted avatar image extension.
+func IsAllowedImageExt(ext string) bool {
 	return allowedImageExts[strings.ToLower(ext)]
 }
 
@@ -104,7 +104,7 @@ func ValidateTempAvatarPath(avatarPath string) (string, error) {
 		return "", fmt.Errorf("invalid avatar path")
 	}
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if !isAllowedImageExt(ext) {
+	if !IsAllowedImageExt(ext) {
 		return "", fmt.Errorf("unsupported image format")
 	}
 	fi, err := os.Stat(absPath)

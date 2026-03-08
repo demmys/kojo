@@ -154,7 +154,7 @@ func (s *Server) handleUploadAvatar(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".svg" {
+	if !agent.IsAllowedImageExt(ext) {
 		writeError(w, http.StatusBadRequest, "bad_request", "unsupported image format")
 		return
 	}
@@ -330,9 +330,8 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only allow image extensions
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".svg" {
+	if !agent.IsAllowedImageExt(ext) {
 		writeError(w, http.StatusBadRequest, "bad_request", "unsupported file type")
 		return
 	}
@@ -657,9 +656,8 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Only allow image extensions
 	ext := strings.ToLower(filepath.Ext(absPath))
-	if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".svg" {
+	if !agent.IsAllowedImageExt(ext) {
 		writeError(w, http.StatusBadRequest, "bad_request", "unsupported image format")
 		return
 	}

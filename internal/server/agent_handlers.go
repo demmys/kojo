@@ -38,6 +38,11 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": agents})
 }
 
+func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
+	entries := s.agents.Directory()
+	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": entries})
+}
+
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	var cfg agent.AgentConfig
 	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -370,21 +375,42 @@ func (s *Server) handleAddCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 	var req struct {
-		Label    string `json:"label"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Label         string `json:"label"`
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		TOTPSecret    string `json:"totpSecret"`
+		TOTPAlgorithm string `json:"totpAlgorithm"`
+		TOTPDigits    int    `json:"totpDigits"`
+		TOTPPeriod    int    `json:"totpPeriod"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	if req.Label == "" || req.Username == "" || req.Password == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "label, username, and password are required")
+	if req.Label == "" || req.Username == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "label and username are required")
 		return
 	}
-	cred, err := agent.AddCredential(id, req.Label, req.Username, req.Password)
+	if req.Password == "" && req.TOTPSecret == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "password or totpSecret is required")
+		return
+	}
+	var totp *agent.TOTPParams
+	if req.TOTPSecret != "" {
+		totp = &agent.TOTPParams{
+			Secret:    req.TOTPSecret,
+			Algorithm: req.TOTPAlgorithm,
+			Digits:    req.TOTPDigits,
+			Period:    req.TOTPPeriod,
+		}
+	}
+	cred, err := agent.AddCredential(id, req.Label, req.Username, req.Password, totp)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		if strings.Contains(err.Error(), "TOTP") || strings.Contains(err.Error(), "base32") {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, cred)
@@ -399,18 +425,45 @@ func (s *Server) handleUpdateCredential(w http.ResponseWriter, r *http.Request) 
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
 	var req struct {
-		Label    *string `json:"label"`
-		Username *string `json:"username"`
-		Password *string `json:"password"`
+		Label         *string `json:"label"`
+		Username      *string `json:"username"`
+		Password      *string `json:"password"`
+		TOTPSecret    *string `json:"totpSecret"`
+		TOTPAlgorithm *string `json:"totpAlgorithm"`
+		TOTPDigits    *int    `json:"totpDigits"`
+		TOTPPeriod    *int    `json:"totpPeriod"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	cred, err := agent.UpdateCredential(id, credID, req.Label, req.Username, req.Password)
+	var totp *agent.TOTPParams
+	if req.TOTPSecret != nil {
+		alg := ""
+		if req.TOTPAlgorithm != nil {
+			alg = *req.TOTPAlgorithm
+		}
+		digits := 0
+		if req.TOTPDigits != nil {
+			digits = *req.TOTPDigits
+		}
+		period := 0
+		if req.TOTPPeriod != nil {
+			period = *req.TOTPPeriod
+		}
+		totp = &agent.TOTPParams{
+			Secret:    *req.TOTPSecret,
+			Algorithm: alg,
+			Digits:    digits,
+			Period:    period,
+		}
+	}
+	cred, err := agent.UpdateCredential(id, credID, req.Label, req.Username, req.Password, totp)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else if strings.Contains(err.Error(), "TOTP") || strings.Contains(err.Error(), "base32") {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
@@ -455,6 +508,82 @@ func (s *Server) handleRevealCredentialPassword(w http.ResponseWriter, r *http.R
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSONResponse(w, http.StatusOK, map[string]string{"password": password})
+}
+
+func (s *Server) handleGetTOTPCode(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	credID := r.PathValue("credId")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	code, remaining, err := agent.GetTOTPCode(id, credID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no TOTP") {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSONResponse(w, http.StatusOK, map[string]any{"code": code, "remaining": remaining})
+}
+
+func (s *Server) handleParseQR(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // 10MB max
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart form")
+		return
+	}
+
+	file, _, err := r.FormFile("qr")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "missing qr file")
+		return
+	}
+	defer file.Close()
+
+	entries, err := agent.DecodeQRImage(file)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
+func (s *Server) handleParseOTPURI(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.agents.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.URI == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "uri is required")
+		return
+	}
+
+	entries, err := agent.ParseOTPURI(req.URI)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"entries": entries})
 }
 
 func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Request) {

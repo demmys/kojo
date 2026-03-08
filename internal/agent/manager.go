@@ -30,6 +30,9 @@ type Manager struct {
 	// resetting tracks agents currently being reset (blocks new chats).
 	resetting map[string]bool
 
+	// profileGen tracks agents with in-flight publicProfile generation.
+	profileGen map[string]bool
+
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
 }
@@ -45,8 +48,9 @@ func NewManager(logger *slog.Logger) *Manager {
 		},
 		store:     newStore(logger),
 		logger:    logger,
-		busy:      make(map[string]context.CancelFunc),
-		resetting: make(map[string]bool),
+		busy:       make(map[string]context.CancelFunc),
+		resetting:  make(map[string]bool),
+		profileGen: make(map[string]bool),
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -126,6 +130,12 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	}
 
 	m.logger.Info("agent created", "id", a.ID, "name", a.Name)
+
+	// Generate public profile in background
+	if a.Persona != "" {
+		go m.regeneratePublicProfile(a.ID, a.Persona)
+	}
+
 	return a, nil
 }
 
@@ -141,12 +151,24 @@ func (m *Manager) syncPersona(agentID string) {
 	}
 	// Read file under lock to prevent race with Update's writePersonaFile
 	content, ok := readPersonaFile(agentID)
-	if !ok || a.Persona == content {
+	if !ok {
 		m.mu.Unlock()
+		return
+	}
+	if a.Persona == content {
+		// Persona unchanged — but backfill publicProfile if missing
+		if content != "" && a.PublicProfile == "" && !a.PublicProfileOverride {
+			persona := content
+			m.mu.Unlock()
+			go m.regeneratePublicProfile(agentID, persona)
+		} else {
+			m.mu.Unlock()
+		}
 		return
 	}
 	a.Persona = content
 	tool := a.Tool
+	override := a.PublicProfileOverride
 	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	m.mu.Unlock()
 	m.save()
@@ -154,6 +176,20 @@ func (m *Manager) syncPersona(agentID string) {
 	// Pre-generate persona summary in background so it's cached for next chat
 	if len([]rune(content)) > maxPersonaSummaryRunes {
 		go getPersonaSummary(agentID, content, tool, m.logger)
+	}
+
+	// Regenerate or clear public profile when persona changes via file edit (unless overridden)
+	if !override {
+		if content != "" {
+			go m.regeneratePublicProfile(agentID, content)
+		} else {
+			m.mu.Lock()
+			if a, ok := m.agents[agentID]; ok {
+				a.PublicProfile = ""
+			}
+			m.mu.Unlock()
+			m.save()
+		}
 	}
 }
 
@@ -213,6 +249,71 @@ func (m *Manager) List() []*Agent {
 	return list
 }
 
+// Directory returns minimal public info for all agents (for agent-to-agent discovery).
+func (m *Manager) Directory() []DirectoryEntry {
+	// Sync persona first (may trigger publicProfile regeneration)
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.agents))
+	for id := range m.agents {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+
+	for _, id := range ids {
+		m.syncPersona(id)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entries := make([]DirectoryEntry, 0, len(m.agents))
+	for _, a := range m.agents {
+		entries = append(entries, DirectoryEntry{
+			ID:            a.ID,
+			Name:          a.Name,
+			PublicProfile: a.PublicProfile,
+		})
+	}
+	return entries
+}
+
+// regeneratePublicProfile generates a public profile from persona in the background.
+// Only writes the result if the agent's persona hasn't changed since generation started.
+// Uses profileGen map to prevent duplicate concurrent generations for the same agent.
+func (m *Manager) regeneratePublicProfile(agentID, persona string) {
+	// Dedupe: skip if generation is already in flight for this agent
+	m.mu.Lock()
+	if m.profileGen[agentID] {
+		m.mu.Unlock()
+		return
+	}
+	m.profileGen[agentID] = true
+	m.mu.Unlock()
+
+	defer func() {
+		m.mu.Lock()
+		delete(m.profileGen, agentID)
+		m.mu.Unlock()
+	}()
+
+	profile, err := GeneratePublicProfile(persona)
+	if err != nil {
+		m.logger.Warn("failed to generate public profile", "agent", agentID, "err", err)
+		return
+	}
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if ok && a.Persona == persona && !a.PublicProfileOverride {
+		a.PublicProfile = profile
+	} else {
+		ok = false // persona changed or override enabled, discard stale result
+	}
+	m.mu.Unlock()
+	if ok {
+		m.save()
+		m.logger.Info("public profile generated", "agent", agentID)
+	}
+}
+
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	has, hash := avatarMeta(id)
@@ -233,6 +334,12 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	if cfg.Name != nil {
 		a.Name = *cfg.Name
+	}
+	if cfg.PublicProfileOverride != nil {
+		a.PublicProfileOverride = *cfg.PublicProfileOverride
+	}
+	if cfg.PublicProfile != nil {
+		a.PublicProfile = *cfg.PublicProfile
 	}
 	if cfg.Model != nil {
 		a.Model = *cfg.Model
@@ -256,8 +363,31 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.AvatarHash = a.UpdatedAt
 	}
 
+	// Handle public profile auto-generation logic (before copy for correct response)
+	needsRegen := false
+	if !a.PublicProfileOverride {
+		if cfg.Persona != nil && *cfg.Persona == "" {
+			// Persona emptied → clear profile
+			a.PublicProfile = ""
+		} else if cfg.Persona != nil && *cfg.Persona != "" {
+			// Persona changed → will regenerate
+			a.PublicProfile = ""
+			needsRegen = true
+		}
+		if cfg.PublicProfileOverride != nil && !*cfg.PublicProfileOverride && a.Persona != "" {
+			// Override turned OFF → will regenerate
+			a.PublicProfile = ""
+			needsRegen = true
+		}
+	}
+	// Override OFF + empty persona → clear any leftover manual profile
+	if !a.PublicProfileOverride && a.Persona == "" {
+		a.PublicProfile = ""
+	}
+
 	// Take a copy for return and post-lock operations
 	cp := copyAgent(a)
+	currentPersona := a.Persona
 	m.mu.Unlock()
 
 	if oldInterval != newInterval {
@@ -265,6 +395,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		if err := m.cron.Schedule(id, expr); err != nil {
 			m.logger.Warn("failed to update cron", "agent", id, "err", err)
 		}
+	}
+
+	if needsRegen {
+		go m.regeneratePublicProfile(id, currentPersona)
 	}
 
 	m.save()

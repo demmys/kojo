@@ -9,6 +9,8 @@ export function AgentSettings() {
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
+  const [publicProfile, setPublicProfile] = useState("");
+  const [publicProfileOverride, setPublicProfileOverride] = useState(false);
   const [model, setModel] = useState("");
   const [tool, setTool] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
@@ -29,6 +31,8 @@ export function AgentSettings() {
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
+      setPublicProfile(a.publicProfile ?? "");
+      setPublicProfileOverride(a.publicProfileOverride ?? false);
       setModel(a.model);
       setTool(a.tool);
       setIntervalMinutes(a.intervalMinutes);
@@ -43,11 +47,15 @@ export function AgentSettings() {
       const updated = await agentApi.update(id!, {
         name: name.trim(),
         persona: persona.trim(),
+        ...(publicProfileOverride ? { publicProfile: publicProfile.trim() } : {}),
+        publicProfileOverride,
         model: model.trim(),
         tool: tool.trim(),
         intervalMinutes,
       });
       setAgent(updated);
+      setPublicProfile(updated.publicProfile ?? "");
+      setPublicProfileOverride(updated.publicProfileOverride ?? false);
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
@@ -221,6 +229,39 @@ export function AgentSettings() {
               )}
             </button>
           </div>
+        </div>
+
+        {/* Public Profile */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <label className="text-sm text-neutral-400">
+              Public Profile
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-neutral-500 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={publicProfileOverride}
+                onChange={(e) => setPublicProfileOverride(e.target.checked)}
+                className="rounded border-neutral-600"
+              />
+              Override
+            </label>
+          </div>
+          <textarea
+            value={publicProfile}
+            onChange={(e) => setPublicProfile(e.target.value)}
+            rows={2}
+            disabled={!publicProfileOverride}
+            placeholder={publicProfileOverride ? "Enter custom public profile" : "Auto-generated from persona"}
+            className={`w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500 ${
+              !publicProfileOverride ? "opacity-60 cursor-not-allowed" : ""
+            }`}
+          />
+          <p className="mt-1 text-xs text-neutral-600">
+            {publicProfileOverride
+              ? "Manual override — won't be replaced when persona changes."
+              : "Auto-generated from persona. Visible to other agents via directory."}
+          </p>
         </div>
 
         {/* Model */}

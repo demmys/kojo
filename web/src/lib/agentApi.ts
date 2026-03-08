@@ -20,6 +20,8 @@ export interface AgentInfo {
   intervalMinutes: number;
   createdAt: string;
   updatedAt: string;
+  publicProfile: string;
+  publicProfileOverride: boolean;
   hasAvatar: boolean;
   avatarHash?: string;
   lastMessage?: {
@@ -35,6 +37,11 @@ export interface AgentConfig {
   model?: string;
   tool?: string;
   intervalMinutes?: number;
+}
+
+export interface AgentUpdateParams extends Partial<AgentConfig> {
+  publicProfile?: string;
+  publicProfileOverride?: boolean;
 }
 
 export interface AgentMessage {
@@ -58,8 +65,22 @@ export interface Credential {
   label: string;
   username: string;
   password: string;
+  totpSecret?: string;
+  totpAlgorithm?: string;
+  totpDigits?: number;
+  totpPeriod?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface OTPEntry {
+  label: string;
+  issuer: string;
+  username: string;
+  totpSecret: string;
+  algorithm?: string;
+  digits?: number;
+  period?: number;
 }
 
 export interface ChatEvent {
@@ -130,7 +151,7 @@ export const agentApi = {
 
   create: (cfg: AgentConfig) => post<AgentInfo>("/api/v1/agents", cfg),
 
-  update: (id: string, cfg: Partial<AgentConfig>) =>
+  update: (id: string, cfg: AgentUpdateParams) =>
     patch<AgentInfo>(`/api/v1/agents/${id}`, cfg),
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
@@ -184,17 +205,31 @@ export const agentApi = {
         `/api/v1/agents/${agentId}/credentials`,
       ).then((r) => r.credentials ?? []),
 
-    add: (agentId: string, label: string, username: string, password: string) =>
+    add: (
+      agentId: string,
+      label: string,
+      username: string,
+      password: string,
+      totp?: { secret: string; algorithm?: string; digits?: number; period?: number },
+    ) =>
       post<Credential>(`/api/v1/agents/${agentId}/credentials`, {
         label,
         username,
         password,
+        ...(totp
+          ? {
+              totpSecret: totp.secret,
+              totpAlgorithm: totp.algorithm || undefined,
+              totpDigits: totp.digits || undefined,
+              totpPeriod: totp.period || undefined,
+            }
+          : {}),
       }),
 
     update: (
       agentId: string,
       credId: string,
-      data: Partial<{ label: string; username: string; password: string }>,
+      data: Partial<{ label: string; username: string; password: string; totpSecret: string }>,
     ) => patch<Credential>(`/api/v1/agents/${agentId}/credentials/${credId}`, data),
 
     delete: (agentId: string, credId: string) =>
@@ -204,5 +239,26 @@ export const agentApi = {
       get<{ password: string }>(
         `/api/v1/agents/${agentId}/credentials/${credId}/password`,
       ).then((r) => r.password),
+
+    getTOTPCode: (agentId: string, credId: string) =>
+      get<{ code: string; remaining: number }>(
+        `/api/v1/agents/${agentId}/credentials/${credId}/totp`,
+      ),
+
+    parseQR: async (agentId: string, file: File) => {
+      const form = new FormData();
+      form.append("qr", file);
+      const res = await fetch(`${BASE}/api/v1/agents/${agentId}/credentials/parse-qr`, {
+        method: "POST",
+        body: form,
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+      return (res.json() as Promise<{ entries: OTPEntry[] }>).then((r) => r.entries ?? []);
+    },
+
+    parseOTPURI: (agentId: string, uri: string) =>
+      post<{ entries: OTPEntry[] }>(`/api/v1/agents/${agentId}/credentials/parse-uri`, { uri }).then(
+        (r) => r.entries ?? [],
+      ),
   },
 };

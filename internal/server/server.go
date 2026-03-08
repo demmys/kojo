@@ -123,6 +123,7 @@ func New(cfg Config) *Server {
 	if s.agents != nil {
 		mux.HandleFunc("GET /api/v1/agents/cron-paused", s.handleGetCronPaused)
 		mux.HandleFunc("PUT /api/v1/agents/cron-paused", s.handleSetCronPaused)
+		mux.HandleFunc("GET /api/v1/agents/directory", s.handleAgentDirectory)
 		mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
 		mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
 		mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
@@ -142,6 +143,9 @@ func New(cfg Config) *Server {
 		mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
 		mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
 		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/password", s.handleRevealCredentialPassword)
+		mux.HandleFunc("GET /api/v1/agents/{id}/credentials/{credId}/totp", s.handleGetTOTPCode)
+		mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-qr", s.handleParseQR)
+		mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
 		mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
 
 		// Group DM routes

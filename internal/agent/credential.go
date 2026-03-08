@@ -17,12 +17,16 @@ var credMu sync.Mutex
 
 // Credential represents a stored ID/password pair for an agent.
 type Credential struct {
-	ID        string `json:"id"`
-	Label     string `json:"label"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	CreatedAt string `json:"createdAt"`
-	UpdatedAt string `json:"updatedAt"`
+	ID            string `json:"id"`
+	Label         string `json:"label"`
+	Username      string `json:"username"`
+	Password      string `json:"password"`
+	TOTPSecret    string `json:"totpSecret,omitempty"`
+	TOTPAlgorithm string `json:"totpAlgorithm,omitempty"` // SHA1 (default), SHA256, SHA512
+	TOTPDigits    int    `json:"totpDigits,omitempty"`     // 6 (default) or 8
+	TOTPPeriod    int    `json:"totpPeriod,omitempty"`     // 30 (default)
+	CreatedAt     string `json:"createdAt"`
+	UpdatedAt     string `json:"updatedAt"`
 }
 
 func generateCredID() string {
@@ -75,6 +79,19 @@ func saveCredentials(agentID string, creds []*Credential) error {
 	return nil
 }
 
+const maskedValue = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+
+func maskCredential(c *Credential) *Credential {
+	cp := *c
+	if cp.Password != "" {
+		cp.Password = maskedValue
+	}
+	if cp.TOTPSecret != "" {
+		cp.TOTPSecret = maskedValue
+	}
+	return &cp
+}
+
 // ListCredentials returns all credentials for an agent with passwords masked.
 func ListCredentials(agentID string) ([]*Credential, error) {
 	credMu.Lock()
@@ -86,15 +103,21 @@ func ListCredentials(agentID string) ([]*Credential, error) {
 	}
 	masked := make([]*Credential, len(creds))
 	for i, c := range creds {
-		cp := *c
-		cp.Password = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
-		masked[i] = &cp
+		masked[i] = maskCredential(c)
 	}
 	return masked, nil
 }
 
+// TOTPParams holds TOTP configuration for a credential.
+type TOTPParams struct {
+	Secret    string
+	Algorithm string // SHA1, SHA256, SHA512
+	Digits    int    // 6 or 8
+	Period    int    // seconds
+}
+
 // AddCredential adds a new credential for an agent.
-func AddCredential(agentID, label, username, password string) (*Credential, error) {
+func AddCredential(agentID, label, username, password string, totp *TOTPParams) (*Credential, error) {
 	credMu.Lock()
 	defer credMu.Unlock()
 
@@ -112,18 +135,26 @@ func AddCredential(agentID, label, username, password string) (*Credential, erro
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	if totp != nil && totp.Secret != "" {
+		normalized, err := ValidateTOTPParams(totp.Secret, totp.Algorithm, totp.Digits, totp.Period)
+		if err != nil {
+			return nil, err
+		}
+		c.TOTPSecret = normalized
+		c.TOTPAlgorithm = totp.Algorithm
+		c.TOTPDigits = totp.Digits
+		c.TOTPPeriod = totp.Period
+	}
 	creds = append(creds, c)
 	if err := saveCredentials(agentID, creds); err != nil {
 		return nil, err
 	}
 
-	masked := *c
-	masked.Password = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
-	return &masked, nil
+	return maskCredential(c), nil
 }
 
 // UpdateCredential updates an existing credential. Only non-nil fields are applied.
-func UpdateCredential(agentID, credID string, label, username, password *string) (*Credential, error) {
+func UpdateCredential(agentID, credID string, label, username, password *string, totp *TOTPParams) (*Credential, error) {
 	credMu.Lock()
 	defer credMu.Unlock()
 
@@ -152,15 +183,26 @@ func UpdateCredential(agentID, credID string, label, username, password *string)
 	if password != nil {
 		target.Password = *password
 	}
+	if totp != nil {
+		if totp.Secret != "" {
+			normalized, err := ValidateTOTPParams(totp.Secret, totp.Algorithm, totp.Digits, totp.Period)
+			if err != nil {
+				return nil, err
+			}
+			totp.Secret = normalized
+		}
+		target.TOTPSecret = totp.Secret
+		target.TOTPAlgorithm = totp.Algorithm
+		target.TOTPDigits = totp.Digits
+		target.TOTPPeriod = totp.Period
+	}
 	target.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
 	if err := saveCredentials(agentID, creds); err != nil {
 		return nil, err
 	}
 
-	masked := *target
-	masked.Password = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
-	return &masked, nil
+	return maskCredential(target), nil
 }
 
 // DeleteCredential removes a credential by ID.
@@ -205,4 +247,25 @@ func RevealPassword(agentID, credID string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("credential not found: %s", credID)
+}
+
+// GetTOTPCode generates the current TOTP code for a credential.
+func GetTOTPCode(agentID, credID string) (string, int64, error) {
+	credMu.Lock()
+	defer credMu.Unlock()
+
+	creds, err := loadCredentials(agentID)
+	if err != nil {
+		return "", 0, err
+	}
+
+	for _, c := range creds {
+		if c.ID == credID {
+			if c.TOTPSecret == "" {
+				return "", 0, fmt.Errorf("no TOTP secret configured for credential: %s", credID)
+			}
+			return GenerateTOTPCode(c.TOTPSecret, c.TOTPAlgorithm, c.TOTPDigits, c.TOTPPeriod)
+		}
+	}
+	return "", 0, fmt.Errorf("credential not found: %s", credID)
 }

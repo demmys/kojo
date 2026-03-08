@@ -83,6 +83,22 @@ func SummarizePersona(persona string) (string, error) {
 
 const summarizePrompt = "以下のペルソナ設定を、核心的な性格・口調・行動パターンだけに絞って200文字以内で要約して。要約のみ出力。\n\n"
 
+const publicProfilePrompt = "以下のペルソナ設定から、他者に見せる簡潔な自己紹介文を100文字以内で生成して。" +
+	"内部設定（口調ルール、行動ルール等）は含めず、その人がどんな人物かだけを自然な文で。自己紹介文のみ出力。\n\n"
+
+// GeneratePublicProfile creates a short outward-facing description from a persona.
+func GeneratePublicProfile(persona string) (string, error) {
+	apiKey, err := loadGeminiAPIKey()
+	if err != nil {
+		return "", err
+	}
+	result, err := callGemini(apiKey, publicProfilePrompt+persona)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(result), nil
+}
+
 // SummarizeWithCLI generates a persona summary using the agent's own CLI tool.
 // Supports "claude" (stdin to -p) and "codex" (exec -o).
 func SummarizeWithCLI(tool string, persona string) (string, error) {
@@ -146,6 +162,9 @@ func loadGeminiAPIKey() (string, error) {
 	return key, nil
 }
 
+// geminiHTTPClient is used for all Gemini API calls with a 60s timeout.
+var geminiHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
 // callGemini makes a simple text generation request to the Gemini API.
 func callGemini(apiKey string, prompt string) (string, error) {
 	url := fmt.Sprintf(geminiAPI, geminiModel, apiKey)
@@ -165,7 +184,7 @@ func callGemini(apiKey string, prompt string) (string, error) {
 		return "", err
 	}
 
-	resp, err := http.Post(url, "application/json", strings.NewReader(string(bodyJSON)))
+	resp, err := geminiHTTPClient.Post(url, "application/json", strings.NewReader(string(bodyJSON)))
 	if err != nil {
 		return "", fmt.Errorf("gemini API request failed: %w", err)
 	}

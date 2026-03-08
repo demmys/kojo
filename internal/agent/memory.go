@@ -134,7 +134,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("\n## Credentials\n\n")
 	sb.WriteString(fmt.Sprintf("Your credentials are stored in %s/credentials.json (read-only).\n", dir))
 	sb.WriteString("Read this file when you need login credentials. Do not edit it directly; credentials are managed via the settings UI.\n")
-	sb.WriteString("NEVER display passwords in chat. When asked about credentials, mention only labels and usernames.\n")
+	sb.WriteString("Some credentials include a totpSecret field for TOTP-based 2FA. To generate a current TOTP code, use the totp_secret with a TOTP algorithm (RFC 6238, 30-second period, SHA1, 6 digits).\n")
+	sb.WriteString("NEVER display passwords or TOTP secrets in chat. When asked about credentials, mention only labels and usernames.\n")
 
 	// Group DM API
 	if apiBase != "" {
@@ -162,7 +163,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		}
 
 		sb.WriteString("\n### API\n\n")
-		sb.WriteString(fmt.Sprintf("List agents: `curl %s '%s/api/v1/agents'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("List agents: `curl %s '%s/api/v1/agents/directory'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Create group: `curl %s -X POST '%s/api/v1/groupdms' -H 'Content-Type: application/json' -d '{\"name\":\"...\",\"memberIds\":[\"your-id\",\"other-agent-id\"]}'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Read messages: `curl %s '%s/api/v1/groupdms/{groupId}/messages?limit=20'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Send message: `curl %s -X POST '%s/api/v1/groupdms/{groupId}/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"...\"}' `\n", curlFlags, apiBase, a.ID))

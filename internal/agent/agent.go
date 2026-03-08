@@ -41,6 +41,11 @@ type Agent struct {
 	// AvatarHash is derived from the avatar file's modtime for cache busting.
 	AvatarHash string `json:"avatarHash,omitempty"`
 
+	// PublicProfile is a short outward-facing description generated from persona.
+	// Shared with other agents via the directory endpoint. Does not expose internal persona details.
+	PublicProfile         string `json:"publicProfile,omitempty"`
+	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
+
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`
 }
@@ -50,6 +55,13 @@ type MessagePreview struct {
 	Content   string `json:"content"`
 	Role      string `json:"role"`
 	Timestamp string `json:"timestamp"`
+}
+
+// DirectoryEntry is the minimal public info shared with other agents.
+type DirectoryEntry struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	PublicProfile string `json:"publicProfile"`
 }
 
 // AgentConfig is the request body for creating an agent.
@@ -64,11 +76,13 @@ type AgentConfig struct {
 // AgentUpdateConfig is the request body for PATCH updates.
 // Pointer fields distinguish "not provided" (nil) from "set to zero".
 type AgentUpdateConfig struct {
-	Name            *string `json:"name"`
-	Persona         *string `json:"persona"`
-	Model           *string `json:"model"`
-	Tool            *string `json:"tool"`
-	IntervalMinutes *int    `json:"intervalMinutes"`
+	Name                  *string `json:"name"`
+	Persona               *string `json:"persona"`
+	PublicProfile         *string `json:"publicProfile"`
+	PublicProfileOverride *bool   `json:"publicProfileOverride"`
+	Model                 *string `json:"model"`
+	Tool                  *string `json:"tool"`
+	IntervalMinutes       *int    `json:"intervalMinutes"`
 }
 
 func generateID() string {

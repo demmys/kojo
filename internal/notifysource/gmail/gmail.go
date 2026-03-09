@@ -335,7 +335,7 @@ func (s *Source) getMessage(ctx context.Context, token, id string) (*message, er
 
 type profile struct {
 	EmailAddress string `json:"emailAddress"`
-	HistoryID    uint64 `json:"historyId"`
+	HistoryID    uint64 `json:"historyId,string"`
 }
 
 type message struct {
@@ -361,7 +361,7 @@ func (m *message) header(name string) string {
 
 type historyResponse struct {
 	History   []historyRecord `json:"history"`
-	HistoryID uint64          `json:"historyId"`
+	HistoryID uint64          `json:"historyId,string"`
 }
 
 type historyRecord struct {

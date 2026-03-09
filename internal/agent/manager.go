@@ -332,6 +332,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	// Write persona.md first — if it fails, no in-memory state is modified
+	oldPersona := a.Persona
 	if cfg.Persona != nil {
 		if err := writePersonaFile(a.ID, *cfg.Persona); err != nil {
 			m.mu.Unlock()
@@ -392,13 +393,14 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	// Handle public profile auto-generation logic (before copy for correct response)
+	personaChanged := cfg.Persona != nil && *cfg.Persona != oldPersona
 	needsRegen := false
 	if !a.PublicProfileOverride {
-		if cfg.Persona != nil && *cfg.Persona == "" {
+		if personaChanged && *cfg.Persona == "" {
 			// Persona emptied → clear profile
 			a.PublicProfile = ""
-		} else if cfg.Persona != nil && *cfg.Persona != "" {
-			// Persona changed → will regenerate
+		} else if personaChanged && *cfg.Persona != "" {
+			// Persona actually changed → will regenerate
 			a.PublicProfile = ""
 			needsRegen = true
 		}

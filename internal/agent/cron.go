@@ -16,8 +16,7 @@ const cronMinInterval = 50 * time.Second // minimum interval between runs for sa
 const cronLockFile = ".cron_last"
 func cronPrompt() string {
 	now := time.Now()
-	today := now.Format("2006-01-02")
-	return "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです（一日のまとめではなく途中経過の確認です）。最近の出来事や気づきがあれば memory/" + today + ".md に記録してください。必要なら、記録の整理や関連ファイルの更新など、短時間で安全に完了する作業があれば実行に移してください。"
+	return "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
 }
 
 // cronScheduler manages periodic agent executions.

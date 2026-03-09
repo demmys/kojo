@@ -5,6 +5,8 @@ import (
 	"hash/fnv"
 	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/notifysource"
 )
 
 // ValidActiveHours validates the active hours range.
@@ -89,6 +91,9 @@ type Agent struct {
 	// Shared with other agents via the directory endpoint. Does not expose internal persona details.
 	PublicProfile         string `json:"publicProfile,omitempty"`
 	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
+
+	// NotifySources holds notification source configurations for this agent.
+	NotifySources []notifysource.Config `json:"notifySources,omitempty"`
 
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`

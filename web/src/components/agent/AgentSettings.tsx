@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
+import { NotifySourcesEditor } from "./NotifySourcesEditor";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -330,6 +331,9 @@ export function AgentSettings() {
         >
           {saving ? "Saving..." : "Save Changes"}
         </button>
+
+        {/* Notifications */}
+        <NotifySourcesEditor agentId={id!} />
 
         <div className="border-t border-neutral-800 pt-5">
           <button

@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/notifysource"
+	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
 )
 
 type busyEntry struct {
@@ -41,6 +44,9 @@ type Manager struct {
 
 	// cronPaused globally pauses all cron jobs when true.
 	cronPaused bool
+
+	// notifyPoller polls external notification sources.
+	notifyPoller *notifyPoller
 }
 
 // NewManager creates a new agent manager.
@@ -67,6 +73,12 @@ func NewManager(logger *slog.Logger) *Manager {
 
 	m.cron = newCronScheduler(m, logger)
 	m.cronPaused = m.store.LoadCronPaused()
+
+	// Initialize notify poller
+	m.notifyPoller = newNotifyPoller(m, logger)
+	m.notifyPoller.RegisterFactory("gmail", func(cfg notifysource.Config, tokens notifysource.TokenAccessor) (notifysource.Source, error) {
+		return gmail.New(cfg, tokens)
+	})
 
 	// Load persisted agents
 	agents, err := m.store.Load()
@@ -97,6 +109,14 @@ func NewManager(logger *slog.Logger) *Manager {
 			if err := m.cron.Schedule(a.ID, expr); err != nil {
 				logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
 			}
+		}
+	}
+
+	// Start notify poller and rebuild sources for all agents
+	m.notifyPoller.Start()
+	for _, a := range m.agents {
+		if len(a.NotifySources) > 0 {
+			m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
 		}
 	}
 
@@ -440,6 +460,24 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	return cp, nil
 }
 
+// UpdateNotifySources updates the notification source configs for an agent
+// and rebuilds the poller's source instances.
+func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) error {
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	a.NotifySources = sources
+	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	m.mu.Unlock()
+
+	m.save()
+	m.notifyPoller.RebuildSources(id, sources)
+	return nil
+}
+
 // ResetData removes conversation logs and memory but keeps settings, persona, avatar, and credentials.
 func (m *Manager) ResetData(id string) error {
 	m.mu.Lock()
@@ -559,11 +597,14 @@ func (m *Manager) Delete(id string) error {
 	}
 	m.busyMu.Unlock()
 
-	// Remove credentials from encrypted store BEFORE removing agent from memory
+	// Remove credentials and notify tokens from encrypted store BEFORE removing agent from memory
 	if m.creds != nil {
 		if err := m.creds.DeleteAllForAgent(id); err != nil {
 			m.mu.Unlock()
 			return fmt.Errorf("delete credentials: %w", err)
+		}
+		if err := m.creds.DeleteTokensByAgent(id); err != nil {
+			m.logger.Warn("failed to delete notify tokens", "agent", id, "err", err)
 		}
 	}
 
@@ -571,6 +612,7 @@ func (m *Manager) Delete(id string) error {
 	m.mu.Unlock()
 
 	m.cron.Remove(id)
+	m.notifyPoller.RemoveAgent(id)
 
 	// Remove agent from group DMs
 	if m.groupdms != nil {
@@ -775,9 +817,10 @@ func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([
 	return loadMessagesPaginated(agentID, limit, before)
 }
 
-// Shutdown stops all cron jobs and cancels active chats.
+// Shutdown stops all cron jobs, notify polling, and cancels active chats.
 func (m *Manager) Shutdown() {
 	m.cron.Stop()
+	m.notifyPoller.Stop()
 
 	m.busyMu.Lock()
 	for _, entry := range m.busy {
@@ -810,6 +853,18 @@ func copyAgent(a *Agent) *Agent {
 	if a.LastMessage != nil {
 		lm := *a.LastMessage
 		cp.LastMessage = &lm
+	}
+	if len(a.NotifySources) > 0 {
+		cp.NotifySources = make([]notifysource.Config, len(a.NotifySources))
+		for i, ns := range a.NotifySources {
+			cp.NotifySources[i] = ns
+			if ns.Options != nil {
+				cp.NotifySources[i].Options = make(map[string]string, len(ns.Options))
+				for k, v := range ns.Options {
+					cp.NotifySources[i].Options[k] = v
+				}
+			}
+		}
 	}
 	return &cp
 }

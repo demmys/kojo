@@ -17,10 +17,13 @@ import (
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
+	"sync"
+
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
+	gmailpkg "github.com/loppo-llc/kojo/internal/notifysource/gmail"
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
@@ -33,8 +36,10 @@ type Server struct {
 	notify   *notify.Manager
 	logger   *slog.Logger
 	httpSrv  *http.Server
-	devMode  bool
-	version  string
+	devMode   bool
+	version   string
+	oauth2Mgr  *gmailpkg.OAuth2Manager
+	oauth2Once sync.Once
 }
 
 type Config struct {
@@ -174,6 +179,22 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-qr", s.handleParseQR)
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials/parse-uri", s.handleParseOTPURI)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ws", s.handleAgentWebSocket)
+
+	// Notify sources
+	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources", s.handleListNotifySources)
+	mux.HandleFunc("POST /api/v1/agents/{id}/notify-sources", s.handleCreateNotifySource)
+	mux.HandleFunc("PATCH /api/v1/agents/{id}/notify-sources/{sourceId}", s.handleUpdateNotifySource)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/notify-sources/{sourceId}", s.handleDeleteNotifySource)
+	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources/{sourceId}/auth", s.handleNotifySourceAuth)
+	mux.HandleFunc("GET /oauth2/callback", s.handleOAuth2Callback)
+
+	// OAuth client configuration
+	mux.HandleFunc("GET /api/v1/oauth-clients", s.handleListOAuthClients)
+	mux.HandleFunc("POST /api/v1/oauth-clients/{provider}", s.handleSetOAuthClient)
+	mux.HandleFunc("DELETE /api/v1/oauth-clients/{provider}", s.handleDeleteOAuthClient)
+
+	// Notify source types
+	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)
 
 	if s.groupdms != nil {
 		mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)

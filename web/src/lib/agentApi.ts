@@ -26,6 +26,7 @@ export interface AgentInfo {
   publicProfileOverride: boolean;
   hasAvatar: boolean;
   avatarHash?: string;
+  notifySources?: NotifySourceConfig[];
   lastMessage?: {
     content: string;
     role: string;
@@ -75,6 +76,27 @@ export interface Credential {
   totpPeriod?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface NotifySourceConfig {
+  id: string;
+  type: string;
+  enabled: boolean;
+  intervalMinutes: number;
+  query?: string;
+  options?: Record<string, string>;
+}
+
+export interface OAuthClientInfo {
+  provider: string;
+  configured: boolean;
+}
+
+export interface NotifySourceType {
+  type: string;
+  name: string;
+  description: string;
+  authType: string;
 }
 
 export interface OTPEntry {
@@ -274,4 +296,60 @@ export const agentApi = {
         (r) => r.entries ?? [],
       ),
   },
+
+  notifySources: {
+    list: (agentId: string) =>
+      get<{ sources: NotifySourceConfig[] }>(
+        `/api/v1/agents/${agentId}/notify-sources`,
+      ).then((r) => r.sources ?? []),
+
+    create: (agentId: string, cfg: { type: string; intervalMinutes?: number; query?: string }) =>
+      post<{ source: NotifySourceConfig }>(
+        `/api/v1/agents/${agentId}/notify-sources`,
+        cfg,
+      ).then((r) => r.source),
+
+    update: (agentId: string, sourceId: string, data: Partial<NotifySourceConfig>) =>
+      patch<{ source: NotifySourceConfig }>(
+        `/api/v1/agents/${agentId}/notify-sources/${sourceId}`,
+        data,
+      ).then((r) => r.source),
+
+    delete: async (agentId: string, sourceId: string) => {
+      const res = await fetch(`${BASE}/api/v1/agents/${agentId}/notify-sources/${sourceId}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    },
+
+    startAuth: (agentId: string, sourceId: string) =>
+      get<{ authUrl: string }>(
+        `/api/v1/agents/${agentId}/notify-sources/${sourceId}/auth`,
+      ).then((r) => r.authUrl),
+  },
+
+  oauthClients: {
+    list: () =>
+      get<{ clients: OAuthClientInfo[] }>("/api/v1/oauth-clients").then(
+        (r) => r.clients ?? [],
+      ),
+
+    set: (provider: string, clientId: string, clientSecret: string) =>
+      post<{ ok: boolean }>(`/api/v1/oauth-clients/${provider}`, {
+        clientId,
+        clientSecret,
+      }),
+
+    delete: async (provider: string) => {
+      const res = await fetch(`${BASE}/api/v1/oauth-clients/${provider}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    },
+  },
+
+  notifySourceTypes: () =>
+    get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
+      (r) => r.types ?? [],
+    ),
 };

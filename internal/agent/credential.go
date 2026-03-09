@@ -111,6 +111,12 @@ func NewCredentialStore() (*CredentialStore, error) {
 
 	s := &CredentialStore{db: db, gcm: gcm}
 
+	// Create notify_tokens table
+	if err := createTokenTable(s); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("create token table: %w", err)
+	}
+
 	// Migrate legacy credentials.json files
 	s.migrateLegacy()
 

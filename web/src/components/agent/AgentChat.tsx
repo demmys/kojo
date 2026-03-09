@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type ChatEvent } from "../../lib/agentApi";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
@@ -24,6 +24,7 @@ export function AgentChat() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
+  const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
 
   // Restore draft and textarea height on mount / id change
   useEffect(() => {
@@ -53,7 +54,18 @@ export function AgentChat() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (suppressAutoScrollRef.current && scrollRestoreRef.current) {
+      const container = scrollContainerRef.current;
+      if (container) {
+        const { prevScrollHeight, prevScrollTop } = scrollRestoreRef.current;
+        const delta = container.scrollHeight - prevScrollHeight;
+        container.scrollTop = prevScrollTop + delta;
+      }
+      scrollRestoreRef.current = null;
+      suppressAutoScrollRef.current = false;
+      return;
+    }
     scrollToBottom();
   }, [messages, scrollToBottom]);
 
@@ -62,24 +74,18 @@ export function AgentChat() {
     loadingMoreRef.current = true;
 
     const oldestId = messages[0].id;
-    const container = scrollContainerRef.current;
-    const prevScrollHeight = container?.scrollHeight ?? 0;
-    const prevScrollTop = container?.scrollTop ?? 0;
 
     try {
       const r = await agentApi.messages(id, PAGE_SIZE, oldestId);
       setHasMore(r.hasMore);
       if (r.messages.length > 0) {
+        const container = scrollContainerRef.current;
         suppressAutoScrollRef.current = true;
+        scrollRestoreRef.current = {
+          prevScrollHeight: container?.scrollHeight ?? 0,
+          prevScrollTop: container?.scrollTop ?? 0,
+        };
         setMessages((prev) => [...r.messages, ...prev]);
-        // Restore scroll position after prepending
-        requestAnimationFrame(() => {
-          if (container) {
-            const delta = container.scrollHeight - prevScrollHeight;
-            container.scrollTop = prevScrollTop + delta;
-          }
-          suppressAutoScrollRef.current = false;
-        });
       }
     } catch (e) {
       console.error(e);

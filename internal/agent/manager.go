@@ -176,15 +176,24 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 // This makes persona.md the single source of truth — the agent can edit it
 // to evolve its personality, and the change is reflected in settings.
 func (m *Manager) syncPersona(agentID string) {
+	// Check existence under lock, then release for file I/O
+	m.mu.Lock()
+	_, exists := m.agents[agentID]
+	m.mu.Unlock()
+	if !exists {
+		return
+	}
+
+	// Read file outside lock to avoid blocking other operations
+	content, ok := readPersonaFile(agentID)
+	if !ok {
+		return
+	}
+
+	// Re-acquire lock to compare and update
 	m.mu.Lock()
 	a, exists := m.agents[agentID]
 	if !exists {
-		m.mu.Unlock()
-		return
-	}
-	// Read file under lock to prevent race with Update's writePersonaFile
-	content, ok := readPersonaFile(agentID)
-	if !ok {
 		m.mu.Unlock()
 		return
 	}
@@ -350,6 +359,14 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	has, hash := avatarMeta(id)
+
+	// Write persona.md outside lock — if it fails, no in-memory state is modified
+	if cfg.Persona != nil {
+		if err := writePersonaFile(id, *cfg.Persona); err != nil {
+			return nil, fmt.Errorf("write persona.md: %w", err)
+		}
+	}
+
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	if !ok {
@@ -357,13 +374,8 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
-	// Write persona.md first — if it fails, no in-memory state is modified
 	oldPersona := a.Persona
 	if cfg.Persona != nil {
-		if err := writePersonaFile(a.ID, *cfg.Persona); err != nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("write persona.md: %w", err)
-		}
 		a.Persona = *cfg.Persona
 	}
 	if cfg.Name != nil {
@@ -598,19 +610,18 @@ func (m *Manager) Delete(id string) error {
 	}
 	m.busyMu.Unlock()
 
-	// Remove credentials and notify tokens from encrypted store BEFORE removing agent from memory
+	delete(m.agents, id)
+	m.mu.Unlock()
+
+	// Remove credentials and notify tokens outside lock (DB I/O)
 	if m.creds != nil {
 		if err := m.creds.DeleteAllForAgent(id); err != nil {
-			m.mu.Unlock()
 			return fmt.Errorf("delete credentials: %w", err)
 		}
 		if err := m.creds.DeleteTokensByAgent(id); err != nil {
 			m.logger.Warn("failed to delete notify tokens", "agent", id, "err", err)
 		}
 	}
-
-	delete(m.agents, id)
-	m.mu.Unlock()
 
 	m.cron.Remove(id)
 	m.notifyPoller.RemoveAgent(id)

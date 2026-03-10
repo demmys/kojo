@@ -56,7 +56,7 @@ func maskCredential(c *Credential) *Credential {
 
 // CredentialStore manages encrypted credential storage in SQLite.
 type CredentialStore struct {
-	mu  sync.Mutex
+	mu  sync.RWMutex
 	db  *sql.DB
 	gcm cipher.AEAD
 }
@@ -216,8 +216,8 @@ func (s *CredentialStore) Close() error {
 // ListCredentials returns all credentials for an agent with secrets masked.
 // Passwords and TOTP secrets are NOT decrypted — only metadata is returned.
 func (s *CredentialStore) ListCredentials(agentID string) ([]*Credential, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
 		`SELECT id, label, username, password_enc, totp_secret_enc,
@@ -396,8 +396,8 @@ func (s *CredentialStore) DeleteAllForAgent(agentID string) error {
 
 // RevealPassword returns the plaintext password for a credential.
 func (s *CredentialStore) RevealPassword(agentID, credID string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	c, err := s.getCredentialLocked(agentID, credID)
 	if err != nil {
@@ -408,8 +408,8 @@ func (s *CredentialStore) RevealPassword(agentID, credID string) (string, error)
 
 // GetTOTPCode generates the current TOTP code for a credential.
 func (s *CredentialStore) GetTOTPCode(agentID, credID string) (string, int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	c, err := s.getCredentialLocked(agentID, credID)
 	if err != nil {

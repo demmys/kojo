@@ -49,8 +49,8 @@ func (s *CredentialStore) SetToken(provider, agentID, sourceID, key, value strin
 
 // GetToken retrieves and decrypts a token value.
 func (s *CredentialStore) GetToken(provider, agentID, sourceID, key string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	var enc string
 	err := s.db.QueryRow(
@@ -65,8 +65,8 @@ func (s *CredentialStore) GetToken(provider, agentID, sourceID, key string) (str
 
 // GetTokenExpiry retrieves a token's value and expiration time.
 func (s *CredentialStore) GetTokenExpiry(provider, agentID, sourceID, key string) (string, time.Time, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	var enc string
 	var expUnix int64
@@ -123,8 +123,8 @@ func (s *CredentialStore) DeleteTokensByAgent(agentID string) error {
 
 // ListTokenKeys returns all keys stored for a given provider/agent/source.
 func (s *CredentialStore) ListTokenKeys(provider, agentID, sourceID string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(
 		`SELECT key FROM notify_tokens WHERE provider=? AND agent_id=? AND source_id=?`,

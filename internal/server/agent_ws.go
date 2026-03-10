@@ -52,57 +52,35 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	// If the agent has a chat running in the background (e.g. user navigated
 	// away and came back), notify the client and resume streaming live events.
 	var bgEvents <-chan agent.ChatEvent
-	if since, events, busy := s.agents.BusyState(agentID); busy {
-		statusMsg := map[string]any{
+	var bgUnsub func()
+	if since, past, live, unsub, busy := s.agents.Subscribe(agentID); busy {
+		bgUnsub = unsub
+		_ = writeJSON(ctx, conn, map[string]any{
 			"type":      "status",
 			"status":    "thinking",
 			"startedAt": since.UTC().Format(time.RFC3339),
-		}
-		_ = writeJSON(ctx, conn, statusMsg)
+		})
 
-		if events != nil {
-			// Drain stale buffered events so the client only sees live
-			// updates from this point forward. If "done" is already in
-			// the buffer, deliver it immediately and skip live streaming.
-			sentTerminal := false
-		drained := false
-		drainLoop:
-			for {
-				select {
-				case ev, ok := <-events:
-					if !ok {
-						// Channel closed — agent already finished.
-						drained = true
-						break drainLoop
-					}
-					if ev.Type == "done" || ev.Type == "error" {
-						_ = writeJSON(ctx, conn, ev)
-						sentTerminal = true
-						drained = true
-						break drainLoop
-					}
-					// Skip stale streaming events (text deltas, tool_use, etc.)
-				default:
-					// Buffer empty — remaining events are live.
-					break drainLoop
-				}
+		// Replay past events so the client catches up.
+		sentTerminal := false
+		for _, ev := range past {
+			_ = writeJSON(ctx, conn, ev)
+			if ev.Type == "done" || ev.Type == "error" {
+				sentTerminal = true
+				break
 			}
-			if !drained {
-				bgEvents = events
-			} else if !sentTerminal {
-				// Channel closed without terminal event — load final message.
-				msgs, _ := s.agents.Messages(agentID, 1)
-				if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
-					_ = writeJSON(ctx, conn, agent.ChatEvent{
-						Type:    "done",
-						Message: msgs[len(msgs)-1],
-					})
-				} else {
-					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
-				}
-			}
+		}
+
+		if sentTerminal {
+			// Already finished — nothing more to stream.
+			unsub()
+			bgUnsub = nil
+		} else if live != nil {
+			bgEvents = live
 		} else {
-			// Fallback: no event channel available, poll for completion.
+			// Fallback: no broadcaster available, poll for completion.
+			unsub()
+			bgUnsub = nil
 			ch := make(chan agent.ChatEvent, 1)
 			bgEvents = ch
 			go func() {
@@ -115,16 +93,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 						return
 					case <-ticker.C:
 						if !s.agents.IsBusy(agentID) {
-							var ev agent.ChatEvent
-							msgs, _ := s.agents.Messages(agentID, 1)
-							if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
-								ev = agent.ChatEvent{
-									Type:    "done",
-									Message: msgs[len(msgs)-1],
-								}
-							} else {
-								ev = agent.ChatEvent{Type: "done"}
-							}
+							ev := s.synthesizeTerminal(agentID)
 							select {
 							case ch <- ev:
 							case <-ctx.Done():
@@ -136,6 +105,11 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 			}()
 		}
 	}
+	defer func() {
+		if bgUnsub != nil {
+			bgUnsub()
+		}
+	}()
 
 	// Channel for client messages (read goroutine → main loop)
 	clientMsgs := make(chan agentWSClientMsg, 8)
@@ -190,18 +164,8 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		case event, ok := <-bgEvents:
 			if !ok {
-				// Channel closed — agent finished before we could read "done".
-				// Load the latest assistant message as a fallback.
 				bgEvents = nil
-				msgs, _ := s.agents.Messages(agentID, 1)
-				if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
-					_ = writeJSON(ctx, conn, agent.ChatEvent{
-						Type:    "done",
-						Message: msgs[len(msgs)-1],
-					})
-				} else {
-					_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
-				}
+				_ = writeJSON(ctx, conn, s.synthesizeTerminal(agentID))
 				continue
 			}
 			_ = writeJSON(ctx, conn, event)
@@ -276,7 +240,8 @@ func (s *Server) streamAgentEvents(
 			return
 		case event, ok := <-events:
 			if !ok {
-				return // channel closed
+				_ = writeJSON(ctx, conn, s.synthesizeTerminal(agentID))
+				return
 			}
 			if err := writeJSON(ctx, conn, event); err != nil {
 				// Write failed (WS disconnected) — let chat continue.
@@ -304,6 +269,18 @@ func (s *Server) streamAgentEvents(
 			// Ignore other messages while streaming
 		}
 	}
+}
+
+// synthesizeTerminal creates a terminal event from the transcript when the
+// broadcaster's channel closed without delivering one. If the last message is
+// from the assistant, it's a successful completion (done); otherwise it's an
+// error (the real terminal event was lost).
+func (s *Server) synthesizeTerminal(agentID string) agent.ChatEvent {
+	msgs, _ := s.agents.Messages(agentID, 1)
+	if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
+		return agent.ChatEvent{Type: "done", Message: msgs[len(msgs)-1]}
+	}
+	return agent.ChatEvent{Type: "error", ErrorMessage: "chat ended unexpectedly"}
 }
 
 // validateAttachments checks that each attachment path is inside the upload

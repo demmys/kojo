@@ -15,9 +15,9 @@ import (
 )
 
 type busyEntry struct {
-	cancel    context.CancelFunc
-	startedAt time.Time
-	events    <-chan ChatEvent // live stream for reconnecting clients
+	cancel      context.CancelFunc
+	startedAt   time.Time
+	broadcaster *chatBroadcaster // fan-out for reconnecting clients
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -657,16 +657,23 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, fmt.Errorf("agent is busy")
 	}
 	chatCtx, cancel := context.WithCancel(ctx)
-	// Placeholder entry — events channel is set after backend.Chat succeeds.
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now()}
+	// Create outCh and broadcaster upfront so they're available from the
+	// moment the busy entry is visible. This prevents a reconnecting
+	// WebSocket from falling back to polling during setup.
+	outCh := make(chan ChatEvent, 64)
+	bc := newChatBroadcaster(outCh)
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
 
 	// Get the backend
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
+		errMsg := fmt.Sprintf("unsupported tool: %s", agentCopy.Tool)
+		outCh <- ChatEvent{Type: "error", ErrorMessage: errMsg}
+		close(outCh)
 		m.clearBusy(agentID)
 		cancel()
-		return nil, fmt.Errorf("unsupported tool: %s", agentCopy.Tool)
+		return nil, fmt.Errorf("%s", errMsg)
 	}
 
 	atts := attachments
@@ -702,18 +709,16 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// Start chat
 	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt)
 	if err != nil {
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+		close(outCh)
 		m.clearBusy(agentID)
 		cancel()
 		return nil, err
 	}
 
-	// Wrap the backend channel to handle completion
-	outCh := make(chan ChatEvent, 64)
-
-	// Store the events channel so reconnecting WebSockets can subscribe.
-	m.busyMu.Lock()
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: m.busy[agentID].startedAt, events: outCh}
-	m.busyMu.Unlock()
+	// Return a subscriber channel for the immediate caller.
+	// The raw outCh is consumed exclusively by the broadcaster.
+	_, callerCh, _ := bc.Subscribe()
 
 	go func() {
 		defer close(outCh)
@@ -732,52 +737,53 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 					event.Message.Role = "system"
 				}
 
-				// Terminal events (done/error) use blocking send so the
+				// Save assistant message to transcript BEFORE publishing
+			// the terminal event, so synthesizeTerminal can find it.
+			if event.Type == "done" && event.Message != nil {
+				if err := appendMessage(agentID, event.Message); err != nil {
+					m.logger.Warn("failed to save assistant message", "err", err)
+				}
+
+				// Sync persona.md → Agent.Persona (agent may have edited it)
+				m.syncPersona(agentID)
+
+				// Update last message preview
+				m.mu.Lock()
+				if ag, ok := m.agents[agentID]; ok {
+					ag.LastMessage = &MessagePreview{
+						Content:   truncatePreview(event.Message.Content, 100),
+						Role:      event.Message.Role,
+						Timestamp: event.Message.Timestamp,
+					}
+					ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+				}
+				m.mu.Unlock()
+				m.save()
+			}
+
+			// Terminal events (done/error) use blocking send so the
 			// client always receives them. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),
 			// they are dropped but processing continues.
-				if event.Type == "done" || event.Type == "error" {
-					select {
-					case outCh <- event:
-					case <-chatCtx.Done():
-						return
-					}
-				} else {
-					select {
-					case outCh <- event:
-					default:
-					}
+			if event.Type == "done" || event.Type == "error" {
+				select {
+				case outCh <- event:
+				case <-chatCtx.Done():
+					return
 				}
-
-				// Save assistant message to transcript and update last message
-				if event.Type == "done" && event.Message != nil {
-					if err := appendMessage(agentID, event.Message); err != nil {
-						m.logger.Warn("failed to save assistant message", "err", err)
-					}
-
-					// Sync persona.md → Agent.Persona (agent may have edited it)
-					m.syncPersona(agentID)
-
-					// Update last message preview
-					m.mu.Lock()
-					if ag, ok := m.agents[agentID]; ok {
-						ag.LastMessage = &MessagePreview{
-							Content:   truncatePreview(event.Message.Content, 100),
-							Role:      event.Message.Role,
-							Timestamp: event.Message.Timestamp,
-						}
-						ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-					}
-					m.mu.Unlock()
-					m.save()
+			} else {
+				select {
+				case outCh <- event:
+				default:
 				}
+			}
 			case <-chatCtx.Done():
 				return
 			}
 		}
 	}()
 
-	return outCh, nil
+	return callerCh, nil
 }
 
 // Abort cancels any running chat for an agent.
@@ -825,20 +831,21 @@ func (m *Manager) BusySince(agentID string) (time.Time, bool) {
 	return entry.startedAt, true
 }
 
-// BusyState returns the start time and live event channel for an agent's
-// ongoing chat under a single lock, so callers see a consistent snapshot.
-// The event channel may be nil if the backend hasn't started yet.
-// Only one WebSocket should read from the channel at a time; this is
-// naturally guaranteed because the previous reader exits on disconnect
-// before the new WebSocket connects.
-func (m *Manager) BusyState(agentID string) (startedAt time.Time, events <-chan ChatEvent, busy bool) {
+// Subscribe returns a snapshot of all past events and a live channel for an
+// agent's ongoing chat. The caller must call unsub when done to free resources.
+// If the agent is not busy, busy is false and all other values are zero.
+func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEvent, live <-chan ChatEvent, unsub func(), busy bool) {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	entry, ok := m.busy[agentID]
 	if !ok {
-		return time.Time{}, nil, false
+		return time.Time{}, nil, nil, func() {}, false
 	}
-	return entry.startedAt, entry.events, true
+	if entry.broadcaster == nil {
+		return entry.startedAt, nil, nil, func() {}, true
+	}
+	past, live, unsub = entry.broadcaster.Subscribe()
+	return entry.startedAt, past, live, unsub, true
 }
 
 // Messages returns recent messages for an agent.

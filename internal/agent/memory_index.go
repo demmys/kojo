@@ -720,6 +720,18 @@ func splitSections(text string) []string {
 	return sections
 }
 
+// ftsSpecialReplacer strips FTS5 special characters from query words.
+var ftsSpecialReplacer = strings.NewReplacer(
+	"\"", "",
+	"*", "",
+	"(", "",
+	")", "",
+	":", "",
+	"^", "",
+	"+", "",
+	"-", "",
+)
+
 // sanitizeFTSQuery converts user input into a safe FTS5 query.
 // Wraps each word in quotes to prevent syntax errors from special characters.
 func sanitizeFTSQuery(query string) string {
@@ -729,17 +741,7 @@ func sanitizeFTSQuery(query string) string {
 	}
 	var parts []string
 	for _, w := range words {
-		// Remove FTS5 special characters
-		w = strings.NewReplacer(
-			"\"", "",
-			"*", "",
-			"(", "",
-			")", "",
-			":", "",
-			"^", "",
-			"+", "",
-			"-", "",
-		).Replace(w)
+		w = ftsSpecialReplacer.Replace(w)
 		w = strings.TrimSpace(w)
 		if w != "" {
 			parts = append(parts, "\""+w+"\"")

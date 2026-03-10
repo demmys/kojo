@@ -223,7 +223,7 @@ func (idx *MemoryIndex) IndexFiles(agentID string) error {
 	memoryPath := filepath.Join(dir, "MEMORY.md")
 	if data, err := os.ReadFile(memoryPath); err == nil && len(data) > 0 {
 		sections := splitSections(string(data))
-		now := time.Now().UTC().Format(time.RFC3339)
+		now := time.Now().Format(time.RFC3339)
 		for _, section := range sections {
 			if strings.TrimSpace(section) == "" {
 				continue
@@ -742,7 +742,7 @@ func (idx *MemoryIndex) getCachedEmbedding(hash string) []byte {
 }
 
 func (idx *MemoryIndex) updateMeta(source string) {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().Format(time.RFC3339)
 	if _, err := idx.db.Exec(`INSERT OR REPLACE INTO index_meta(source, indexed_at) VALUES(?, ?)`, source, now); err != nil {
 		idx.logger.Debug("failed to update index meta", "source", source, "err", err)
 	}

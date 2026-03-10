@@ -28,5 +28,9 @@ func loadMessages(agentID string, limit int) ([]*Message, error) {
 // Returns the messages and whether there are more older messages.
 func loadMessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
 	path := filepath.Join(agentDir(agentID), messagesFile)
-	return jsonlLoadPaginated(path, limit, before, func(m *Message) string { return m.ID })
+	msgs, hasMore, err := jsonlLoadPaginated(path, limit, before, func(m *Message) string { return m.ID })
+	for _, m := range msgs {
+		m.Timestamp = normalizeTimestamp(m.Timestamp)
+	}
+	return msgs, hasMore, err
 }

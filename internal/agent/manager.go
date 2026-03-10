@@ -211,7 +211,7 @@ func (m *Manager) syncPersona(agentID string) {
 	a.Persona = content
 	tool := a.Tool
 	override := a.PublicProfileOverride
-	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 	m.save()
 
@@ -433,7 +433,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.ActiveEnd = *cfg.ActiveEnd
 	}
 	newInterval := a.IntervalMinutes
-	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	a.HasAvatar = has
 	a.AvatarHash = hash
 	if !has {
@@ -472,7 +472,7 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 	a.NotifySources = sources
-	a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	m.mu.Unlock()
 
 	m.save()
@@ -578,7 +578,7 @@ func (m *Manager) ResetData(id string) error {
 	m.mu.Lock()
 	if a, ok := m.agents[id]; ok {
 		a.LastMessage = nil
-		a.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		a.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	m.mu.Unlock()
 
@@ -815,7 +815,7 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 			Role:      msg.Role,
 			Timestamp: msg.Timestamp,
 		}
-		ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		ag.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	m.mu.Unlock()
 	m.save()

@@ -125,7 +125,7 @@ func (s *Session) Info() SessionInfo {
 		ExitCode:        s.ExitCode,
 		YoloMode:        s.YoloMode,
 		Internal:        s.Internal,
-		CreatedAt:       s.CreatedAt.UTC().Format(time.RFC3339),
+		CreatedAt:       s.CreatedAt.Local().Format(time.RFC3339),
 		ToolSessionID: s.ToolSessionID,
 		ParentID:        s.ParentID,
 		TmuxSessionName: s.TmuxSessionName,

@@ -120,7 +120,7 @@ func (b *Browser) List(dir string, hidden bool) (*ListResult, error) {
 		result.Entries = append(result.Entries, DirEntry{
 			Name:    e.Name(),
 			Type:    entryType,
-			ModTime: modTime.UTC().Format(time.RFC3339),
+			ModTime: modTime.Format(time.RFC3339),
 		})
 	}
 

@@ -66,6 +66,12 @@ func (st *store) Load() ([]*Agent, error) {
 	}
 	st.mu.Unlock()
 
+	// Normalize timestamps to local timezone (legacy data may be UTC)
+	for _, a := range agents {
+		a.CreatedAt = normalizeTimestamp(a.CreatedAt)
+		a.UpdatedAt = normalizeTimestamp(a.UpdatedAt)
+	}
+
 	// Migrate legacy cronExpr → intervalMinutes and validate
 	needsSave := false
 	for _, a := range agents {

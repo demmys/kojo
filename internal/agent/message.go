@@ -61,7 +61,7 @@ func newUserMessage(content string, attachments []MessageAttachment) *Message {
 		Role:        "user",
 		Content:     content,
 		Attachments: attachments,
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+		Timestamp:   time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -70,7 +70,7 @@ func newSystemMessage(content string) *Message {
 		ID:        generateMessageID(),
 		Role:      "system",
 		Content:   content,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -78,6 +78,6 @@ func newAssistantMessage() *Message {
 	return &Message{
 		ID:        generateMessageID(),
 		Role:      "assistant",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 }

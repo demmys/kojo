@@ -222,7 +222,7 @@ func (s *CredentialStore) ListCredentials(agentID string) ([]*Credential, error)
 	rows, err := s.db.Query(
 		`SELECT id, label, username, password_enc, totp_secret_enc,
 		        totp_algorithm, totp_digits, totp_period, created_at, updated_at
-		 FROM credentials WHERE agent_id = ? ORDER BY created_at`,
+		 FROM credentials WHERE agent_id = ? ORDER BY datetime(created_at)`,
 		agentID,
 	)
 	if err != nil {
@@ -236,6 +236,8 @@ func (s *CredentialStore) ListCredentials(agentID string) ([]*Credential, error)
 		if err != nil {
 			return nil, err
 		}
+		c.CreatedAt = normalizeTimestamp(c.CreatedAt)
+		c.UpdatedAt = normalizeTimestamp(c.UpdatedAt)
 		creds = append(creds, c)
 	}
 	return creds, rows.Err()
@@ -262,7 +264,7 @@ func (s *CredentialStore) AddCredential(agentID, label, username, password strin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().Format(time.RFC3339)
 	c := &Credential{
 		ID:        generateCredID(),
 		Label:     label,
@@ -339,7 +341,7 @@ func (s *CredentialStore) UpdateCredential(agentID, credID string, label, userna
 		c.TOTPDigits = totp.Digits
 		c.TOTPPeriod = totp.Period
 	}
-	c.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	c.UpdatedAt = time.Now().Format(time.RFC3339)
 
 	pwEnc, err := s.encryptChecked(c.Password)
 	if err != nil {

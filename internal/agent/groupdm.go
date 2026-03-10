@@ -60,7 +60,11 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 // loadGroupMessages reads messages from a group's JSONL transcript with pagination.
 func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessage, bool, error) {
 	path := filepath.Join(groupDir(groupID), messagesFile)
-	return jsonlLoadPaginated(path, limit, before, func(m *GroupMessage) string { return m.ID })
+	msgs, hasMore, err := jsonlLoadPaginated(path, limit, before, func(m *GroupMessage) string { return m.ID })
+	for _, m := range msgs {
+		m.Timestamp = normalizeTimestamp(m.Timestamp)
+	}
+	return msgs, hasMore, err
 }
 
 func newGroupMessage(agentID, agentName, content string) *GroupMessage {
@@ -69,6 +73,6 @@ func newGroupMessage(agentID, agentName, content string) *GroupMessage {
 		AgentID:   agentID,
 		AgentName: agentName,
 		Content:   content,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 }

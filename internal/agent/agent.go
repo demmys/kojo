@@ -143,7 +143,7 @@ func generateID() string {
 }
 
 func newAgent(cfg AgentConfig) (*Agent, error) {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().Format(time.RFC3339)
 	interval := 30 // default
 	if cfg.IntervalMinutes != nil {
 		interval = *cfg.IntervalMinutes
@@ -221,4 +221,15 @@ func intervalToCron(intervalMinutes int, agentID string) string {
 		mins = append(mins, fmt.Sprintf("%d", m))
 	}
 	return fmt.Sprintf("%s * * * *", strings.Join(mins, ","))
+}
+
+// normalizeTimestamp converts any RFC3339 timestamp to local time.
+// This ensures that older UTC timestamps (e.g. "...Z") are displayed
+// in the server's local timezone, consistent with newly generated ones.
+func normalizeTimestamp(s string) string {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return s
+	}
+	return t.Local().Format(time.RFC3339)
 }

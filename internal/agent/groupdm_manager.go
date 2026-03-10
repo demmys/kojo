@@ -93,7 +93,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, erro
 		return nil, ErrGroupTooFew
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().Format(time.RFC3339)
 	g := &GroupDM{
 		ID:        generateGroupID(),
 		Name:      name,
@@ -207,7 +207,7 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	// Update timestamp after successful write
 	m.mu.Lock()
 	if g, ok := m.groups[groupID]; ok {
-		g.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		g.UpdatedAt = time.Now().Format(time.RFC3339)
 	}
 	m.mu.Unlock()
 	m.save()
@@ -460,7 +460,7 @@ func (m *GroupDMManager) RemoveAgent(agentID string) {
 			toDelete = append(toDelete, id)
 		} else {
 			g.Members = filtered
-			g.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			g.UpdatedAt = time.Now().Format(time.RFC3339)
 		}
 	}
 	for _, id := range toDelete {
@@ -528,6 +528,8 @@ func (m *GroupDMManager) load() {
 		return
 	}
 	for _, g := range groups {
+		g.CreatedAt = normalizeTimestamp(g.CreatedAt)
+		g.UpdatedAt = normalizeTimestamp(g.UpdatedAt)
 		m.groups[g.ID] = g
 	}
 }

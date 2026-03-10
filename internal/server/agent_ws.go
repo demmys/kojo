@@ -58,7 +58,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = writeJSON(ctx, conn, map[string]any{
 			"type":      "status",
 			"status":    "thinking",
-			"startedAt": since.UTC().Format(time.RFC3339),
+			"startedAt": since.Format(time.RFC3339),
 		})
 
 		// Replay past events so the client catches up.

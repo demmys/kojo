@@ -161,8 +161,8 @@ func (s *Session) CheckAttachments(data []byte) []*Attachment {
 			Name:      filepath.Base(c.resolved),
 			Size:      c.info.Size(),
 			Mime:      c.mime,
-			ModTime:   c.info.ModTime().UTC().Format(time.RFC3339),
-			CreatedAt: fileCreationTime(c.info).UTC().Format(time.RFC3339),
+			ModTime:   c.info.ModTime().Format(time.RFC3339),
+			CreatedAt: fileCreationTime(c.info).Format(time.RFC3339),
 		}
 		s.attachments[c.resolved] = att
 		newAttachments = append(newAttachments, att)

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
 import { api } from "../../lib/api";
+import { localRFC3339 } from "../../lib/utils";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
@@ -176,7 +177,7 @@ export function AgentChat() {
               id: "error_" + Date.now(),
               role: "system",
               content: `\u26a0\ufe0f Error: ${errorMsg}`,
-              timestamp: new Date().toISOString(),
+              timestamp: localRFC3339(),
             },
           ]);
           resetStream();
@@ -243,7 +244,7 @@ export function AgentChat() {
       role: "user",
       content: text,
       attachments: pendingFiles.length > 0 ? pendingFiles : undefined,
-      timestamp: new Date().toISOString(),
+      timestamp: localRFC3339(),
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");

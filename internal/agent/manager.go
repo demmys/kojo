@@ -738,45 +738,45 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 				}
 
 				// Save assistant message to transcript BEFORE publishing
-			// the terminal event, so synthesizeTerminal can find it.
-			if event.Type == "done" && event.Message != nil {
-				if err := appendMessage(agentID, event.Message); err != nil {
-					m.logger.Warn("failed to save assistant message", "err", err)
-				}
-
-				// Sync persona.md → Agent.Persona (agent may have edited it)
-				m.syncPersona(agentID)
-
-				// Update last message preview
-				m.mu.Lock()
-				if ag, ok := m.agents[agentID]; ok {
-					ag.LastMessage = &MessagePreview{
-						Content:   truncatePreview(event.Message.Content, 100),
-						Role:      event.Message.Role,
-						Timestamp: event.Message.Timestamp,
+				// the terminal event, so synthesizeTerminal can find it.
+				if event.Type == "done" && event.Message != nil {
+					if err := appendMessage(agentID, event.Message); err != nil {
+						m.logger.Warn("failed to save assistant message", "err", err)
 					}
-					ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-				}
-				m.mu.Unlock()
-				m.save()
-			}
 
-			// Terminal events (done/error) use blocking send so the
-			// client always receives them. Streaming events use
-			// non-blocking send — if no reader (WS disconnected),
-			// they are dropped but processing continues.
-			if event.Type == "done" || event.Type == "error" {
-				select {
-				case outCh <- event:
-				case <-chatCtx.Done():
-					return
+					// Sync persona.md → Agent.Persona (agent may have edited it)
+					m.syncPersona(agentID)
+
+					// Update last message preview
+					m.mu.Lock()
+					if ag, ok := m.agents[agentID]; ok {
+						ag.LastMessage = &MessagePreview{
+							Content:   truncatePreview(event.Message.Content, 100),
+							Role:      event.Message.Role,
+							Timestamp: event.Message.Timestamp,
+						}
+						ag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+					}
+					m.mu.Unlock()
+					m.save()
 				}
-			} else {
-				select {
-				case outCh <- event:
-				default:
+
+				// Terminal events (done/error) use blocking send so the
+				// client always receives them. Streaming events use
+				// non-blocking send — if no reader (WS disconnected),
+				// they are dropped but processing continues.
+				if event.Type == "done" || event.Type == "error" {
+					select {
+					case outCh <- event:
+					case <-chatCtx.Done():
+						return
+					}
+				} else {
+					select {
+					case outCh <- event:
+					default:
+					}
 				}
-			}
 			case <-chatCtx.Done():
 				return
 			}

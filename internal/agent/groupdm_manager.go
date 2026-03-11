@@ -18,7 +18,7 @@ import (
 const groupdmsFile = "groups.json"
 
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
-const notifyTimeout = 10 * time.Minute
+const notifyTimeout = 30 * time.Minute
 
 // notifyCooldown is the minimum interval between notifications to the same agent
 // for the same group. This prevents sequential ping-pong loops.
@@ -142,6 +142,66 @@ func (m *GroupDMManager) List() []*GroupDM {
 	return list
 }
 
+// Rename changes the name of a group DM. Only members can rename.
+func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error) {
+	if name == "" {
+		return nil, errors.New("name must not be empty")
+	}
+
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+
+	// Verify caller is a member
+	if callerAgentID != "" {
+		isMember := false
+		for _, mem := range g.Members {
+			if mem.AgentID == callerAgentID {
+				isMember = true
+				break
+			}
+		}
+		if !isMember {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+	}
+
+	oldName := g.Name
+	g.Name = name
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+
+	// Resolve caller name and collect recipients
+	var callerName string
+	var recipients []GroupMember
+	for _, mem := range g.Members {
+		if mem.AgentID == callerAgentID {
+			callerName = mem.AgentName
+		} else {
+			recipients = append(recipients, mem)
+		}
+	}
+	if callerName == "" {
+		callerName = "the owner"
+	}
+	groupName := g.Name
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+
+	m.save()
+	m.logger.Info("group DM renamed", "id", id, "oldName", oldName, "name", name)
+
+	// Notify other members about the rename
+	for _, r := range recipients {
+		go m.notifyRename(r.AgentID, id, groupName, oldName, name, callerName)
+	}
+
+	return cp, nil
+}
+
 // Delete removes a group DM and its data.
 func (m *GroupDMManager) Delete(id string) error {
 	m.mu.Lock()
@@ -248,6 +308,29 @@ func (m *GroupDMManager) GroupsForAgent(agentID string) []*GroupDM {
 		}
 	}
 	return result
+}
+
+// notifyRename sends a lightweight notification about a group rename.
+// Unlike message notifications, this does not enforce cooldown or expect a reply.
+func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newName, callerName string) {
+	notification := fmt.Sprintf(
+		"[Group DM: %s] Group renamed from %q to %q by %s.",
+		groupName, oldName, newName, callerName,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+	if err != nil {
+		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
+			m.logger.Warn("failed to notify agent about rename", "agent", agentID, "group", groupID, "err", err)
+		}
+		return
+	}
+	// Drain events
+	for range events {
+	}
 }
 
 // notifyAgent sends a system message to an agent about new group activity.

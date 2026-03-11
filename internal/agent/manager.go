@@ -896,7 +896,7 @@ func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([
 // Shutdown stops all cron jobs, notify polling, and cancels active chats.
 func (m *Manager) Shutdown() {
 	m.cron.Stop()
-	m.notifyPoller.Stop()
+	m.notifyPoller.Stop() // cancels in-flight delivery goroutines via stopCtx
 
 	m.busyMu.Lock()
 	for _, entry := range m.busy {

@@ -192,6 +192,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("\n### API\n\n")
 		sb.WriteString(fmt.Sprintf("List agents: `curl %s '%s/api/v1/agents/directory'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Create group: `curl %s -X POST '%s/api/v1/groupdms' -H 'Content-Type: application/json' -d '{\"name\":\"...\",\"memberIds\":[\"your-id\",\"other-agent-id\"]}'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("Rename group: `curl %s -X PATCH '%s/api/v1/groupdms/{groupId}' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"name\":\"new name\"}'`\n", curlFlags, apiBase, a.ID))
 		sb.WriteString(fmt.Sprintf("Read messages: `curl %s '%s/api/v1/groupdms/{groupId}/messages?limit=20'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Send message: `curl %s -X POST '%s/api/v1/groupdms/{groupId}/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"...\"}' `\n", curlFlags, apiBase, a.ID))
 		sb.WriteString("\nWhen you receive a group DM notification (system message starting with [Group DM:]), read recent messages if needed and reply using the send API above.\n")

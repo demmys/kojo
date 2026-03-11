@@ -42,10 +42,14 @@ type notifyPoller struct {
 	pending   []pendingNotify
 	logger    *slog.Logger
 	stopCh    chan struct{}
+	stopCtx   context.Context    // cancelled on Stop(); parent for delivery goroutines
+	stopFn    context.CancelFunc // cancels stopCtx
+	sendWg    sync.WaitGroup     // tracks in-flight sendSystemMessage goroutines
 	done      chan struct{}
 }
 
 func newNotifyPoller(mgr *Manager, logger *slog.Logger) *notifyPoller {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &notifyPoller{
 		mgr:       mgr,
 		factories: make(map[string]notifysource.Factory),
@@ -54,6 +58,8 @@ func newNotifyPoller(mgr *Manager, logger *slog.Logger) *notifyPoller {
 		lastPoll:  make(map[string]time.Time),
 		logger:    logger,
 		stopCh:    make(chan struct{}),
+		stopCtx:   ctx,
+		stopFn:    cancel,
 		done:      make(chan struct{}),
 	}
 }
@@ -71,10 +77,13 @@ func (p *notifyPoller) Start() {
 	go p.loop()
 }
 
-// Stop stops the polling loop and waits for completion.
+// Stop stops the polling loop, cancels in-flight delivery goroutines, and
+// waits for everything to finish.
 func (p *notifyPoller) Stop() {
+	p.stopFn() // cancel all in-flight sendSystemMessage goroutines
 	close(p.stopCh)
 	<-p.done
+	p.sendWg.Wait() // wait for delivery goroutines to return
 }
 
 // RebuildSources rebuilds source instances for an agent from its config.
@@ -301,7 +310,11 @@ func (p *notifyPoller) deliverToAgent(agentID, sourceID, message string) {
 		return
 	}
 
-	p.sendSystemMessage(agentID, sourceID, message, 0)
+	p.sendWg.Add(1)
+	go func() {
+		defer p.sendWg.Done()
+		p.sendSystemMessage(agentID, sourceID, message, 0)
+	}()
 }
 
 func (p *notifyPoller) processRetries() {
@@ -333,12 +346,16 @@ func (p *notifyPoller) processRetries() {
 			p.mu.Unlock()
 			continue
 		}
-		p.sendSystemMessage(pn.agentID, pn.sourceID, pn.message, pn.retries)
+		p.sendWg.Add(1)
+		go func() {
+			defer p.sendWg.Done()
+			p.sendSystemMessage(pn.agentID, pn.sourceID, pn.message, pn.retries)
+		}()
 	}
 }
 
 func (p *notifyPoller) sendSystemMessage(agentID, sourceID, message string, retries int) {
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	ctx, cancel := context.WithTimeout(p.stopCtx, notifyTimeout)
 	defer cancel()
 
 	events, err := p.mgr.Chat(ctx, agentID, message, "system", nil)

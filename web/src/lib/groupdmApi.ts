@@ -37,6 +37,16 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   return res.json();
 }
 
+async function patch<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 async function del<T>(path: string): Promise<T> {
   const res = await fetch(BASE + path, { method: "DELETE" });
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
@@ -51,6 +61,9 @@ export const groupdmApi = {
 
   create: (name: string, memberIds: string[]) =>
     post<GroupDMInfo>("/api/v1/groupdms", { name, memberIds }),
+
+  rename: (id: string, name: string) =>
+    patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { name }),
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/groupdms/${id}`),
 

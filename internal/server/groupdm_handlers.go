@@ -49,6 +49,28 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, g)
 }
 
+func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Name    string `json:"name"`
+		AgentID string `json:"agentId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+		return
+	}
+	g, err := s.groupdms.Rename(id, req.Name, req.AgentID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, g)
+}
+
 func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.groupdms.Delete(id); err != nil {

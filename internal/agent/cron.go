@@ -14,9 +14,20 @@ import (
 const cronTimeout = 10 * time.Minute
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 const cronLockFile = ".cron_last"
-func cronPrompt() string {
+func cronPrompt(nextRun time.Time) string {
 	now := time.Now()
-	return "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
+	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
+	if !nextRun.IsZero() {
+		var nextFmt string
+		if nextRun.YearDay() == now.YearDay() && nextRun.Year() == now.Year() {
+			nextFmt = nextRun.Format("15:04")
+		} else {
+			nextFmt = nextRun.Format("1月2日 15:04")
+		}
+		msg += "（次回予定: " + nextFmt + "）"
+	}
+	msg += "最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
+	return msg
 }
 
 // cronScheduler manages periodic agent executions.
@@ -80,6 +91,55 @@ func (cs *cronScheduler) Schedule(agentID string, cronExpr string) error {
 	return nil
 }
 
+// nextRun returns the next scheduled run time for an agent, adjusted for
+// active hours. If the cron's Next falls outside the active window, it
+// iterates the cron schedule forward to find the first tick inside the window.
+// Returns zero time if no schedule exists.
+func (cs *cronScheduler) nextRun(agentID string, activeStart, activeEnd string) time.Time {
+	cs.mu.Lock()
+	var entry cron.Entry
+	if entryID, ok := cs.entries[agentID]; ok {
+		entry = cs.c.Entry(entryID)
+	}
+	cs.mu.Unlock()
+
+	if entry.Schedule == nil || entry.Next.IsZero() {
+		return time.Time{}
+	}
+
+	if activeStart == "" || activeEnd == "" {
+		return entry.Next
+	}
+
+	return nextRunInActiveWindow(entry.Schedule, entry.Next, activeStart, activeEnd)
+}
+
+// nextRunInActiveWindow finds the first cron tick at or after t that falls
+// within the active hours window. Tries up to 48 iterations to avoid infinite loops.
+func nextRunInActiveWindow(sched cron.Schedule, t time.Time, start, end string) time.Time {
+	s, _ := time.Parse("15:04", start)
+	e, _ := time.Parse("15:04", end)
+	startMin := s.Hour()*60 + s.Minute()
+	endMin := e.Hour()*60 + e.Minute()
+
+	candidate := t
+	for i := 0; i < 48; i++ {
+		cMin := candidate.Hour()*60 + candidate.Minute()
+		inWindow := false
+		if startMin <= endMin {
+			inWindow = cMin >= startMin && cMin < endMin
+		} else {
+			inWindow = cMin >= startMin || cMin < endMin
+		}
+		if inWindow {
+			return candidate
+		}
+		candidate = sched.Next(candidate)
+	}
+	// Couldn't find one within 48 ticks; return raw next
+	return t
+}
+
 // Remove removes the cron schedule for an agent.
 func (cs *cronScheduler) Remove(agentID string) {
 	cs.mu.Lock()
@@ -141,10 +201,12 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check active hours
+	var activeStart, activeEnd string
 	if a, ok := cs.mgr.Get(agentID); ok {
-		if !IsWithinActiveHours(a.ActiveStart, a.ActiveEnd) {
+		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
+		if !IsWithinActiveHours(activeStart, activeEnd) {
 			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
-				"activeStart", a.ActiveStart, "activeEnd", a.ActiveEnd)
+				"activeStart", activeStart, "activeEnd", activeEnd)
 			return
 		}
 	}
@@ -157,10 +219,12 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 
 	cs.logger.Info("cron job triggered", "agent", agentID)
 
+	nextRun := cs.nextRun(agentID, activeStart, activeEnd)
+
 	ctx, cancel := context.WithTimeout(context.Background(), cronTimeout)
 	defer cancel()
 
-	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(), "system", nil)
+	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun), "system", nil)
 	if err != nil {
 		cs.logger.Warn("cron chat failed", "agent", agentID, "err", err)
 		return
@@ -171,4 +235,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	cs.logger.Info("cron job completed", "agent", agentID)
+
+	// Run memory compaction synchronously within cron job lifecycle
+	maybeCompact(agentID, cs.logger)
 }

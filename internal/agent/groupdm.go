@@ -11,6 +11,7 @@ type GroupDM struct {
 	ID        string        `json:"id"`
 	Name      string        `json:"name"`
 	Members   []GroupMember `json:"members"`
+	Cooldown  int           `json:"cooldown"` // notification cooldown in seconds (0 = use default)
 	CreatedAt string        `json:"createdAt"`
 	UpdatedAt string        `json:"updatedAt"`
 }

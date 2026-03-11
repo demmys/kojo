@@ -4,6 +4,7 @@ export interface GroupDMInfo {
   id: string;
   name: string;
   members: GroupMember[];
+  cooldown: number; // notification cooldown in seconds (0 = default 50s)
   createdAt: string;
   updatedAt: string;
 }
@@ -64,6 +65,9 @@ export const groupdmApi = {
 
   rename: (id: string, name: string) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { name }),
+
+  setCooldown: (id: string, cooldown: number) =>
+    patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { cooldown }),
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/groupdms/${id}`),
 

@@ -20,9 +20,10 @@ const groupdmsFile = "groups.json"
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
 const notifyTimeout = 30 * time.Minute
 
-// notifyCooldown is the minimum interval between notifications to the same agent
+// defaultNotifyCooldown is the minimum interval between notifications to the same agent
 // for the same group. This prevents sequential ping-pong loops.
-const notifyCooldown = 50 * time.Second
+// Individual groups can override this via GroupDM.Cooldown.
+const defaultNotifyCooldown = 50 * time.Second
 
 // notifyState tracks cooldown and deferred notification state per (groupID, agentID).
 type notifyState struct {
@@ -80,7 +81,8 @@ func (m *GroupDMManager) APIBase() string {
 }
 
 // Create creates a new group DM with the given members.
-func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, error) {
+// cooldown is the notification cooldown in seconds (0 = use default).
+func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int) (*GroupDM, error) {
 	if len(memberIDs) < 2 {
 		return nil, ErrGroupTooFew
 	}
@@ -98,6 +100,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string) (*GroupDM, erro
 		ID:        generateGroupID(),
 		Name:      name,
 		Members:   members,
+		Cooldown:  clampCooldown(cooldown),
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -310,6 +313,52 @@ func (m *GroupDMManager) GroupsForAgent(agentID string) []*GroupDM {
 	return result
 }
 
+// maxCooldown is the upper bound for notification cooldown (1 hour).
+const maxCooldown = 3600
+
+// groupCooldown returns the effective cooldown duration for a group.
+func (m *GroupDMManager) groupCooldown(groupID string) time.Duration {
+	m.mu.Lock()
+	var cd int
+	if g, ok := m.groups[groupID]; ok {
+		cd = g.Cooldown
+	}
+	m.mu.Unlock()
+	if cd > 0 {
+		return time.Duration(cd) * time.Second
+	}
+	return defaultNotifyCooldown
+}
+
+// clampCooldown validates and clamps cooldown to [0, maxCooldown].
+func clampCooldown(seconds int) int {
+	if seconds < 0 {
+		return 0
+	}
+	if seconds > maxCooldown {
+		return maxCooldown
+	}
+	return seconds
+}
+
+// SetCooldown updates the notification cooldown for a group (in seconds).
+func (m *GroupDMManager) SetCooldown(id string, seconds int) (*GroupDM, error) {
+	seconds = clampCooldown(seconds)
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+	g.Cooldown = seconds
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+	m.save()
+	m.logger.Info("group DM cooldown updated", "id", id, "cooldown", seconds)
+	return cp, nil
+}
+
 // notifyRename sends a lightweight notification about a group rename.
 // Unlike message notifications, this does not enforce cooldown or expect a reply.
 func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newName, callerName string) {
@@ -339,6 +388,7 @@ func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newN
 // Enforces a per-(group, agent) cooldown to prevent ping-pong loops.
 func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, msgTime string) {
 	key := groupID + ":" + agentID
+	cooldown := m.groupCooldown(groupID)
 
 	m.notifyMu.Lock()
 	ns := m.notify[key]
@@ -349,7 +399,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, ms
 
 	// Defer if: cooldown active, delivery in progress, or a pending timer exists
 	elapsed := time.Since(ns.lastSent)
-	if elapsed < notifyCooldown || ns.inFlight || ns.timer != nil {
+	if elapsed < cooldown || ns.inFlight || ns.timer != nil {
 		ns.agentID = agentID
 		ns.groupID = groupID
 		ns.groupName = groupName
@@ -358,7 +408,7 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName, senderName, ms
 		ns.hasPending = true
 
 		if ns.timer == nil && !ns.inFlight {
-			delay := notifyCooldown - elapsed
+			delay := cooldown - elapsed
 			if delay < 0 {
 				delay = 0
 			}
@@ -411,7 +461,8 @@ func (m *GroupDMManager) firePending(key string, gen uint64) {
 // deliverNotification sends a notification to the agent immediately.
 // On transient failure (agent busy), it re-defers for retry after cooldown.
 // The gen parameter prevents operating on state that was cleaned up.
-func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName, senderName, msgTime string) {
+func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, groupID, groupName, senderName, msgTime string) { //nolint:gocognit
+	cooldown := m.groupCooldown(groupID)
 	apiBase := m.APIBase()
 	curlFlags := "-s"
 	if strings.HasPrefix(apiBase, "https://") {
@@ -456,7 +507,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 				ns.hasPending = true
 			}
 			if ns.timer == nil {
-				ns.timer = time.AfterFunc(notifyCooldown, func() {
+				ns.timer = time.AfterFunc(cooldown, func() {
 					m.firePending(key, gen)
 				})
 			}
@@ -478,7 +529,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	// Success — record cooldown and fire any pending notification that arrived during delivery
 	ns.lastSent = time.Now()
 	if ns.hasPending && ns.timer == nil {
-		ns.timer = time.AfterFunc(notifyCooldown, func() {
+		ns.timer = time.AfterFunc(cooldown, func() {
 			m.firePending(key, gen)
 		})
 	}

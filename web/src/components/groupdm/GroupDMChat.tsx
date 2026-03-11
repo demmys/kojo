@@ -40,6 +40,8 @@ export function GroupDMChat() {
   const suppressAutoScrollRef = useRef(false);
 
   const [notFound, setNotFound] = useState(false);
+  const [editingCooldown, setEditingCooldown] = useState(false);
+  const [cooldownInput, setCooldownInput] = useState("");
 
   // Reset state when id changes
   useEffect(() => {
@@ -173,6 +175,48 @@ export function GroupDMChat() {
           <div className="text-xs text-neutral-500">
             {group.members.map((m) => m.agentName).join(", ")}
           </div>
+        </div>
+        {/* Cooldown setting */}
+        <div className="shrink-0">
+          {editingCooldown ? (
+            <form
+              className="flex items-center gap-1"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const val = parseInt(cooldownInput, 10);
+                if (isNaN(val) || val < 0) return;
+                try {
+                  const updated = await groupdmApi.setCooldown(group.id, val);
+                  setGroup(updated);
+                } catch (err) {
+                  console.error("Failed to set cooldown", err);
+                }
+                setEditingCooldown(false);
+              }}
+            >
+              <input
+                type="number"
+                min="0"
+                value={cooldownInput}
+                onChange={(e) => setCooldownInput(e.target.value)}
+                className="w-16 px-1.5 py-0.5 text-xs bg-neutral-800 border border-neutral-700 rounded text-neutral-200 text-center"
+                autoFocus
+                onBlur={() => setEditingCooldown(false)}
+              />
+              <span className="text-[10px] text-neutral-500">s</span>
+            </form>
+          ) : (
+            <button
+              onClick={() => {
+                setCooldownInput(String(group.cooldown || 50));
+                setEditingCooldown(true);
+              }}
+              className="text-[10px] text-neutral-600 hover:text-neutral-400 px-1.5 py-0.5 rounded"
+              title="Notification cooldown (seconds)"
+            >
+              {group.cooldown || 50}s
+            </button>
+          )}
         </div>
         <button
           onClick={async () => {

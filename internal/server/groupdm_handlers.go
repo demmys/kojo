@@ -22,6 +22,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name      string   `json:"name"`
 		MemberIDs []string `json:"memberIds"`
+		Cooldown  int      `json:"cooldown"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -31,7 +32,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "at least 2 members required")
 		return
 	}
-	g, err := s.groupdms.Create(req.Name, req.MemberIDs)
+	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -52,23 +53,42 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {
-		Name    string `json:"name"`
-		AgentID string `json:"agentId"`
+		Name     string `json:"name"`
+		AgentID  string `json:"agentId"`
+		Cooldown *int   `json:"cooldown"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	if req.Name == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+
+	var result *agent.GroupDM
+
+	// Update cooldown if provided
+	if req.Cooldown != nil {
+		g, err := s.groupdms.SetCooldown(id, *req.Cooldown)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		result = g
+	}
+
+	// Rename if name provided
+	if req.Name != "" {
+		g, err := s.groupdms.Rename(id, req.Name, req.AgentID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		result = g
+	}
+
+	if result == nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "name or cooldown is required")
 		return
 	}
-	g, err := s.groupdms.Rename(id, req.Name, req.AgentID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	writeJSONResponse(w, http.StatusOK, g)
+	writeJSONResponse(w, http.StatusOK, result)
 }
 
 func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {

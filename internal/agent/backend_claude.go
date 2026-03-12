@@ -234,14 +234,15 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		}
 
 		// Check process exit status
+		var processError string
 		if err := cmd.Wait(); err != nil {
 			b.logger.Warn("claude process exited with error", "err", err, "stderr", stderrBuf.String())
+			processError = strings.TrimSpace(stderrBuf.String())
+			if processError == "" {
+				processError = err.Error()
+			}
 			if fullText.Len() == 0 && lastAssistantText == "" && len(toolUses) == 0 {
-				errMsg := strings.TrimSpace(stderrBuf.String())
-				if errMsg == "" {
-					errMsg = err.Error()
-				}
-				send(ChatEvent{Type: "error", ErrorMessage: errMsg})
+				send(ChatEvent{Type: "error", ErrorMessage: processError})
 				return
 			}
 		}
@@ -277,7 +278,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: usage})
+		send(ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: processError})
 	}()
 
 	return ch, nil

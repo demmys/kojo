@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -63,6 +64,10 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(fullMessage)
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION"}, agent.ID)
+
+	// Capture stderr for error diagnostics (limit to 4KB)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -200,10 +205,15 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		}
 		pendingTexts = nil
 
+		var processError string
 		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("codex process exited with error", "err", err)
+			b.logger.Warn("codex process exited with error", "err", err, "stderr", stderrBuf.String())
+			processError = strings.TrimSpace(stderrBuf.String())
+			if processError == "" {
+				processError = err.Error()
+			}
 			if fullText.Len() == 0 && len(toolUses) == 0 {
-				send(ChatEvent{Type: "error", ErrorMessage: fmt.Sprintf("codex exited with error: %v", err)})
+				send(ChatEvent{Type: "error", ErrorMessage: processError})
 				return
 			}
 		}
@@ -214,7 +224,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: usage})
+		send(ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: processError})
 	}()
 
 	return ch, nil

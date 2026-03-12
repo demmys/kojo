@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -76,8 +77,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
-	// Capture stderr for error reporting
-	cmd.Stderr = os.Stderr
+	// Capture stderr for error diagnostics (limit to 4KB)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start gemini: %w", err)
@@ -170,10 +172,15 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			b.logger.Warn("gemini stream scanner error", "err", err)
 		}
 
+		var processError string
 		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("gemini process exited with error", "err", err)
+			b.logger.Warn("gemini process exited with error", "err", err, "stderr", stderrBuf.String())
+			processError = strings.TrimSpace(stderrBuf.String())
+			if processError == "" {
+				processError = err.Error()
+			}
 			if fullText.Len() == 0 && len(toolUses) == 0 {
-				send(ChatEvent{Type: "error", ErrorMessage: fmt.Sprintf("gemini exited with error: %v", err)})
+				send(ChatEvent{Type: "error", ErrorMessage: processError})
 				return
 			}
 		}
@@ -183,7 +190,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: usage})
+		send(ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: processError})
 	}()
 
 	return ch, nil

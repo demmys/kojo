@@ -156,7 +156,33 @@ export function AgentChat() {
                 ? prev
                 : [...prev, event.message!],
             );
-          } else if (id) {
+          }
+          // Show process error as system message (e.g. auth failures, stderr).
+          // Appended after assistant message to match persistence order.
+          // Skipped if an identical error is already in the messages list
+          // (e.g. loaded from transcript on reconnect).
+          if (event.errorMessage) {
+            const errorContent = `⚠️ Error: ${event.errorMessage}`;
+            setMessages((prev) => {
+              // Skip if already shown (e.g. loaded from transcript on reconnect).
+              // Only check the last message to avoid suppressing genuinely
+              // recurring errors from different turns.
+              const last = prev[prev.length - 1];
+              if (last?.role === "system" && last.content === errorContent) {
+                return prev;
+              }
+              return [
+                ...prev,
+                {
+                  id: "error_" + Date.now(),
+                  role: "system",
+                  content: errorContent,
+                  timestamp: localRFC3339(),
+                },
+              ];
+            });
+          }
+          if (!event.message && id) {
             // Background chat finished — reload recent and merge with older loaded messages
             agentApi.messages(id, PAGE_SIZE).then((r) => {
               setMessages((prev) => {
@@ -170,16 +196,23 @@ export function AgentChat() {
           resetStream();
           break;
         case "error": {
-          const errorMsg = event.errorMessage || "An error occurred";
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: "error_" + Date.now(),
-              role: "system",
-              content: `\u26a0\ufe0f Error: ${errorMsg}`,
-              timestamp: localRFC3339(),
-            },
-          ]);
+          const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
+          setMessages((prev) => {
+            // Skip if already shown (e.g. loaded from transcript on reconnect)
+            const last = prev[prev.length - 1];
+            if (last?.role === "system" && last.content === errorContent) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                id: "error_" + Date.now(),
+                role: "system",
+                content: errorContent,
+                timestamp: localRFC3339(),
+              },
+            ];
+          });
           resetStream();
           break;
         }

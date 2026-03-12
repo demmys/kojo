@@ -272,13 +272,23 @@ func (s *Server) streamAgentEvents(
 }
 
 // synthesizeTerminal creates a terminal event from the transcript when the
-// broadcaster's channel closed without delivering one. If the last message is
-// from the assistant, it's a successful completion (done); otherwise it's an
-// error (the real terminal event was lost).
+// broadcaster's channel closed without delivering one. It searches recent
+// messages for the latest assistant message (skipping trailing system error
+// messages that may have been appended after the response). If no assistant
+// message is found, it falls back to the most recent persisted system error.
 func (s *Server) synthesizeTerminal(agentID string) agent.ChatEvent {
-	msgs, _ := s.agents.Messages(agentID, 1)
-	if len(msgs) > 0 && msgs[len(msgs)-1].Role == "assistant" {
-		return agent.ChatEvent{Type: "done", Message: msgs[len(msgs)-1]}
+	msgs, _ := s.agents.Messages(agentID, 5)
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			return agent.ChatEvent{Type: "done", Message: msgs[i]}
+		}
+	}
+	// No assistant message found — look for a persisted system error
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "system" && strings.HasPrefix(msgs[i].Content, "⚠️ Error: ") {
+			errText := strings.TrimPrefix(msgs[i].Content, "⚠️ Error: ")
+			return agent.ChatEvent{Type: "error", ErrorMessage: errText}
+		}
 	}
 	return agent.ChatEvent{Type: "error", ErrorMessage: "chat ended unexpectedly"}
 }

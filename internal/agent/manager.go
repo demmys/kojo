@@ -776,6 +776,18 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 				m.persistDoneEvent(agentID, event.Message)
 			}
 
+			// Persist process errors as system messages so they survive
+			// page reloads and appear in the transcript history.
+			// This covers both:
+			//   - terminal "error" events (no output captured)
+			//   - "done" events with ErrorMessage (partial output + error)
+			if event.ErrorMessage != "" {
+				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+				if err := appendMessage(agentID, errMsg); err != nil {
+					m.logger.Warn("failed to save error message", "err", err)
+				}
+			}
+
 			// Terminal events (done/error) use blocking send so the
 			// client always receives them. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),

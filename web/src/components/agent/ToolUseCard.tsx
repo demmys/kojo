@@ -5,8 +5,22 @@ interface ToolUseCardProps {
   toolUse: ToolUse;
 }
 
+function extractDescription(input: string): string | undefined {
+  if (!input) return undefined;
+  try {
+    const parsed = JSON.parse(input);
+    if (typeof parsed === "object" && parsed !== null && typeof parsed.description === "string") {
+      return parsed.description;
+    }
+  } catch {
+    // not JSON
+  }
+  return undefined;
+}
+
 export function ToolUseCard({ toolUse }: ToolUseCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const description = extractDescription(toolUse.input);
 
   return (
     <div className="my-1 border border-neutral-700 rounded-lg overflow-hidden text-xs">
@@ -22,7 +36,9 @@ export function ToolUseCard({ toolUse }: ToolUseCardProps) {
         >
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
         </svg>
-        <span className="font-mono text-neutral-300">{toolUse.name}</span>
+        <span className="font-mono text-neutral-300">
+          {toolUse.name}{description ? `: ${description}` : ""}
+        </span>
       </button>
       {expanded && (
         <div className="px-3 py-2 space-y-2 bg-neutral-900/50">

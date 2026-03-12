@@ -117,10 +117,17 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 		var fullText strings.Builder
+		var thinking strings.Builder
 		var lastAssistantText string
 		var streamSessionID string
 		var toolUses []ToolUse
 		var usage *Usage
+
+		// Tool use tracking for content_block_start/delta/stop flow
+		var currentToolName string
+		var currentToolID string
+		var currentToolInput strings.Builder
+		toolIDToName := make(map[string]string)
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -157,12 +164,19 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				}
 
 			case "assistant":
-				// Extract text from content blocks as fallback when
+				// Extract text/thinking from content blocks as fallback when
 				// content_block_delta events are not emitted.
 				var atext strings.Builder
 				for _, block := range event.Message.Content {
-					if block.Type == "text" && block.Text != "" {
-						atext.WriteString(block.Text)
+					switch block.Type {
+					case "text":
+						if block.Text != "" {
+							atext.WriteString(block.Text)
+						}
+					case "thinking":
+						if block.Thinking != "" && thinking.Len() == 0 {
+							thinking.WriteString(block.Thinking)
+						}
 					}
 				}
 				if atext.Len() > 0 {
@@ -179,19 +193,68 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				}
 
 			case "content_block_start":
-				// tool_use is sent later when the full input is available (see "tool_use" case).
+				if event.ContentBlock.Type == "tool_use" {
+					currentToolName = event.ContentBlock.Name
+					currentToolID = event.ContentBlock.ID
+					currentToolInput.Reset()
+					toolIDToName[currentToolID] = currentToolName
+				}
 
 			case "content_block_delta":
-				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
-					fullText.WriteString(event.Delta.Text)
-					if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
-						cmd.Wait()
-						return
+				switch event.Delta.Type {
+				case "text_delta":
+					if event.Delta.Text != "" {
+						fullText.WriteString(event.Delta.Text)
+						if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
+							cmd.Wait()
+							return
+						}
 					}
+				case "thinking_delta":
+					if event.Delta.Thinking != "" {
+						thinking.WriteString(event.Delta.Thinking)
+						if !send(ChatEvent{Type: "thinking", Delta: event.Delta.Thinking}) {
+							cmd.Wait()
+							return
+						}
+					}
+				case "input_json_delta":
+					currentToolInput.WriteString(event.Delta.PartialJSON)
 				}
 
 			case "content_block_stop":
-				// If it was a tool use block, we'll get the result next
+				if currentToolName != "" {
+					input := truncate(currentToolInput.String(), 2000)
+					tu := ToolUse{
+						ID:    currentToolID,
+						Name:  currentToolName,
+						Input: input,
+					}
+					toolUses = append(toolUses, tu)
+					if !send(ChatEvent{Type: "tool_use", ToolName: currentToolName, ToolInput: input}) {
+						cmd.Wait()
+						return
+					}
+					currentToolName = ""
+					currentToolID = ""
+					currentToolInput.Reset()
+				}
+
+			case "user":
+				// Tool results arrive as user messages with tool_result content blocks.
+				for _, block := range event.Message.Content {
+					if block.Type == "tool_result" && block.ToolUseID != "" {
+						toolName := toolIDToName[block.ToolUseID]
+						if toolName != "" {
+							output := truncate(block.contentText(), 2000)
+							if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+								cmd.Wait()
+								return
+							}
+							matchToolOutput(toolUses, block.ToolUseID, toolName, output)
+						}
+					}
+				}
 
 			case "result":
 				if event.SessionID != "" {
@@ -206,24 +269,6 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 						}
 					}
 				}
-
-			case "tool_use":
-				tu := ToolUse{
-					Name:  event.Name,
-					Input: truncate(event.Input, 2000),
-				}
-				toolUses = append(toolUses, tu)
-				if !send(ChatEvent{Type: "tool_use", ToolName: event.Name, ToolInput: truncate(event.Input, 2000)}) {
-					cmd.Wait()
-					return
-				}
-
-			case "tool_result":
-				if !send(ChatEvent{Type: "tool_result", ToolName: event.Name, ToolOutput: truncate(event.Content, 2000)}) {
-					cmd.Wait()
-					return
-				}
-				matchToolOutput(toolUses, "", event.Name, truncate(event.Content, 2000))
 			}
 		}
 
@@ -274,6 +319,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 		msg := newAssistantMessage()
 		msg.Content = finalText
+		msg.Thinking = thinking.String()
 		msg.ToolUses = toolUses
 		msg.Usage = usage
 
@@ -306,6 +352,7 @@ type claudeStreamEvent struct {
 	// "content_block_start" event
 	ContentBlock struct {
 		Type string `json:"type"`
+		ID   string `json:"id,omitempty"`
 		Name string `json:"name,omitempty"`
 	} `json:"content_block,omitempty"`
 
@@ -313,6 +360,7 @@ type claudeStreamEvent struct {
 	Delta struct {
 		Type        string `json:"type"`
 		Text        string `json:"text,omitempty"`
+		Thinking    string `json:"thinking,omitempty"`
 		PartialJSON string `json:"partial_json,omitempty"`
 	} `json:"delta,omitempty"`
 
@@ -327,10 +375,42 @@ type claudeStreamEvent struct {
 	Content string `json:"content,omitempty"`
 }
 
-// claudeContentBlock represents a content block in a Claude assistant message.
+// claudeContentBlock represents a content block in a Claude message.
 type claudeContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`    // thinking block
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
+	Content   json.RawMessage `json:"content,omitempty"`     // tool_result output (string or array)
+}
+
+// contentText extracts a plain-text representation from a claudeContentBlock's Content field.
+// Content may be a JSON string or an array of content blocks with "text" entries.
+func (b *claudeContentBlock) contentText() string {
+	if len(b.Content) == 0 {
+		return ""
+	}
+	// Try as plain string first
+	var s string
+	if json.Unmarshal(b.Content, &s) == nil {
+		return s
+	}
+	// Try as array of content blocks
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(b.Content, &blocks) == nil {
+		var sb strings.Builder
+		for _, bl := range blocks {
+			if bl.Type == "text" && bl.Text != "" {
+				sb.WriteString(bl.Text)
+			}
+		}
+		return sb.String()
+	}
+	// Fallback: raw string
+	return string(b.Content)
 }
 
 // limitedWriter wraps a bytes.Buffer and stops writing after limit bytes.

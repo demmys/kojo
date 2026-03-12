@@ -218,6 +218,41 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			case "abort":
 				s.agents.Abort(agentID)
+				if bgEvents != nil {
+					// Drain bgEvents so the client gets a proper terminal
+					// event (or an empty done for the abort snapshot path)
+					// instead of a stale synthesizeTerminal message.
+					var terminal *agent.ChatEvent
+					drainTimer := time.NewTimer(10 * time.Second)
+				bgDrainLoop:
+					for {
+						select {
+						case ev, ok := <-bgEvents:
+							if !ok {
+								break bgDrainLoop
+							}
+							if ev.Type == "done" || ev.Type == "error" {
+								terminal = &ev
+								break bgDrainLoop
+							}
+						case <-drainTimer.C:
+							break bgDrainLoop
+						case <-ctx.Done():
+							break bgDrainLoop
+						}
+					}
+					drainTimer.Stop()
+					bgEvents = nil
+					if bgUnsub != nil {
+						bgUnsub()
+						bgUnsub = nil
+					}
+					if terminal != nil {
+						_ = writeJSON(ctx, conn, *terminal)
+					} else {
+						_ = writeJSON(ctx, conn, agent.ChatEvent{Type: "done"})
+					}
+				}
 			}
 		}
 	}
@@ -245,6 +280,9 @@ func (s *Server) streamAgentEvents(
 			}
 			if err := writeJSON(ctx, conn, event); err != nil {
 				// Write failed (WS disconnected) — let chat continue.
+				return
+			}
+			if event.Type == "done" || event.Type == "error" {
 				return
 			}
 		case msg := <-clientMsgs:

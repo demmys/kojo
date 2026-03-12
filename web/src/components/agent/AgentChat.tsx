@@ -173,24 +173,55 @@ export function AgentChat() {
           const abortSnapshot = abortedContentRef.current;
           abortedContentRef.current = null;
 
-          if (event.message) {
-            // Deduplicate by message ID (bgDone may overlap with initial load)
+          if (abortSnapshot) {
+            // User aborted — commit the best available content.
+            // The server may return a stale/duplicate message (e.g.
+            // synthesizeTerminal returning the previous assistant message
+            // when the current one wasn't persisted due to race conditions).
+            // Check inside the updater where prev is the latest state.
+            const snapshotHasContent = abortSnapshot.text || abortSnapshot.thinking || abortSnapshot.tools.length > 0;
+            setMessages((prev) => {
+              // If server provided a NEW message, prefer it (more complete)
+              if (event.message && !prev.some((m) => m.id === event.message!.id)) {
+                return [...prev, event.message!];
+              }
+              // Otherwise, commit abort snapshot (partial content the user saw)
+              if (snapshotHasContent) {
+                return [...prev, {
+                  id: "aborted_" + Date.now(),
+                  role: "assistant" as const,
+                  content: abortSnapshot.text,
+                  thinking: abortSnapshot.thinking || undefined,
+                  toolUses: abortSnapshot.tools.length > 0
+                    ? abortSnapshot.tools.map((t: { name: string; input: string; output: string | null }) => ({ name: t.name, input: t.input, output: t.output ?? "" }))
+                    : undefined,
+                  timestamp: localRFC3339(),
+                }];
+              }
+              return prev;
+            });
+          } else if (event.message) {
+            // Normal completion — deduplicate by message ID
             setMessages((prev) =>
               prev.some((m) => m.id === event.message!.id)
                 ? prev
                 : [...prev, event.message!],
             );
+          } else if (id) {
+            // Background chat finished — reload recent and merge with older loaded messages
+            agentApi.messages(id, PAGE_SIZE).then((r) => {
+              setMessages((prev) => {
+                const newIds = new Set(r.messages.map((m) => m.id));
+                const older = prev.filter((m) => !newIds.has(m.id));
+                return [...older, ...r.messages];
+              });
+              // Don't overwrite hasMore — older pages are already loaded
+            }).catch(console.error);
           }
           // Show process error as system message (e.g. auth failures, stderr).
-          // Appended after assistant message to match persistence order.
-          // Skipped if an identical error is already in the messages list
-          // (e.g. loaded from transcript on reconnect).
           if (event.errorMessage) {
             const errorContent = `⚠️ Error: ${event.errorMessage}`;
             setMessages((prev) => {
-              // Skip if already shown (e.g. loaded from transcript on reconnect).
-              // Only check the last message to avoid suppressing genuinely
-              // recurring errors from different turns.
               const last = prev[prev.length - 1];
               if (last?.role === "system" && last.content === errorContent) {
                 return prev;
@@ -205,34 +236,6 @@ export function AgentChat() {
                 },
               ];
             });
-          }
-          if (!event.message && abortSnapshot) {
-            // Aborted: commit partial streaming content as a local message
-            if (abortSnapshot.text || abortSnapshot.thinking || abortSnapshot.tools.length > 0) {
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: "aborted_" + Date.now(),
-                  role: "assistant" as const,
-                  content: abortSnapshot.text,
-                  thinking: abortSnapshot.thinking || undefined,
-                  toolUses: abortSnapshot.tools.length > 0
-                    ? abortSnapshot.tools.map((t: { name: string; input: string; output: string | null }) => ({ name: t.name, input: t.input, output: t.output ?? "" }))
-                    : undefined,
-                  timestamp: localRFC3339(),
-                },
-              ]);
-            }
-          } else if (!event.message && id) {
-            // Background chat finished — reload recent and merge with older loaded messages
-            agentApi.messages(id, PAGE_SIZE).then((r) => {
-              setMessages((prev) => {
-                const newIds = new Set(r.messages.map((m) => m.id));
-                const older = prev.filter((m) => !newIds.has(m.id));
-                return [...older, ...r.messages];
-              });
-              // Don't overwrite hasMore — older pages are already loaded
-            }).catch(console.error);
           }
           resetStream();
           break;

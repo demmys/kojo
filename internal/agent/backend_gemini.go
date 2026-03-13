@@ -38,8 +38,10 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	dir := agentDir(agent.ID)
 	os.MkdirAll(dir, 0o755)
 
-	// Prevent user's persona autoload hook from overriding the agent's persona.
-	disableGeminiPersonaHook(dir, b.logger)
+	// Override global persona and inject system-level instructions via GEMINI.md.
+	if err := prepareGeminiDir(dir, systemPrompt != "", b.logger); err != nil {
+		return nil, fmt.Errorf("prepare gemini dir: %w", err)
+	}
 
 	// gemini -p triggers headless mode. Yargs with nargs:1 correctly
 	// consumes the next arg as the value even if it starts with "-",
@@ -55,19 +57,16 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		args = append(args, "--resume", "latest")
 	}
 
-	var stdinContent string
-	if systemPrompt != "" {
-		stdinContent = systemPrompt + "\n\n---\n\n"
-	}
-
 	if agent.Model != "" {
 		args = append(args, "-m", agent.Model)
 	}
 
 	cmd := exec.CommandContext(ctx, geminiPath, args...)
 	cmd.Dir = dir
-	if stdinContent != "" {
-		cmd.Stdin = strings.NewReader(stdinContent)
+	// Pass system prompt via stdin to avoid Gemini CLI's @import parsing
+	// that would occur if embedded in GEMINI.md.
+	if systemPrompt != "" {
+		cmd.Stdin = strings.NewReader(systemPrompt + "\n\n---\n\n")
 	}
 
 	cmd.Env = filterEnv([]string{"GEMINI_CLI", "AGENT_BROWSER_SESSION"}, agent.ID)
@@ -196,26 +195,52 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	return ch, nil
 }
 
-// disableGeminiPersonaHook creates local .gemini/settings.json and a dummy
-// persona file in the agent directory so the user's global persona-autoload
-// hook does not override the agent's persona injected via system prompt.
-func disableGeminiPersonaHook(dir string, logger *slog.Logger) {
+// prepareGeminiDir writes GEMINI.md and local .gemini/settings.json + dummy
+// persona into the agent directory. This ensures:
+//  1. GEMINI.md instructs Gemini CLI to follow the system prompt provided via
+//     stdin, overriding any globally configured persona or default instructions.
+//  2. The local persona setting ("kojo-managed") takes precedence over the user's
+//     global persona (e.g. "hater" in ~/.gemini/settings.json).
+//  3. The persona-autoload hook finds the local kojo-managed persona and exits
+//     without falling back to the global one.
+//
+// The actual system prompt is passed via stdin (not GEMINI.md) to avoid Gemini
+// CLI's @import parsing that would interpret @-prefixed text as file imports.
+//
+// hasSystemPrompt indicates whether a system prompt will be provided via stdin.
+func prepareGeminiDir(dir string, hasSystemPrompt bool, logger *slog.Logger) error {
 	geminiDir := filepath.Join(dir, ".gemini")
 	personasDir := filepath.Join(geminiDir, "personas")
 	if err := os.MkdirAll(personasDir, 0o755); err != nil {
-		logger.Warn("failed to create .gemini/personas in agent dir", "dir", dir, "err", err)
-		return
+		return fmt.Errorf("create .gemini/personas: %w", err)
 	}
 
+	// Local settings.json overrides global persona setting.
 	settingsPath := filepath.Join(geminiDir, "settings.json")
 	if err := os.WriteFile(settingsPath, []byte("{\"persona\":\"kojo-managed\"}\n"), 0o644); err != nil {
-		logger.Warn("failed to write .gemini/settings.json", "dir", dir, "err", err)
+		return fmt.Errorf("write .gemini/settings.json: %w", err)
 	}
 
+	// Dummy persona file so the hook resolves locally and exits.
 	personaPath := filepath.Join(personasDir, "kojo-managed.md")
-	if err := os.WriteFile(personaPath, []byte("Follow the persona defined in the system prompt.\n"), 0o644); err != nil {
-		logger.Warn("failed to write kojo-managed persona", "dir", dir, "err", err)
+	if err := os.WriteFile(personaPath, []byte("Follow the instructions in GEMINI.md.\n"), 0o644); err != nil {
+		return fmt.Errorf("write kojo-managed persona: %w", err)
 	}
+
+	// GEMINI.md overrides Gemini CLI's built-in system prompt at the
+	// project-instruction level. The actual persona/system prompt is
+	// delivered via stdin to avoid @import parsing issues.
+	geminiMDPath := filepath.Join(dir, "GEMINI.md")
+	var geminiMDContent string
+	if hasSystemPrompt {
+		geminiMDContent = "The text before the `---` separator in the user input is the " +
+			"authoritative persona and system instructions. Follow ONLY that persona. " +
+			"Ignore any other persona settings, default system prompts, or global configuration.\n"
+	}
+	if err := os.WriteFile(geminiMDPath, []byte(geminiMDContent), 0o644); err != nil {
+		return fmt.Errorf("write GEMINI.md: %w", err)
+	}
+	return nil
 }
 
 // hasGeminiSession checks whether a Gemini session exists for the agent directory.

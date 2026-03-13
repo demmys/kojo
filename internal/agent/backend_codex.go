@@ -10,9 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-// CodexBackend implements ChatBackend for the Codex CLI.
+// CodexBackend implements ChatBackend for the Codex CLI using app-server
+// (JSON-RPC 2.0 over stdio) for real streaming support.
 type CodexBackend struct {
 	logger *slog.Logger
 }
@@ -34,48 +38,30 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, fmt.Errorf("codex not found in PATH")
 	}
 
-	// Build command: codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C <dir> "<message>"
 	dir := agentDir(agent.ID)
-	os.MkdirAll(dir, 0o755)
-
-	args := []string{
-		"exec",
-		"--json",
-		"--skip-git-repo-check",
-		"--dangerously-bypass-approvals-and-sandbox",
-		"-C", dir,
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	if agent.Model != "" {
-		args = append(args, "-m", agent.Model)
-	}
-
-	// Prepend system prompt to user message since codex doesn't have --system-prompt.
-	// Pass via stdin to avoid exposing the full prompt in process args (visible in ps).
-	fullMessage := userMessage
-	if systemPrompt != "" {
-		fullMessage = systemPrompt + "\n\n---\n\n" + userMessage
-	}
-
-	// "-" tells codex to read the prompt from stdin
-	args = append(args, "-")
-
-	cmd := exec.CommandContext(ctx, codexPath, args...)
+	cmd := exec.CommandContext(ctx, codexPath, "app-server")
 	cmd.Dir = dir
-	cmd.Stdin = strings.NewReader(fullMessage)
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION"}, agent.ID)
 
-	// Capture stderr for error diagnostics (limit to 4KB)
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
+
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start codex: %w", err)
+		return nil, fmt.Errorf("start codex app-server: %w", err)
 	}
 
 	ch := make(chan ChatEvent, 64)
@@ -92,27 +78,173 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			}
 		}
 
+		// JSON-RPC message sender (mutex-protected since stdin is shared)
+		var reqID atomic.Int64
+		var writeMu sync.Mutex
+		sendRPC := func(method string, params any) int64 {
+			id := reqID.Add(1)
+			msg := rpcRequest{
+				JSONRPC: "2.0",
+				Method:  method,
+				ID:      &id,
+				Params:  params,
+			}
+			data, _ := json.Marshal(msg)
+			data = append(data, '\n')
+			writeMu.Lock()
+			stdin.Write(data)
+			writeMu.Unlock()
+			b.logger.Debug("codex rpc send", "method", method, "id", id)
+			return id
+		}
+
+		sendNotify := func(method string) {
+			msg := struct {
+				JSONRPC string `json:"jsonrpc"`
+				Method  string `json:"method"`
+			}{"2.0", method}
+			data, _ := json.Marshal(msg)
+			data = append(data, '\n')
+			writeMu.Lock()
+			stdin.Write(data)
+			writeMu.Unlock()
+			b.logger.Debug("codex rpc notify", "method", method)
+		}
+
+		shutdown := func() {
+			stdin.Close()
+			done := make(chan struct{})
+			go func() {
+				cmd.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				cmd.Process.Kill()
+				<-done
+			}
+		}
+
+		// Step 1: Initialize handshake
+		initID := sendRPC("initialize", map[string]any{
+			"clientInfo": map[string]any{
+				"name":    "kojo",
+				"title":   "Kojo",
+				"version": "1.0.0",
+			},
+			"capabilities": map[string]any{
+				"experimentalApi": true,
+			},
+		})
+
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+		// Wait for initialize response
+		var threadStartID, turnStartID int64
+		var threadID string
+		initDone := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var msg rpcMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			if msg.ID != nil && *msg.ID == initID {
+				if msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: "codex initialize failed: " + msg.Error.Message})
+					shutdown()
+					return
+				}
+				initDone = true
+				break
+			}
+		}
+		if !initDone {
+			send(ChatEvent{Type: "error", ErrorMessage: "codex app-server initialize failed"})
+			shutdown()
+			return
+		}
+
+		// Step 2: Send initialized notification (no params per protocol)
+		sendNotify("initialized")
+
+		// Step 3: Start thread
+		threadParams := map[string]any{
+			"cwd":            dir,
+			"approvalPolicy": "never",
+			"sandbox":        "danger-full-access",
+		}
+		if agent.Model != "" {
+			threadParams["model"] = agent.Model
+		}
+		threadStartID = sendRPC("thread/start", threadParams)
+
+		// Wait for thread/start response to get thread ID
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var msg rpcMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			if msg.ID != nil && *msg.ID == threadStartID {
+				if msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: "codex thread/start failed: " + msg.Error.Message})
+					shutdown()
+					return
+				}
+				if msg.Result != nil {
+					var result struct {
+						Thread struct {
+							ID string `json:"id"`
+						} `json:"thread"`
+					}
+					json.Unmarshal(*msg.Result, &result)
+					threadID = result.Thread.ID
+				}
+				break
+			}
+		}
+
+		if threadID == "" {
+			send(ChatEvent{Type: "error", ErrorMessage: "codex app-server: failed to get thread ID"})
+			shutdown()
+			return
+		}
+
+		// Step 4: Start turn with user message
+		fullMessage := userMessage
+		if systemPrompt != "" {
+			fullMessage = systemPrompt + "\n\n---\n\n" + userMessage
+		}
+
+		turnStartID = sendRPC("turn/start", map[string]any{
+			"threadId": threadID,
+			"input": []map[string]any{
+				{"type": "text", "text": fullMessage},
+			},
+		})
+
+		if !send(ChatEvent{Type: "status", Status: "thinking"}) {
+			shutdown()
+			return
+		}
+
+		// Step 5: Process streaming events
 		var fullText strings.Builder
 		var thinking strings.Builder
 		var toolUses []ToolUse
 		var usage *Usage
 
-		// Buffer agent_message texts. When a tool_call follows, the buffered
-		// texts are emitted as "thinking" events (intermediate reasoning).
-		// Texts remaining after the last tool call are the final response.
-		var pendingTexts []string
-		turnCompleted := false
-
-		flushAsThinking := func() {
-			for _, t := range pendingTexts {
-				thinking.WriteString(t)
-				send(ChatEvent{Type: "thinking", Delta: t})
-			}
-			pendingTexts = nil
-		}
+		// Track item phases: itemID -> phase ("commentary" or "final_answer")
+		itemPhases := make(map[string]string)
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -120,137 +252,287 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				continue
 			}
 
-			var event codexStreamEvent
-			if err := json.Unmarshal([]byte(line), &event); err != nil {
-				b.logger.Debug("failed to parse codex stream event", "line", line, "err", err)
+			var msg rpcMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				b.logger.Debug("codex rpc parse error", "line", line, "err", err)
 				continue
 			}
 
-			switch event.Type {
-			case "thread.started":
-				if !send(ChatEvent{Type: "status", Status: "thinking"}) {
-					cmd.Wait()
+			// Handle RPC response errors
+			if msg.ID != nil {
+				if *msg.ID == turnStartID && msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: msg.Error.Message})
+					shutdown()
 					return
 				}
+				continue
+			}
 
-			case "turn.started":
-				// Turn started, keep thinking
+			switch msg.Method {
+			case "item/started":
+				if msg.Params == nil {
+					continue
+				}
+				var params struct {
+					Item struct {
+						ID        string          `json:"id"`
+						Type      string          `json:"type"`
+						Phase     string          `json:"phase"`
+						Command   string          `json:"command"`
+						Tool      string          `json:"tool"`
+						Server    string          `json:"server"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"item"`
+				}
+				json.Unmarshal(*msg.Params, &params)
 
-			case "item.completed":
-				if event.Item.Type == "reasoning" && event.Item.Text != "" {
-					// Dedicated reasoning items go directly to thinking
-					thinking.WriteString(event.Item.Text)
-					send(ChatEvent{Type: "thinking", Delta: event.Item.Text})
-				} else if event.Item.Type == "agent_message" && event.Item.Text != "" {
-					pendingTexts = append(pendingTexts, event.Item.Text)
-				} else if event.Item.Type == "tool_call" {
-					// Buffered texts before a tool call are intermediate thinking
-					flushAsThinking()
-					tu := ToolUse{
-						ID:    event.Item.ID,
-						Name:  event.Item.Name,
-						Input: truncate(event.Item.Arguments, 2000),
-					}
-					toolUses = append(toolUses, tu)
-					if !send(ChatEvent{Type: "tool_use", ToolName: event.Item.Name, ToolInput: truncate(event.Item.Arguments, 2000)}) {
-						cmd.Wait()
-						return
-					}
-				} else if event.Item.Type == "tool_call_output" {
-					// Texts between tool calls are also thinking
-					flushAsThinking()
-					if !send(ChatEvent{Type: "tool_result", ToolName: event.Item.Name, ToolOutput: truncate(event.Item.Output, 2000)}) {
-						cmd.Wait()
-						return
-					}
-					matchToolOutput(toolUses, event.Item.ID, event.Item.Name, truncate(event.Item.Output, 2000))
+				if params.Item.Phase != "" {
+					itemPhases[params.Item.ID] = params.Item.Phase
 				}
 
-			case "turn.completed":
-				turnCompleted = true
-				// Remaining buffered texts are the final response
-				for _, t := range pendingTexts {
-					fullText.WriteString(t)
-					if !send(ChatEvent{Type: "text", Delta: t}) {
-						cmd.Wait()
+				switch params.Item.Type {
+				case "commandExecution":
+					input := truncate(params.Item.Command, 2000)
+					toolUses = append(toolUses, ToolUse{
+						ID:    params.Item.ID,
+						Name:  "shell",
+						Input: input,
+					})
+					if !send(ChatEvent{Type: "tool_use", ToolName: "shell", ToolInput: input}) {
+						shutdown()
+						return
+					}
+				case "mcpToolCall", "dynamicToolCall":
+					toolName := params.Item.Tool
+					if params.Item.Server != "" {
+						toolName = params.Item.Server + "/" + toolName
+					}
+					input := truncate(string(params.Item.Arguments), 2000)
+					toolUses = append(toolUses, ToolUse{
+						ID:    params.Item.ID,
+						Name:  toolName,
+						Input: input,
+					})
+					if !send(ChatEvent{Type: "tool_use", ToolName: toolName, ToolInput: input}) {
+						shutdown()
 						return
 					}
 				}
-				pendingTexts = nil
 
-				if event.Usage.OutputTokens > 0 {
+			case "item/agentMessage/delta":
+				if msg.Params == nil {
+					continue
+				}
+				var params struct {
+					ItemID string `json:"itemId"`
+					Delta  string `json:"delta"`
+				}
+				json.Unmarshal(*msg.Params, &params)
+				if params.Delta == "" {
+					continue
+				}
+
+				phase := itemPhases[params.ItemID]
+				if phase == "commentary" {
+					thinking.WriteString(params.Delta)
+					if !send(ChatEvent{Type: "thinking", Delta: params.Delta}) {
+						shutdown()
+						return
+					}
+				} else {
+					// "final_answer" or unknown → treat as response text
+					fullText.WriteString(params.Delta)
+					if !send(ChatEvent{Type: "text", Delta: params.Delta}) {
+						shutdown()
+						return
+					}
+				}
+
+			case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
+				if msg.Params == nil {
+					continue
+				}
+				var params struct {
+					Delta string `json:"delta"`
+				}
+				json.Unmarshal(*msg.Params, &params)
+				if params.Delta != "" {
+					thinking.WriteString(params.Delta)
+					send(ChatEvent{Type: "thinking", Delta: params.Delta})
+				}
+
+			case "item/completed":
+				if msg.Params == nil {
+					continue
+				}
+				var params struct {
+					Item struct {
+						ID               string          `json:"id"`
+						Type             string          `json:"type"`
+						Text             string          `json:"text"`
+						Status           string          `json:"status"`
+						Command          string          `json:"command"`
+						AggregatedOutput string          `json:"aggregatedOutput"`
+						ExitCode         *int            `json:"exitCode"`
+						Tool             string          `json:"tool"`
+						Server           string          `json:"server"`
+						Result           json.RawMessage `json:"result"`
+						Error            *struct {
+							Message string `json:"message"`
+						} `json:"error"`
+						ContentItems json.RawMessage `json:"contentItems"`
+						Success      *bool           `json:"success"`
+					} `json:"item"`
+				}
+				json.Unmarshal(*msg.Params, &params)
+
+				switch params.Item.Type {
+				case "commandExecution":
+					output := truncate(params.Item.AggregatedOutput, 2000)
+					if output == "" && params.Item.ExitCode != nil && *params.Item.ExitCode != 0 {
+						output = fmt.Sprintf("exit code: %d", *params.Item.ExitCode)
+					}
+					toolName := "shell"
+					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+						shutdown()
+						return
+					}
+					matchToolOutput(toolUses, params.Item.ID, toolName, output)
+				case "mcpToolCall":
+					var output string
+					if params.Item.Error != nil {
+						output = truncate("error: "+params.Item.Error.Message, 2000)
+					} else if len(params.Item.Result) > 0 && string(params.Item.Result) != "null" {
+						output = truncate(string(params.Item.Result), 2000)
+					}
+					toolName := params.Item.Tool
+					if params.Item.Server != "" {
+						toolName = params.Item.Server + "/" + toolName
+					}
+					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+						shutdown()
+						return
+					}
+					matchToolOutput(toolUses, params.Item.ID, toolName, output)
+				case "dynamicToolCall":
+					var output string
+					if len(params.Item.ContentItems) > 0 && string(params.Item.ContentItems) != "null" {
+						output = truncate(string(params.Item.ContentItems), 2000)
+					} else if params.Item.Success != nil && !*params.Item.Success {
+						output = "failed"
+					}
+					toolName := params.Item.Tool
+					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+						shutdown()
+						return
+					}
+					matchToolOutput(toolUses, params.Item.ID, toolName, output)
+				}
+
+			case "thread/tokenUsage/updated":
+				if msg.Params == nil {
+					continue
+				}
+				var params struct {
+					TokenUsage struct {
+						Last struct {
+							InputTokens  int `json:"inputTokens"`
+							OutputTokens int `json:"outputTokens"`
+						} `json:"last"`
+					} `json:"tokenUsage"`
+				}
+				json.Unmarshal(*msg.Params, &params)
+				if params.TokenUsage.Last.OutputTokens > 0 {
 					usage = &Usage{
-						InputTokens:  event.Usage.InputTokens,
-						OutputTokens: event.Usage.OutputTokens,
+						InputTokens:  params.TokenUsage.Last.InputTokens,
+						OutputTokens: params.TokenUsage.Last.OutputTokens,
 					}
 				}
-			}
-		}
 
-		if err := scanner.Err(); err != nil {
-			b.logger.Warn("codex stream scanner error", "err", err)
-		}
+			case "turn/completed":
+				var processError string
+				if msg.Params != nil {
+					var params struct {
+						Turn struct {
+							Status string    `json:"status"`
+							Error  *rpcError `json:"error"`
+						} `json:"turn"`
+					}
+					json.Unmarshal(*msg.Params, &params)
+					if params.Turn.Status == "failed" || params.Turn.Status == "interrupted" {
+						processError = "codex turn " + params.Turn.Status
+						if params.Turn.Error != nil {
+							processError = params.Turn.Error.Message
+						}
+					}
+				}
 
-		// Flush remaining buffered texts
-		for _, t := range pendingTexts {
-			if turnCompleted {
-				// turn.completed was received — remaining texts are final response
-				fullText.WriteString(t)
-				send(ChatEvent{Type: "text", Delta: t})
-			} else {
-				// Abnormal exit — treat as thinking to avoid leaking reasoning into content
-				thinking.WriteString(t)
-				send(ChatEvent{Type: "thinking", Delta: t})
-			}
-		}
-		pendingTexts = nil
+				finalMsg := newAssistantMessage()
+				finalMsg.Content = fullText.String()
+				finalMsg.Thinking = thinking.String()
+				finalMsg.ToolUses = toolUses
+				finalMsg.Usage = usage
 
-		var processError string
-		if err := cmd.Wait(); err != nil {
-			b.logger.Warn("codex process exited with error", "err", err, "stderr", stderrBuf.String())
-			processError = strings.TrimSpace(stderrBuf.String())
-			if processError == "" {
-				processError = err.Error()
-			}
-			if fullText.Len() == 0 && len(toolUses) == 0 {
-				send(ChatEvent{Type: "error", ErrorMessage: processError})
+				send(ChatEvent{Type: "done", Message: finalMsg, Usage: usage, ErrorMessage: processError})
+				shutdown()
 				return
 			}
 		}
 
-		msg := newAssistantMessage()
-		msg.Content = fullText.String()
-		msg.Thinking = thinking.String()
-		msg.ToolUses = toolUses
-		msg.Usage = usage
+		// Scanner exited without turn/completed — abnormal exit
+		if err := scanner.Err(); err != nil {
+			b.logger.Warn("codex app-server scanner error", "err", err)
+		}
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: processError})
+		var processError string
+		if err := cmd.Wait(); err != nil {
+			b.logger.Warn("codex app-server exited with error", "err", err, "stderr", stderrBuf.String())
+			processError = strings.TrimSpace(stderrBuf.String())
+			if processError == "" {
+				processError = err.Error()
+			}
+		}
+
+		errMsg := processError
+		if errMsg == "" {
+			errMsg = "codex app-server exited unexpectedly"
+		}
+
+		if fullText.Len() > 0 || len(toolUses) > 0 {
+			// Partial output exists — return as done with error
+			finalMsg := newAssistantMessage()
+			finalMsg.Content = fullText.String()
+			finalMsg.Thinking = thinking.String()
+			finalMsg.ToolUses = toolUses
+			finalMsg.Usage = usage
+			send(ChatEvent{Type: "done", Message: finalMsg, Usage: usage, ErrorMessage: errMsg})
+		} else {
+			send(ChatEvent{Type: "error", ErrorMessage: errMsg})
+		}
 	}()
 
 	return ch, nil
 }
 
-// codexStreamEvent represents a Codex CLI JSONL event.
-type codexStreamEvent struct {
-	Type string `json:"type"`
+// rpcRequest is a JSON-RPC 2.0 request.
+type rpcRequest struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	ID      *int64 `json:"id,omitempty"`
+	Params  any    `json:"params,omitempty"`
+}
 
-	// thread.started
-	ThreadID string `json:"thread_id,omitempty"`
+// rpcMessage is a generic JSON-RPC 2.0 message (response or notification).
+type rpcMessage struct {
+	JSONRPC string           `json:"jsonrpc,omitempty"`
+	Method  string           `json:"method,omitempty"`
+	ID      *int64           `json:"id,omitempty"`
+	Result  *json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError        `json:"error,omitempty"`
+	Params  *json.RawMessage `json:"params,omitempty"`
+}
 
-	// item.completed
-	Item struct {
-		ID        string `json:"id,omitempty"`
-		Type      string `json:"type,omitempty"`      // "agent_message", "tool_call", "tool_call_output", "reasoning"
-		Text      string `json:"text,omitempty"`       // for agent_message / reasoning
-		Name      string `json:"name,omitempty"`       // for tool_call / tool_call_output
-		Arguments string `json:"arguments,omitempty"`  // for tool_call
-		Output    string `json:"output,omitempty"`     // for tool_call_output
-	} `json:"item,omitempty"`
-
-	// turn.completed
-	Usage struct {
-		InputTokens       int `json:"input_tokens"`
-		CachedInputTokens int `json:"cached_input_tokens"`
-		OutputTokens      int `json:"output_tokens"`
-	} `json:"usage,omitempty"`
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }

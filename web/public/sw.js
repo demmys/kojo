@@ -1,5 +1,5 @@
 self.addEventListener("push", (event) => {
-  let data = { type: "notification", tool: "kojo", workDir: "" };
+  let data = {};
   try {
     data = event.data.json();
   } catch {
@@ -7,29 +7,30 @@ self.addEventListener("push", (event) => {
   }
 
   let title = "kojo";
-  let body = "Session event";
-  let tag = "kojo-session";
+  let body = "";
+  let tag = "kojo";
+  let navData = {};
 
-  if (data.type === "session_exit") {
-    title = `${data.tool} exited`;
-    const code = data.exitCode !== undefined && data.exitCode !== null ? data.exitCode : "?";
-    body = `Exit code: ${code}\n${data.workDir}`;
-    tag = `kojo-exit-${data.sessionId}`;
+  if (data.type === "agent_chat_done") {
+    title = data.name || "Agent";
+    body = data.preview || "Response ready";
+    tag = `kojo-agent-${data.agentId}`;
+    navData = { agentId: data.agentId };
   }
 
   event.waitUntil(
     self.registration.showNotification(title, {
       body,
       tag,
-      data: { sessionId: data.sessionId },
+      data: navData,
     })
   );
 });
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const sessionId = event.notification.data?.sessionId;
-  const url = sessionId ? `/session/${sessionId}` : "/";
+  const { agentId } = event.notification.data || {};
+  const url = agentId ? `/agents/${agentId}` : "/";
   event.waitUntil(
     clients.matchAll({ type: "window" }).then((windowClients) => {
       for (const client of windowClients) {

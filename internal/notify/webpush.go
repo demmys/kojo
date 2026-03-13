@@ -1,12 +1,14 @@
 package notify
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 
@@ -47,8 +49,9 @@ func (m *Manager) Subscribe(sub *webpush.Subscription) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	for _, existing := range m.subscriptions {
+	for i, existing := range m.subscriptions {
 		if existing.Endpoint == sub.Endpoint {
+			m.subscriptions[i] = sub
 			return
 		}
 	}
@@ -78,17 +81,39 @@ func (m *Manager) Send(payload []byte) {
 	copy(subs, m.subscriptions)
 	m.mu.Unlock()
 
+	var expired []string
+
 	for _, sub := range subs {
-		resp, err := webpush.SendNotification(payload, sub, &webpush.Options{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := webpush.SendNotificationWithContext(ctx, payload, sub, &webpush.Options{
 			VAPIDPublicKey:  m.vapidPublic,
 			VAPIDPrivateKey: m.vapidPrivate,
-			Subscriber:      "mailto:kojo@localhost",
+			Subscriber:      "kojo@localhost",
+			TTL:             86400, // 24 hours
+			Urgency:         webpush.UrgencyHigh,
 		})
+		cancel()
 		if err != nil {
-			m.logger.Debug("push send failed", "err", err)
+			m.logger.Warn("push send failed", "err", err)
 			continue
 		}
 		resp.Body.Close()
+
+		if resp.StatusCode == 410 || resp.StatusCode == 404 {
+			expired = append(expired, sub.Endpoint)
+			m.logger.Info("push subscription expired, removing", "status", resp.StatusCode)
+		} else if resp.StatusCode >= 400 {
+			ep := sub.Endpoint
+			if len(ep) > 50 {
+				ep = ep[:50] + "..."
+			}
+			m.logger.Warn("push send error", "status", resp.StatusCode, "endpoint", ep)
+		}
+	}
+
+	// remove expired subscriptions
+	for _, ep := range expired {
+		m.Unsubscribe(ep)
 	}
 }
 
@@ -99,12 +124,16 @@ func (m *Manager) loadOrGenerateVAPID() error {
 	data, err := os.ReadFile(path)
 	if err == nil {
 		var keys vapidKeys
-		if err := json.Unmarshal(data, &keys); err == nil && keys.PrivateKey != "" {
-			m.vapidPrivate = keys.PrivateKey
-			m.vapidPublic = keys.PublicKey
-			m.logger.Info("loaded VAPID keys")
-			return nil
+		if jsonErr := json.Unmarshal(data, &keys); jsonErr != nil {
+			return fmt.Errorf("corrupted VAPID key file %s: %w", path, jsonErr)
 		}
+		if keys.PrivateKey == "" || keys.PublicKey == "" {
+			return fmt.Errorf("incomplete VAPID key file %s: missing privateKey or publicKey", path)
+		}
+		m.vapidPrivate = keys.PrivateKey
+		m.vapidPublic = keys.PublicKey
+		m.logger.Info("loaded VAPID keys")
+		return nil
 	}
 
 	// generate new keys using webpush-go's GenerateVAPIDKeys

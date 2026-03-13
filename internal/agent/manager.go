@@ -48,6 +48,9 @@ type Manager struct {
 
 	// notifyPoller polls external notification sources.
 	notifyPoller *notifyPoller
+
+	// OnChatDone is called when an agent finishes its response.
+	OnChatDone func(agent *Agent, message *Message)
 }
 
 // NewManager creates a new agent manager.
@@ -781,6 +784,14 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// the terminal event, so synthesizeTerminal can find it.
 			if event.Type == "done" && event.Message != nil {
 				m.persistDoneEvent(agentID, event.Message)
+
+				if m.OnChatDone != nil && event.ErrorMessage == "" {
+					m.mu.Lock()
+					agCopy := *m.agents[agentID]
+					m.mu.Unlock()
+					msgCopy := *event.Message
+					go m.OnChatDone(&agCopy, &msgCopy)
+				}
 			}
 
 			// Persist process errors as system messages so they survive

@@ -257,8 +257,27 @@ func SummarizeWithCLI(tool string, persona string) (string, error) {
 	}
 }
 
-// loadGeminiAPIKey reads the API key from nanobanana credentials file.
+// globalCreds holds a reference to the credential store for API key lookups.
+// Set by SetGlobalCredentialStore during manager initialization.
+var globalCreds *CredentialStore
+
+// SetGlobalCredentialStore sets the package-level credential store reference.
+// Called once during Manager initialization.
+func SetGlobalCredentialStore(cs *CredentialStore) {
+	globalCreds = cs
+}
+
+// loadGeminiAPIKey loads the Gemini API key.
+// Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
 func loadGeminiAPIKey() (string, error) {
+	// 1. Try credential store (encrypted, set via Settings UI)
+	if globalCreds != nil {
+		if key, err := globalCreds.GetToken("gemini", "", "", "api_key"); err == nil && key != "" {
+			return key, nil
+		}
+	}
+
+	// 2. Fallback: nanobanana credentials file
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot get home dir: %w", err)
@@ -267,12 +286,12 @@ func loadGeminiAPIKey() (string, error) {
 	credPath := filepath.Join(home, ".config", "nanobanana", "credentials")
 	data, err := os.ReadFile(credPath)
 	if err != nil {
-		return "", fmt.Errorf("cannot read credentials at %s: %w", credPath, err)
+		return "", fmt.Errorf("gemini API key not configured (check Settings) and fallback failed: %w", err)
 	}
 
 	key := strings.TrimSpace(string(data))
 	if key == "" {
-		return "", fmt.Errorf("empty API key in %s", credPath)
+		return "", fmt.Errorf("gemini API key not configured (check Settings)")
 	}
 	return key, nil
 }

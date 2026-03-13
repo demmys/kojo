@@ -358,6 +358,21 @@ export const agentApi = {
     },
   },
 
+  apiKeys: {
+    get: (provider: string) =>
+      get<{ provider: string; configured: boolean }>(`/api/v1/api-keys/${provider}`),
+
+    set: (provider: string, apiKey: string) =>
+      put<{ ok: boolean }>(`/api/v1/api-keys/${provider}`, { apiKey }),
+
+    delete: async (provider: string) => {
+      const res = await fetch(`${BASE}/api/v1/api-keys/${provider}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    },
+  },
+
   notifySourceTypes: () =>
     get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
       (r) => r.types ?? [],

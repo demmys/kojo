@@ -59,6 +59,7 @@ func NewManager(logger *slog.Logger) *Manager {
 	if err != nil {
 		logger.Warn("failed to open credential store", "err", err)
 	}
+	SetGlobalCredentialStore(creds)
 
 	m := &Manager{
 		agents: make(map[string]*Agent),

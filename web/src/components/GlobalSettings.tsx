@@ -12,8 +12,19 @@ export function GlobalSettings() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
 
+  // API Keys state
+  const [geminiKeyConfigured, setGeminiKeyConfigured] = useState(false);
+  const [geminiHasFallback, setGeminiHasFallback] = useState(false);
+  const [editingGeminiKey, setEditingGeminiKey] = useState(false);
+  const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+
   useEffect(() => {
     agentApi.oauthClients.list().then(setClients).catch(() => {});
+    agentApi.apiKeys.get("gemini").then((r: { configured: boolean; hasFallback?: boolean }) => {
+      setGeminiKeyConfigured(r.configured);
+      setGeminiHasFallback(r.hasFallback ?? false);
+    }).catch(() => {});
   }, []);
 
   const handleSave = async (provider: string) => {
@@ -49,6 +60,34 @@ export function GlobalSettings() {
     }
   };
 
+  const handleSaveGeminiKey = async () => {
+    if (!geminiKeyInput.trim()) return;
+    setSavingKey(true);
+    setError("");
+    try {
+      await agentApi.apiKeys.set("gemini", geminiKeyInput.trim());
+      setGeminiKeyConfigured(true);
+      setEditingGeminiKey(false);
+      setGeminiKeyInput("");
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingKey(false);
+    }
+  };
+
+  const handleRemoveGeminiKey = async () => {
+    if (!confirm("Remove Gemini API key?")) return;
+    try {
+      await agentApi.apiKeys.delete("gemini");
+      setGeminiKeyConfigured(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const providerLabels: Record<string, string> = {
     gmail: "Google (Gmail)",
   };
@@ -66,6 +105,72 @@ export function GlobalSettings() {
       </header>
 
       <main className="p-4 space-y-5 max-w-md mx-auto">
+        {/* API Keys */}
+        <div>
+          <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-3">
+            API Keys
+          </h2>
+          <p className="text-xs text-neutral-600 mb-3">
+            Encrypted storage for API keys. Used for embedding and image generation.
+          </p>
+
+          <div className="p-3 bg-neutral-900 border border-neutral-800 rounded-lg mb-2">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Gemini API</div>
+                <div className="text-xs text-neutral-500 mt-0.5">
+                  {geminiKeyConfigured ? (
+                    <span className="text-emerald-500">Configured</span>
+                  ) : geminiHasFallback ? (
+                    <span className="text-amber-500">Using fallback</span>
+                  ) : (
+                    <span className="text-neutral-600">Not configured</span>
+                  )}
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    setEditingGeminiKey(!editingGeminiKey);
+                    setGeminiKeyInput("");
+                    setError("");
+                  }}
+                  className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs"
+                >
+                  {editingGeminiKey ? "Cancel" : geminiKeyConfigured ? "Update" : "Configure"}
+                </button>
+                {geminiKeyConfigured && (
+                  <button
+                    onClick={handleRemoveGeminiKey}
+                    className="text-neutral-600 hover:text-red-400 text-sm"
+                  >
+                    &times;
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {editingGeminiKey && (
+              <div className="mt-3 space-y-2 border-t border-neutral-800 pt-3">
+                <input
+                  type="password"
+                  value={geminiKeyInput}
+                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  placeholder="AIza..."
+                  className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
+                />
+                <button
+                  onClick={handleSaveGeminiKey}
+                  disabled={savingKey || !geminiKeyInput.trim()}
+                  className="w-full py-2 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+                >
+                  {savingKey ? "Saving..." : "Save"}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+
         {/* OAuth Clients */}
         <div>
           <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider mb-3">

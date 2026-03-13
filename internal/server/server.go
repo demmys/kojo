@@ -196,6 +196,11 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/oauth-clients/{provider}", s.handleSetOAuthClient)
 	mux.HandleFunc("DELETE /api/v1/oauth-clients/{provider}", s.handleDeleteOAuthClient)
 
+	// API keys
+	mux.HandleFunc("GET /api/v1/api-keys/{provider}", s.handleGetAPIKey)
+	mux.HandleFunc("PUT /api/v1/api-keys/{provider}", s.handleSetAPIKey)
+	mux.HandleFunc("DELETE /api/v1/api-keys/{provider}", s.handleDeleteAPIKey)
+
 	// Notify source types
 	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)
 

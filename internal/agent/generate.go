@@ -159,6 +159,7 @@ func GeneratePersona(currentPersona string, userPrompt string) (string, error) {
 - 性格の矛盾や弱点も含め、奥行きのあるキャラクターにする
 - 一人称、語尾、口癖、感情表現の癖など、口調を具体例付きで記述する
 - 行動パターン、価値観、好き嫌い、地雷なども含める
+- 職業や専門分野はユーザーが明示した場合のみ記述すること。指定がなければ付与しない
 
 ` + neutralToneRule + `
 
@@ -175,6 +176,7 @@ func GeneratePersona(currentPersona string, userPrompt string) (string, error) {
 ## 編集方針
 - 既存設定の良い部分は保持しつつ、要望に沿って加筆・修正する
 - より独創的で具体的な表現に改善できる箇所があれば積極的に磨く
+- 職業や専門分野はユーザーまたは既存設定で明示された場合のみ記述する。勝手に付与しないこと
 
 ## 出力形式
 マークダウン形式。改訂後のペルソナ設定全文のみ出力し、前置き・後書き・解説・差分説明は一切不要。
@@ -230,6 +232,7 @@ func SummarizePersona(persona string) (string, error) {
 const summarizePrompt = "以下のペルソナ設定を、核心的な性格・口調・行動パターンだけに絞って200文字以内で要約して。要約のみ出力。\n\n"
 
 const publicProfilePrompt = "以下のペルソナ設定から、他者に見せる簡潔な自己紹介文を100文字以内で生成して。" +
+	"職業や専門分野はペルソナで明示された場合のみ含め、なければ付与しないこと。" +
 	"内部設定（口調ルール、行動ルール等）は含めず、その人がどんな人物かだけを自然な文で。自己紹介文のみ出力。\n\n"
 
 // GeneratePublicProfile creates a short outward-facing description from a persona.

@@ -70,6 +70,7 @@ export interface AgentMessage {
 }
 
 export interface ToolUse {
+  id?: string;
   name: string;
   input: string;
   output: string;
@@ -123,6 +124,7 @@ export interface ChatEvent {
   type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error";
   status?: string;
   delta?: string;
+  toolUseId?: string;
   toolName?: string;
   toolInput?: string;
   toolOutput?: string;

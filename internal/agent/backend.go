@@ -44,7 +44,8 @@ func filterEnv(removePrefixes []string, agentID string) []string {
 }
 
 // matchToolOutput pairs a tool result with the most recent matching ToolUse
-// that has no output yet. It tries to match by ID first, then falls back to name.
+// that has no output yet. When a tool use ID is provided, only ID-based
+// matching is used to avoid mispairing parallel calls with the same name.
 func matchToolOutput(toolUses []ToolUse, id, name, output string) {
 	if id != "" {
 		for i := len(toolUses) - 1; i >= 0; i-- {
@@ -53,6 +54,7 @@ func matchToolOutput(toolUses []ToolUse, id, name, output string) {
 				return
 			}
 		}
+		return // ID was provided but not found; don't fall back to name
 	}
 	for i := len(toolUses) - 1; i >= 0; i-- {
 		if toolUses[i].Name == name && toolUses[i].Output == "" {

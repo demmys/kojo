@@ -292,13 +292,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 				switch params.Item.Type {
 				case "commandExecution":
-					input := truncate(params.Item.Command, 2000)
+					input := params.Item.Command
 					toolUses = append(toolUses, ToolUse{
 						ID:    params.Item.ID,
 						Name:  "shell",
 						Input: input,
 					})
-					if !send(ChatEvent{Type: "tool_use", ToolName: "shell", ToolInput: input}) {
+					if !send(ChatEvent{Type: "tool_use", ToolUseID: params.Item.ID, ToolName: "shell", ToolInput: input}) {
 						shutdown()
 						return
 					}
@@ -307,13 +307,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					if params.Item.Server != "" {
 						toolName = params.Item.Server + "/" + toolName
 					}
-					input := truncate(string(params.Item.Arguments), 2000)
+					input := string(params.Item.Arguments)
 					toolUses = append(toolUses, ToolUse{
 						ID:    params.Item.ID,
 						Name:  toolName,
 						Input: input,
 					})
-					if !send(ChatEvent{Type: "tool_use", ToolName: toolName, ToolInput: input}) {
+					if !send(ChatEvent{Type: "tool_use", ToolUseID: params.Item.ID, ToolName: toolName, ToolInput: input}) {
 						shutdown()
 						return
 					}
@@ -388,12 +388,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 				switch params.Item.Type {
 				case "commandExecution":
-					output := truncate(params.Item.AggregatedOutput, 2000)
+					output := params.Item.AggregatedOutput
 					if output == "" && params.Item.ExitCode != nil && *params.Item.ExitCode != 0 {
 						output = fmt.Sprintf("exit code: %d", *params.Item.ExitCode)
 					}
 					toolName := "shell"
-					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: params.Item.ID, ToolName: toolName, ToolOutput: output}) {
 						shutdown()
 						return
 					}
@@ -401,15 +401,15 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				case "mcpToolCall":
 					var output string
 					if params.Item.Error != nil {
-						output = truncate("error: "+params.Item.Error.Message, 2000)
+						output = "error: " + params.Item.Error.Message
 					} else if len(params.Item.Result) > 0 && string(params.Item.Result) != "null" {
-						output = truncate(string(params.Item.Result), 2000)
+						output = string(params.Item.Result)
 					}
 					toolName := params.Item.Tool
 					if params.Item.Server != "" {
 						toolName = params.Item.Server + "/" + toolName
 					}
-					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: params.Item.ID, ToolName: toolName, ToolOutput: output}) {
 						shutdown()
 						return
 					}
@@ -417,12 +417,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				case "dynamicToolCall":
 					var output string
 					if len(params.Item.ContentItems) > 0 && string(params.Item.ContentItems) != "null" {
-						output = truncate(string(params.Item.ContentItems), 2000)
+						output = string(params.Item.ContentItems)
 					} else if params.Item.Success != nil && !*params.Item.Success {
 						output = "failed"
 					}
 					toolName := params.Item.Tool
-					if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: params.Item.ID, ToolName: toolName, ToolOutput: output}) {
 						shutdown()
 						return
 					}

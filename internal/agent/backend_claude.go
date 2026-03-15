@@ -224,14 +224,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 			case "content_block_stop":
 				if currentToolName != "" {
-					input := truncate(currentToolInput.String(), 2000)
+					input := currentToolInput.String()
 					tu := ToolUse{
 						ID:    currentToolID,
 						Name:  currentToolName,
 						Input: input,
 					}
 					toolUses = append(toolUses, tu)
-					if !send(ChatEvent{Type: "tool_use", ToolName: currentToolName, ToolInput: input}) {
+					if !send(ChatEvent{Type: "tool_use", ToolUseID: currentToolID, ToolName: currentToolName, ToolInput: input}) {
 						cmd.Wait()
 						return
 					}
@@ -246,8 +246,8 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 					if block.Type == "tool_result" && block.ToolUseID != "" {
 						toolName := toolIDToName[block.ToolUseID]
 						if toolName != "" {
-							output := truncate(block.contentText(), 2000)
-							if !send(ChatEvent{Type: "tool_result", ToolName: toolName, ToolOutput: output}) {
+							output := block.contentText()
+							if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output}) {
 								cmd.Wait()
 								return
 							}
@@ -433,12 +433,6 @@ func (lw *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
 
 // claudeEncodePath encodes a directory path using Claude's project path scheme:
 // "/" (or separator), ".", "_" are all replaced with "-".

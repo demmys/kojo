@@ -43,6 +43,7 @@ type ChatEvent struct {
 	Type         string   `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error"
 	Status       string   `json:"status,omitempty"`
 	Delta        string   `json:"delta,omitempty"`
+	ToolUseID    string   `json:"toolUseId,omitempty"`
 	ToolName     string   `json:"toolName,omitempty"`
 	ToolInput    string   `json:"toolInput,omitempty"`
 	ToolOutput   string   `json:"toolOutput,omitempty"`

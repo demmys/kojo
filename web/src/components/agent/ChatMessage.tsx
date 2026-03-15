@@ -551,7 +551,7 @@ function CollapsedToolUses({ toolUses }: { toolUses: import("../../lib/agentApi"
       {expanded && (
         <div className="mt-1">
           {toolUses.map((tu, i) => (
-            <ToolUseCard key={i} toolUse={tu} defaultExpanded />
+            <ToolUseCard key={i} toolUse={tu} />
           ))}
         </div>
       )}
@@ -602,7 +602,7 @@ function ThinkingBlock({ text, streaming = false }: { text: string; streaming?: 
 interface StreamingMessageProps {
   text: string;
   thinking: string;
-  toolUses: Array<{ name: string; input: string; output: string | null }>;
+  toolUses: Array<{ id?: string; name: string; input: string; output: string | null }>;
   agentName: string;
   agentId: string;
   status: string;

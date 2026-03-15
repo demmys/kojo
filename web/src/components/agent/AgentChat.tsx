@@ -18,7 +18,7 @@ export function AgentChat() {
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [streamThinking, setStreamThinking] = useState("");
-  const [streamTools, setStreamTools] = useState<Array<{ name: string; input: string; output: string | null }>>([]);
+  const [streamTools, setStreamTools] = useState<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [hasMore, setHasMore] = useState(false);
@@ -32,12 +32,12 @@ export function AgentChat() {
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
   const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
-  const abortedContentRef = useRef<{ text: string; thinking: string; tools: Array<{ name: string; input: string; output: string | null }> } | null>(null);
+  const abortedContentRef = useRef<{ text: string; thinking: string; tools: Array<{ id: string; name: string; input: string; output: string | null }> } | null>(null);
   // Live refs for streaming content — updated synchronously in onEvent
   // so handleAbort always snapshots the latest data (React state lags).
   const liveStreamTextRef = useRef("");
   const liveStreamThinkingRef = useRef("");
-  const liveStreamToolsRef = useRef<Array<{ name: string; input: string; output: string | null }>>([]);
+  const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
 
   // Restore draft and textarea height on mount / id change
   useEffect(() => {
@@ -142,15 +142,17 @@ export function AgentChat() {
           break;
         case "tool_use":
           if (event.toolName) {
-            const tool = { name: event.toolName!, input: event.toolInput ?? "", output: null };
+            const tool = { id: event.toolUseId ?? "", name: event.toolName!, input: event.toolInput ?? "", output: null };
             liveStreamToolsRef.current = [...liveStreamToolsRef.current, tool];
             setStreamTools((prev) => [...prev, tool]);
           }
           break;
         case "tool_result": {
+          const matchById = (t: { id: string; name: string; output: string | null }) =>
+            event.toolUseId ? t.id === event.toolUseId : t.name === event.toolName && t.output === null;
           const liveTools = [...liveStreamToolsRef.current];
           for (let i = liveTools.length - 1; i >= 0; i--) {
-            if (liveTools[i].name === event.toolName && liveTools[i].output === null) {
+            if (matchById(liveTools[i])) {
               liveTools[i] = { ...liveTools[i], output: event.toolOutput ?? "" };
               break;
             }
@@ -159,7 +161,7 @@ export function AgentChat() {
           setStreamTools((prev) => {
             const copy = [...prev];
             for (let i = copy.length - 1; i >= 0; i--) {
-              if (copy[i].name === event.toolName && copy[i].output === null) {
+              if (matchById(copy[i])) {
                 copy[i] = { ...copy[i], output: event.toolOutput ?? "" };
                 break;
               }
@@ -193,7 +195,7 @@ export function AgentChat() {
                   content: abortSnapshot.text,
                   thinking: abortSnapshot.thinking || undefined,
                   toolUses: abortSnapshot.tools.length > 0
-                    ? abortSnapshot.tools.map((t: { name: string; input: string; output: string | null }) => ({ name: t.name, input: t.input, output: t.output ?? "" }))
+                    ? abortSnapshot.tools.map((t: { id: string; name: string; input: string; output: string | null }) => ({ id: t.id || undefined, name: t.name, input: t.input, output: t.output ?? "" }))
                     : undefined,
                   timestamp: localRFC3339(),
                 }];

@@ -138,10 +138,10 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				tu := ToolUse{
 					ID:    event.ToolID,
 					Name:  event.ToolName,
-					Input: truncate(string(paramsJSON), 2000),
+					Input: string(paramsJSON),
 				}
 				toolUses = append(toolUses, tu)
-				if !send(ChatEvent{Type: "tool_use", ToolName: event.ToolName, ToolInput: truncate(string(paramsJSON), 2000)}) {
+				if !send(ChatEvent{Type: "tool_use", ToolUseID: event.ToolID, ToolName: event.ToolName, ToolInput: string(paramsJSON)}) {
 					cmd.Wait()
 					return
 				}
@@ -151,11 +151,11 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				if event.Error.Message != "" {
 					output = "Error: " + event.Error.Message
 				}
-				if !send(ChatEvent{Type: "tool_result", ToolName: event.ToolName, ToolOutput: truncate(output, 2000)}) {
+				if !send(ChatEvent{Type: "tool_result", ToolUseID: event.ToolID, ToolName: event.ToolName, ToolOutput: output}) {
 					cmd.Wait()
 					return
 				}
-				matchToolOutput(toolUses, event.ToolID, "", truncate(output, 2000))
+				matchToolOutput(toolUses, event.ToolID, "", output)
 
 			case "result":
 				if event.Stats.OutputTokens > 0 {

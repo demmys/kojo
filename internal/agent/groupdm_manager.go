@@ -206,13 +206,24 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 }
 
 // Delete removes a group DM and its data.
-func (m *GroupDMManager) Delete(id string) error {
+// If notify is true, members are notified about the deletion before the group is removed.
+func (m *GroupDMManager) Delete(id string, notify bool) error {
 	m.mu.Lock()
-	_, ok := m.groups[id]
+	g, ok := m.groups[id]
 	if !ok {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrGroupNotFound, id)
 	}
+
+	// Collect members for notification before deleting
+	var members []GroupMember
+	var groupName string
+	if notify {
+		members = make([]GroupMember, len(g.Members))
+		copy(members, g.Members)
+		groupName = g.Name
+	}
+
 	delete(m.groups, id)
 	m.mu.Unlock()
 
@@ -221,8 +232,37 @@ func (m *GroupDMManager) Delete(id string) error {
 
 	os.RemoveAll(groupDir(id))
 	m.save()
-	m.logger.Info("group DM deleted", "id", id)
+	m.logger.Info("group DM deleted", "id", id, "notify", notify)
+
+	// Notify members after deletion
+	if notify {
+		for _, mem := range members {
+			go m.notifyGroupDeleted(mem.AgentID, id, groupName)
+		}
+	}
+
 	return nil
+}
+
+// notifyGroupDeleted sends a notification about group deletion to a member.
+func (m *GroupDMManager) notifyGroupDeleted(agentID, groupID, groupName string) {
+	notification := fmt.Sprintf(
+		"[Group DM: %s] This group has been deleted.",
+		groupName,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+	if err != nil {
+		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
+			m.logger.Warn("failed to notify agent about group deletion", "agent", agentID, "group", groupID, "err", err)
+		}
+		return
+	}
+	for range events {
+	}
 }
 
 // PostMessage posts a message to a group and optionally notifies other members.

@@ -75,7 +75,8 @@ export const groupdmApi = {
   leave: (id: string, agentId: string) =>
     del<{ ok: boolean }>(`/api/v1/groupdms/${id}/members/${agentId}`),
 
-  delete: (id: string) => del<{ ok: boolean }>(`/api/v1/groupdms/${id}`),
+  delete: (id: string, notify = false) =>
+    del<{ ok: boolean }>(`/api/v1/groupdms/${id}${notify ? "?notify=true" : ""}`),
 
   messages: (id: string, limit = 50, before?: string) => {
     const params = new URLSearchParams({ limit: String(limit) });

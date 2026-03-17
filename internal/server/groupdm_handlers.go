@@ -93,7 +93,8 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.groupdms.Delete(id); err != nil {
+	notify := r.URL.Query().Get("notify") == "true"
+	if err := s.groupdms.Delete(id, notify); err != nil {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
 	}

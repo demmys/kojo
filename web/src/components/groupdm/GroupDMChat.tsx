@@ -42,6 +42,16 @@ export function GroupDMChat() {
   const [notFound, setNotFound] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
   const [cooldownInput, setCooldownInput] = useState("");
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [deleteNotify, setDeleteNotify] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const deleteDialogRef = useRef<HTMLDivElement>(null);
+
+  // Focus delete dialog overlay for Escape key
+  useEffect(() => {
+    if (showDeleteDialog) deleteDialogRef.current?.focus();
+  }, [showDeleteDialog]);
 
   // Reset state when id changes
   useEffect(() => {
@@ -49,6 +59,9 @@ export function GroupDMChat() {
     setMessages([]);
     setHasMore(false);
     setNotFound(false);
+    setShowDeleteDialog(false);
+    setDeleteNotify(false);
+    setDeleteError("");
   }, [id]);
 
   // Load group info
@@ -219,15 +232,10 @@ export function GroupDMChat() {
           )}
         </div>
         <button
-          onClick={async () => {
-            if (confirm(`Delete group "${group.name}"?`)) {
-              try {
-                await groupdmApi.delete(group.id);
-                navigate("/");
-              } catch (e) {
-                console.error("Failed to delete group", e);
-              }
-            }
+          onClick={() => {
+            setDeleteNotify(false);
+            setDeleteError("");
+            setShowDeleteDialog(true);
           }}
           className="p-2 text-neutral-600 hover:text-red-400 rounded"
           title="Delete group"
@@ -287,6 +295,63 @@ export function GroupDMChat() {
           Read-only view &mdash; agents communicate via API
         </div>
       </div>
+
+      {/* Delete confirmation dialog */}
+      {showDeleteDialog && (
+        <div
+          ref={deleteDialogRef}
+          tabIndex={-1}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 outline-none"
+          onClick={(e) => { if (e.target === e.currentTarget && !deleting) setShowDeleteDialog(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape" && !deleting) setShowDeleteDialog(false); }}
+        >
+          <div className="bg-neutral-900 border border-neutral-700 rounded-lg p-5 w-80 shadow-xl">
+            <h3 className="text-sm font-medium text-neutral-200 mb-3">
+              Delete &ldquo;{group.name}&rdquo;?
+            </h3>
+            <label className="flex items-center gap-2 text-sm text-neutral-400 mb-4 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={deleteNotify}
+                onChange={(e) => setDeleteNotify(e.target.checked)}
+                disabled={deleting}
+                className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+              />
+              Notify members
+            </label>
+            {deleteError && (
+              <p className="text-xs text-red-400 mb-3">{deleteError}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowDeleteDialog(false)}
+                disabled={deleting}
+                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setDeleting(true);
+                  setDeleteError("");
+                  try {
+                    await groupdmApi.delete(group.id, deleteNotify);
+                    navigate("/");
+                  } catch (e) {
+                    setDeleteError(e instanceof Error ? e.message : "Failed to delete");
+                  } finally {
+                    setDeleting(false);
+                  }
+                }}
+                disabled={deleting}
+                className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50"
+              >
+                {deleting ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

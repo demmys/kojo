@@ -201,9 +201,9 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check active hours
-	var activeStart, activeEnd, agentTool string
+	var activeStart, activeEnd string
 	if a, ok := cs.mgr.Get(agentID); ok {
-		activeStart, activeEnd, agentTool = a.ActiveStart, a.ActiveEnd, a.Tool
+		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
 		if !IsWithinActiveHours(activeStart, activeEnd) {
 			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
 				"activeStart", activeStart, "activeEnd", activeEnd)
@@ -235,7 +235,4 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	cs.logger.Info("cron job completed", "agent", agentID)
-
-	// Run memory compaction synchronously within cron job lifecycle
-	maybeCompact(agentID, agentTool, cs.logger)
 }

@@ -17,35 +17,30 @@ const geminiModel = "gemini-2.5-flash"
 const geminiAPI = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
 
 // runClaude executes a prompt via claude CLI (stdin) and returns the output.
+// Uses --setting-sources user to ignore project-level CLAUDE.local.md (persona),
+// --system-prompt to enforce neutral output, and --tools "" to disable all tools.
 func runClaude(prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "claude", "-p")
+	cmd := exec.CommandContext(ctx, "claude", "-p",
+		"--setting-sources", "user",
+		"--system-prompt", "You are a helpful assistant. Follow the user's instructions exactly. Output only what is requested, with no preamble or commentary.",
+		"--tools", "",
+	)
 	cmd.Stdin = strings.NewReader(prompt)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("claude: %w", err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	return stripCodeFence(string(output)), nil
 }
 
-// runCodex executes a prompt via codex CLI (temp input file → -o output file).
+// runCodex executes a prompt via codex CLI (stdin → -o output file).
+// Uses -s read-only to prevent file modifications, reads prompt from stdin,
+// and runs in os.TempDir() to avoid picking up project-level config/docs.
 func runCodex(prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-
-	// Write prompt to temp file to avoid ARG_MAX and ps exposure
-	inFile, err := os.CreateTemp("", "kojo-prompt-*.txt")
-	if err != nil {
-		return "", err
-	}
-	inPath := inFile.Name()
-	defer os.Remove(inPath)
-	if _, err := inFile.WriteString(prompt); err != nil {
-		inFile.Close()
-		return "", err
-	}
-	inFile.Close()
 
 	outFile, err := os.CreateTemp("", "kojo-gen-*.txt")
 	if err != nil {
@@ -55,8 +50,13 @@ func runCodex(prompt string) (string, error) {
 	outFile.Close()
 	defer os.Remove(outPath)
 
-	cmd := exec.CommandContext(ctx, "codex", "exec", "--ephemeral", "--skip-git-repo-check",
-		"-o", outPath, fmt.Sprintf("Read %s and follow the instructions inside it exactly.", inPath))
+	cmd := exec.CommandContext(ctx, "codex", "exec",
+		"--ephemeral", "--skip-git-repo-check",
+		"-s", "read-only",
+		"-o", outPath,
+	)
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = strings.NewReader(prompt)
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("codex: %w", err)
 	}
@@ -64,21 +64,50 @@ func runCodex(prompt string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	return stripCodeFence(string(data)), nil
 }
 
 // runGemini executes a prompt via gemini CLI (stdin to -p) and returns the output.
+// Runs in os.TempDir() to avoid picking up project-level GEMINI.md or persona config.
 func runGemini(prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	// gemini -p requires a string arg; pass a short trigger and feed real prompt via stdin
 	cmd := exec.CommandContext(ctx, "gemini", "-p", "Follow the instructions from stdin.")
+	cmd.Dir = os.TempDir()
 	cmd.Stdin = strings.NewReader(prompt)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("gemini: %w", err)
 	}
-	return strings.TrimSpace(string(output)), nil
+	return stripCodeFence(string(output)), nil
+}
+
+// stripCodeFence removes a single outer markdown code fence that LLMs sometimes
+// wrap around output. Only strips when the entire content is enclosed in one
+// matching fence pair (``` ... ```). Returns original text otherwise.
+func stripCodeFence(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	// Must end with a closing fence on its own line
+	if !strings.HasSuffix(s, "```") {
+		return s
+	}
+	// Find end of opening fence line
+	i := strings.Index(s, "\n")
+	if i < 0 {
+		return s
+	}
+	// Extract inner content (between opening and closing fence)
+	inner := s[i+1 : len(s)-3]
+	// Verify there are no other top-level fence pairs inside
+	if strings.Contains(inner, "\n```") {
+		// Could be nested fences or multiple blocks — don't strip
+		return s
+	}
+	return strings.TrimSpace(inner)
 }
 
 type cliBackend struct {

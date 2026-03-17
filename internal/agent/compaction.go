@@ -103,29 +103,14 @@ func maybeCompact(agentID string, tool string, logger *slog.Logger) {
 		return
 	}
 
-	// Remove incorporated diary files only if unchanged since we read them
-	removed := 0
-	for _, d := range diaries {
-		curInfo, err := os.Stat(d.path)
-		if err != nil {
-			continue
-		}
-		if !curInfo.ModTime().Equal(d.mtime) {
-			logger.Debug("compaction: diary modified during compaction, keeping", "path", d.path)
-			continue
-		}
-		if err := os.Remove(d.path); err != nil {
-			logger.Warn("compaction: failed to remove diary", "path", d.path, "err", err)
-		} else {
-			removed++
-		}
-	}
+	// Diary files are intentionally kept after compaction.
+	// They serve as the authoritative source; MEMORY.md is a derived summary.
 
 	logger.Info("memory compacted",
 		"agent", agentID,
 		"beforeBytes", len(memory),
 		"afterBytes", len(compacted),
-		"diariesMerged", removed,
+		"diariesUsed", len(diaries),
 	)
 }
 

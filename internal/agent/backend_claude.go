@@ -7,6 +7,7 @@ import (
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -120,168 +121,12 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			}
 		}
 
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		result := parseClaudeStream(stdout, b.logger, send)
 
-		var fullText strings.Builder
-		var thinking strings.Builder
-		var lastAssistantText string
-		var streamSessionID string
-		var toolUses []ToolUse
-		var usage *Usage
-
-		// Tool use tracking for content_block_start/delta/stop flow
-		var currentToolName string
-		var currentToolID string
-		var currentToolInput strings.Builder
-		toolIDToName := make(map[string]string)
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				continue
-			}
-
-			var event claudeStreamEvent
-			if err := json.Unmarshal([]byte(line), &event); err != nil {
-				b.logger.Debug("failed to parse claude stream event", "err", err)
-				continue
-			}
-
-			// Unwrap stream_event wrapper emitted by --include-partial-messages.
-			// The inner "event" field contains the actual streaming event
-			// (content_block_start, content_block_delta, etc.).
-			if event.Type == "stream_event" && len(event.Event) > 0 {
-				var inner claudeStreamEvent
-				if err := json.Unmarshal(event.Event, &inner); err != nil {
-					b.logger.Debug("failed to parse inner stream event", "err", err)
-					continue
-				}
-				if inner.Type == "" {
-					continue
-				}
-				event = inner
-			}
-
-			switch event.Type {
-			case "system":
-				if !send(ChatEvent{Type: "status", Status: "thinking"}) {
-					cmd.Wait()
-					return
-				}
-
-			case "assistant":
-				// Extract text/thinking from content blocks as fallback when
-				// content_block_delta events are not emitted.
-				var atext strings.Builder
-				for _, block := range event.Message.Content {
-					switch block.Type {
-					case "text":
-						if block.Text != "" {
-							atext.WriteString(block.Text)
-						}
-					case "thinking":
-						if block.Thinking != "" && thinking.Len() == 0 {
-							thinking.WriteString(block.Thinking)
-						}
-					}
-				}
-				if atext.Len() > 0 {
-					lastAssistantText = atext.String()
-				}
-
-				if event.Message.StopReason != "" {
-					if event.Message.Usage.OutputTokens > 0 {
-						usage = &Usage{
-							InputTokens:  event.Message.Usage.InputTokens,
-							OutputTokens: event.Message.Usage.OutputTokens,
-						}
-					}
-				}
-
-			case "content_block_start":
-				if event.ContentBlock.Type == "tool_use" {
-					currentToolName = event.ContentBlock.Name
-					currentToolID = event.ContentBlock.ID
-					currentToolInput.Reset()
-					toolIDToName[currentToolID] = currentToolName
-				}
-
-			case "content_block_delta":
-				switch event.Delta.Type {
-				case "text_delta":
-					if event.Delta.Text != "" {
-						fullText.WriteString(event.Delta.Text)
-						if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
-							cmd.Wait()
-							return
-						}
-					}
-				case "thinking_delta":
-					if event.Delta.Thinking != "" {
-						thinking.WriteString(event.Delta.Thinking)
-						if !send(ChatEvent{Type: "thinking", Delta: event.Delta.Thinking}) {
-							cmd.Wait()
-							return
-						}
-					}
-				case "input_json_delta":
-					currentToolInput.WriteString(event.Delta.PartialJSON)
-				}
-
-			case "content_block_stop":
-				if currentToolName != "" {
-					input := currentToolInput.String()
-					tu := ToolUse{
-						ID:    currentToolID,
-						Name:  currentToolName,
-						Input: input,
-					}
-					toolUses = append(toolUses, tu)
-					if !send(ChatEvent{Type: "tool_use", ToolUseID: currentToolID, ToolName: currentToolName, ToolInput: input}) {
-						cmd.Wait()
-						return
-					}
-					currentToolName = ""
-					currentToolID = ""
-					currentToolInput.Reset()
-				}
-
-			case "user":
-				// Tool results arrive as user messages with tool_result content blocks.
-				for _, block := range event.Message.Content {
-					if block.Type == "tool_result" && block.ToolUseID != "" {
-						toolName := toolIDToName[block.ToolUseID]
-						if toolName != "" {
-							output := block.contentText()
-							if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output}) {
-								cmd.Wait()
-								return
-							}
-							matchToolOutput(toolUses, block.ToolUseID, toolName, output)
-						}
-					}
-				}
-
-			case "result":
-				if event.SessionID != "" {
-					streamSessionID = event.SessionID
-				}
-				if event.Result != "" {
-					if fullText.Len() == 0 {
-						fullText.WriteString(event.Result)
-						if !send(ChatEvent{Type: "text", Delta: event.Result}) {
-							cmd.Wait()
-							return
-						}
-					}
-				}
-			}
-		}
-
-		// Check for scanner errors
-		if err := scanner.Err(); err != nil {
-			b.logger.Warn("claude stream scanner error", "err", err)
+		// If stream was cancelled (send returned false), clean up process.
+		if result.cancelled {
+			cmd.Wait()
+			return
 		}
 
 		// Check process exit status
@@ -292,18 +137,18 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			if processError == "" {
 				processError = err.Error()
 			}
-			if fullText.Len() == 0 && lastAssistantText == "" && len(toolUses) == 0 {
+			if result.fullText == "" && result.lastAssistantText == "" && len(result.toolUses) == 0 {
 				send(ChatEvent{Type: "error", ErrorMessage: processError})
 				return
 			}
 		}
 
 		// Determine final text with fallback chain
-		finalText := fullText.String()
+		finalText := result.fullText
 
 		// Fallback: text extracted from assistant event content blocks
-		if finalText == "" && lastAssistantText != "" {
-			finalText = lastAssistantText
+		if finalText == "" && result.lastAssistantText != "" {
+			finalText = result.lastAssistantText
 			b.logger.Info("used assistant event text as fallback", "agent", agent.ID, "len", len(finalText))
 		}
 
@@ -311,7 +156,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// produced no usable text. Only used as fallback, never overrides
 		// text that was successfully captured from the stream.
 		if finalText == "" {
-			if sessionText := recoverFromSession(agent.ID, streamSessionID, b.logger); sessionText != "" {
+			if sessionText := recoverFromSession(agent.ID, result.streamSessionID, b.logger); sessionText != "" {
 				b.logger.Info("recovered text from session log",
 					"agent", agent.ID,
 					"sessionLen", len(sessionText))
@@ -320,20 +165,199 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		}
 
 		// Send recovered text if nothing was streamed to client
-		if finalText != "" && fullText.Len() == 0 {
+		if finalText != "" && result.fullText == "" {
 			send(ChatEvent{Type: "text", Delta: finalText})
 		}
 
 		msg := newAssistantMessage()
 		msg.Content = finalText
-		msg.Thinking = thinking.String()
-		msg.ToolUses = toolUses
-		msg.Usage = usage
+		msg.Thinking = result.thinking
+		msg.ToolUses = result.toolUses
+		msg.Usage = result.usage
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: processError})
+		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
 	}()
 
 	return ch, nil
+}
+
+// streamParseResult holds the accumulated state from parsing a Claude stream.
+type streamParseResult struct {
+	fullText          string
+	thinking          string
+	lastAssistantText string
+	streamSessionID   string
+	toolUses          []ToolUse
+	usage             *Usage
+	scannerErr        error
+	cancelled         bool // true if send returned false (context cancelled)
+}
+
+// parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
+// via the send callback. Returns the accumulated parse result.
+// If send returns false (channel full / context cancelled), parsing stops immediately.
+func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool) *streamParseResult {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	res := &streamParseResult{}
+	var fullText strings.Builder
+	var thinking strings.Builder
+	var toolUses []ToolUse
+
+	// Tool use tracking for content_block_start/delta/stop flow
+	var currentToolName string
+	var currentToolID string
+	var currentToolInput strings.Builder
+	toolIDToName := make(map[string]string)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var event claudeStreamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			logger.Debug("failed to parse claude stream event", "err", err)
+			continue
+		}
+
+		// Unwrap stream_event wrapper emitted by --include-partial-messages.
+		if event.Type == "stream_event" && len(event.Event) > 0 {
+			var inner claudeStreamEvent
+			if err := json.Unmarshal(event.Event, &inner); err != nil {
+				logger.Debug("failed to parse inner stream event", "err", err)
+				continue
+			}
+			if inner.Type == "" {
+				continue
+			}
+			event = inner
+		}
+
+		switch event.Type {
+		case "system":
+			if !send(ChatEvent{Type: "status", Status: "thinking"}) {
+				res.cancelled = true
+				return res
+			}
+
+		case "assistant":
+			var atext strings.Builder
+			for _, block := range event.Message.Content {
+				switch block.Type {
+				case "text":
+					if block.Text != "" {
+						atext.WriteString(block.Text)
+					}
+				case "thinking":
+					if block.Thinking != "" && thinking.Len() == 0 {
+						thinking.WriteString(block.Thinking)
+					}
+				}
+			}
+			if atext.Len() > 0 {
+				res.lastAssistantText = atext.String()
+			}
+
+			if event.Message.StopReason != "" {
+				if event.Message.Usage.OutputTokens > 0 {
+					res.usage = &Usage{
+						InputTokens:  event.Message.Usage.InputTokens,
+						OutputTokens: event.Message.Usage.OutputTokens,
+					}
+				}
+			}
+
+		case "content_block_start":
+			if event.ContentBlock.Type == "tool_use" {
+				currentToolName = event.ContentBlock.Name
+				currentToolID = event.ContentBlock.ID
+				currentToolInput.Reset()
+				toolIDToName[currentToolID] = currentToolName
+			}
+
+		case "content_block_delta":
+			switch event.Delta.Type {
+			case "text_delta":
+				if event.Delta.Text != "" {
+					fullText.WriteString(event.Delta.Text)
+					if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
+						res.cancelled = true
+						return res
+					}
+				}
+			case "thinking_delta":
+				if event.Delta.Thinking != "" {
+					thinking.WriteString(event.Delta.Thinking)
+					if !send(ChatEvent{Type: "thinking", Delta: event.Delta.Thinking}) {
+						res.cancelled = true
+						return res
+					}
+				}
+			case "input_json_delta":
+				currentToolInput.WriteString(event.Delta.PartialJSON)
+			}
+
+		case "content_block_stop":
+			if currentToolName != "" {
+				input := currentToolInput.String()
+				tu := ToolUse{
+					ID:    currentToolID,
+					Name:  currentToolName,
+					Input: input,
+				}
+				toolUses = append(toolUses, tu)
+				if !send(ChatEvent{Type: "tool_use", ToolUseID: currentToolID, ToolName: currentToolName, ToolInput: input}) {
+					res.cancelled = true
+					return res
+				}
+				currentToolName = ""
+				currentToolID = ""
+				currentToolInput.Reset()
+			}
+
+		case "user":
+			for _, block := range event.Message.Content {
+				if block.Type == "tool_result" && block.ToolUseID != "" {
+					toolName := toolIDToName[block.ToolUseID]
+					if toolName != "" {
+						output := block.contentText()
+						if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output}) {
+							res.cancelled = true
+							return res
+						}
+						matchToolOutput(toolUses, block.ToolUseID, toolName, output)
+					}
+				}
+			}
+
+		case "result":
+			if event.SessionID != "" {
+				res.streamSessionID = event.SessionID
+			}
+			if event.Result != "" {
+				if fullText.Len() == 0 {
+					fullText.WriteString(event.Result)
+					if !send(ChatEvent{Type: "text", Delta: event.Result}) {
+						res.cancelled = true
+						return res
+					}
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		logger.Warn("claude stream scanner error", "err", err)
+		res.scannerErr = err
+	}
+
+	res.fullText = fullText.String()
+	res.thinking = thinking.String()
+	res.toolUses = toolUses
+	return res
 }
 
 // Claude stream-json event types

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router";
-import { groupdmApi, type GroupDMInfo, type GroupMessage } from "../../lib/groupdmApi";
+import { groupdmApi, type GroupDMInfo, type GroupDMStyle, type GroupMessage } from "../../lib/groupdmApi";
 import { AgentAvatar } from "../agent/AgentAvatar";
 import { splitFilePaths, FileTextContent, MediaOverlay } from "../agent/ChatMessage";
 
@@ -189,6 +189,28 @@ export function GroupDMChat() {
             {group.members.map((m) => m.agentName).join(", ")}
           </div>
         </div>
+        {/* Style toggle */}
+        <button
+          onClick={async () => {
+            const cur = group.style || "efficient";
+            const next: GroupDMStyle = cur === "efficient" ? "expressive" : "efficient";
+            try {
+              const updated = await groupdmApi.setStyle(group.id, next);
+              setGroup(updated);
+            } catch (err) {
+              console.error("Failed to set style", err);
+            }
+          }}
+          className="shrink-0 text-sm text-neutral-600 hover:text-neutral-400 px-1.5 py-0.5 rounded"
+          aria-label={(group.style || "efficient") === "efficient"
+            ? "Token-saving mode (click to switch to expressive)"
+            : "Expressive mode (click to switch to efficient)"}
+          title={(group.style || "efficient") === "efficient"
+            ? "Token-saving mode (click to switch to expressive)"
+            : "Expressive mode (click to switch to efficient)"}
+        >
+          {(group.style || "efficient") === "efficient" ? "\u26A1" : "\uD83D\uDCAC"}
+        </button>
         {/* Cooldown setting */}
         <div className="shrink-0">
           {editingCooldown ? (

@@ -1,10 +1,13 @@
 import { get, post, del, patch } from "./httpClient";
 
+export type GroupDMStyle = "efficient" | "expressive";
+
 export interface GroupDMInfo {
   id: string;
   name: string;
   members: GroupMember[];
   cooldown: number; // notification cooldown in seconds (0 = default 50s)
+  style: GroupDMStyle; // communication style
   createdAt: string;
   updatedAt: string;
 }
@@ -36,6 +39,9 @@ export const groupdmApi = {
 
   setCooldown: (id: string, cooldown: number) =>
     patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { cooldown }),
+
+  setStyle: (id: string, style: GroupDMStyle) =>
+    patch<GroupDMInfo>(`/api/v1/groupdms/${id}`, { style }),
 
   addMember: (id: string, agentId: string, callerAgentId: string) =>
     post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),

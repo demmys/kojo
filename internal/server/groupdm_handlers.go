@@ -23,6 +23,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		Name      string   `json:"name"`
 		MemberIDs []string `json:"memberIds"`
 		Cooldown  int      `json:"cooldown"`
+		Style     string   `json:"style"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -32,7 +33,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "at least 2 members required")
 		return
 	}
-	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown)
+	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown, agent.GroupDMStyle(req.Style))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
@@ -56,10 +57,34 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		Name     string `json:"name"`
 		AgentID  string `json:"agentId"`
 		Cooldown *int   `json:"cooldown"`
+		Style    string `json:"style"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
+	}
+
+	// Validate all fields before applying any changes to avoid partial writes.
+	if req.Name == "" && req.Cooldown == nil && req.Style == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "name, cooldown, or style is required")
+		return
+	}
+	if req.Style != "" && !agent.ValidGroupDMStyles[agent.GroupDMStyle(req.Style)] {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"invalid style: must be \"efficient\" or \"expressive\"")
+		return
+	}
+	// Rename requires agentId (membership authorization).
+	if req.Name != "" && req.AgentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required for name changes")
+		return
+	}
+	// Preflight: verify group exists and caller is a member (for rename).
+	if req.AgentID != "" {
+		if err := s.groupdms.CheckMembership(id, req.AgentID); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
 	}
 
 	var result *agent.GroupDM
@@ -67,6 +92,16 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	// Update cooldown if provided
 	if req.Cooldown != nil {
 		g, err := s.groupdms.SetCooldown(id, *req.Cooldown)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		result = g
+	}
+
+	// Update style if provided
+	if req.Style != "" {
+		g, err := s.groupdms.SetStyle(id, agent.GroupDMStyle(req.Style), req.AgentID)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 			return
@@ -82,11 +117,6 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result = g
-	}
-
-	if result == nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "name or cooldown is required")
-		return
 	}
 	writeJSONResponse(w, http.StatusOK, result)
 }

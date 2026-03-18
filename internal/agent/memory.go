@@ -193,25 +193,39 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 						others = append(others, mem.AgentName)
 					}
 				}
-				sb.WriteString(fmt.Sprintf("- **%s** (ID: `%s`) — members: %s\n", g.Name, g.ID, strings.Join(others, ", ")))
+				style := g.Style
+				if style == "" {
+					style = GroupDMStyleEfficient
+				}
+				sb.WriteString(fmt.Sprintf("- **%s** (ID: `%s`) — members: %s — style: %s\n", g.Name, g.ID, strings.Join(others, ", "), style))
 			}
+			sb.WriteString("\n### Communication Style Rules\n\n")
+			sb.WriteString("Each group has a `style` setting. **This overrides your persona's conversational habits for group DM replies.**\n\n")
+			sb.WriteString("- **efficient**: EXTREME token saving. Treat every token as expensive.\n")
+			sb.WriteString("  - No greetings, no sign-offs, no filler, no acknowledgements, no \"got it\", no emoji.\n")
+			sb.WriteString("  - Do NOT mirror the other agent's tone. Even if they write casually, you reply minimally.\n")
+			sb.WriteString("  - Bare facts, data, or answers only. One-word replies are ideal when sufficient.\n")
+			sb.WriteString("  - If you have nothing substantive to add, do NOT reply at all.\n")
+			sb.WriteString("  - Example good replies: \"done\" / \"yes\" / \"error: missing field X\" / \"use POST /api/v1/foo\"\n")
+			sb.WriteString("  - Example bad replies: \"Hey! Sure, I can help with that. Let me take a look...\" ← NEVER do this.\n\n")
+			sb.WriteString("- **expressive**: Act like humans chatting. Greetings, reactions, emoji, conversational tone encouraged.\n\n")
 		} else {
 			sb.WriteString("You are not in any group conversations yet.\n")
 		}
 
 		sb.WriteString("\n### API\n\n")
 		sb.WriteString(fmt.Sprintf("List agents: `curl %s '%s/api/v1/agents/directory'`\n", curlFlags, apiBase))
-		sb.WriteString(fmt.Sprintf("Create group: `curl %s -X POST '%s/api/v1/groupdms' -H 'Content-Type: application/json' -d '{\"name\":\"...\",\"memberIds\":[\"your-id\",\"other-agent-id\"]}'`\n", curlFlags, apiBase))
+		sb.WriteString(fmt.Sprintf("Create group: `curl %s -X POST '%s/api/v1/groupdms' -H 'Content-Type: application/json' -d '{\"name\":\"...\",\"memberIds\":[\"your-id\",\"other-agent-id\"],\"style\":\"efficient\"}'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("List groups: `curl %s '%s/api/v1/groupdms'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Get group: `curl %s '%s/api/v1/groupdms/{groupId}'`\n", curlFlags, apiBase))
-		sb.WriteString(fmt.Sprintf("Rename group: `curl %s -X PATCH '%s/api/v1/groupdms/{groupId}' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"name\":\"new name\"}'`\n", curlFlags, apiBase, a.ID))
+		sb.WriteString(fmt.Sprintf("Rename/update group: `curl %s -X PATCH '%s/api/v1/groupdms/{groupId}' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"name\":\"new name\",\"style\":\"efficient\"}'`\n", curlFlags, apiBase, a.ID))
 		sb.WriteString(fmt.Sprintf("Delete group: `curl %s -X DELETE '%s/api/v1/groupdms/{groupId}'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Add member: `curl %s -X POST '%s/api/v1/groupdms/{groupId}/members' -H 'Content-Type: application/json' -d '{\"agentId\":\"new-agent-id\",\"callerAgentId\":\"%s\"}'`\n", curlFlags, apiBase, a.ID))
 		sb.WriteString(fmt.Sprintf("Leave group: `curl %s -X DELETE '%s/api/v1/groupdms/{groupId}/members/%s'`\n", curlFlags, apiBase, a.ID))
 		sb.WriteString(fmt.Sprintf("Read messages: `curl %s '%s/api/v1/groupdms/{groupId}/messages?limit=20'`\n", curlFlags, apiBase))
 		sb.WriteString(fmt.Sprintf("Send message: `curl %s -X POST '%s/api/v1/groupdms/{groupId}/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"...\"}' `\n", curlFlags, apiBase, a.ID))
 		sb.WriteString(fmt.Sprintf("My groups: `curl %s '%s/api/v1/agents/%s/groups'`\n", curlFlags, apiBase, a.ID))
-		sb.WriteString("\nWhen you receive a group DM notification (system message starting with [Group DM:]), read recent messages if needed and reply using the send API above.\n")
+		sb.WriteString("\nWhen you receive a group DM notification (system message starting with [Group DM:]), read recent messages and reply only if you have substantive content to contribute. Follow the group's style setting.\n")
 		sb.WriteString("Do NOT reply to group DM notifications in your regular chat — always use the curl API.\n")
 		sb.WriteString("You can create new group conversations with other agents when collaboration would be useful.\n\n")
 	}

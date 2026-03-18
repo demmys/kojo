@@ -82,7 +82,8 @@ func (m *GroupDMManager) APIBase() string {
 
 // Create creates a new group DM with the given members.
 // cooldown is the notification cooldown in seconds (0 = use default).
-func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int) (*GroupDM, error) {
+// style controls the communication style ("efficient" or "expressive"; empty = "efficient").
+func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, style GroupDMStyle) (*GroupDM, error) {
 	if len(memberIDs) < 2 {
 		return nil, ErrGroupTooFew
 	}
@@ -95,12 +96,20 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int) (
 		return nil, ErrGroupTooFew
 	}
 
+	if style == "" {
+		style = GroupDMStyleEfficient
+	}
+	if !ValidGroupDMStyles[style] {
+		return nil, fmt.Errorf("invalid style: %q (must be %q or %q)", style, GroupDMStyleEfficient, GroupDMStyleExpressive)
+	}
+
 	now := time.Now().Format(time.RFC3339)
 	g := &GroupDM{
 		ID:        generateGroupID(),
 		Name:      name,
 		Members:   members,
 		Cooldown:  clampCooldown(cooldown),
+		Style:     style,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -121,6 +130,22 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int) (
 	m.save()
 	m.logger.Info("group DM created", "id", g.ID, "name", g.Name)
 	return m.copyGroup(g), nil
+}
+
+// CheckMembership verifies that the group exists and the agent is a member.
+func (m *GroupDMManager) CheckMembership(groupID, agentID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.groups[groupID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	for _, mem := range g.Members {
+		if mem.AgentID == agentID {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, groupID)
 }
 
 // Get returns a group DM by ID.
@@ -370,6 +395,16 @@ func (m *GroupDMManager) groupCooldown(groupID string) time.Duration {
 	return defaultNotifyCooldown
 }
 
+// groupStyle returns the communication style for a group (defaults to efficient).
+func (m *GroupDMManager) groupStyle(groupID string) GroupDMStyle {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if g, ok := m.groups[groupID]; ok && g.Style != "" {
+		return g.Style
+	}
+	return GroupDMStyleEfficient
+}
+
 // clampCooldown validates and clamps cooldown to [0, maxCooldown].
 func clampCooldown(seconds int) int {
 	if seconds < 0 {
@@ -396,6 +431,43 @@ func (m *GroupDMManager) SetCooldown(id string, seconds int) (*GroupDM, error) {
 	m.mu.Unlock()
 	m.save()
 	m.logger.Info("group DM cooldown updated", "id", id, "cooldown", seconds)
+	return cp, nil
+}
+
+// SetStyle updates the communication style for a group. callerAgentID must be a member.
+// An empty callerAgentID skips the membership check (for admin/UI calls).
+func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID string) (*GroupDM, error) {
+	if style == "" {
+		style = GroupDMStyleEfficient
+	}
+	if !ValidGroupDMStyles[style] {
+		return nil, fmt.Errorf("invalid style: %q (must be %q or %q)", style, GroupDMStyleEfficient, GroupDMStyleExpressive)
+	}
+	m.mu.Lock()
+	g, ok := m.groups[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, id)
+	}
+	if callerAgentID != "" {
+		found := false
+		for _, mem := range g.Members {
+			if mem.AgentID == callerAgentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+	}
+	g.Style = style
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	cp := m.copyGroup(g)
+	m.mu.Unlock()
+	m.save()
+	m.logger.Info("group DM style updated", "id", id, "style", style)
 	return cp, nil
 }
 
@@ -508,11 +580,21 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	if strings.HasPrefix(apiBase, "https://") {
 		curlFlags = "-sk"
 	}
+	style := m.groupStyle(groupID)
+	var styleHint string
+	switch style {
+	case GroupDMStyleExpressive:
+		styleHint = "Style: expressive — reply naturally like a human chat."
+	default:
+		styleHint = "Style: efficient — EXTREME token saving. No greetings, no filler, no acknowledgements. Bare facts only. One-word replies preferred. Do NOT reply if you have nothing substantive to add."
+	}
 	notification := fmt.Sprintf(
 		"[Group DM: %s] New message from %s at %s.\n"+
+			"%s\n"+
 			"Read: curl %s '%s/api/v1/groupdms/%s/messages?limit=20'\n"+
 			"Reply: curl %s -X POST '%s/api/v1/groupdms/%s/messages' -H 'Content-Type: application/json' -d '{\"agentId\":\"%s\",\"content\":\"your reply\"}'",
 		groupName, senderName, msgTime,
+		styleHint,
 		curlFlags, apiBase, groupID,
 		curlFlags, apiBase, groupID, agentID,
 	)
@@ -850,6 +932,10 @@ func (m *GroupDMManager) load() {
 	for _, g := range groups {
 		g.CreatedAt = normalizeTimestamp(g.CreatedAt)
 		g.UpdatedAt = normalizeTimestamp(g.UpdatedAt)
+		// Normalize legacy groups that predate the style field.
+		if g.Style == "" || !ValidGroupDMStyles[g.Style] {
+			g.Style = GroupDMStyleEfficient
+		}
 		m.groups[g.ID] = g
 	}
 }

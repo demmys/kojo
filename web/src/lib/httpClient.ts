@@ -3,6 +3,9 @@ const BASE = "";
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, init);
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
   return res.json();
 }
 

@@ -189,8 +189,7 @@ type streamParseResult struct {
 	streamSessionID   string
 	toolUses          []ToolUse
 	usage             *Usage
-	scannerErr        error
-	cancelled         bool // true if send returned false (context cancelled)
+	cancelled bool // true if send returned false (context cancelled)
 }
 
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
@@ -351,7 +350,6 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 
 	if err := scanner.Err(); err != nil {
 		logger.Warn("claude stream scanner error", "err", err)
-		res.scannerErr = err
 	}
 
 	res.fullText = fullText.String()

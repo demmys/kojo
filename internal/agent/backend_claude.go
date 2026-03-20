@@ -86,7 +86,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 
-	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION"}, agent.ID)
+	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 	cmd.Dir = dir
 
 	// Pass user message via stdin to avoid option injection when the message

@@ -412,8 +412,9 @@ func TestMatchToolOutput_IDNotFound(t *testing.T) {
 func TestFilterEnv_RemovesPrefixes(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_TEST", "val1")
 	t.Setenv("AGENT_BROWSER_SESSION", "old")
+	t.Setenv("AGENT_BROWSER_COOKIE_DIR", "/old/path")
 
-	env := filterEnv([]string{"CLAUDE_CODE", "AGENT_BROWSER_SESSION"}, "ag_test")
+	env := filterEnv([]string{"CLAUDE_CODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, "ag_test", "/tmp/ag_test")
 
 	for _, e := range env {
 		if strings.HasPrefix(e, "CLAUDE_CODE_TEST=") {
@@ -421,15 +422,32 @@ func TestFilterEnv_RemovesPrefixes(t *testing.T) {
 		}
 	}
 
-	// Should have the new AGENT_BROWSER_SESSION
-	found := false
+	// Should have the new AGENT_BROWSER_SESSION, with old value filtered
+	sessionCount := 0
 	for _, e := range env {
+		if e == "AGENT_BROWSER_SESSION=old" {
+			t.Error("stale AGENT_BROWSER_SESSION=old should be filtered")
+		}
 		if e == "AGENT_BROWSER_SESSION=ag_test" {
-			found = true
+			sessionCount++
 		}
 	}
-	if !found {
-		t.Error("expected AGENT_BROWSER_SESSION=ag_test in env")
+	if sessionCount != 1 {
+		t.Errorf("expected exactly 1 AGENT_BROWSER_SESSION=ag_test, got %d", sessionCount)
+	}
+
+	// Should have AGENT_BROWSER_COOKIE_DIR set to dataDir, with old value filtered
+	cookieCount := 0
+	for _, e := range env {
+		if e == "AGENT_BROWSER_COOKIE_DIR=/old/path" {
+			t.Error("stale AGENT_BROWSER_COOKIE_DIR=/old/path should be filtered")
+		}
+		if e == "AGENT_BROWSER_COOKIE_DIR=/tmp/ag_test" {
+			cookieCount++
+		}
+	}
+	if cookieCount != 1 {
+		t.Errorf("expected exactly 1 AGENT_BROWSER_COOKIE_DIR=/tmp/ag_test, got %d", cookieCount)
 	}
 }
 

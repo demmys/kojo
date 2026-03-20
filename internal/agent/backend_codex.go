@@ -45,7 +45,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 	cmd := exec.CommandContext(ctx, codexPath, "app-server")
 	cmd.Dir = dir
-	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION"}, agent.ID)
+	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

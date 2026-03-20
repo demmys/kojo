@@ -69,7 +69,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		cmd.Stdin = strings.NewReader(systemPrompt + "\n\n---\n\n")
 	}
 
-	cmd.Env = filterEnv([]string{"GEMINI_CLI", "AGENT_BROWSER_SESSION"}, agent.ID)
+	cmd.Env = filterEnv([]string{"GEMINI_CLI", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

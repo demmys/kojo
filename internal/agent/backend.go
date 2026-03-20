@@ -20,8 +20,9 @@ type ChatBackend interface {
 }
 
 // filterEnv returns a copy of os.Environ() with entries matching any of the
-// given prefixes removed, and AGENT_BROWSER_SESSION vars set to agentID.
-func filterEnv(removePrefixes []string, agentID string) []string {
+// given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
+// vars set to agentID / dataDir.
+func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	env := os.Environ()
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
@@ -39,6 +40,7 @@ func filterEnv(removePrefixes []string, agentID string) []string {
 	filtered = append(filtered,
 		"AGENT_BROWSER_SESSION="+agentID,
 		"AGENT_BROWSER_SESSION_NAME="+agentID,
+		"AGENT_BROWSER_COOKIE_DIR="+dataDir,
 	)
 	return filtered
 }

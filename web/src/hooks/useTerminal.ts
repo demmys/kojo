@@ -44,6 +44,10 @@ export function useTerminal({
   const termRef = useRef<Terminal>(null);
   const fitRef = useRef<FitAddon>(null);
   const autoScrollRef = useRef(true);
+  // Tracks the user's intended viewport position (distance from bottom) when
+  // autoScroll is off. Used to restore position after xterm.js internally
+  // resets the viewport during data writes or buffer reflow.
+  const savedDeltaRef = useRef(0);
   const fitRafRef = useRef(0);
   const onResizeRef = useRef(onResize);
   onResizeRef.current = onResize;
@@ -145,13 +149,24 @@ export function useTerminal({
       }, 150);
     });
 
-    const onWriteParsedDisposable = term.onWriteParsed(() => {
-      if (autoScrollRef.current) term.scrollToBottom();
-    });
+    const restoreOrFollow = () => {
+      if (autoScrollRef.current) {
+        term.scrollToBottom();
+      } else if (savedDeltaRef.current >= 0) {
+        // xterm.js may internally move the viewport during writes / reflow.
+        // Restore the user's intended position (distance from bottom).
+        const buf = term.buffer.active;
+        const delta = Math.min(savedDeltaRef.current, buf.baseY);
+        const target = buf.baseY - delta;
+        if (buf.viewportY !== target) {
+          term.scrollToLine(target);
+        }
+      }
+    };
 
-    const onRenderDisposable = term.onRender(() => {
-      if (autoScrollRef.current) term.scrollToBottom();
-    });
+    const onWriteParsedDisposable = term.onWriteParsed(restoreOrFollow);
+
+    const onRenderDisposable = term.onRender(restoreOrFollow);
 
     const ro = new ResizeObserver(() => safeFit());
     ro.observe(containerRef.current);
@@ -162,11 +177,20 @@ export function useTerminal({
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) {
         autoScrollRef.current = false;
+        savedDeltaRef.current = -1; // pending until xterm processes wheel
+        requestAnimationFrame(() => {
+          if (!autoScrollRef.current) {
+            const buf = term.buffer.active;
+            savedDeltaRef.current = buf.baseY - buf.viewportY;
+          }
+        });
       } else if (e.deltaY > 0) {
         requestAnimationFrame(() => {
           const buf = term.buffer.active;
           if (buf.baseY - buf.viewportY <= 3) {
             autoScrollRef.current = true;
+          } else if (!autoScrollRef.current) {
+            savedDeltaRef.current = buf.baseY - buf.viewportY;
           }
         });
       }
@@ -224,6 +248,9 @@ export function useTerminal({
           } else {
             autoScrollRef.current = false;
             term.scrollLines(lines);
+            // scrollLines is synchronous — capture delta immediately
+            const buf = term.buffer.active;
+            savedDeltaRef.current = buf.baseY - buf.viewportY;
           }
         }
         accumDelta -= lines * lineHeight;

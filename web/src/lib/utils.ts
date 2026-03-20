@@ -9,6 +9,9 @@ export function restoreScrollback(
   data: Uint8Array,
   autoScrollRef: React.RefObject<boolean>,
 ): void {
+  // Set autoScroll=true BEFORE reset so restoreOrFollow in useTerminal
+  // doesn't try to restore a stale savedDelta during the write.
+  autoScrollRef.current = true;
   const el = term.element;
   if (el) el.style.visibility = "hidden";
   term.reset();

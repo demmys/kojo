@@ -32,7 +32,10 @@ export function AgentChat() {
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
   const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
-  const abortedContentRef = useRef<{ text: string; thinking: string; tools: Array<{ id: string; name: string; input: string; output: string | null }> } | null>(null);
+  // ID of the synthetic abort message committed by handleAbort.
+  // When the server's "done" arrives later, the aborted message can be
+  // upgraded to the server's (potentially more complete) version.
+  const abortedIdRef = useRef<string | null>(null);
   // Live refs for streaming content — updated synchronously in onEvent
   // so handleAbort always snapshots the latest data (React state lags).
   const liveStreamTextRef = useRef("");
@@ -55,7 +58,7 @@ export function AgentChat() {
   // Load agent and initial messages
   useEffect(() => {
     if (!id) return;
-    abortedContentRef.current = null; // Clear stale abort snapshot on agent change
+    abortedIdRef.current = null; // Clear stale abort state on agent change
     agentApi.get(id).then(setAgent).catch(() => navigate("/agents"));
     agentApi.messages(id, PAGE_SIZE).then((r) => {
       setMessages(r.messages);
@@ -171,37 +174,22 @@ export function AgentChat() {
           break;
         }
         case "done": {
-          // Capture and clear abort snapshot before any branching
-          const abortSnapshot = abortedContentRef.current;
-          abortedContentRef.current = null;
+          const abortedId = abortedIdRef.current;
+          abortedIdRef.current = null;
 
-          if (abortSnapshot) {
-            // User aborted — commit the best available content.
-            // The server may return a stale/duplicate message (e.g.
-            // synthesizeTerminal returning the previous assistant message
-            // when the current one wasn't persisted due to race conditions).
-            // Check inside the updater where prev is the latest state.
-            const snapshotHasContent = abortSnapshot.text || abortSnapshot.thinking || abortSnapshot.tools.length > 0;
-            setMessages((prev) => {
-              // If server provided a NEW message, prefer it (more complete)
-              if (event.message && !prev.some((m) => m.id === event.message!.id)) {
-                return [...prev, event.message!];
-              }
-              // Otherwise, commit abort snapshot (partial content the user saw)
-              if (snapshotHasContent) {
-                return [...prev, {
-                  id: "aborted_" + Date.now(),
-                  role: "assistant" as const,
-                  content: abortSnapshot.text,
-                  thinking: abortSnapshot.thinking || undefined,
-                  toolUses: abortSnapshot.tools.length > 0
-                    ? abortSnapshot.tools.map((t: { id: string; name: string; input: string; output: string | null }) => ({ id: t.id || undefined, name: t.name, input: t.input, output: t.output ?? "" }))
-                    : undefined,
-                  timestamp: localRFC3339(),
-                }];
-              }
-              return prev;
-            });
+          if (abortedId) {
+            // Abort message was already committed by handleAbort.
+            // If the server delivered a more complete version, upgrade it.
+            if (event.message) {
+              setMessages((prev) => {
+                // If server's message already exists (e.g. stale synthesized
+                // terminal from a prior turn), just remove the synthetic abort.
+                if (prev.some((m) => m.id === event.message!.id && m.id !== abortedId)) {
+                  return prev.filter((m) => m.id !== abortedId);
+                }
+                return prev.map((m) => m.id === abortedId ? event.message! : m);
+              });
+            }
           } else if (event.message) {
             // Normal completion — deduplicate by message ID
             setMessages((prev) =>
@@ -243,7 +231,7 @@ export function AgentChat() {
           break;
         }
         case "error": {
-          abortedContentRef.current = null; // Clear on every terminal path
+          abortedIdRef.current = null; // Clear on every terminal path
           const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
           setMessages((prev) => {
             // Skip if already shown (e.g. loaded from transcript on reconnect)
@@ -270,9 +258,7 @@ export function AgentChat() {
   );
 
   const onDisconnect = useCallback(() => {
-    // Don't clear abortedContentRef here — if the socket drops after
-    // handleAbort() but before the terminal "done" arrives, the snapshot
-    // must survive the reconnect cycle.
+    abortedIdRef.current = null; // Finalize pending abort — "done" won't arrive on this connection
     resetStream();
   }, [resetStream]);
 
@@ -283,14 +269,31 @@ export function AgentChat() {
   });
 
   const handleAbort = useCallback(() => {
-    // Snapshot live refs (sync with onEvent, not async React state)
-    abortedContentRef.current = {
-      text: liveStreamTextRef.current,
-      thinking: liveStreamThinkingRef.current,
-      tools: liveStreamToolsRef.current,
-    };
+    // Commit partial content immediately so it survives even if the
+    // server's "done" event is lost (e.g. WebSocket disconnect).
+    const text = liveStreamTextRef.current;
+    const thinking = liveStreamThinkingRef.current;
+    const tools = liveStreamToolsRef.current;
+    const hasContent = text || thinking || tools.length > 0;
+
+    if (hasContent) {
+      const syntheticId = "aborted_" + Date.now();
+      abortedIdRef.current = syntheticId;
+      setMessages((prev) => [...prev, {
+        id: syntheticId,
+        role: "assistant" as const,
+        content: text,
+        thinking: thinking || undefined,
+        toolUses: tools.length > 0
+          ? tools.map((t) => ({ id: t.id || undefined, name: t.name, input: t.input, output: t.output ?? "" }))
+          : undefined,
+        timestamp: localRFC3339(),
+      }]);
+    }
+
+    resetStream();
     abort();
-  }, [abort]);
+  }, [abort, resetStream]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -331,7 +334,7 @@ export function AgentChat() {
   const handleSend = () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
-    abortedContentRef.current = null; // Clear any stale abort snapshot
+    abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
     const userMsg: AgentMessage = {

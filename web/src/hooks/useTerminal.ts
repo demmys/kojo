@@ -53,15 +53,24 @@ export function useTerminal({
     const fit = fitRef.current;
     const el = containerRef.current;
     if (!term || !fit || !el) return;
+    // Save scroll position before fit() which can reflow the buffer
+    const buf = term.buffer.active;
+    const deltaFromBottom = buf.baseY - buf.viewportY;
     // fit() needs the element visible to measure; skip if hidden
-    if (el.offsetParent) {
+    const visible = el.offsetParent && getComputedStyle(el).visibility !== "hidden";
+    if (visible) {
       fit.fit();
     }
     // Always send current dimensions so the server gets a resize on connect,
     // even if the terminal tab is hidden (uses last known cols/rows).
     onResizeRef.current(term.cols, term.rows);
+    if (!visible) return;
     if (autoScrollRef.current) {
       term.scrollToBottom();
+    } else {
+      // Restore relative scroll position after reflow
+      const target = term.buffer.active.baseY - deltaFromBottom;
+      term.scrollToLine(Math.max(0, target));
     }
   }, [containerRef]);
 
@@ -76,11 +85,17 @@ export function useTerminal({
     fitRafRef.current = requestAnimationFrame(() => {
       if (!termRef.current || !fitRef.current) return;
       const el2 = containerRef.current;
-      if (!el2 || !el2.offsetParent) return;
+      if (!el2 || !el2.offsetParent || getComputedStyle(el2).visibility === "hidden") return;
+      // Save scroll position before fit() which can reflow the buffer
+      const buf = termRef.current.buffer.active;
+      const delta = buf.baseY - buf.viewportY;
       fitRef.current.fit();
       onResizeRef.current(termRef.current.cols, termRef.current.rows);
       if (autoScrollRef.current) {
         termRef.current.scrollToBottom();
+      } else {
+        const target = termRef.current.buffer.active.baseY - delta;
+        termRef.current.scrollToLine(Math.max(0, target));
       }
     });
   }, [containerRef]);

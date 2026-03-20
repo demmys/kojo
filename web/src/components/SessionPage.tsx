@@ -302,7 +302,10 @@ export function SessionPage() {
         {/* CLI / exited terminal — visible when cli tab or exited */}
         <div
           className="absolute inset-0 flex flex-col"
-          style={{ display: (exited || activeTab === "cli") ? "" : "none" }}
+          inert={(exited || activeTab === "cli") ? undefined : true}
+          style={{
+            visibility: (exited || activeTab === "cli") ? "visible" : "hidden",
+          }}
         >
           <div className="relative flex-1 min-h-0">
             <div ref={termContainerRef} className="absolute inset-0" style={{ touchAction: "none" }} />
@@ -366,7 +369,10 @@ export function SessionPage() {
           <>
             <div
               className="absolute inset-0"
-              style={{ display: activeTab === "terminal" ? "" : "none" }}
+              inert={activeTab === "terminal" ? undefined : true}
+              style={{
+                visibility: activeTab === "terminal" ? "visible" : "hidden",
+              }}
             >
               <TerminalTab
                 parentSessionId={id!}
@@ -376,19 +382,28 @@ export function SessionPage() {
             </div>
             <div
               className="absolute inset-0 overflow-y-auto"
-              style={{ display: activeTab === "files" ? "" : "none" }}
+              inert={activeTab === "files" ? undefined : true}
+              style={{
+                visibility: activeTab === "files" ? "visible" : "hidden",
+              }}
             >
               <FileBrowser embedded initialPath={session?.workDir} />
             </div>
             <div
               className="absolute inset-0"
-              style={{ display: activeTab === "git" ? "" : "none" }}
+              inert={activeTab === "git" ? undefined : true}
+              style={{
+                visibility: activeTab === "git" ? "visible" : "hidden",
+              }}
             >
               <GitPanel embedded workDir={session?.workDir} />
             </div>
             <div
               className="absolute inset-0"
-              style={{ display: activeTab === "attachments" ? "" : "none" }}
+              inert={activeTab === "attachments" ? undefined : true}
+              style={{
+                visibility: activeTab === "attachments" ? "visible" : "hidden",
+              }}
             >
               <AttachmentsTab
                 sessionId={id!}

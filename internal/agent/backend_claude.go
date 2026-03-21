@@ -38,58 +38,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("claude not found in PATH")
 	}
 
-	args := []string{
-		"-p",
-		"--output-format", "stream-json",
-		"--verbose",
-		"--include-partial-messages",
-		"--dangerously-skip-permissions",
-	}
-
-	if systemPrompt != "" {
-		args = append(args, "--system-prompt", systemPrompt)
-	}
-
-	if agent.Model != "" {
-		args = append(args, "--model", agent.Model)
-	}
-
-	if agent.Effort != "" {
-		args = append(args, "--effort", agent.Effort)
-	}
-
-	// Use --continue for conversation continuity when a session already exists
-	// in the agent's working directory. Otherwise use --session-id to create
-	// a new session with a deterministic UUID derived from the agent ID.
 	dir := agentDir(agent.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	// Remove CLAUDE.local.md to prevent persona autoload hook from
-	// overriding --system-prompt. The .claude/settings.local.json
-	// (including persona override + PreCompact hook) is written by
-	// Manager.Chat via PrepareClaudeSettings before this method runs.
-	if err := os.Remove(filepath.Join(dir, "CLAUDE.local.md")); err != nil && !os.IsNotExist(err) {
-		b.logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
-	}
-
-	if hasExistingSession(dir) {
-		if memoryModifiedSinceSession(dir) {
-			b.logger.Info("memory modified since last session, resetting Claude session", "agent", agent.ID)
-			clearClaudeSession(agent.ID)
-			sessionID := agentIDToUUID(agent.ID)
-			args = append(args, "--session-id", sessionID)
-		} else {
-			args = append(args, "--continue")
-		}
-	} else {
-		sessionID := agentIDToUUID(agent.ID)
-		args = append(args, "--session-id", sessionID)
-	}
+	args := b.buildClaudeArgs(agent, systemPrompt, dir)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
-
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 	cmd.Dir = dir
 
@@ -183,6 +139,47 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}()
 
 	return ch, nil
+}
+
+// buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string) []string {
+	args := []string{
+		"-p",
+		"--output-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
+		"--dangerously-skip-permissions",
+	}
+
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
+	}
+	if agent.Model != "" {
+		args = append(args, "--model", agent.Model)
+	}
+	if agent.Effort != "" {
+		args = append(args, "--effort", agent.Effort)
+	}
+
+	// Remove CLAUDE.local.md to prevent persona autoload hook from
+	// overriding --system-prompt.
+	if err := os.Remove(filepath.Join(dir, "CLAUDE.local.md")); err != nil && !os.IsNotExist(err) {
+		b.logger.Warn("failed to remove CLAUDE.local.md from agent dir", "dir", dir, "err", err)
+	}
+
+	if hasExistingSession(dir) {
+		if memoryModifiedSinceSession(dir) {
+			b.logger.Info("memory modified since last session, resetting Claude session", "agent", agent.ID)
+			clearClaudeSession(agent.ID)
+			args = append(args, "--session-id", agentIDToUUID(agent.ID))
+		} else {
+			args = append(args, "--continue")
+		}
+	} else {
+		args = append(args, "--session-id", agentIDToUUID(agent.ID))
+	}
+
+	return args
 }
 
 // streamParseResult holds the accumulated state from parsing a Claude stream.

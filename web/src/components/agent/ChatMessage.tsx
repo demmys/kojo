@@ -3,6 +3,7 @@ import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { formatSize } from "../../lib/utils";
 
 // File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
@@ -115,7 +116,7 @@ function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAtta
                 <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
               </svg>
               <span className="max-w-[150px] truncate">{att.name}</span>
-              <span className="opacity-50">{formatFileSize(att.size)}</span>
+              <span className="opacity-50">{formatSize(att.size)}</span>
             </div>
           );
         })}
@@ -127,11 +128,6 @@ function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAtta
   );
 }
 
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes}B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
 
 /** Clickable file path chip with hover tooltip */
 function FilePathChip({
@@ -155,7 +151,7 @@ function FilePathChip({
     fetch(rawUrl, { method: "HEAD" })
       .then((res) => {
         const len = res.headers.get("content-length");
-        setFileSize(len ? formatFileSize(Number(len)) : "—");
+        setFileSize(len ? formatSize(Number(len)) : "—");
       })
       .catch(() => setFileSize("—"));
   }, [hover, fileType, rawUrl]);

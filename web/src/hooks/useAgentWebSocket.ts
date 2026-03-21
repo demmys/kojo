@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import type { AgentMessageAttachment, ChatEvent } from "../lib/agentApi";
+import { wsUrl } from "../lib/utils";
 
 interface UseAgentWebSocketOptions {
   agentId: string;
@@ -29,9 +30,7 @@ export function useAgentWebSocket({
   const connect = useCallback(() => {
     if (!activeRef.current) return;
 
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/api/v1/agents/${agentId}/ws`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(wsUrl(`/api/v1/agents/${agentId}/ws`));
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return;

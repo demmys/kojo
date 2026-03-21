@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
-import { toBase64, base64ToBytes, restoreScrollback } from "../lib/utils";
+import { toBase64, base64ToBytes, restoreScrollback, wsUrl } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import { useTerminal } from "../hooks/useTerminal";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
@@ -79,9 +79,7 @@ export function TerminalTab({ parentSessionId, workDir, visible }: TerminalTabPr
     outputBufRef.current?.clear();
     outputBufRef.current = createOutputBuffer((data) => term.write(data));
 
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/api/v1/ws?session=${tmuxSessionId}`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(wsUrl(`/api/v1/ws?session=${tmuxSessionId}`));
 
     ws.onmessage = (evt) => {
       let msg: { type: string; data?: string; exitCode?: number; live?: boolean };

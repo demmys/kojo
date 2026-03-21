@@ -1,5 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from "react";
-import { toBase64, base64ToBytes } from "../lib/utils";
+import { toBase64, base64ToBytes, wsUrl } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import type { Attachment } from "../lib/api";
 
@@ -41,9 +41,7 @@ export function useWebSocket({ sessionId, onOutput, onScrollback, onExit, onYolo
   const connect = useCallback(() => {
     if (!activeRef.current) return;
 
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/api/v1/ws?session=${sessionId}`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(wsUrl(`/api/v1/ws?session=${sessionId}`));
 
     ws.onopen = () => {
       if (wsRef.current !== ws) return; // stale connection

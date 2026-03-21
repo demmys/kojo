@@ -212,14 +212,22 @@ export function SessionPage() {
 
   const handleStop = async () => {
     if (!id) return;
-    await api.sessions.delete(id);
-    setExited(true);
+    try {
+      await api.sessions.delete(id);
+      setExited(true);
+    } catch (err) {
+      console.error("failed to stop session", err);
+    }
   };
 
   const handleYoloToggle = async () => {
     if (!id || !session) return;
-    const updated = await api.sessions.patch(id, { yoloMode: !session.yoloMode });
-    setSession(updated);
+    try {
+      const updated = await api.sessions.patch(id, { yoloMode: !session.yoloMode });
+      setSession(updated);
+    } catch (err) {
+      console.error("failed to toggle yolo mode", err);
+    }
   };
 
   const handleFileAttach = async () => {

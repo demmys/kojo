@@ -45,6 +45,12 @@ export function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Build a WebSocket URL from an API path (e.g. "/api/v1/ws?session=abc"). */
+export function wsUrl(path: string): string {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}${path}`;
+}
+
 /** Format a Date as RFC3339 with local timezone offset (e.g. +09:00). */
 export function localRFC3339(d: Date = new Date()): string {
   const off = -d.getTimezoneOffset();

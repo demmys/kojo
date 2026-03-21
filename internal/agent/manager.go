@@ -95,7 +95,8 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger.Warn("failed to load agents", "err", err)
 	}
 	for _, a := range agents {
-		applyAvatarMeta(a)
+		has, hash := avatarMeta(a.ID)
+		applyAvatarMeta(a, has, hash)
 		// Load last message preview
 		if msgs, err := loadMessages(a.ID, 1); err == nil && len(msgs) > 0 {
 			last := msgs[len(msgs)-1]
@@ -204,7 +205,8 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	applyAvatarMeta(a)
+	has, hash := avatarMeta(a.ID)
+	applyAvatarMeta(a, has, hash)
 
 	m.mu.Lock()
 	m.agents[a.ID] = a
@@ -294,13 +296,14 @@ func (m *Manager) syncPersona(agentID string) {
 // Get returns a deep copy of an agent by ID.
 func (m *Manager) Get(id string) (*Agent, bool) {
 	m.syncPersona(id)
+	has, hash := avatarMeta(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.agents[id]
 	if !ok {
 		return nil, false
 	}
-	applyAvatarMeta(a)
+	applyAvatarMeta(a, has, hash)
 	return copyAgent(a), true
 }
 
@@ -318,11 +321,21 @@ func (m *Manager) List() []*Agent {
 		m.syncPersona(id)
 	}
 
+	// Pre-fetch avatar info outside lock (disk I/O)
+	type avInfo struct{ has bool; hash string }
+	avMap := make(map[string]avInfo, len(ids))
+	for _, id := range ids {
+		has, hash := avatarMeta(id)
+		avMap[id] = avInfo{has, hash}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	list := make([]*Agent, 0, len(m.agents))
 	for _, a := range m.agents {
-		applyAvatarMeta(a)
+		if info, ok := avMap[a.ID]; ok {
+			applyAvatarMeta(a, info.has, info.hash)
+		}
 		list = append(list, copyAgent(a))
 	}
 	return list
@@ -411,6 +424,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		}
 	}
 
+	// Pre-fetch avatar info outside lock (disk I/O)
+	avHas, avHash := avatarMeta(id)
+
 	m.mu.Lock()
 	// Re-check: agent may have been deleted concurrently
 	a, ok = m.agents[id]
@@ -489,7 +505,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
-	applyAvatarMeta(a)
+	applyAvatarMeta(a, avHas, avHash)
 
 	needsRegen := resolvePublicProfile(a, cfg, oldPersona)
 

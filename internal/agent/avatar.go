@@ -45,10 +45,10 @@ func avatarMeta(agentID string) (exists bool, hash string) {
 	return true, fmt.Sprintf("%x", fi.ModTime().UnixNano())
 }
 
-// applyAvatarMeta sets HasAvatar and AvatarHash on the agent.
+// applyAvatarMeta sets HasAvatar and AvatarHash on the agent from pre-fetched values.
 // Falls back to UpdatedAt as hash when no avatar exists.
-func applyAvatarMeta(a *Agent) {
-	has, hash := avatarMeta(a.ID)
+// Call avatarMeta(id) outside any lock to get has/hash, then apply under lock.
+func applyAvatarMeta(a *Agent, has bool, hash string) {
 	a.HasAvatar = has
 	a.AvatarHash = hash
 	if !has {

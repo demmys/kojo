@@ -68,7 +68,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"},
+		OriginPatterns: wsOriginPatterns,
 	})
 	if err != nil {
 		s.logger.Error("websocket accept failed", "err", err)

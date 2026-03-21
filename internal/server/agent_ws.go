@@ -35,7 +35,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"},
+		OriginPatterns: wsOriginPatterns,
 	})
 	if err != nil {
 		s.logger.Error("agent websocket accept failed", "err", err)

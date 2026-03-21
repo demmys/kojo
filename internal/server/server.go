@@ -29,6 +29,9 @@ import (
 	"github.com/loppo-llc/kojo/internal/session"
 )
 
+// wsOriginPatterns lists allowed WebSocket origins for both session and agent endpoints.
+var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
+
 type Server struct {
 	sessions *session.Manager
 	agents   *agent.Manager

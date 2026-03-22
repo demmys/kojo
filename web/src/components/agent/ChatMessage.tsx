@@ -328,6 +328,21 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
   const parts = useMemo(() => splitFilePaths(content), [content]);
   const hasFiles = parts.length > 1 || (parts.length === 1 && parts[0].type === "file");
 
+  const processText = useCallback(
+    (text: string): React.ReactNode => {
+      const segs = splitFilePaths(text);
+      if (segs.length === 1 && segs[0].type === "text") return text;
+      return segs.map((seg, i) =>
+        seg.type === "text" ? (
+          seg.value
+        ) : (
+          <FilePathChip key={i} path={seg.value} onPreview={setPreview} />
+        ),
+      );
+    },
+    [],
+  );
+
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(content).then(
       () => {
@@ -367,8 +382,8 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
         {copied ? "Copied" : "Copy"}
       </button>
 
-      {/* Plain/Markdown toggle — hidden when file paths force plain mode */}
-      {!hasFiles && <button
+      {/* Plain/Markdown toggle */}
+      {<button
         onClick={() => setViewMode(viewMode === "markdown" ? "plain" : "markdown")}
         className={btnCls}
         title={viewMode === "markdown" ? "Show plain text" : "Show rendered"}
@@ -392,8 +407,8 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
     </div>
   );
 
-  // Plain text mode or file-path-containing messages
-  if (viewMode === "plain" || hasFiles) {
+  // Plain text mode
+  if (viewMode === "plain") {
     return (
       <>
         {hasFiles ? (
@@ -415,13 +430,20 @@ function MessageContent({ content, isUser, timestamp }: { content: string; isUse
     );
   }
 
-  // Markdown mode
+  // Markdown mode (with optional file path chips)
   return (
     <>
       <div className={isUser ? "md-content-user" : ""}>
-        <MarkdownRenderer content={content} />
+        <MarkdownRenderer content={content} processText={processText} />
       </div>
       {actionButtons}
+      {preview && (
+        <MediaOverlay
+          path={preview.path}
+          type={preview.type}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </>
   );
 }

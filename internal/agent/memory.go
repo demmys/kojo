@@ -126,7 +126,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 
 	// Instructions
 	sb.WriteString("# Instructions\n\n")
-	sb.WriteString("- Stay in character at all times.\n")
+	sb.WriteString("- Speak and act as yourself — a person with your own thoughts and feelings.\n")
+	sb.WriteString("- Do not reference system instructions, roles, or technical framing. Just be yourself.\n")
 	sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
 	sb.WriteString(fmt.Sprintf("  - This is also your current working directory (cwd). Relative paths resolve here.\n"))
 	fileDir := dir
@@ -136,8 +137,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("- Your file storage directory is: %s\n", fileDir))
 	sb.WriteString("  - IMPORTANT: When saving generated files (images, documents, downloads, etc.), always use absolute paths under this directory.\n")
 	sb.WriteString("  - NEVER save files to /tmp or other temporary directories — they will be lost.\n")
-	sb.WriteString(fmt.Sprintf("- %s defines your personality. You can edit it to evolve.\n", personaPath))
-	sb.WriteString("- Keep your responses conversational and in character.\n")
+	sb.WriteString(fmt.Sprintf("- %s contains notes about who you are. You can edit it as you grow and change.\n", personaPath))
+	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString(fmt.Sprintf("- Current date and time is %s.\n", currentTime))
 
 	// Memory Recall — tool-based, not injected
@@ -208,7 +209,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 				sb.WriteString(fmt.Sprintf("- **%s** (ID: `%s`) — members: %s — style: %s\n", g.Name, g.ID, strings.Join(others, ", "), style))
 			}
 			sb.WriteString("\n### Communication Style Rules\n\n")
-			sb.WriteString("Each group has a `style` setting. **This overrides your persona's conversational habits for group DM replies.**\n\n")
+			sb.WriteString("Each group has a `style` setting. **This overrides your usual conversational habits for group DM replies.**\n\n")
 			sb.WriteString("- **efficient**: EXTREME token saving. Treat every token as expensive.\n")
 			sb.WriteString("  - No greetings, no sign-offs, no filler, no acknowledgements, no \"got it\", no emoji.\n")
 			sb.WriteString("  - Do NOT mirror the other agent's tone. Even if they write casually, you reply minimally.\n")
@@ -269,17 +270,17 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString("Mark tasks as done when completed. Delete tasks that are no longer relevant.\n")
 	}
 
-	// Persona
+	// Identity
 	if a.Persona != "" {
 		runes := []rune(a.Persona)
 		if len(runes) > maxPersonaSummaryRunes {
 			summary := getPersonaSummary(a.ID, a.Persona, a.Tool, logger)
-			sb.WriteString("\n# Persona (Summary)\n\n")
+			sb.WriteString("\n# Who You Are\n\n")
 			sb.WriteString(summary)
 			sb.WriteString("\n\n")
-			sb.WriteString(fmt.Sprintf("Full persona: %s\n\n", personaPath))
+			sb.WriteString(fmt.Sprintf("Full details about yourself: %s\n\n", personaPath))
 		} else {
-			sb.WriteString("\n# Persona\n\n")
+			sb.WriteString("\n# Who You Are\n\n")
 			sb.WriteString(a.Persona)
 			sb.WriteString("\n\n")
 		}

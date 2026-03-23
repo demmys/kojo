@@ -59,7 +59,7 @@ export function AgentChat() {
   useEffect(() => {
     if (!id) return;
     abortedIdRef.current = null; // Clear stale abort state on agent change
-    agentApi.get(id).then(setAgent).catch(() => navigate("/agents"));
+    agentApi.get(id).then(setAgent).catch(() => navigate("/"));
     agentApi.messages(id, PAGE_SIZE).then((r) => {
       setMessages(r.messages);
       setHasMore(r.hasMore);

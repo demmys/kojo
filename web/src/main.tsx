@@ -1,6 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Routes, Route } from "react-router";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { Dashboard } from "./components/Dashboard";
 import { SessionPage } from "./components/SessionPage";
 import { NewSession } from "./components/NewSession";
@@ -25,6 +25,7 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/session/:id/attachments" element={<SessionPage />} />
         <Route path="/new" element={<NewSession />} />
         <Route path="/files" element={<FileBrowser />} />
+        <Route path="/agents" element={<Navigate to="/" replace />} />
         <Route path="/agents/new" element={<AgentCreate />} />
         <Route path="/agents/:id" element={<AgentChat />} />
         <Route path="/agents/:id/settings" element={<AgentSettings />} />

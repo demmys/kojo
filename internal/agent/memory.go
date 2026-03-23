@@ -118,9 +118,13 @@ func getPersonaSummary(agentID string, persona string, tool string, logger *slog
 func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM, hasCreds bool) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")
-	now := time.Now()
+	now := time.Now().In(jst)
 	today := now.Format("2006-01-02")
-	currentTime := now.Format("2006-01-02 15:04 -0700 MST")
+	wd := jpWeekday[now.Weekday()]
+	currentTime := now.Format("2006-01-02 15:04 -0700 MST") + " (" + wd + ")"
+	if h := jpHolidayName(now); h != "" {
+		currentTime += " [" + h + "]"
+	}
 
 	var sb strings.Builder
 

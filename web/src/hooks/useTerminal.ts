@@ -200,7 +200,10 @@ export function useTerminal({
     let touchStartY = 0;
     let accumDelta = 0;
     let touchDirty = false; // set after multi-touch; resets baseline on next single-touch
-    const lineHeight = 20;
+    const getLineHeight = () => {
+      const rect = el.getBoundingClientRect();
+      return (term.rows > 0 && rect.height > 0) ? rect.height / term.rows : 20;
+    };
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) { touchDirty = true; return; }
       touchStartY = e.touches[0].clientY;
@@ -217,9 +220,13 @@ export function useTerminal({
         e.preventDefault();
         return;
       }
-      const dy = touchStartY - e.touches[0].clientY;
+      // Negate so swipe-up (finger moves up, clientY decreases) yields
+      // negative dy → scroll UP (older content), matching mobile terminal
+      // apps (direct-manipulation style, not natural/web-page scrolling).
+      const dy = e.touches[0].clientY - touchStartY;
       touchStartY = e.touches[0].clientY;
       accumDelta += dy;
+      const lineHeight = getLineHeight();
       const lines = Math.trunc(accumDelta / lineHeight);
       if (lines !== 0) {
         if (touchMode === "mouse") {
@@ -244,7 +251,11 @@ export function useTerminal({
           if (lines > 0) {
             term.scrollLines(lines);
             const buf = term.buffer.active;
-            if (buf.viewportY >= buf.baseY) autoScrollRef.current = true;
+            if (buf.viewportY >= buf.baseY) {
+              autoScrollRef.current = true;
+            } else {
+              savedDeltaRef.current = buf.baseY - buf.viewportY;
+            }
           } else {
             autoScrollRef.current = false;
             term.scrollLines(lines);

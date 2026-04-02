@@ -846,43 +846,79 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 // processChatEvents reads events from the backend channel, persists messages,
 // and forwards events to outCh for the broadcaster.
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	// Accumulate streaming data so we can persist a partial message if
+	// the chat is aborted before a "done" event arrives.
+	var accText strings.Builder
+	var accThinking strings.Builder
+	var accToolUses []ToolUse
+	receivedDone := false
+
+	defer func() {
+		if receivedDone {
+			return
+		}
+		if accText.Len() == 0 && accThinking.Len() == 0 && len(accToolUses) == 0 {
+			return
+		}
+		msg := newAssistantMessage()
+		msg.Content = accText.String()
+		msg.Thinking = accThinking.String()
+		msg.ToolUses = accToolUses
+		m.persistDoneEvent(agentID, msg)
+	}()
+
+	// accumulate records streaming data for abort recovery.
+	accumulate := func(event *ChatEvent) {
+		switch event.Type {
+		case "text":
+			accText.WriteString(event.Delta)
+		case "thinking":
+			accThinking.WriteString(event.Delta)
+		case "tool_use":
+			accToolUses = append(accToolUses, ToolUse{
+				ID:    event.ToolUseID,
+				Name:  event.ToolName,
+				Input: event.ToolInput,
+			})
+		case "tool_result":
+			matchToolOutput(accToolUses, event.ToolUseID, event.ToolName, event.ToolOutput)
+		}
+	}
+
+	// handleTerminal persists terminal events (done/error) to the transcript.
+	handleTerminal := func(event *ChatEvent) {
+		if event.Type == "done" && event.Message != nil && isRateLimitMessage(event.Message) {
+			event.Message.Role = "system"
+		}
+		if event.Type == "done" && event.Message != nil {
+			receivedDone = true
+			m.persistDoneEvent(agentID, event.Message)
+
+			if m.OnChatDone != nil && event.ErrorMessage == "" {
+				m.mu.Lock()
+				agCopy := *m.agents[agentID]
+				m.mu.Unlock()
+				msgCopy := *event.Message
+				go m.OnChatDone(&agCopy, &msgCopy)
+			}
+		}
+		if event.ErrorMessage != "" {
+			errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+			if err := appendMessage(agentID, errMsg); err != nil {
+				m.logger.Warn("failed to save error message", "err", err)
+			}
+		}
+	}
+
 	for {
 		select {
 		case event, ok := <-backendCh:
 			if !ok {
 				return
 			}
-			// Convert rate-limit notices to system messages before
-			// sending, so both UI and transcript see the same role.
-			if event.Type == "done" && event.Message != nil && isRateLimitMessage(event.Message) {
-				event.Message.Role = "system"
-			}
 
-			// Save assistant message to transcript BEFORE publishing
-			// the terminal event, so synthesizeTerminal can find it.
-			if event.Type == "done" && event.Message != nil {
-				m.persistDoneEvent(agentID, event.Message)
-
-				if m.OnChatDone != nil && event.ErrorMessage == "" {
-					m.mu.Lock()
-					agCopy := *m.agents[agentID]
-					m.mu.Unlock()
-					msgCopy := *event.Message
-					go m.OnChatDone(&agCopy, &msgCopy)
-				}
-			}
-
-			// Persist process errors as system messages so they survive
-			// page reloads and appear in the transcript history.
-			// This covers both:
-			//   - terminal "error" events (no output captured)
-			//   - "done" events with ErrorMessage (partial output + error)
-			if event.ErrorMessage != "" {
-				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
-				if err := appendMessage(agentID, errMsg); err != nil {
-					m.logger.Warn("failed to save error message", "err", err)
-				}
-			}
+			accumulate(&event)
+			handleTerminal(&event)
 
 			// Terminal events (done/error) use blocking send so the
 			// client always receives them. Streaming events use
@@ -901,6 +937,13 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 				}
 			}
 		case <-ctx.Done():
+			// Abort: drain remaining events from backendCh to capture
+			// any data buffered before the backend goroutine noticed
+			// the cancellation. Don't forward to outCh (no readers).
+			for event := range backendCh {
+				accumulate(&event)
+				handleTerminal(&event)
+			}
 			return
 		}
 	}

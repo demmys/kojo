@@ -46,7 +46,10 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
     setTestResult("");
     setError("");
     try {
-      const res = await agentApi.slackBot.test(agentId);
+      const res = await agentApi.slackBot.test(agentId, {
+        ...(appToken ? { appToken } : {}),
+        ...(botToken ? { botToken } : {}),
+      });
       setTestResult(`Connected: team=${res.team}, bot=${res.botUser}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

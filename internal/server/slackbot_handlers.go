@@ -166,14 +166,31 @@ func (s *Server) handleTestSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	creds := s.agents.Creds()
-	if creds == nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "credential store not available")
-		return
+	// Accept optional tokens in request body (for testing before saving).
+	var req struct {
+		AppToken string `json:"appToken"`
+		BotToken string `json:"botToken"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // best-effort; empty body is fine
+
+	appToken := strings.TrimSpace(req.AppToken)
+	botToken := strings.TrimSpace(req.BotToken)
+
+	// Fall back to stored tokens for any that weren't provided.
+	if appToken == "" || botToken == "" {
+		creds := s.agents.Creds()
+		if creds != nil {
+			storedApp, storedBot, _ := slackbot.LoadTokens(creds, agentID)
+			if appToken == "" {
+				appToken = storedApp
+			}
+			if botToken == "" {
+				botToken = storedBot
+			}
+		}
 	}
 
-	appToken, botToken, err := slackbot.LoadTokens(creds, agentID)
-	if err != nil || appToken == "" || botToken == "" {
+	if appToken == "" || botToken == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "slack tokens not configured")
 		return
 	}

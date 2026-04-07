@@ -371,9 +371,10 @@ export const agentApi = {
     delete: (agentId: string) =>
       del<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`),
 
-    test: (agentId: string) =>
+    test: (agentId: string, tokens?: { appToken?: string; botToken?: string }) =>
       post<{ ok: boolean; team: string; botUser: string }>(
         `/api/v1/agents/${agentId}/slackbot/test`,
+        tokens,
       ),
   },
 };

@@ -33,17 +33,28 @@ var (
 	reInlineCode = regexp.MustCompile("`[^`]+`")
 )
 
+// UserResolver resolves a Slack user ID to a display name.
+// Return the original ID if resolution fails.
+type UserResolver func(userID string) string
+
 // SlackToPlain converts Slack mrkdwn to plain text suitable for the agent.
 // It resolves links and strips mention formatting.
-func SlackToPlain(text string) string {
+// If resolve is non-nil, user mentions <@U12345> are resolved to display names.
+func SlackToPlain(text string, resolve UserResolver) string {
 	// Replace links: <url|text> → text (url)
 	text = reLinkWithText.ReplaceAllString(text, "$2 ($1)")
 	// Replace bare links: <url> → url
 	text = reLinkBare.ReplaceAllString(text, "$1")
 	// Replace channel mentions: <#C123|general> → #general
 	text = reChannelMention.ReplaceAllString(text, "#$1")
-	// Simplify user mentions: <@U12345> → @U12345
-	text = reUserMention.ReplaceAllString(text, "@$1")
+	// Resolve user mentions: <@U12345> → @DisplayName
+	text = reUserMention.ReplaceAllStringFunc(text, func(match string) string {
+		id := reUserMention.FindStringSubmatch(match)[1]
+		if resolve != nil {
+			return "@" + resolve(id)
+		}
+		return "@" + id
+	})
 	return text
 }
 

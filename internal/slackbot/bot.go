@@ -211,8 +211,8 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		return
 	}
 
-	// Convert Slack formatting to plain text
-	text = SlackToPlain(text)
+	// Convert Slack formatting to plain text, resolving user mentions to display names
+	text = SlackToPlain(text, b.resolveUserName)
 
 	// Resolve user display name
 	displayName := b.resolveUserName(userID)

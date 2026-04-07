@@ -6,10 +6,19 @@ import (
 )
 
 func TestSlackToPlain(t *testing.T) {
+	// Mock resolver that maps U12345 → "Alice"
+	resolver := func(id string) string {
+		if id == "U12345" {
+			return "Alice"
+		}
+		return id
+	}
+
 	tests := []struct {
-		name  string
-		input string
-		want  string
+		name    string
+		input   string
+		want    string
+		resolve UserResolver
 	}{
 		{
 			name:  "link with text",
@@ -27,14 +36,22 @@ func TestSlackToPlain(t *testing.T) {
 			want:  `Go to #general`,
 		},
 		{
-			name:  "user mention",
-			input: `Hello <@U12345>`,
-			want:  `Hello @U12345`,
+			name:    "user mention without resolver",
+			input:   `Hello <@U12345>`,
+			want:    `Hello @U12345`,
+			resolve: nil,
 		},
 		{
-			name:  "mixed formatting",
-			input: `<@U12345> posted <https://example.com|a link> in <#C12345|random>`,
-			want:  `@U12345 posted a link (https://example.com) in #random`,
+			name:    "user mention with resolver",
+			input:   `Hello <@U12345>`,
+			want:    `Hello @Alice`,
+			resolve: resolver,
+		},
+		{
+			name:    "mixed formatting with resolver",
+			input:   `<@U12345> posted <https://example.com|a link> in <#C12345|random>`,
+			want:    `@Alice posted a link (https://example.com) in #random`,
+			resolve: resolver,
 		},
 		{
 			name:  "plain text unchanged",
@@ -45,7 +62,7 @@ func TestSlackToPlain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := SlackToPlain(tt.input)
+			got := SlackToPlain(tt.input, tt.resolve)
 			if got != tt.want {
 				t.Errorf("SlackToPlain(%q) = %q, want %q", tt.input, got, tt.want)
 			}

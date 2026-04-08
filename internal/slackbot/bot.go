@@ -29,7 +29,6 @@ type ChatEvent struct {
 type ChatManager interface {
 	ChatForSlack(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
 	ChatForSlackOneShot(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
-	IsBusy(agentID string) bool
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -46,28 +45,16 @@ type Bot struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	// pending tracks messages received while agent is busy
-	pendingMu sync.Mutex
-	pending   []pendingMsg
+	// threadLocks serializes processing per thread to maintain history consistency.
+	threadLocksMu sync.Mutex
+	threadLocks   map[string]*sync.Mutex // key: "channel:threadTS"
 
 	// userCache caches Slack user ID → display name
 	userCacheMu sync.RWMutex
 	userCache   map[string]string
 }
 
-type pendingMsg struct {
-	channel   string
-	threadTS  string
-	text      string
-	userID    string
-	retries   int
-	messageTS string // for removing reaction
-}
-
 const (
-	maxPendingRetries = 3
-	maxPendingQueue   = 20
-	pendingRetryDelay = 5 * time.Second
 	slackMaxMsgLen    = 3000
 	maxRateLimitRetry = 3
 	userCacheTTL      = 10 * time.Minute
@@ -88,6 +75,7 @@ func NewBot(agentID string, agentDataDir string, cfg Config, appToken, botToken 
 		mgr:          mgr,
 		logger:       logger.With("component", "slackbot", "agent", agentID),
 		done:         make(chan struct{}),
+		threadLocks:  make(map[string]*sync.Mutex),
 		userCache:    make(map[string]string),
 	}
 }
@@ -312,32 +300,6 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		}
 	}
 
-	if b.mgr.IsBusy(b.agentID) {
-		// Check queue limit
-		b.pendingMu.Lock()
-		if len(b.pending) >= maxPendingQueue {
-			b.pendingMu.Unlock()
-			b.logger.Warn("slack pending queue full, dropping message", "user", userID)
-			b.postMessage(ctx, channel, replyTS, "Sorry, too many messages are queued. Please try again later.")
-			return
-		}
-		// Add hourglass reaction and queue
-		_ = b.api.AddReactionContext(ctx, "hourglass_flowing_sand", slack.ItemRef{
-			Channel:   channel,
-			Timestamp: messageTS,
-		})
-		b.pending = append(b.pending, pendingMsg{
-			channel:   channel,
-			threadTS:  replyTS,
-			text:      formattedMsg,
-			userID:    userID,
-			messageTS: messageTS,
-		})
-		b.pendingMu.Unlock()
-		b.logger.Debug("agent busy, queued slack message", "user", userID)
-		return
-	}
-
 	go b.sendToAgent(ctx, channel, replyTS, messageTS, formattedMsg)
 }
 
@@ -345,6 +307,16 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 const streamAppendInterval = 1 * time.Second
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
+	// Serialize processing within the same thread to maintain history consistency.
+	mu := b.getThreadLock(channel, threadTS)
+	mu.Lock()
+	defer func() {
+		b.threadLocksMu.Lock()
+		delete(b.threadLocks, channel+":"+threadTS)
+		b.threadLocksMu.Unlock()
+		mu.Unlock()
+	}()
+
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
 	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 		ChannelID: channel,
@@ -467,16 +439,6 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		}
 	}
 
-	// Remove hourglass if this was from a pending message
-	if messageTS != "" {
-		_ = b.api.RemoveReactionContext(ctx, "hourglass_flowing_sand", slack.ItemRef{
-			Channel:   channel,
-			Timestamp: messageTS,
-		})
-	}
-
-	// Process any pending messages
-	b.processPending(ctx)
 }
 
 // appendStream appends text to a streaming Slack message with rate limit retry.
@@ -546,48 +508,18 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
 }
 
-func (b *Bot) processPending(ctx context.Context) {
-	b.pendingMu.Lock()
-	if len(b.pending) == 0 {
-		b.pendingMu.Unlock()
-		return
+// getThreadLock returns the mutex for the given channel+thread combination.
+// Creates one if it doesn't exist yet.
+func (b *Bot) getThreadLock(channel, threadTS string) *sync.Mutex {
+	key := channel + ":" + threadTS
+	b.threadLocksMu.Lock()
+	defer b.threadLocksMu.Unlock()
+	mu, ok := b.threadLocks[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		b.threadLocks[key] = mu
 	}
-	// Take the first pending message
-	msg := b.pending[0]
-	b.pending = b.pending[1:]
-	b.pendingMu.Unlock()
-
-	if b.mgr.IsBusy(b.agentID) {
-		msg.retries++
-		if msg.retries >= maxPendingRetries {
-			b.logger.Warn("slack pending message dropped after max retries", "user", msg.userID)
-			b.postMessage(ctx, msg.channel, msg.threadTS, "Sorry, I'm currently busy. Please try again later.")
-			// Remove hourglass reaction
-			_ = b.api.RemoveReactionContext(ctx, "hourglass_flowing_sand", slack.ItemRef{
-				Channel:   msg.channel,
-				Timestamp: msg.messageTS,
-			})
-			// Continue processing remaining pending messages
-			b.processPending(ctx)
-			return
-		}
-		// Re-queue and schedule a retry
-		b.pendingMu.Lock()
-		b.pending = append([]pendingMsg{msg}, b.pending...)
-		b.pendingMu.Unlock()
-
-		go func() {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(pendingRetryDelay):
-				b.processPending(ctx)
-			}
-		}()
-		return
-	}
-
-	b.sendToAgent(ctx, msg.channel, msg.threadTS, msg.messageTS, msg.text)
+	return mu
 }
 
 // resolveUserName resolves a Slack user ID to a display name, with caching.

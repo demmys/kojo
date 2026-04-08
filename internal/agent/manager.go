@@ -729,22 +729,16 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		m.busyMu.Unlock()
 		return nil, ErrAgentResetting
 	}
-	if _, busy := m.busy[agentID]; busy {
-		m.busyMu.Unlock()
-		return nil, ErrAgentBusy
-	}
+	m.busyMu.Unlock()
+
 	chatCtx, cancel := context.WithCancel(ctx)
 	outCh := make(chan ChatEvent, 64)
-	bc := newChatBroadcaster(outCh)
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
-	m.busyMu.Unlock()
 
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
 		err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
-		m.clearBusy(agentID)
 		cancel()
 		return nil, err
 	}
@@ -776,21 +770,17 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
-		m.clearBusy(agentID)
 		cancel()
 		return nil, err
 	}
 
-	_, callerCh, _ := bc.Subscribe()
-
 	go func() {
 		defer close(outCh)
-		defer m.clearBusy(agentID)
 		defer cancel()
 		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
 	}()
 
-	return callerCh, nil
+	return outCh, nil
 }
 
 // processOneShotEvents is like processChatEvents but does not persist
@@ -1164,9 +1154,6 @@ func (a *slackChatAdapter) ChatForSlackOneShot(ctx context.Context, agentID, mes
 	return out, nil
 }
 
-func (a *slackChatAdapter) IsBusy(agentID string) bool {
-	return a.m.IsBusy(agentID)
-}
 
 func (m *Manager) save() {
 	m.mu.Lock()

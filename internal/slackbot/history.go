@@ -13,6 +13,15 @@ import (
 const (
 	// channelHistoryLimit is the default number of recent channel messages to fetch.
 	channelHistoryLimit = 30
+
+	// incompleteMessageID is the MessageID used for the synthetic marker entry
+	// that indicates the history file contains incomplete data. On the next
+	// fetch, this marker causes a full re-fetch instead of a delta fetch.
+	incompleteMessageID = "_incomplete"
+
+	// incompleteText is the human-readable text for the incomplete marker,
+	// visible to agents via conversation context injection.
+	incompleteText = "⚠️ The conversation history below may be incomplete due to a temporary API error. Some earlier messages could be missing."
 )
 
 // FetchThreadHistory retrieves thread messages from Slack.
@@ -27,6 +36,10 @@ const (
 func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, channelID, threadTS string, resolve UserResolver, logger *slog.Logger) []chathistory.HistoryMessage {
 	path := chathistory.HistoryFilePath(agentDataDir, "slack", channelID, threadTS)
 
+	// If the previous fetch was incomplete, ignore the cursor and re-fetch
+	// the entire thread to recover missing messages.
+	forceFullFetch := isIncomplete(path)
+
 	// Determine if this is a first fetch or a delta fetch.
 	lastRealTS := chathistory.LastPlatformTS(path)
 
@@ -35,17 +48,19 @@ func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, ch
 		Timestamp: threadTS,
 		Limit:     200,
 	}
-	if lastRealTS != "" {
+	if lastRealTS != "" && !forceFullFetch {
 		// Delta fetch: only messages after the last real Slack ts.
 		// Slack oldest is inclusive, so we deduplicate below.
 		params.Oldest = lastRealTS
 	}
 
 	var allSlackMsgs []slack.Message
+	fetchComplete := true
 	for {
 		msgs, hasMore, cursor, err := api.GetConversationRepliesContext(ctx, params)
 		if err != nil {
 			logger.Warn("failed to fetch thread replies", "channel", channelID, "thread", threadTS, "err", err)
+			fetchComplete = false
 			break
 		}
 		allSlackMsgs = append(allSlackMsgs, msgs...)
@@ -62,9 +77,13 @@ func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, ch
 	}
 
 	// Convert and deduplicate (skip the cursor message we already have)
+	skipTS := lastRealTS
+	if forceFullFetch {
+		skipTS = "" // full re-fetch: don't skip any messages
+	}
 	var newMsgs []chathistory.HistoryMessage
 	for _, sm := range allSlackMsgs {
-		if sm.Timestamp == lastRealTS {
+		if skipTS != "" && sm.Timestamp == skipTS {
 			continue
 		}
 		newMsgs = append(newMsgs, slackMsgToHistory(sm, channelID, threadTS, resolve))
@@ -74,9 +93,14 @@ func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, ch
 		return newMsgs[i].MessageID < newMsgs[j].MessageID
 	})
 
+	// Prepend incomplete marker if the fetch was partial
+	if !fetchComplete {
+		newMsgs = append([]chathistory.HistoryMessage{incompleteMarker("slack", channelID, threadTS)}, newMsgs...)
+	}
+
 	if len(newMsgs) > 0 {
-		if lastRealTS == "" {
-			// First fetch: write the full thread (including parent message)
+		if lastRealTS == "" || forceFullFetch {
+			// First fetch or re-fetch: write the full thread
 			if err := chathistory.WriteMessages(path, newMsgs); err != nil {
 				logger.Warn("failed to save thread history", "path", path, "err", err)
 			}
@@ -112,7 +136,9 @@ func FetchChannelHistory(ctx context.Context, api *slack.Client, agentDataDir, c
 	resp, err := api.GetConversationHistoryContext(ctx, params)
 	if err != nil {
 		logger.Warn("failed to fetch channel history", "channel", channelID, "err", err)
-		return nil
+		// Fall back to existing file (may contain incomplete marker from prior failure)
+		history, _ := chathistory.LoadHistory(chathistory.HistoryFilePath(agentDataDir, "slack", channelID, ""))
+		return history
 	}
 
 	var msgs []chathistory.HistoryMessage
@@ -125,13 +151,36 @@ func FetchChannelHistory(ctx context.Context, api *slack.Client, agentDataDir, c
 		return msgs[i].MessageID < msgs[j].MessageID
 	})
 
-	// Overwrite channel history file (sliding window)
+	// Overwrite channel history file (sliding window).
+	// A successful fetch replaces any previous incomplete data.
 	path := chathistory.HistoryFilePath(agentDataDir, "slack", channelID, "")
 	if err := chathistory.WriteMessages(path, msgs); err != nil {
 		logger.Warn("failed to save channel history", "path", path, "err", err)
 	}
 
 	return msgs
+}
+
+// incompleteMarker returns a synthetic HistoryMessage that signals the history
+// is incomplete. It is placed as the first entry in the JSONL file and is
+// visible to agents as a natural conversation message.
+func incompleteMarker(platform, channelID, threadID string) chathistory.HistoryMessage {
+	return chathistory.HistoryMessage{
+		Platform:  platform,
+		ChannelID: channelID,
+		ThreadID:  threadID,
+		MessageID: incompleteMessageID,
+		UserName:  "system",
+		Text:      incompleteText,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+}
+
+// isIncomplete checks if the first entry in a history file is an incomplete marker.
+// If so, the file should be fully re-fetched rather than delta-fetched.
+func isIncomplete(path string) bool {
+	msgs, _ := chathistory.LoadHistory(path)
+	return len(msgs) > 0 && msgs[0].MessageID == incompleteMessageID
 }
 
 // slackMsgToHistory converts a Slack message to a platform-agnostic HistoryMessage.

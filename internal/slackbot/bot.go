@@ -42,12 +42,15 @@ type Bot struct {
 	logger       *slog.Logger
 	botUserID    string
 
+	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
 
 	// threadLocks serializes processing per thread to maintain history consistency.
+	// Each threadLock carries a reference count so the map entry is only deleted
+	// when the last goroutine releases the lock.
 	threadLocksMu sync.Mutex
-	threadLocks   map[string]*sync.Mutex // key: "channel:threadTS"
+	threadLocks   map[string]*threadLock // key: "channel:threadTS"
 
 	// userCache caches Slack user ID → display name
 	userCacheMu sync.RWMutex
@@ -62,10 +65,12 @@ const (
 
 // NewBot creates a new Bot instance. Call Run() to start it.
 // agentDataDir is the agent's data directory used for storing conversation history files.
-func NewBot(agentID string, agentDataDir string, cfg Config, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
+// parentCtx controls the Bot's lifetime: cancelling it will stop the event loop.
+func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg Config, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	sm := socketmode.New(api, socketmode.OptionLog(slog.NewLogLogger(logger.Handler(), slog.LevelWarn)))
 
+	ctx, cancel := context.WithCancel(parentCtx)
 	return &Bot{
 		agentID:      agentID,
 		agentDataDir: agentDataDir,
@@ -74,17 +79,19 @@ func NewBot(agentID string, agentDataDir string, cfg Config, appToken, botToken 
 		sm:           sm,
 		mgr:          mgr,
 		logger:       logger.With("component", "slackbot", "agent", agentID),
+		ctx:          ctx,
+		cancel:       cancel,
 		done:         make(chan struct{}),
-		threadLocks:  make(map[string]*sync.Mutex),
+		threadLocks:  make(map[string]*threadLock),
 		userCache:    make(map[string]string),
 	}
 }
 
-// Run starts the Socket Mode event loop. It blocks until ctx is cancelled.
-func (b *Bot) Run(ctx context.Context) {
+// Run starts the Socket Mode event loop. It blocks until the Bot's context is cancelled.
+func (b *Bot) Run() {
 	defer close(b.done)
 
-	ctx, b.cancel = context.WithCancel(ctx)
+	ctx := b.ctx
 
 	// Resolve our own user ID
 	authResp, err := b.api.AuthTestContext(ctx)
@@ -116,9 +123,7 @@ func (b *Bot) Run(ctx context.Context) {
 
 // Stop cancels the bot's context and waits for it to finish.
 func (b *Bot) Stop() {
-	if b.cancel != nil {
-		b.cancel()
-	}
+	b.cancel()
 	<-b.done
 }
 
@@ -308,13 +313,11 @@ const streamAppendInterval = 1 * time.Second
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
 	// Serialize processing within the same thread to maintain history consistency.
-	mu := b.getThreadLock(channel, threadTS)
-	mu.Lock()
+	tl := b.acquireThreadLock(channel, threadTS)
+	tl.mu.Lock()
 	defer func() {
-		b.threadLocksMu.Lock()
-		delete(b.threadLocks, channel+":"+threadTS)
-		b.threadLocksMu.Unlock()
-		mu.Unlock()
+		b.releaseThreadLock(channel, threadTS, tl)
+		tl.mu.Unlock()
 	}()
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
@@ -508,18 +511,41 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
 }
 
-// getThreadLock returns the mutex for the given channel+thread combination.
-// Creates one if it doesn't exist yet.
-func (b *Bot) getThreadLock(channel, threadTS string) *sync.Mutex {
+// threadLock is a reference-counted mutex for serializing per-thread processing.
+// The map entry is only removed when the last holder releases it, preventing a
+// race where a new mutex is created while another goroutine is still waiting on
+// the previous one.
+type threadLock struct {
+	mu      sync.Mutex
+	waiters int
+}
+
+// acquireThreadLock returns the threadLock for the given channel+thread,
+// creating one if needed, and increments its reference count.
+// Must be paired with releaseThreadLock after tl.mu.Unlock().
+func (b *Bot) acquireThreadLock(channel, threadTS string) *threadLock {
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
-	mu, ok := b.threadLocks[key]
+	tl, ok := b.threadLocks[key]
 	if !ok {
-		mu = &sync.Mutex{}
-		b.threadLocks[key] = mu
+		tl = &threadLock{}
+		b.threadLocks[key] = tl
 	}
-	return mu
+	tl.waiters++
+	return tl
+}
+
+// releaseThreadLock decrements the reference count and removes the map entry
+// when no goroutines are waiting or holding the lock.
+func (b *Bot) releaseThreadLock(channel, threadTS string, tl *threadLock) {
+	key := channel + ":" + threadTS
+	b.threadLocksMu.Lock()
+	defer b.threadLocksMu.Unlock()
+	tl.waiters--
+	if tl.waiters == 0 {
+		delete(b.threadLocks, key)
+	}
 }
 
 // resolveUserName resolves a Slack user ID to a display name, with caching.

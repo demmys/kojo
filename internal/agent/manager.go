@@ -1178,6 +1178,10 @@ func copyAgent(a *Agent) *Agent {
 		lm := *a.LastMessage
 		cp.LastMessage = &lm
 	}
+	if a.SlackBot != nil {
+		sb := *a.SlackBot
+		cp.SlackBot = &sb
+	}
 	if len(a.NotifySources) > 0 {
 		cp.NotifySources = make([]notifysource.Config, len(a.NotifySources))
 		for i, ns := range a.NotifySources {

@@ -3,42 +3,98 @@ package slackbot
 import (
 	"context"
 	"log/slog"
-	"sync"
 )
 
 // AgentDataDirFunc resolves an agent ID to its data directory path.
 type AgentDataDirFunc func(agentID string) string
 
+// hubCommand represents a serialized operation on the Hub's event loop.
+type hubCommand struct {
+	kind    hubCmdKind
+	agentID string
+	cfg     Config
+	result  chan<- bool // for IsRunning; nil for fire-and-forget commands
+}
+
+type hubCmdKind int
+
+const (
+	cmdStartBot hubCmdKind = iota
+	cmdStopBot
+	cmdReconfigure
+	cmdIsRunning
+	cmdStop
+)
+
 // Hub manages all SlackBot instances across agents.
+// All operations are serialized through a single event loop goroutine,
+// eliminating lock juggling and TOCTOU races.
 type Hub struct {
-	mu           sync.Mutex
-	bots         map[string]*Bot // agentID → bot
+	cmdCh        chan hubCommand
 	mgr          ChatManager
 	tokens       TokenProvider
 	agentDataDir AgentDataDirFunc
 	logger       *slog.Logger
 	ctx          context.Context
 	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
-// NewHub creates a new Hub. Call Stop() on shutdown.
+// NewHub creates a new Hub and starts its event loop. Call Stop() on shutdown.
 // agentDataDir resolves an agent ID to its data directory path for history file storage.
 func NewHub(mgr ChatManager, tokens TokenProvider, agentDataDir AgentDataDirFunc, logger *slog.Logger) *Hub {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Hub{
-		bots:         make(map[string]*Bot),
+	h := &Hub{
+		cmdCh:        make(chan hubCommand, 32),
 		mgr:          mgr,
 		tokens:       tokens,
 		agentDataDir: agentDataDir,
 		logger:       logger.With("component", "slackbot-hub"),
 		ctx:          ctx,
 		cancel:       cancel,
+		done:         make(chan struct{}),
+	}
+	go h.loop()
+	return h
+}
+
+// loop is the single event loop goroutine that processes all Hub commands.
+// Because only this goroutine touches the bots map, no mutex is needed.
+func (h *Hub) loop() {
+	defer close(h.done)
+	bots := make(map[string]*Bot) // agentID → bot
+
+	for cmd := range h.cmdCh {
+		switch cmd.kind {
+		case cmdStartBot:
+			h.doStartBot(bots, cmd.agentID, cmd.cfg)
+
+		case cmdStopBot:
+			h.doStopBot(bots, cmd.agentID)
+
+		case cmdReconfigure:
+			if !cmd.cfg.Enabled {
+				h.doStopBot(bots, cmd.agentID)
+			} else {
+				h.doStartBot(bots, cmd.agentID, cmd.cfg)
+			}
+
+		case cmdIsRunning:
+			_, ok := bots[cmd.agentID]
+			cmd.result <- ok
+
+		case cmdStop:
+			for id, bot := range bots {
+				bot.Stop()
+				delete(bots, id)
+			}
+			h.logger.Info("all slack bots stopped")
+			return // exits the loop; cmdCh will be drained by callers getting zero values
+		}
 	}
 }
 
-// StartBot starts a Slack bot for the given agent. If one is already running,
-// it is stopped first.
-func (h *Hub) StartBot(agentID string, cfg Config) {
+func (h *Hub) doStartBot(bots map[string]*Bot, agentID string, cfg Config) {
 	if h.tokens == nil {
 		h.logger.Warn("no credential store, cannot start slack bot", "agent", agentID)
 		return
@@ -54,87 +110,72 @@ func (h *Hub) StartBot(agentID string, cfg Config) {
 		return
 	}
 
-	// Remove existing bot from map, then stop it outside the lock.
-	// Re-check under lock before inserting the new bot.
-	h.mu.Lock()
-	old, hadOld := h.bots[agentID]
-	if hadOld {
-		delete(h.bots, agentID)
-	}
-	h.mu.Unlock()
-
-	if hadOld {
+	// Stop existing bot first (synchronous — safe because we're in the single loop goroutine)
+	if old, ok := bots[agentID]; ok {
 		old.Stop()
+		delete(bots, agentID)
 	}
 
 	dataDir := ""
 	if h.agentDataDir != nil {
 		dataDir = h.agentDataDir(agentID)
 	}
-	bot := NewBot(agentID, dataDir, cfg, appToken, botToken, h.mgr, h.logger)
+	bot := NewBot(h.ctx, agentID, dataDir, cfg, appToken, botToken, h.mgr, h.logger)
+	bots[agentID] = bot
 
-	h.mu.Lock()
-	// If another goroutine raced and already registered a bot, stop it first.
-	if racing, ok := h.bots[agentID]; ok {
-		delete(h.bots, agentID)
-		h.mu.Unlock()
-		racing.Stop()
-		h.mu.Lock()
-	}
-	h.bots[agentID] = bot
-	h.mu.Unlock()
-
-	go bot.Run(h.ctx)
+	go bot.Run()
 	h.logger.Info("slack bot started", "agent", agentID)
+}
+
+func (h *Hub) doStopBot(bots map[string]*Bot, agentID string) {
+	bot, ok := bots[agentID]
+	if !ok {
+		return
+	}
+	delete(bots, agentID)
+	bot.Stop()
+	h.logger.Info("slack bot stopped", "agent", agentID)
+}
+
+// send enqueues a command. Returns false if the hub is already stopped.
+func (h *Hub) send(cmd hubCommand) bool {
+	select {
+	case h.cmdCh <- cmd:
+		return true
+	case <-h.done:
+		return false
+	}
+}
+
+// StartBot starts a Slack bot for the given agent. If one is already running,
+// it is stopped first.
+func (h *Hub) StartBot(agentID string, cfg Config) {
+	h.send(hubCommand{kind: cmdStartBot, agentID: agentID, cfg: cfg})
 }
 
 // StopBot stops the Slack bot for the given agent.
 func (h *Hub) StopBot(agentID string) {
-	h.mu.Lock()
-	bot, ok := h.bots[agentID]
-	if ok {
-		delete(h.bots, agentID)
-	}
-	h.mu.Unlock()
-
-	if ok {
-		bot.Stop()
-		h.logger.Info("slack bot stopped", "agent", agentID)
-	}
+	h.send(hubCommand{kind: cmdStopBot, agentID: agentID})
 }
 
 // Reconfigure stops and restarts the bot with new configuration.
 // If the config is disabled, it only stops the bot.
 func (h *Hub) Reconfigure(agentID string, cfg Config) {
-	if !cfg.Enabled {
-		h.StopBot(agentID)
-		return
-	}
-	h.StartBot(agentID, cfg)
+	h.send(hubCommand{kind: cmdReconfigure, agentID: agentID, cfg: cfg})
 }
 
-// Stop stops all bots and prevents new ones from starting.
+// Stop stops all bots and shuts down the event loop. Blocks until complete.
 func (h *Hub) Stop() {
 	h.cancel()
-
-	h.mu.Lock()
-	bots := make(map[string]*Bot, len(h.bots))
-	for k, v := range h.bots {
-		bots[k] = v
-	}
-	h.bots = make(map[string]*Bot)
-	h.mu.Unlock()
-
-	for _, bot := range bots {
-		bot.Stop()
-	}
-	h.logger.Info("all slack bots stopped")
+	h.send(hubCommand{kind: cmdStop})
+	<-h.done
 }
 
 // IsRunning returns true if a bot is running for the given agent.
 func (h *Hub) IsRunning(agentID string) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, ok := h.bots[agentID]
-	return ok
+	ch := make(chan bool, 1)
+	if !h.send(hubCommand{kind: cmdIsRunning, agentID: agentID, result: ch}) {
+		return false
+	}
+	return <-ch
 }

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/slack-go/slack"
 )
 
 // AgentDataDirFunc resolves an agent ID to its data directory path.
@@ -41,6 +42,7 @@ type Hub struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	done         chan struct{}
+	slackOpts    []slack.Option // extra slack.Client options; used in tests
 }
 
 // NewHub creates a new Hub and starts its event loop. Call Stop() on shutdown.
@@ -133,7 +135,7 @@ func (h *Hub) doStartBot(bots map[string]*Bot, agentID string, cfg agent.SlackBo
 	if h.agentDataDir != nil {
 		dataDir = h.agentDataDir(agentID)
 	}
-	bot := NewBot(h.ctx, agentID, dataDir, cfg, appToken, botToken, h.mgr, h.logger)
+	bot := NewBot(h.ctx, agentID, dataDir, cfg, appToken, botToken, h.mgr, h.logger, h.slackOpts...)
 	bots[agentID] = bot
 
 	go bot.Run()
@@ -152,6 +154,15 @@ func (h *Hub) doStopBot(bots map[string]*Bot, agentID string) {
 
 // send enqueues a command. Returns false if the hub is already stopped.
 func (h *Hub) send(cmd hubCommand) bool {
+	// Fast path: if done is already closed (Stop completed), bail out
+	// immediately. Without this, the buffered cmdCh could accept the
+	// command even though no goroutine will ever process it — causing
+	// callers like IsRunning to deadlock on the response channel.
+	select {
+	case <-h.done:
+		return false
+	default:
+	}
 	select {
 	case h.cmdCh <- cmd:
 		return true

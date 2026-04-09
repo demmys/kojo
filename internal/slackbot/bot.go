@@ -72,8 +72,9 @@ const (
 // NewBot creates a new Bot instance. Call Run() to start it.
 // agentDataDir is the agent's data directory used for storing conversation history files.
 // parentCtx controls the Bot's lifetime: cancelling it will stop the event loop.
-func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg agent.SlackBotConfig, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
-	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg agent.SlackBotConfig, appToken, botToken string, mgr ChatManager, logger *slog.Logger, extraSlackOpts ...slack.Option) *Bot {
+	opts := append([]slack.Option{slack.OptionAppLevelToken(appToken)}, extraSlackOpts...)
+	api := slack.New(botToken, opts...)
 	sm := socketmode.New(api, socketmode.OptionLog(slog.NewLogLogger(logger.Handler(), slog.LevelWarn)))
 
 	ctx, cancel := context.WithCancel(parentCtx)

@@ -3,6 +3,7 @@ package slackbot
 import (
 	"context"
 	"log/slog"
+	"time"
 )
 
 // AgentDataDirFunc resolves an agent ID to its data directory path.
@@ -84,8 +85,18 @@ func (h *Hub) loop() {
 			cmd.result <- ok
 
 		case cmdStop:
+			// All bot contexts are children of Hub's context, which was
+			// cancelled before this command was sent. Bots are already
+			// shutting down concurrently — just wait for each to finish.
+			const stopTimeout = 10 * time.Second
+			deadline := time.After(stopTimeout)
 			for id, bot := range bots {
-				bot.Stop()
+				select {
+				case <-bot.Done():
+					// clean exit
+				case <-deadline:
+					h.logger.Warn("slack bot did not stop within timeout, abandoning", "agent", id)
+				}
 				delete(bots, id)
 			}
 			h.logger.Info("all slack bots stopped")

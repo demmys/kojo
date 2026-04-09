@@ -52,15 +52,23 @@ type Bot struct {
 	threadLocksMu sync.Mutex
 	threadLocks   map[string]*threadLock // key: "channel:threadTS"
 
-	// userCache caches Slack user ID → display name
+	// userCache caches Slack user ID → display name for the Bot's lifetime.
+	// Display names rarely change; the cache is cleared on Bot restart.
 	userCacheMu sync.RWMutex
 	userCache   map[string]string
+
+	// sem limits the number of concurrent sendToAgent goroutines.
+	sem chan struct{}
 }
 
 const (
 	slackMaxMsgLen    = 3000
 	maxRateLimitRetry = 3
-	userCacheTTL      = 10 * time.Minute
+
+	// maxConcurrentChats is the maximum number of concurrent sendToAgent
+	// goroutines per Bot (i.e. per agent). This prevents resource exhaustion
+	// when many Slack threads send messages simultaneously.
+	maxConcurrentChats = 10
 
 	// platformSlack is the platform identifier used in chat history entries.
 	platformSlack = "slack"
@@ -87,9 +95,10 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 		logger:       logger.With("component", "slackbot", "agent", agentID),
 		ctx:          ctx,
 		cancel:       cancel,
-		done:         make(chan struct{}),
-		threadLocks:  make(map[string]*threadLock),
-		userCache:    make(map[string]string),
+		done:        make(chan struct{}),
+		threadLocks: make(map[string]*threadLock),
+		userCache:   make(map[string]string),
+		sem:         make(chan struct{}, maxConcurrentChats),
 	}
 }
 
@@ -312,7 +321,16 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		}
 	}
 
-	go b.sendToAgent(ctx, channel, replyTS, messageTS, formattedMsg)
+	select {
+	case b.sem <- struct{}{}:
+		go func() {
+			defer func() { <-b.sem }()
+			b.sendToAgent(ctx, channel, replyTS, messageTS, formattedMsg)
+		}()
+	default:
+		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
+		b.postMessage(ctx, channel, replyTS, "I'm currently handling too many conversations. Please try again shortly.")
+	}
 }
 
 // streamAppendInterval is the minimum interval between AppendStream calls.
@@ -384,15 +402,21 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		}
 	}
 
+	// Use a separate context for finalization so that cleanup API calls
+	// (StopStream, UpdateMessage, etc.) complete even if the Bot's context
+	// was cancelled (e.g. during shutdown or reconfiguration).
+	finCtx, finCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer finCancel()
+
 	// Flush remaining delta
 	if streamTS != "" && pendingDelta.Len() > 0 {
-		b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+		b.appendStream(finCtx, channel, streamTS, pendingDelta.String())
 	}
 
 	// Finalize
 	if streamTS != "" {
 		// Stop stream (no text — just finalize the typing indicator)
-		if _, _, err := b.api.StopStreamContext(ctx, channel, streamTS); err != nil {
+		if _, _, err := b.api.StopStreamContext(finCtx, channel, streamTS); err != nil {
 			b.logger.Warn("failed to stop slack stream", "err", err)
 		}
 
@@ -407,12 +431,12 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 			if threadTS != "" {
 				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
 			}
-			if _, _, _, err := b.api.UpdateMessageContext(ctx, channel, streamTS, updateOpts...); err != nil {
+			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
 				b.logger.Warn("failed to update stream message with final text", "err", err)
 			}
 			// Remaining chunks: post as follow-up messages
 			for _, chunk := range chunks[1:] {
-				b.postMessage(ctx, channel, threadTS, chunk)
+				b.postMessage(finCtx, channel, threadTS, chunk)
 			}
 		}
 	} else if response.Len() > 0 {
@@ -420,14 +444,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		text := PlainToSlack(response.String())
 		chunks := SplitMessage(text, slackMaxMsgLen)
 		for _, chunk := range chunks {
-			b.postMessage(ctx, channel, threadTS, chunk)
+			b.postMessage(finCtx, channel, threadTS, chunk)
 		}
 	} else if hasError {
-		b.postMessage(ctx, channel, threadTS, "Sorry, something went wrong while processing your request.")
+		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
 	// Clear typing indicator (auto-clears on message post, but explicit clear as safety net)
-	b.clearAssistantStatus(ctx, channel, threadTS)
+	b.clearAssistantStatus(finCtx, channel, threadTS)
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
@@ -581,14 +605,6 @@ func (b *Bot) resolveUserName(userID string) string {
 	b.userCacheMu.Lock()
 	b.userCache[userID] = name
 	b.userCacheMu.Unlock()
-
-	// Expire cache entry after TTL
-	go func() {
-		time.Sleep(userCacheTTL)
-		b.userCacheMu.Lock()
-		delete(b.userCache, userID)
-		b.userCacheMu.Unlock()
-	}()
 
 	return name
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/loppo-llc/kojo/internal/lmsproxy"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
-	"github.com/loppo-llc/kojo/internal/slackbot"
 )
 
 type busyEntry struct {
@@ -62,9 +61,6 @@ type Manager struct {
 	// lmsProxyPort/Stop manage the LM Studio proxy lifecycle (Anthropic → OAI Responses API).
 	lmsProxyPort int
 	lmsProxyStop context.CancelFunc
-
-	// slackHub manages Slack Socket Mode bots for agents.
-	slackHub *slackbot.Hub
 
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
@@ -174,14 +170,6 @@ func NewManager(logger *slog.Logger) *Manager {
 	for _, a := range m.agents {
 		if len(a.NotifySources) > 0 {
 			m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
-		}
-	}
-
-	// Initialize Slack bot hub
-	m.slackHub = slackbot.NewHub(&slackChatAdapter{m: m}, creds, func(id string) string { return agentDir(id) }, logger)
-	for _, a := range m.agents {
-		if a.SlackBot != nil && a.SlackBot.Enabled {
-			m.slackHub.StartBot(a.ID, *a.SlackBot)
 		}
 	}
 
@@ -580,15 +568,6 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 	m.mu.Unlock()
 
 	m.save()
-
-	// Reconcile running bot with new config (mirrors UpdateNotifySources pattern).
-	if m.slackHub != nil {
-		if cfg != nil && cfg.Enabled {
-			m.slackHub.Reconfigure(id, *cfg)
-		} else {
-			m.slackHub.StopBot(id)
-		}
-	}
 	return nil
 }
 
@@ -1158,13 +1137,10 @@ func (m *Manager) LMStudioModels() []string {
 	return m.lmStudio.ListModels()
 }
 
-// Shutdown stops all cron jobs, notify polling, Slack bots, and cancels active chats.
+// Shutdown stops all cron jobs, notify polling, and cancels active chats.
 func (m *Manager) Shutdown() {
 	m.cron.Stop()
 	m.notifyPoller.Stop() // cancels in-flight delivery goroutines via stopCtx
-	if m.slackHub != nil {
-		m.slackHub.Stop()
-	}
 
 	if m.lmsProxyStop != nil {
 		m.lmsProxyStop()
@@ -1181,55 +1157,12 @@ func (m *Manager) Shutdown() {
 	m.save()
 }
 
-// SlackHub returns the Slack bot hub for use by HTTP handlers.
-func (m *Manager) SlackHub() *slackbot.Hub {
-	return m.slackHub
+// AgentDir returns the data directory path for the given agent ID.
+// Exported for use by external subsystems (e.g. slackbot Hub) that need
+// to resolve agent data directories without importing agent internals.
+func AgentDir(id string) string {
+	return agentDir(id)
 }
-
-// slackChatAdapter adapts Manager to the slackbot.ChatManager interface.
-type slackChatAdapter struct {
-	m *Manager
-}
-
-func (a *slackChatAdapter) ChatForSlack(ctx context.Context, agentID, message, role string) (<-chan slackbot.ChatEvent, error) {
-	agentCh, err := a.m.Chat(ctx, agentID, message, role, nil)
-	if err != nil {
-		return nil, err
-	}
-	// Convert agent.ChatEvent channel to slackbot.ChatEvent channel
-	out := make(chan slackbot.ChatEvent, 64)
-	go func() {
-		defer close(out)
-		for evt := range agentCh {
-			out <- slackbot.ChatEvent{
-				Type:         evt.Type,
-				Delta:        evt.Delta,
-				ErrorMessage: evt.ErrorMessage,
-			}
-		}
-	}()
-	return out, nil
-}
-
-func (a *slackChatAdapter) ChatForSlackOneShot(ctx context.Context, agentID, message, role string) (<-chan slackbot.ChatEvent, error) {
-	agentCh, err := a.m.ChatOneShot(ctx, agentID, message)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan slackbot.ChatEvent, 64)
-	go func() {
-		defer close(out)
-		for evt := range agentCh {
-			out <- slackbot.ChatEvent{
-				Type:         evt.Type,
-				Delta:        evt.Delta,
-				ErrorMessage: evt.ErrorMessage,
-			}
-		}
-	}()
-	return out, nil
-}
-
 
 func (m *Manager) save() {
 	m.mu.Lock()

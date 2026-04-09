@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/slackbot"
 )
 
@@ -62,9 +63,8 @@ func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
 		resp.HasBotToken = botToken != ""
 	}
 
-	hub := s.agents.SlackHub()
-	if hub != nil {
-		resp.Connected = hub.IsRunning(agentID)
+	if s.slackHub != nil {
+		resp.Connected = s.slackHub.IsRunning(agentID)
 	}
 
 	writeJSONResponse(w, http.StatusOK, resp)
@@ -123,7 +123,7 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	if req.ThreadReplies != nil {
 		threadReplies = *req.ThreadReplies
 	}
-	cfg := slackbot.Config{
+	cfg := agent.SlackBotConfig{
 		Enabled:        req.Enabled,
 		ThreadReplies:  threadReplies,
 		RespondDM:      req.RespondDM,
@@ -131,16 +131,15 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		RespondThread:  req.RespondThread,
 	}
 
-	// Update agent
+	// Update agent config
 	if err := s.agents.UpdateSlackBot(agentID, &cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
 
-	// Start/stop bot
-	hub := s.agents.SlackHub()
-	if hub != nil {
-		hub.Reconfigure(agentID, cfg)
+	// Reconcile running bot with new config
+	if s.slackHub != nil {
+		s.slackHub.Reconfigure(agentID, cfg)
 	}
 
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})
@@ -155,9 +154,8 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stop bot
-	hub := s.agents.SlackHub()
-	if hub != nil {
-		hub.StopBot(agentID)
+	if s.slackHub != nil {
+		s.slackHub.StopBot(agentID)
 	}
 
 	// Remove config

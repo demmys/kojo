@@ -103,6 +103,10 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Stop Slack bot before deleting the agent so it doesn't keep running.
+	if s.slackHub != nil {
+		s.slackHub.StopBot(id)
+	}
 	if err := s.agents.Delete(id); err != nil {
 		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())

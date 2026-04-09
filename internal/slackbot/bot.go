@@ -9,33 +9,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
-// ChatEvent represents a streaming event from the agent chat backend.
-// This mirrors agent.ChatEvent but is defined here to avoid a circular import
-// (agent imports slackbot indirectly via manager → hub).
-// The adapter in agent/manager wires the concrete types together.
-type ChatEvent struct {
-	Type         string
-	Delta        string
-	ErrorMessage string
-}
-
 // ChatManager is the interface the bot uses to interact with agents.
+// agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
-	ChatForSlack(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
-	ChatForSlackOneShot(ctx context.Context, agentID, message, role string) (<-chan ChatEvent, error)
+	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment) (<-chan agent.ChatEvent, error)
+	ChatOneShot(ctx context.Context, agentID, message string) (<-chan agent.ChatEvent, error)
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
 	agentID      string
 	agentDataDir string // agent data directory for history file storage
-	config       Config
+	config       agent.SlackBotConfig
 	api          *slack.Client
 	sm           *socketmode.Client
 	mgr          ChatManager
@@ -80,7 +72,7 @@ const (
 // NewBot creates a new Bot instance. Call Run() to start it.
 // agentDataDir is the agent's data directory used for storing conversation history files.
 // parentCtx controls the Bot's lifetime: cancelling it will stop the event loop.
-func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg Config, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
+func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg agent.SlackBotConfig, appToken, botToken string, mgr ChatManager, logger *slog.Logger) *Bot {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	sm := socketmode.New(api, socketmode.OptionLog(slog.NewLogLogger(logger.Handler(), slog.LevelWarn)))
 
@@ -352,7 +344,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, mes
 		Status:    typingStatus,
 	})
 
-	events, err := b.mgr.ChatForSlackOneShot(ctx, b.agentID, message, "user")
+	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message)
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/agent"
 )
 
 // AgentDataDirFunc resolves an agent ID to its data directory path.
@@ -13,7 +15,7 @@ type AgentDataDirFunc func(agentID string) string
 type hubCommand struct {
 	kind    hubCmdKind
 	agentID string
-	cfg     Config
+	cfg     agent.SlackBotConfig
 	result  chan<- bool // for IsRunning; nil for fire-and-forget commands
 }
 
@@ -105,7 +107,7 @@ func (h *Hub) loop() {
 	}
 }
 
-func (h *Hub) doStartBot(bots map[string]*Bot, agentID string, cfg Config) {
+func (h *Hub) doStartBot(bots map[string]*Bot, agentID string, cfg agent.SlackBotConfig) {
 	if h.tokens == nil {
 		h.logger.Warn("no credential store, cannot start slack bot", "agent", agentID)
 		return
@@ -160,7 +162,7 @@ func (h *Hub) send(cmd hubCommand) bool {
 
 // StartBot starts a Slack bot for the given agent. If one is already running,
 // it is stopped first.
-func (h *Hub) StartBot(agentID string, cfg Config) {
+func (h *Hub) StartBot(agentID string, cfg agent.SlackBotConfig) {
 	h.send(hubCommand{kind: cmdStartBot, agentID: agentID, cfg: cfg})
 }
 
@@ -171,7 +173,7 @@ func (h *Hub) StopBot(agentID string) {
 
 // Reconfigure stops and restarts the bot with new configuration.
 // If the config is disabled, it only stops the bot.
-func (h *Hub) Reconfigure(agentID string, cfg Config) {
+func (h *Hub) Reconfigure(agentID string, cfg agent.SlackBotConfig) {
 	h.send(hubCommand{kind: cmdReconfigure, agentID: agentID, cfg: cfg})
 }
 

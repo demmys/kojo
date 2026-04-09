@@ -9,11 +9,28 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/notifysource"
-	"github.com/loppo-llc/kojo/internal/slackbot"
 )
 
-// SlackBotConfig is an alias for slackbot.Config used in Agent JSON serialization.
-type SlackBotConfig = slackbot.Config
+// SlackBotConfig holds Slack bot configuration for an agent.
+type SlackBotConfig struct {
+	Enabled       bool `json:"enabled"`
+	ThreadReplies bool `json:"threadReplies"` // always reply in-thread (default true)
+
+	// Reaction patterns — which message types the bot responds to.
+	// All default to true for backwards compatibility.
+	RespondDM      *bool `json:"respondDM,omitempty"`      // respond to direct messages
+	RespondMention *bool `json:"respondMention,omitempty"`  // respond to @mentions in channels
+	RespondThread  *bool `json:"respondThread,omitempty"`   // auto-reply in threads with history
+}
+
+// ReactDM returns whether the bot should respond to direct messages.
+func (c *SlackBotConfig) ReactDM() bool { return c.RespondDM == nil || *c.RespondDM }
+
+// ReactMention returns whether the bot should respond to @mentions.
+func (c *SlackBotConfig) ReactMention() bool { return c.RespondMention == nil || *c.RespondMention }
+
+// ReactThread returns whether the bot should auto-reply in threads with history.
+func (c *SlackBotConfig) ReactThread() bool { return c.RespondThread == nil || *c.RespondThread }
 
 // ValidActiveHours validates the active hours range.
 // Both must be empty (no restriction) or both must be valid HH:MM format.

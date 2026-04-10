@@ -33,25 +33,25 @@ func BuildOAIRequest(req *AnthropicRequest, prevID string, newMsgs []AnthropicMe
 		Store:              true,
 	}
 
-	// On first request (no previous_response_id), send instructions and tools.
-	// On follow-ups, LM Studio restores them from previous_response_id,
-	// so we skip them to reduce request size and processing overhead.
+	// Instructions are only needed on the first request; LM Studio
+	// restores them from previous_response_id on follow-ups.
 	if prevID == "" {
 		oai.Instructions = extractSystem(req.System)
+	}
 
-		// Convert tools (Responses API uses flat format, not nested "function" wrapper).
-		// Filter by allowedTools whitelist and trim descriptions.
-		for _, t := range req.Tools {
-			if len(allowedTools) > 0 && !allowedTools[t.Name] {
-				continue
-			}
-			oai.Tools = append(oai.Tools, OAITool{
-				Type:        "function",
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.InputSchema,
-			})
+	// Always send tools: LM Studio does NOT restore tool definitions
+	// from previous_response_id, so omitting them causes the model to
+	// fall back to text-based pseudo-tool-calls.
+	for _, t := range req.Tools {
+		if len(allowedTools) > 0 && !allowedTools[t.Name] {
+			continue
 		}
+		oai.Tools = append(oai.Tools, OAITool{
+			Type:        "function",
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.InputSchema,
+		})
 	}
 
 	return oai, nil

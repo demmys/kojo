@@ -85,12 +85,6 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Session lookup: find previous_response_id and extract delta.
 	prevID, newMsgs := p.session.Lookup(sessionID, req.Model, req.Messages)
 
-	if prevID != "" {
-		p.logger.Info("session hit", "prevID", prevID, "delta", len(newMsgs), "total", len(req.Messages))
-	} else {
-		p.logger.Info("session miss", "total", len(req.Messages))
-	}
-
 	// Apply session config (model override, allowed tools).
 	var allowedTools map[string]bool
 	if cfg, ok := p.session.GetConfig(sessionID); ok {
@@ -141,7 +135,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Store session for next request.
 	if rid := converter.ResponseID(); rid != "" {
 		p.session.Store(sessionID, req.Model, rid)
-		p.logger.Info("session stored", "session", sessionID, "model", req.Model, "responseID", rid)
+		p.logger.Debug("session stored", "session", sessionID, "model", req.Model, "responseID", rid)
 	}
 }
 

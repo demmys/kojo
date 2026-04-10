@@ -255,4 +255,25 @@ func TestProxy_ModelsEndpoint(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("status: %d", resp.StatusCode)
 	}
+
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should contain Claude model IDs for CLI validation.
+	found := false
+	for _, m := range result.Data {
+		if m.ID == "claude-opus-4-6[1m]" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected claude-opus-4-6[1m] in models response")
+	}
 }

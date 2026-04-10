@@ -183,22 +183,34 @@ func (p *Proxy) forwardToLMS(ctx context.Context, oaiReq *OAIRequest) (*http.Res
 	return p.client.Do(httpReq)
 }
 
-// handleModels proxies GET /v1/models to LM Studio for Claude Code compatibility.
+// claudeModelIDs lists Claude model identifiers that Claude Code CLI may use.
+// The proxy returns these so the CLI's model validation passes.
+var claudeModelIDs = []string{
+	"claude-opus-4-6",
+	"claude-opus-4-6[1m]",
+	"claude-sonnet-4-6",
+	"claude-sonnet-4-6[1m]",
+	"claude-sonnet-4-5-20241022",
+	"claude-haiku-4-5-20251001",
+	"claude-3-5-sonnet-20241022",
+	"claude-3-5-haiku-20241022",
+}
+
+// handleModels returns Claude model IDs so the CLI's model validation passes.
+// The actual model mapping to LM Studio happens in handleMessages via session
+// config or query parameter.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
-	req, err := http.NewRequestWithContext(r.Context(), "GET", p.lmsBaseURL+"/v1/models", nil)
-	if err != nil {
-		writeAnthropicErrorResponse(w, http.StatusInternalServerError, "api_error", err.Error())
-		return
+	type modelEntry struct {
+		ID string `json:"id"`
 	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		writeAnthropicErrorResponse(w, http.StatusBadGateway, "api_error", "LM Studio unavailable")
-		return
+	data := make([]modelEntry, len(claudeModelIDs))
+	for i, id := range claudeModelIDs {
+		data[i] = modelEntry{ID: id}
 	}
-	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"data": data,
+	})
 }
 
 // handleSessionConfig sets per-session configuration (model override, allowed tools).

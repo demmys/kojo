@@ -690,16 +690,23 @@ func clearClaudeSession(agentID string) {
 	dir := agentDir(agentID)
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
+		slog.Warn("clearClaudeSession: Abs failed", "agent", agentID, "err", err)
 		return
 	}
 	projectDir := claudeProjectDir(absDir)
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
+		slog.Info("clearClaudeSession: no project dir", "agent", agentID, "dir", projectDir)
 		return
 	}
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
-			os.Remove(filepath.Join(projectDir, e.Name()))
+			path := filepath.Join(projectDir, e.Name())
+			if err := os.Remove(path); err != nil {
+				slog.Warn("clearClaudeSession: remove failed", "path", path, "err", err)
+			} else {
+				slog.Info("clearClaudeSession: removed", "path", path)
+			}
 		}
 	}
 }

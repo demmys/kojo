@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -194,6 +195,7 @@ type StreamConverter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
 	model   string
+	logger  *slog.Logger
 
 	// State tracking.
 	responseID    string
@@ -201,6 +203,9 @@ type StreamConverter struct {
 	hasToolUse    bool
 	argsDeltaSent bool // whether any function_call_arguments.delta was sent for current block
 }
+
+// SetLogger enables debug logging of all emitted SSE events.
+func (c *StreamConverter) SetLogger(l *slog.Logger) { c.logger = l }
 
 // NewStreamConverter creates a converter that writes Anthropic SSE to w.
 func NewStreamConverter(w http.ResponseWriter, model string) *StreamConverter {
@@ -356,6 +361,9 @@ func (c *StreamConverter) writeSSE(event string, payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
+	}
+	if c.logger != nil {
+		c.logger.Info("proxy SSE out", "event", event, "data", string(data))
 	}
 	_, err = fmt.Fprintf(c.w, "event: %s\ndata: %s\n\n", event, data)
 	if c.flusher != nil {

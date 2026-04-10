@@ -95,10 +95,6 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 			allowedTools = cfg.AllowedTools
 		}
 	}
-	// Query params as fallback (for simple/standalone usage).
-	if modelOverride := r.URL.Query().Get("model"); modelOverride != "" {
-		req.Model = modelOverride
-	}
 
 	// Build OAI Responses request.
 	oaiReq, err := BuildOAIRequest(&req, prevID, newMsgs, allowedTools)
@@ -127,6 +123,7 @@ func (p *Proxy) handleMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	converter := NewStreamConverter(w, req.Model)
+	converter.SetLogger(p.logger)
 	if err := converter.Process(oaiResp.Body); err != nil {
 		p.logger.Error("stream conversion error", "err", err)
 		return

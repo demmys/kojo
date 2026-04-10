@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -110,6 +111,28 @@ func (m *Manager) GetLMSProxyPort() int {
 	return m.lmsProxyPort
 }
 
+// configureLMSSession sets the model override for an LMS proxy session via its config API.
+func (m *Manager) configureLMSSession(proxyBaseURL, model string) {
+	configURL := proxyBaseURL + "/config"
+	body := fmt.Sprintf(`{"model":%q}`, model)
+	req, err := http.NewRequest("PUT", configURL, strings.NewReader(body))
+	if err != nil {
+		m.logger.Warn("failed to create LMS config request", "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		m.logger.Warn("failed to configure LMS session", "url", configURL, "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		m.logger.Warn("LMS session config failed", "status", resp.StatusCode, "body", string(respBody))
+	}
+}
+
 func NewManager(logger *slog.Logger) *Manager {
 	st := newStore(logger)
 	m := &Manager{
@@ -128,6 +151,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 
 	// lm-studio sessions run claude CLI with ANTHROPIC_BASE_URL pointing at the proxy.
 	var lmsProxyURL string
+	var lmsModelOverride string
 	actualTool := tool
 	if tool == "lm-studio" {
 		m.mu.Lock()
@@ -137,17 +161,18 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		if port == 0 {
 			return nil, fmt.Errorf("LM Studio proxy is not running")
 		}
-		// Model is passed via proxy URL query param, not --model (Claude CLI rejects unknown models).
-		modelParam := defaultModel
+		// Model is configured via proxy session config API (PUT /session/{id}/config),
+		// not query params. The Stainless SDK corrupts query strings in ANTHROPIC_BASE_URL.
+		lmsModelOverride = defaultModel
 		// Check if user specified --model or -m in args; if so, extract and remove it.
 		for i, a := range args {
 			if (a == "--model" || a == "-m") && i+1 < len(args) {
-				modelParam = args[i+1]
+				lmsModelOverride = args[i+1]
 				args = append(args[:i], args[i+2:]...)
 				break
 			}
 		}
-		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%%s?model=%s", port, modelParam) // %s filled with session ID later
+		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%%s", port) // %s filled with session ID later
 		actualTool = "claude"
 	}
 
@@ -205,7 +230,13 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	// Build extra environment variables for the tool process.
 	var extraEnv []string
 	if lmsProxyURL != "" {
-		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+fmt.Sprintf(lmsProxyURL, id))
+		proxyBaseURL := fmt.Sprintf(lmsProxyURL, id)
+		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+proxyBaseURL)
+
+		// Configure session model via proxy config API before starting the CLI.
+		if lmsModelOverride != "" {
+			m.configureLMSSession(proxyBaseURL, lmsModelOverride)
+		}
 	}
 
 	var res *startResult
@@ -311,6 +342,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	if tool == "lm-studio" {
 		m.mu.Lock()
 		port := m.lmsProxyPort
+		defaultModel := m.lmsDefaultModel
 		m.mu.Unlock()
 		if port == 0 {
 			clearRestarting()
@@ -318,6 +350,18 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		}
 		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%s", port, id)
 		actualTool = "claude"
+
+		// Re-apply model override in case the proxy was restarted.
+		lmsModel := defaultModel
+		for i, a := range args {
+			if (a == "--model" || a == "-m") && i+1 < len(args) {
+				lmsModel = args[i+1]
+				break
+			}
+		}
+		if lmsModel != "" {
+			m.configureLMSSession(lmsProxyURL, lmsModel)
+		}
 	}
 
 	// Internal tools are resolved by platform functions, not LookPath

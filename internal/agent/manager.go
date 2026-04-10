@@ -1,15 +1,19 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/lmsproxy"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
 )
@@ -54,6 +58,10 @@ type Manager struct {
 	// notifyPoller polls external notification sources.
 	notifyPoller *notifyPoller
 
+	// lmsProxyPort/Stop manage the LM Studio proxy lifecycle (Anthropic → OAI Responses API).
+	lmsProxyPort int
+	lmsProxyStop context.CancelFunc
+
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
 }
@@ -84,6 +92,24 @@ func NewManager(logger *slog.Logger) *Manager {
 
 	// Expose LM Studio backend for model listing
 	m.lmStudio = m.backends["lm-studio"].(*LMStudioBackend)
+
+	// Start LMS proxy if LM Studio is available.
+	if m.lmStudio.Available() {
+		// Ensure loaded models have sufficient context for Claude Code's tools.
+		lmsproxy.EnsureModelContext(logger)
+
+		proxyCtx, proxyCancel := context.WithCancel(context.Background())
+		proxy := lmsproxy.New(lmsproxy.DetectLMSBaseURL(), logger)
+		port, err := proxy.Start(proxyCtx, 19234)
+		if err != nil {
+			logger.Warn("failed to start lmsproxy", "err", err)
+			proxyCancel()
+		} else {
+			m.lmsProxyPort = port
+			m.lmsProxyStop = proxyCancel
+			logger.Info("lmsproxy started", "port", port)
+		}
+	}
 
 	m.cron = newCronScheduler(m, logger)
 	m.cronPaused = m.store.LoadCronPaused()
@@ -133,6 +159,11 @@ func NewManager(logger *slog.Logger) *Manager {
 	}
 
 	return m
+}
+
+// LMSProxyPort returns the LMS proxy port (0 if not running).
+func (m *Manager) LMSProxyPort() int {
+	return m.lmsProxyPort
 }
 
 // SetGroupDMManager sets the group DM manager reference.
@@ -508,6 +539,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ActiveEnd != nil {
 		a.ActiveEnd = *cfg.ActiveEnd
 	}
+	if cfg.AllowedTools != nil {
+		a.AllowedTools = cfg.AllowedTools
+	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
 	applyAvatarMeta(a, avHas, avHash)
@@ -752,15 +786,38 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
 
-	// Get the backend
-	backend, ok := m.backends[agentCopy.Tool]
-	if !ok {
-		err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
-		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
-		close(outCh)
-		m.clearBusy(agentID)
-		cancel()
-		return nil, err
+	// Get the backend.
+	// When lm-studio is selected and the proxy is running, route through
+	// Claude CLI with ANTHROPIC_BASE_URL pointing at the proxy so that
+	// tool use works via /v1/responses (stateful + custom tools).
+	var backend ChatBackend
+	claudeBackend := m.backends["claude"]
+	useLMSProxy := agentCopy.Tool == "lm-studio" && m.lmsProxyPort > 0 && claudeBackend != nil && claudeBackend.Available()
+	if useLMSProxy {
+		cb := NewClaudeBackend(m.logger)
+		proxyBase := fmt.Sprintf("http://localhost:%d", m.lmsProxyPort)
+		// Configure session on the proxy (model override + allowed tools).
+		cfgBody, _ := json.Marshal(map[string]interface{}{
+			"model":        agentCopy.Model,
+			"allowedTools": agentCopy.AllowedTools,
+		})
+		sessionPath := "/session/" + agentID
+		http.Post(proxyBase+sessionPath+"/config", "application/json", bytes.NewReader(cfgBody))
+		cb.SetProxyURL(proxyBase + sessionPath)
+		// Clear the model so Claude CLI uses its default (the proxy overrides it).
+		agentCopy.Model = ""
+		backend = cb
+	} else {
+		var ok bool
+		backend, ok = m.backends[agentCopy.Tool]
+		if !ok {
+			err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
+			outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+			close(outCh)
+			m.clearBusy(agentID)
+			cancel()
+			return nil, err
+		}
 	}
 
 	atts := attachments
@@ -773,7 +830,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
 	// Prepare Claude settings (persona override + PreCompact hook) before backend starts
-	if agentCopy.Tool == "claude" {
+	if agentCopy.Tool == "claude" || useLMSProxy {
 		PrepareClaudeSettings(agentID, apiBase, m.logger)
 	}
 
@@ -1017,6 +1074,9 @@ func (m *Manager) ResetSession(agentID string) error {
 		clearGeminiSession(agentID)
 	case "lm-studio":
 		m.lmStudio.ResetSession(agentID)
+		if m.lmsProxyPort > 0 {
+			clearClaudeSession(agentID)
+		}
 	}
 	// Codex uses ephemeral sessions — no persistent state to clear
 
@@ -1117,6 +1177,10 @@ func (m *Manager) LMStudioModels() []string {
 func (m *Manager) Shutdown() {
 	m.cron.Stop()
 	m.notifyPoller.Stop() // cancels in-flight delivery goroutines via stopCtx
+
+	if m.lmsProxyStop != nil {
+		m.lmsProxyStop()
+	}
 
 	m.busyMu.Lock()
 	for _, entry := range m.busy {

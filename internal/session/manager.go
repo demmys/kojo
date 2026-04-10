@@ -54,9 +54,10 @@ const (
 )
 
 var userTools = map[string]bool{
-	"claude": true,
-	"codex":  true,
-	"gemini": true,
+	"claude":    true,
+	"codex":     true,
+	"gemini":    true,
+	"lm-studio": true,
 }
 
 // internalTools is populated by platform-specific init() functions.
@@ -67,6 +68,15 @@ func isAllowedTool(name string) bool {
 	return userTools[name] || internalTools[name]
 }
 
+func hasArg(args []string, name string) bool {
+	for _, a := range args {
+		if a == name || strings.HasPrefix(a, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -75,8 +85,29 @@ type Manager struct {
 
 	shuttingDown bool
 
+	// lmsProxyPort is the port of the LMS proxy (Anthropic → OAI Responses).
+	// Set by the caller when the proxy is active.
+	lmsProxyPort int
+	// lmsDefaultModel is the default LM Studio model for CLI sessions.
+	lmsDefaultModel string
+
 	// callback for session events
 	OnSessionExit func(s *Session)
+}
+
+// SetLMSProxy configures the LMS proxy port and default model for CLI sessions.
+func (m *Manager) SetLMSProxy(port int, defaultModel string) {
+	m.mu.Lock()
+	m.lmsProxyPort = port
+	m.lmsDefaultModel = defaultModel
+	m.mu.Unlock()
+}
+
+// GetLMSProxyPort returns the LMS proxy port (0 if not running).
+func (m *Manager) GetLMSProxyPort() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lmsProxyPort
 }
 
 func NewManager(logger *slog.Logger) *Manager {
@@ -95,13 +126,38 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
 
+	// lm-studio sessions run claude CLI with ANTHROPIC_BASE_URL pointing at the proxy.
+	var lmsProxyURL string
+	actualTool := tool
+	if tool == "lm-studio" {
+		m.mu.Lock()
+		port := m.lmsProxyPort
+		defaultModel := m.lmsDefaultModel
+		m.mu.Unlock()
+		if port == 0 {
+			return nil, fmt.Errorf("LM Studio proxy is not running")
+		}
+		// Model is passed via proxy URL query param, not --model (Claude CLI rejects unknown models).
+		modelParam := defaultModel
+		// Check if user specified --model or -m in args; if so, extract and remove it.
+		for i, a := range args {
+			if (a == "--model" || a == "-m") && i+1 < len(args) {
+				modelParam = args[i+1]
+				args = append(args[:i], args[i+2:]...)
+				break
+			}
+		}
+		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%%s?model=%s", port, modelParam) // %s filled with session ID later
+		actualTool = "claude"
+	}
+
 	// Internal tools (tmux/shell) are resolved by platform functions, not LookPath
 	var toolPath string
 	var err error
 	if userTools[tool] {
-		toolPath, err = exec.LookPath(tool)
+		toolPath, err = exec.LookPath(actualTool)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, tool)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
 		}
 	}
 
@@ -114,7 +170,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	// For claude, assign a stable session ID so we can --resume later
 	var toolSessionID string
 	runArgs := args
-	if tool == "claude" {
+	if actualTool == "claude" {
 		hasSessionID := false
 		for i, a := range args {
 			if a == "--session-id" {
@@ -146,9 +202,15 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	// codex: session ID is captured from PTY output in readLoop
 	// gemini: no session ID mechanism; uses --resume latest on restart
 
+	// Build extra environment variables for the tool process.
+	var extraEnv []string
+	if lmsProxyURL != "" {
+		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+fmt.Sprintf(lmsProxyURL, id))
+	}
+
 	var res *startResult
 	if userTools[tool] {
-		res, err = m.platformStartUserTool(id, workDir, toolPath, runArgs, 0, 0)
+		res, err = m.platformStartUserTool(id, workDir, toolPath, runArgs, 0, 0, extraEnv)
 	} else {
 		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, runArgs, toolSessionID)
 	}
@@ -243,21 +305,41 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
+	// lm-studio sessions use claude CLI with proxy.
+	var lmsProxyURL string
+	actualTool := tool
+	if tool == "lm-studio" {
+		m.mu.Lock()
+		port := m.lmsProxyPort
+		m.mu.Unlock()
+		if port == 0 {
+			clearRestarting()
+			return nil, fmt.Errorf("LM Studio proxy is not running")
+		}
+		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%s", port, id)
+		actualTool = "claude"
+	}
+
 	// Internal tools are resolved by platform functions, not LookPath
 	var toolPath string
 	if userTools[tool] {
 		var err error
-		toolPath, err = exec.LookPath(tool)
+		toolPath, err = exec.LookPath(actualTool)
 		if err != nil {
 			clearRestarting()
-			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, tool)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
 		}
 	}
 
 	// Platform-specific cleanup of old session resources
 	m.platformPrepareRestart(s)
 
-	restartArgs := buildRestartArgs(tool, args, toolSessionID)
+	restartArgs := buildRestartArgs(actualTool, args, toolSessionID)
+
+	var extraEnv []string
+	if lmsProxyURL != "" {
+		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+lmsProxyURL)
+	}
 
 	var res *startResult
 	var err error
@@ -265,7 +347,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		s.mu.Lock()
 		cols, rows := s.lastCols, s.lastRows
 		s.mu.Unlock()
-		res, err = m.platformStartUserTool(id, workDir, toolPath, restartArgs, cols, rows)
+		res, err = m.platformStartUserTool(id, workDir, toolPath, restartArgs, cols, rows, extraEnv)
 	} else {
 		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, restartArgs, toolSessionID)
 	}
@@ -646,9 +728,22 @@ func generateID() string {
 }
 
 // ToolAvailability checks which user-facing tools are available on this system.
-func ToolAvailability() map[string]ToolInfo {
+// lmsProxyPort should be >0 when the LMS proxy is running.
+func ToolAvailability(lmsProxyPort int) map[string]ToolInfo {
 	result := make(map[string]ToolInfo)
 	for tool := range userTools {
+		if tool == "lm-studio" {
+			// lm-studio requires: lms CLI + claude CLI + proxy running.
+			_, lmsErr := exec.LookPath("lms")
+			claudePath, claudeErr := exec.LookPath("claude")
+			available := lmsErr == nil && claudeErr == nil && lmsProxyPort > 0
+			path := ""
+			if available {
+				path = claudePath
+			}
+			result[tool] = ToolInfo{Available: available, Path: path}
+			continue
+		}
 		path, err := exec.LookPath(tool)
 		result[tool] = ToolInfo{
 			Available: err == nil,

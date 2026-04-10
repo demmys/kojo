@@ -405,8 +405,16 @@ type tmuxAttachResult struct {
 }
 
 // startTmuxAttach creates a tmux session, sets up pipe-pane, and attaches via PTY.
-func (m *Manager) startTmuxAttach(tmuxName, workDir, toolPath string, args []string, cols, rows uint16) (*tmuxAttachResult, error) {
+func (m *Manager) startTmuxAttach(tmuxName, workDir, toolPath string, args []string, cols, rows uint16, envVars []string) (*tmuxAttachResult, error) {
 	shellCmd := buildShellCommand(toolPath, args)
+	// Prepend environment variable exports to the shell command.
+	if len(envVars) > 0 {
+		var exports string
+		for _, ev := range envVars {
+			exports += "export " + shellQuote(ev) + "; "
+		}
+		shellCmd = exports + shellCmd
+	}
 	if err := tmuxNewSession(tmuxName, workDir, shellCmd, true); err != nil {
 		return nil, fmt.Errorf("failed to create tmux session: %w", err)
 	}

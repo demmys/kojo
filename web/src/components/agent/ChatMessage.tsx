@@ -70,7 +70,7 @@ export const ChatMessage = memo(function ChatMessage({
         )}
 
         {/* Usage */}
-        {message.usage && (
+        {message.usage && message.usage.inputTokens != null && (
           <div className="text-[10px] text-neutral-500 mt-1 font-mono">
             {message.usage.inputTokens.toLocaleString()}&rarr;{message.usage.outputTokens.toLocaleString()} tokens
           </div>

@@ -27,9 +27,9 @@ func (m *Manager) platformInit() {
 }
 
 // platformStartUserTool starts a user-facing tool inside a tmux session.
-func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []string, cols, rows uint16) (*startResult, error) {
+func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []string, cols, rows uint16, envVars []string) (*startResult, error) {
 	tmuxName := tmuxSessionName(id)
-	res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, args, cols, rows)
+	res, err := m.startTmuxAttach(tmuxName, workDir, toolPath, args, cols, rows, envVars)
 	if err != nil {
 		return nil, err
 	}

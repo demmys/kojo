@@ -7,6 +7,7 @@ export function NewSession() {
   const [searchParams] = useSearchParams();
   const [info, setInfo] = useState<ServerInfo>();
   const [tool, setTool] = useState("claude");
+  const [model, setModel] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [args, setArgs] = useState("");
   const [yoloMode, setYoloMode] = useState(false);
@@ -74,8 +75,11 @@ export function NewSession() {
     setLoading(true);
     setError("");
     try {
-      const parsedArgs = args.trim() ? args.trim().split(/\s+/) : undefined;
-      const session = await api.sessions.create({ tool, workDir, args: parsedArgs, yoloMode });
+      let parsedArgs = args.trim() ? args.trim().split(/\s+/) : [];
+      if (model && !parsedArgs.includes("--model")) {
+        parsedArgs = ["--model", model, ...parsedArgs];
+      }
+      const session = await api.sessions.create({ tool, workDir, args: parsedArgs.length > 0 ? parsedArgs : undefined, yoloMode });
       navigate(`/session/${session.id}`, { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -115,7 +119,14 @@ export function NewSession() {
                     value={name}
                     checked={tool === name}
                     disabled={!t.available}
-                    onChange={() => setTool(name)}
+                    onChange={() => {
+                      setTool(name);
+                      if (name === "lm-studio") {
+                        setModel(info?.lmStudioModels?.[0] ?? "");
+                      } else {
+                        setModel("");
+                      }
+                    }}
                     className="accent-neutral-400"
                   />
                   <span className="font-mono">{name}</span>
@@ -126,6 +137,22 @@ export function NewSession() {
               ))}
           </div>
         </div>
+
+        {/* Model (lm-studio) */}
+        {tool === "lm-studio" && info?.lmStudioModels && info.lmStudioModels.length > 0 && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Model</label>
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              {info.lmStudioModels.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Working directory */}
         <div ref={wrapperRef} className="relative">

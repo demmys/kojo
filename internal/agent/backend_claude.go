@@ -18,11 +18,17 @@ import (
 
 // ClaudeBackend implements ChatBackend using the Claude CLI with stream-json output.
 type ClaudeBackend struct {
-	logger *slog.Logger
+	logger   *slog.Logger
+	proxyURL string // if set, injected as ANTHROPIC_BASE_URL
 }
 
 func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
 	return &ClaudeBackend{logger: logger}
+}
+
+// SetProxyURL configures an ANTHROPIC_BASE_URL to inject into Claude CLI env.
+func (b *ClaudeBackend) SetProxyURL(url string) {
+	b.proxyURL = url
 }
 
 func (b *ClaudeBackend) Name() string { return "claude" }
@@ -47,6 +53,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	if b.proxyURL != "" {
+		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
+	}
 	cmd.Dir = dir
 
 	// Pass user message via stdin to avoid option injection when the message

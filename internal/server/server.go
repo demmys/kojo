@@ -83,8 +83,20 @@ func New(cfg Config) *Server {
 		logger = slog.Default()
 	}
 
+	sessMgr := session.NewManager(logger)
+	if cfg.AgentManager != nil {
+		if port := cfg.AgentManager.LMSProxyPort(); port > 0 {
+			models := cfg.AgentManager.LMStudioModels()
+			defaultModel := ""
+			if len(models) > 0 {
+				defaultModel = models[0]
+			}
+			sessMgr.SetLMSProxy(port, defaultModel)
+		}
+	}
+
 	s := &Server{
-		sessions: session.NewManager(logger),
+		sessions: sessMgr,
 		agents:   cfg.AgentManager,
 		groupdms: cfg.GroupDMManager,
 		files:    filebrowser.New(logger),
@@ -320,7 +332,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"version":   s.version,
 		"hostname":  hostname,
 		"homeDir":   homeDir,
-		"tools":     session.ToolAvailability(),
+		"tools":     session.ToolAvailability(s.sessions.GetLMSProxyPort()),
 		"shellTool": session.ShellToolName(),
 	}
 	if s.agents != nil {

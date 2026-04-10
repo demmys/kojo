@@ -75,7 +75,10 @@ func (m *Manager) restoreSession(info SessionInfo) *Session {
 }
 
 // platformStartUserTool starts a user-facing tool directly via ConPTY (no tmux on Windows).
-func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []string, cols, rows uint16) (*startResult, error) {
+func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []string, cols, rows uint16, envVars []string) (*startResult, error) {
+	if len(envVars) > 0 {
+		return nil, fmt.Errorf("environment variable injection is not supported on Windows (lm-studio sessions require Unix)")
+	}
 	cmdLine := buildCmdLine(toolPath, args)
 	rwc, cmd, resizeFn, err := startConPTY(cmdLine, workDir, cols, rows)
 	if err != nil {

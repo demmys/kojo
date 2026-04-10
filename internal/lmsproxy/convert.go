@@ -368,16 +368,14 @@ func (c *StreamConverter) writeMessageStart(id string) error {
 	return c.writeSSE("message_start", map[string]interface{}{
 		"type": "message_start",
 		"message": map[string]interface{}{
-			"id":          id,
-			"type":        "message",
-			"role":        "assistant",
-			"content":     []interface{}{},
-			"model":       c.model,
-			"stop_reason": nil,
-			"usage": map[string]int{
-				"input_tokens":  0,
-				"output_tokens": 0,
-			},
+			"id":            id,
+			"type":          "message",
+			"role":          "assistant",
+			"content":       []interface{}{},
+			"model":         c.model,
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage":         anthropicUsage(0, 0),
 		},
 	})
 }
@@ -434,9 +432,7 @@ func (c *StreamConverter) writeMessageDelta(stopReason string, outputTokens int)
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]int{
-			"output_tokens": outputTokens,
-		},
+		"usage": anthropicUsage(0, outputTokens),
 	})
 }
 
@@ -444,6 +440,24 @@ func (c *StreamConverter) writeMessageStop() error {
 	return c.writeSSE("message_stop", map[string]interface{}{
 		"type": "message_stop",
 	})
+}
+
+// anthropicUsage returns a usage object matching the Anthropic Messages API
+// schema. Claude CLI expects fields like cache_creation_input_tokens and speed
+// to exist; omitting them causes JavaScript crashes in the CLI.
+func anthropicUsage(inputTokens, outputTokens int) map[string]interface{} {
+	return map[string]interface{}{
+		"input_tokens":                inputTokens,
+		"output_tokens":               outputTokens,
+		"cache_creation_input_tokens": 0,
+		"cache_read_input_tokens":     0,
+		"server_tool_use": map[string]int{
+			"web_search_requests": 0,
+			"web_fetch_requests":  0,
+		},
+		"service_tier": nil,
+		"speed":        nil,
+	}
 }
 
 func (c *StreamConverter) writeError(msg string) error {

@@ -66,7 +66,7 @@ type OAIInputItem struct {
 	Arguments string `json:"arguments,omitempty"`
 	// function_call / function_call_output fields
 	CallID string `json:"call_id,omitempty"`
-	Output string `json:"output,omitempty"`
+	Output string `json:"output"` // required for function_call_output; LM Studio rejects items without it
 }
 
 // OAIContentPart is a typed part inside a message's content array.

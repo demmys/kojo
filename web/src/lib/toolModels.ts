@@ -31,6 +31,10 @@ export const toolModels: Record<string, ToolModelConfig> = {
       "gemini-2.5-flash-lite",
     ],
   },
+  "lm-studio": {
+    default: "",
+    models: [],
+  },
 };
 
 /** Return the default model for a given tool. */

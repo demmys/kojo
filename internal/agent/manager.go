@@ -25,6 +25,7 @@ type Manager struct {
 	mu       sync.Mutex
 	agents   map[string]*Agent
 	backends map[string]ChatBackend
+	lmStudio *LMStudioBackend
 	store    *store
 	creds    *CredentialStore
 	cron     *cronScheduler
@@ -67,9 +68,10 @@ func NewManager(logger *slog.Logger) *Manager {
 	m := &Manager{
 		agents: make(map[string]*Agent),
 		backends: map[string]ChatBackend{
-			"claude": NewClaudeBackend(logger),
-			"codex":  NewCodexBackend(logger),
-			"gemini": NewGeminiBackend(logger),
+			"claude":    NewClaudeBackend(logger),
+			"codex":     NewCodexBackend(logger),
+			"gemini":    NewGeminiBackend(logger),
+			"lm-studio": NewLMStudioBackend(logger),
 		},
 		store:     newStore(logger),
 		creds:     creds,
@@ -79,6 +81,9 @@ func NewManager(logger *slog.Logger) *Manager {
 		profileGen: make(map[string]bool),
 		memIndexes: make(map[string]*MemoryIndex),
 	}
+
+	// Expose LM Studio backend for model listing
+	m.lmStudio = m.backends["lm-studio"].(*LMStudioBackend)
 
 	m.cron = newCronScheduler(m, logger)
 	m.cronPaused = m.store.LoadCronPaused()
@@ -621,6 +626,7 @@ func (m *Manager) ResetData(id string) error {
 	// Clear global CLI session stores
 	clearClaudeSession(id)
 	clearGeminiSession(id)
+	m.lmStudio.ResetSession(id)
 
 	// Recreate empty memory directory and MEMORY.md (required for agent to function)
 	if err := os.MkdirAll(filepath.Join(dir, "memory"), 0o755); err != nil {
@@ -1009,6 +1015,8 @@ func (m *Manager) ResetSession(agentID string) error {
 		clearClaudeSession(agentID)
 	case "gemini":
 		clearGeminiSession(agentID)
+	case "lm-studio":
+		m.lmStudio.ResetSession(agentID)
 	}
 	// Codex uses ephemeral sessions — no persistent state to clear
 
@@ -1086,6 +1094,23 @@ func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 // MessagesPaginated returns messages with cursor-based pagination.
 func (m *Manager) MessagesPaginated(agentID string, limit int, before string) ([]*Message, bool, error) {
 	return loadMessagesPaginated(agentID, limit, before)
+}
+
+// BackendAvailability returns which agent backends are available.
+func (m *Manager) BackendAvailability() map[string]bool {
+	result := make(map[string]bool, len(m.backends))
+	for name, b := range m.backends {
+		result[name] = b.Available()
+	}
+	return result
+}
+
+// LMStudioModels returns the list of LLM models from LM Studio (via lms CLI).
+func (m *Manager) LMStudioModels() []string {
+	if m.lmStudio == nil {
+		return nil
+	}
+	return m.lmStudio.ListModels()
 }
 
 // Shutdown stops all cron jobs, notify polling, and cancels active chats.

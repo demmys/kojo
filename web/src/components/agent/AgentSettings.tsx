@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
+import { api } from "../../lib/api";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
@@ -31,7 +32,14 @@ export function AgentSettings() {
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
+  const [lmsModels, setLmsModels] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    api.info().then((info) => {
+      if (info.lmStudioModels?.length) setLmsModels(info.lmStudioModels);
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!id) return;
@@ -298,20 +306,33 @@ export function AgentSettings() {
         {/* Model */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Model</label>
-          <select
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          >
-            {model && !modelsForTool(tool).includes(model) && (
-              <option value={model}>{model}</option>
-            )}
-            {modelsForTool(tool).map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+          {(() => {
+            const models = tool === "lm-studio" ? lmsModels : modelsForTool(tool);
+            return models.length > 0 ? (
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+              >
+                {model && !models.includes(model) && (
+                  <option value={model}>{model}</option>
+                )}
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="model name"
+                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+              />
+            );
+          })()}
         </div>
 
         {/* Effort (claude only) */}
@@ -337,13 +358,17 @@ export function AgentSettings() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="flex gap-2">
-            {["claude", "codex", "gemini"].map((t) => (
+            {["claude", "codex", "gemini", "lm-studio"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    setModel(defaultModelForTool(t));
+                    if (t === "lm-studio") {
+                      setModel(lmsModels[0] ?? "");
+                    } else {
+                      setModel(defaultModelForTool(t));
+                    }
                   }
                 }}
                 className={`flex-1 px-3 py-2 rounded text-sm font-mono ${

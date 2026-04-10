@@ -21,6 +21,8 @@ export interface ServerInfo {
   homeDir: string;
   tools: Record<string, { available: boolean; path: string }>;
   shellTool: string; // "tmux" on Unix, "shell" on Windows
+  agentBackends?: Record<string, boolean>;
+  lmStudioModels?: string[];
 }
 
 export interface DirEntry {

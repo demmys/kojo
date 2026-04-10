@@ -435,7 +435,7 @@ export function SessionPage() {
           <button
             onClick={async () => {
               if (!session) return;
-              const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir });
+              const s = await api.sessions.create({ tool: session.tool, workDir: session.workDir, args: session.args });
               navigate(`/session/${s.id}`, { replace: true });
             }}
             className="w-full py-3.5 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-base font-medium"

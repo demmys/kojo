@@ -408,16 +408,20 @@ export function AgentCreate() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
           <div className="flex gap-2">
-            {["claude", "codex", "gemini"].map((t) => (
+            {["claude", "codex", "gemini", "lm-studio"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    setModel(defaultModelForTool(t));
+                    if (t === "lm-studio") {
+                      setModel(info?.lmStudioModels?.[0] ?? "");
+                    } else {
+                      setModel(defaultModelForTool(t));
+                    }
                   }
                 }}
-                disabled={info ? !info.tools[t]?.available : false}
+                disabled={info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false}
                 className={`flex-1 px-3 py-2 rounded text-sm font-mono ${
                   tool === t
                     ? "bg-neutral-700 border border-neutral-500"
@@ -433,17 +437,33 @@ export function AgentCreate() {
         {/* Model */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Model</label>
-          <select
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-          >
-            {modelsForTool(tool).map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </select>
+          {(() => {
+            const models = tool === "lm-studio" ? (info?.lmStudioModels ?? []) : modelsForTool(tool);
+            return models.length > 0 ? (
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+              >
+                {model && !models.includes(model) && (
+                  <option value={model}>{model}</option>
+                )}
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder="model name"
+                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+              />
+            );
+          })()}
         </div>
 
         {/* Effort (claude only) */}

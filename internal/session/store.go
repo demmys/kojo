@@ -42,7 +42,7 @@ func (st *Store) Save(infos []SessionInfo) {
 		return
 	}
 
-	if err := atomicfile.WriteJSON(st.path, infos, 0o644); err != nil {
+	if err := atomicfile.WriteJSON(st.path, infos, 0o600); err != nil {
 		st.logger.Warn("failed to save sessions", "err", err)
 	}
 }

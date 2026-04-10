@@ -323,6 +323,10 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"tools":     session.ToolAvailability(),
 		"shellTool": session.ShellToolName(),
 	}
+	if s.agents != nil {
+		resp["agentBackends"] = s.agents.BackendAvailability()
+		resp["lmStudioModels"] = s.agents.LMStudioModels()
+	}
 	writeJSONResponse(w, http.StatusOK, resp)
 }
 

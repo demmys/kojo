@@ -578,38 +578,14 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
 
-	// Get the backend.
-	// When lm-studio is selected and the proxy is running, route through
-	// Claude CLI with ANTHROPIC_BASE_URL pointing at the proxy so that
-	// tool use works via /v1/responses (stateful + custom tools).
-	var backend ChatBackend
-	claudeBackend := m.backends["claude"]
-	useLMSProxy := agentCopy.Tool == "lm-studio" && m.lmsProxyPort > 0 && claudeBackend != nil && claudeBackend.Available()
-	if useLMSProxy {
-		cb := NewClaudeBackend(m.logger)
-		proxyBase := fmt.Sprintf("http://localhost:%d", m.lmsProxyPort)
-		// Configure session on the proxy (model override + allowed tools).
-		cfgBody, _ := json.Marshal(map[string]interface{}{
-			"model":        agentCopy.Model,
-			"allowedTools": agentCopy.AllowedTools,
-		})
-		sessionPath := "/session/" + agentID
-		http.Post(proxyBase+sessionPath+"/config", "application/json", bytes.NewReader(cfgBody))
-		cb.SetProxyURL(proxyBase + sessionPath)
-		// Clear the model so Claude CLI uses its default (the proxy overrides it).
-		agentCopy.Model = ""
-		backend = cb
-	} else {
-		var ok bool
-		backend, ok = m.backends[agentCopy.Tool]
-		if !ok {
-			err := fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
-			outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
-			close(outCh)
-			m.clearBusy(agentID)
-			cancel()
-			return nil, err
-		}
+	// Resolve backend (may configure LMS proxy and clear agentCopy.Model)
+	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
+	if err != nil {
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+		close(outCh)
+		m.clearBusy(agentID)
+		cancel()
+		return nil, err
 	}
 
 	atts := attachments
@@ -677,22 +653,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer cancel()
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 
-		// Update memory index after chat completes.
-		// Skip if agent was deleted/reset during chat to avoid reopening a closed index.
-		m.busyMu.Lock()
-		isResetting := m.resetting[agentID]
-		m.busyMu.Unlock()
-		m.mu.Lock()
-		_, agentExists := m.agents[agentID]
-		m.mu.Unlock()
-		if agentExists && !isResetting {
-			if idx := m.getOrOpenIndex(agentID); idx != nil {
-				idx.IndexNewMessages(agentID)
-				idx.IndexFilesIfStale(agentID)
-			}
-			// Memory compaction summaries are handled by PreCompact hook
-			// (see injectPreCompactHook), not by post-chat polling.
-		}
+		m.updatePostChatIndex(agentID)
 	}()
 
 	return callerCh, nil
@@ -825,6 +786,52 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 	}
 	m.mu.Unlock()
 	m.save()
+}
+
+// resolveBackend selects the ChatBackend for the agent's tool.
+// When lm-studio is selected and the LMS proxy is running, it configures
+// a Claude backend with ANTHROPIC_BASE_URL pointing at the proxy and
+// clears agentCopy.Model so the proxy controls model selection.
+// Returns the backend, whether the LMS proxy is used, and any error.
+func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend, bool, error) {
+	claudeBackend := m.backends["claude"]
+	useLMSProxy := agentCopy.Tool == "lm-studio" && m.lmsProxyPort > 0 && claudeBackend != nil && claudeBackend.Available()
+	if useLMSProxy {
+		cb := NewClaudeBackend(m.logger)
+		proxyBase := fmt.Sprintf("http://localhost:%d", m.lmsProxyPort)
+		cfgBody, _ := json.Marshal(map[string]interface{}{
+			"model":        agentCopy.Model,
+			"allowedTools": agentCopy.AllowedTools,
+		})
+		sessionPath := "/session/" + agentID
+		http.Post(proxyBase+sessionPath+"/config", "application/json", bytes.NewReader(cfgBody))
+		cb.SetProxyURL(proxyBase + sessionPath)
+		agentCopy.Model = ""
+		return cb, true, nil
+	}
+
+	backend, ok := m.backends[agentCopy.Tool]
+	if !ok {
+		return nil, false, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
+	}
+	return backend, false, nil
+}
+
+// updatePostChatIndex updates the memory index after a chat completes.
+// Skips if the agent was deleted or is being reset to avoid reopening a closed index.
+func (m *Manager) updatePostChatIndex(agentID string) {
+	m.busyMu.Lock()
+	isResetting := m.resetting[agentID]
+	m.busyMu.Unlock()
+	m.mu.Lock()
+	_, agentExists := m.agents[agentID]
+	m.mu.Unlock()
+	if agentExists && !isResetting {
+		if idx := m.getOrOpenIndex(agentID); idx != nil {
+			idx.IndexNewMessages(agentID)
+			idx.IndexFilesIfStale(agentID)
+		}
+	}
 }
 
 // CronPaused returns whether all cron jobs are globally paused.

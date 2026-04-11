@@ -269,25 +269,30 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	return nil
 }
 
-// notifyGroupDeleted sends a notification about group deletion to a member.
-func (m *GroupDMManager) notifyGroupDeleted(agentID, groupID, groupName string) {
-	notification := fmt.Sprintf(
-		"[Group DM: %s] This group has been deleted.",
-		groupName,
-	)
-
+// sendSystemNotification sends a system message to an agent and drains the response.
+// Errors from busy/resetting agents are silently ignored; other errors are logged.
+func (m *GroupDMManager) sendSystemNotification(agentID, notification, logContext string) {
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
 	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
 	if err != nil {
 		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
-			m.logger.Warn("failed to notify agent about group deletion", "agent", agentID, "group", groupID, "err", err)
+			m.logger.Warn("failed to send notification", "agent", agentID, "context", logContext, "err", err)
 		}
 		return
 	}
 	for range events {
 	}
+}
+
+// notifyGroupDeleted sends a notification about group deletion to a member.
+func (m *GroupDMManager) notifyGroupDeleted(agentID, groupID, groupName string) {
+	notification := fmt.Sprintf(
+		"[Group DM: %s] This group has been deleted.",
+		groupName,
+	)
+	m.sendSystemNotification(agentID, notification, "group_deleted:"+groupID)
 }
 
 // PostMessage posts a message to a group and optionally notifies other members.
@@ -478,20 +483,7 @@ func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newN
 		"[Group DM: %s] Group renamed from %q to %q by %s.",
 		groupName, oldName, newName, callerName,
 	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-	defer cancel()
-
-	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
-	if err != nil {
-		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
-			m.logger.Warn("failed to notify agent about rename", "agent", agentID, "group", groupID, "err", err)
-		}
-		return
-	}
-	// Drain events
-	for range events {
-	}
+	m.sendSystemNotification(agentID, notification, "rename:"+groupID)
 }
 
 // notifyAgent sends a system message to an agent about new group activity.
@@ -825,19 +817,7 @@ func (m *GroupDMManager) notifyMemberChange(agentID, groupID, groupName, actorNa
 	case "left":
 		notification = fmt.Sprintf("[Group DM: %s] %s left the group.", groupName, targetName)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
-	defer cancel()
-
-	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
-	if err != nil {
-		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
-			m.logger.Warn("failed to notify member change", "agent", agentID, "group", groupID, "action", action, "err", err)
-		}
-		return
-	}
-	for range events {
-	}
+	m.sendSystemNotification(agentID, notification, action+":"+groupID)
 }
 
 // RemoveAgent removes an agent from all groups. Groups with fewer than 2 members are deleted.

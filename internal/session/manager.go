@@ -149,41 +149,17 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
 
-	// lm-studio sessions run claude CLI with ANTHROPIC_BASE_URL pointing at the proxy.
-	var lmsProxyURL string
-	var lmsModelOverride string
-	actualTool := tool
-	if tool == "lm-studio" {
-		m.mu.Lock()
-		port := m.lmsProxyPort
-		defaultModel := m.lmsDefaultModel
-		m.mu.Unlock()
-		if port == 0 {
-			return nil, fmt.Errorf("LM Studio proxy is not running")
-		}
-		// Model is configured via proxy session config API (PUT /session/{id}/config),
-		// not query params. The Stainless SDK corrupts query strings in ANTHROPIC_BASE_URL.
-		lmsModelOverride = defaultModel
-		// Check if user specified --model or -m in args; if so, extract and remove it.
-		for i, a := range args {
-			if (a == "--model" || a == "-m") && i+1 < len(args) {
-				lmsModelOverride = args[i+1]
-				args = append(args[:i], args[i+2:]...)
-				break
-			}
-		}
-		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%%s", port) // %s filled with session ID later
-		actualTool = "claude"
+	// Resolve lm-studio → claude proxy setup; may modify args to extract --model.
+	lmsResult, err := m.resolveLMSProxy(tool, args, "")
+	if err != nil {
+		return nil, err
 	}
+	actualTool := lmsResult.actualTool
+	args = lmsResult.args
 
-	// Internal tools (tmux/shell) are resolved by platform functions, not LookPath
-	var toolPath string
-	var err error
-	if userTools[tool] {
-		toolPath, err = exec.LookPath(actualTool)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
-		}
+	toolPath, err := resolveToolPath(tool, actualTool)
+	if err != nil {
+		return nil, err
 	}
 
 	if info, err := os.Stat(workDir); err != nil || !info.IsDir() {
@@ -192,52 +168,20 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 
 	id := generateID()
 
-	// For claude, assign a stable session ID so we can --resume later
+	// Assign session ID and build run args based on tool type.
 	var toolSessionID string
-	runArgs := args
-	if actualTool == "claude" {
-		hasSessionID := false
-		for i, a := range args {
-			if a == "--session-id" {
-				hasSessionID = true
-				if i+1 < len(args) {
-					toolSessionID = args[i+1]
-				}
-				break
-			}
-			if strings.HasPrefix(a, "--session-id=") {
-				hasSessionID = true
-				toolSessionID = strings.TrimPrefix(a, "--session-id=")
-				break
-			}
-		}
-		if !hasSessionID {
-			toolSessionID = uuid.New().String()
-			runArgs = make([]string, len(args), len(args)+2)
-			copy(runArgs, args)
-			runArgs = append(runArgs, "--session-id", toolSessionID)
-		}
-	}
-
-	// For internal tools, build platform-specific args
+	var runArgs []string
 	if !userTools[tool] {
 		runArgs, toolSessionID = platformBuildInternalToolArgs(id, tool, workDir, args)
+	} else {
+		toolSessionID, runArgs = assignClaudeSessionID(actualTool, args)
 	}
 
 	// codex: session ID is captured from PTY output in readLoop
 	// gemini: no session ID mechanism; uses --resume latest on restart
 
 	// Build extra environment variables for the tool process.
-	var extraEnv []string
-	if lmsProxyURL != "" {
-		proxyBaseURL := fmt.Sprintf(lmsProxyURL, id)
-		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+proxyBaseURL)
-
-		// Configure session model via proxy config API before starting the CLI.
-		if lmsModelOverride != "" {
-			m.configureLMSSession(proxyBaseURL, lmsModelOverride)
-		}
-	}
+	extraEnv := m.buildLMSEnv(lmsResult, id)
 
 	var res *startResult
 	if userTools[tool] {
@@ -336,43 +280,18 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
-	// lm-studio sessions use claude CLI with proxy.
-	var lmsProxyURL string
-	actualTool := tool
-	if tool == "lm-studio" {
-		m.mu.Lock()
-		port := m.lmsProxyPort
-		defaultModel := m.lmsDefaultModel
-		m.mu.Unlock()
-		if port == 0 {
-			clearRestarting()
-			return nil, fmt.Errorf("LM Studio proxy is not running")
-		}
-		lmsProxyURL = fmt.Sprintf("http://localhost:%d/session/%s", port, id)
-		actualTool = "claude"
-
-		// Re-apply model override in case the proxy was restarted.
-		lmsModel := defaultModel
-		for i, a := range args {
-			if (a == "--model" || a == "-m") && i+1 < len(args) {
-				lmsModel = args[i+1]
-				break
-			}
-		}
-		if lmsModel != "" {
-			m.configureLMSSession(lmsProxyURL, lmsModel)
-		}
+	// Resolve lm-studio → claude proxy setup.
+	lmsResult, err := m.resolveLMSProxy(tool, args, id)
+	if err != nil {
+		clearRestarting()
+		return nil, err
 	}
+	actualTool := lmsResult.actualTool
 
-	// Internal tools are resolved by platform functions, not LookPath
-	var toolPath string
-	if userTools[tool] {
-		var err error
-		toolPath, err = exec.LookPath(actualTool)
-		if err != nil {
-			clearRestarting()
-			return nil, fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
-		}
+	toolPath, err := resolveToolPath(tool, actualTool)
+	if err != nil {
+		clearRestarting()
+		return nil, err
 	}
 
 	// Platform-specific cleanup of old session resources
@@ -380,13 +299,9 @@ func (m *Manager) Restart(id string) (*Session, error) {
 
 	restartArgs := buildRestartArgs(actualTool, args, toolSessionID)
 
-	var extraEnv []string
-	if lmsProxyURL != "" {
-		extraEnv = append(extraEnv, "ANTHROPIC_BASE_URL="+lmsProxyURL)
-	}
+	extraEnv := m.buildLMSEnv(lmsResult, id)
 
 	var res *startResult
-	var err error
 	if userTools[tool] {
 		s.mu.Lock()
 		cols, rows := s.lastCols, s.lastRows
@@ -705,6 +620,120 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	if m.OnSessionExit != nil {
 		m.OnSessionExit(s)
 	}
+}
+
+// lmsProxyResult holds the result of resolving lm-studio proxy configuration.
+type lmsProxyResult struct {
+	actualTool    string   // the actual tool to execute ("claude" if lm-studio)
+	args          []string // args with --model extracted (only for Create)
+	proxyURLTmpl  string   // proxy URL template (contains %s for session ID) or fixed URL
+	modelOverride string   // model to configure on the proxy
+}
+
+// resolveLMSProxy resolves lm-studio → claude proxy setup.
+// If sessionID is non-empty, produces a fixed proxy URL (for Restart);
+// otherwise produces a template URL with %s placeholder (for Create).
+// May modify args to extract --model flag.
+func (m *Manager) resolveLMSProxy(tool string, args []string, sessionID string) (lmsProxyResult, error) {
+	result := lmsProxyResult{actualTool: tool, args: args}
+	if tool != "lm-studio" {
+		return result, nil
+	}
+
+	m.mu.Lock()
+	port := m.lmsProxyPort
+	defaultModel := m.lmsDefaultModel
+	m.mu.Unlock()
+
+	if port == 0 {
+		return result, fmt.Errorf("LM Studio proxy is not running")
+	}
+
+	result.actualTool = "claude"
+	result.modelOverride = defaultModel
+
+	// Extract --model from args.
+	outArgs := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		if (args[i] == "--model" || args[i] == "-m") && i+1 < len(args) {
+			result.modelOverride = args[i+1]
+			i++ // skip value
+			continue
+		}
+		outArgs = append(outArgs, args[i])
+	}
+	result.args = outArgs
+
+	if sessionID != "" {
+		result.proxyURLTmpl = fmt.Sprintf("http://localhost:%d/session/%s", port, sessionID)
+	} else {
+		result.proxyURLTmpl = fmt.Sprintf("http://localhost:%d/session/%%s", port)
+	}
+
+	return result, nil
+}
+
+// buildLMSEnv builds extra environment variables for LMS proxy sessions.
+// For Create (template URL), sessionID is used to fill the template.
+// For Restart (fixed URL), the template is used as-is.
+func (m *Manager) buildLMSEnv(lms lmsProxyResult, sessionID string) []string {
+	if lms.proxyURLTmpl == "" {
+		return nil
+	}
+
+	proxyBaseURL := lms.proxyURLTmpl
+	if strings.Contains(proxyBaseURL, "%s") {
+		proxyBaseURL = fmt.Sprintf(lms.proxyURLTmpl, sessionID)
+	}
+
+	if lms.modelOverride != "" {
+		m.configureLMSSession(proxyBaseURL, lms.modelOverride)
+	}
+
+	return []string{"ANTHROPIC_BASE_URL=" + proxyBaseURL}
+}
+
+// resolveToolPath resolves the executable path for a tool.
+// Internal tools (tmux/shell) are resolved by platform functions, not LookPath.
+func resolveToolPath(tool, actualTool string) (string, error) {
+	if !userTools[tool] {
+		return "", nil
+	}
+	toolPath, err := exec.LookPath(actualTool)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
+	}
+	return toolPath, nil
+}
+
+// assignClaudeSessionID assigns a stable session ID for claude sessions
+// and builds the run args. For non-claude tools, returns empty sessionID
+// and the original args.
+func assignClaudeSessionID(actualTool string, args []string) (string, []string) {
+	if actualTool != "claude" {
+		return "", args
+	}
+
+	var toolSessionID string
+	for i, a := range args {
+		if a == "--session-id" {
+			if i+1 < len(args) {
+				toolSessionID = args[i+1]
+			}
+			return toolSessionID, args
+		}
+		if strings.HasPrefix(a, "--session-id=") {
+			toolSessionID = strings.TrimPrefix(a, "--session-id=")
+			return toolSessionID, args
+		}
+	}
+
+	// No --session-id found; generate one and append.
+	toolSessionID = uuid.New().String()
+	runArgs := make([]string, len(args), len(args)+2)
+	copy(runArgs, args)
+	runArgs = append(runArgs, "--session-id", toolSessionID)
+	return toolSessionID, runArgs
 }
 
 // buildRestartArgs produces the command arguments for restarting a session.

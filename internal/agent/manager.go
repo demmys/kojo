@@ -172,60 +172,6 @@ func (m *Manager) SetGroupDMManager(gdm *GroupDMManager) {
 	m.groupdms = gdm
 }
 
-// getOrOpenIndex returns a cached MemoryIndex for the agent, opening one if needed.
-// Uses double-checked locking to avoid holding the mutex during I/O.
-func (m *Manager) getOrOpenIndex(agentID string) *MemoryIndex {
-	m.memIndexesMu.Lock()
-	if idx, ok := m.memIndexes[agentID]; ok {
-		m.memIndexesMu.Unlock()
-		return idx
-	}
-	m.memIndexesMu.Unlock()
-
-	// Open outside lock
-	idx, err := OpenMemoryIndex(agentID, m.logger, m.creds)
-	if err != nil {
-		m.logger.Warn("failed to open memory index", "agent", agentID, "err", err)
-		return nil
-	}
-
-	// Re-check and store
-	m.memIndexesMu.Lock()
-	if existing, ok := m.memIndexes[agentID]; ok {
-		m.memIndexesMu.Unlock()
-		idx.Close() // another goroutine opened it first
-		return existing
-	}
-	m.memIndexes[agentID] = idx
-	m.memIndexesMu.Unlock()
-	return idx
-}
-
-// closeIndex closes and removes the cached MemoryIndex for an agent.
-func (m *Manager) closeIndex(agentID string) {
-	m.memIndexesMu.Lock()
-	idx, ok := m.memIndexes[agentID]
-	if ok {
-		delete(m.memIndexes, agentID)
-	}
-	m.memIndexesMu.Unlock()
-
-	if ok {
-		idx.Close()
-	}
-}
-
-// CloseAllIndexes closes all cached MemoryIndex instances.
-func (m *Manager) CloseAllIndexes() {
-	m.memIndexesMu.Lock()
-	defer m.memIndexesMu.Unlock()
-
-	for id, idx := range m.memIndexes {
-		idx.Close()
-		delete(m.memIndexes, id)
-	}
-}
-
 // Create creates a new agent.
 func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	if cfg.Name == "" {
@@ -586,104 +532,6 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 	return nil
 }
 
-// ResetData removes conversation logs and memory but keeps settings, persona, avatar, and credentials.
-func (m *Manager) ResetData(id string) error {
-	m.mu.Lock()
-	a, ok := m.agents[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
-	name := a.Name
-	m.mu.Unlock()
-
-	cleanup, err := m.acquireResetGuard(id)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	if err := m.waitBusyClear(id); err != nil {
-		return err
-	}
-
-	dir := agentDir(id)
-
-	// Remove conversation log
-	if err := os.Remove(filepath.Join(dir, messagesFile)); err != nil && !os.IsNotExist(err) {
-		m.logger.Warn("reset: failed to remove messages", "agent", id, "err", err)
-	}
-
-	// Remove memory files
-	if err := os.RemoveAll(filepath.Join(dir, "memory")); err != nil {
-		m.logger.Warn("reset: failed to remove memory dir", "agent", id, "err", err)
-	}
-	if err := os.Remove(filepath.Join(dir, "MEMORY.md")); err != nil && !os.IsNotExist(err) {
-		m.logger.Warn("reset: failed to remove MEMORY.md", "agent", id, "err", err)
-	}
-
-	// Close and remove FTS index
-	m.closeIndex(id)
-	if err := os.RemoveAll(filepath.Join(dir, indexDir)); err != nil {
-		m.logger.Warn("reset: failed to remove index dir", "agent", id, "err", err)
-	}
-
-	// Remove persona summary cache (will be regenerated)
-	if err := os.Remove(filepath.Join(dir, "persona_summary.md")); err != nil && !os.IsNotExist(err) {
-		m.logger.Warn("reset: failed to remove persona summary", "agent", id, "err", err)
-	}
-
-	// Remove tasks (acquire lock to avoid racing with concurrent task API calls)
-	mu := agentTaskLock(id)
-	mu.Lock()
-	DeleteTasksFile(id)
-	mu.Unlock()
-
-	// Remove auto-summary marker
-	if err := os.Remove(filepath.Join(dir, autoSummaryMarkerFile)); err != nil && !os.IsNotExist(err) {
-		m.logger.Warn("reset: failed to remove autosummary marker", "agent", id, "err", err)
-	}
-
-	// Remove cron lock file
-	if err := os.Remove(filepath.Join(dir, cronLockFile)); err != nil && !os.IsNotExist(err) {
-		m.logger.Warn("reset: failed to remove cron lock", "agent", id, "err", err)
-	}
-
-	// Remove CLI local state so next chat starts fresh
-	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
-		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
-	}
-	if err := os.RemoveAll(filepath.Join(dir, ".gemini")); err != nil {
-		m.logger.Warn("reset: failed to remove .gemini dir", "agent", id, "err", err)
-	}
-
-	// Clear global CLI session stores
-	clearClaudeSession(id)
-	clearGeminiSession(id)
-	m.lmStudio.ResetSession(id)
-
-	// Recreate empty memory directory and MEMORY.md (required for agent to function)
-	if err := os.MkdirAll(filepath.Join(dir, "memory"), 0o755); err != nil {
-		return fmt.Errorf("recreate memory dir: %w", err)
-	}
-	initial := fmt.Sprintf("# %s's Memory\n\nThis file stores persistent memories. Update it as you learn new things.\n", name)
-	if err := os.WriteFile(filepath.Join(dir, "MEMORY.md"), []byte(initial), 0o644); err != nil {
-		return fmt.Errorf("recreate MEMORY.md: %w", err)
-	}
-
-	// Clear last message preview
-	m.mu.Lock()
-	if a, ok := m.agents[id]; ok {
-		a.LastMessage = nil
-		a.UpdatedAt = time.Now().Format(time.RFC3339)
-	}
-	m.mu.Unlock()
-
-	m.save()
-	m.logger.Info("agent data reset", "id", id)
-	return nil
-}
-
 // Credentials returns the credential store. Returns nil if the store failed to initialize.
 func (m *Manager) Credentials() *CredentialStore {
 	return m.creds
@@ -692,62 +540,6 @@ func (m *Manager) Credentials() *CredentialStore {
 // HasCredentials returns true if the credential store is available.
 func (m *Manager) HasCredentials() bool {
 	return m.creds != nil
-}
-
-// Delete removes an agent and its data.
-func (m *Manager) Delete(id string) error {
-	m.mu.Lock()
-	_, ok := m.agents[id]
-	m.mu.Unlock()
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
-
-	cleanup, err := m.acquireResetGuard(id)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	if err := m.waitBusyClear(id); err != nil {
-		return err
-	}
-
-	// Remove credentials and notify tokens outside lock (DB I/O)
-	if m.creds != nil {
-		if err := m.creds.DeleteAllForAgent(id); err != nil {
-			return fmt.Errorf("delete credentials: %w", err)
-		}
-		if err := m.creds.DeleteTokensByAgent(id); err != nil {
-			m.logger.Warn("failed to delete notify tokens", "agent", id, "err", err)
-		}
-	}
-
-	m.cron.Remove(id)
-	m.notifyPoller.RemoveAgent(id)
-
-	// Remove agent from group DMs
-	if m.groupdms != nil {
-		m.groupdms.RemoveAgent(id)
-	}
-
-	// Close cached memory index before removing directory
-	m.closeIndex(id)
-
-	// Remove agent data directory (best-effort: credentials/cron/notify already cleaned up)
-	dir := agentDir(id)
-	if err := os.RemoveAll(dir); err != nil {
-		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
-	}
-
-	// Remove from in-memory map
-	m.mu.Lock()
-	delete(m.agents, id)
-	m.mu.Unlock()
-
-	m.save()
-	m.logger.Info("agent deleted", "id", id)
-	return nil
 }
 
 // Chat sends a message to an agent and returns a channel of streaming events.
@@ -1035,64 +827,6 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 	m.save()
 }
 
-// ResetSession clears the CLI session (e.g. Claude JSONL) for an agent
-// without deleting conversation history or memory. The next chat will start
-// a fresh CLI session with the full system prompt re-injected.
-func (m *Manager) ResetSession(agentID string) error {
-	m.mu.Lock()
-	a, ok := m.agents[agentID]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
-	}
-	tool := a.Tool
-	m.mu.Unlock()
-
-	// Block if agent is busy or being reset
-	m.busyMu.Lock()
-	if _, busy := m.busy[agentID]; busy {
-		m.busyMu.Unlock()
-		return ErrAgentBusy
-	}
-	if m.resetting[agentID] {
-		m.busyMu.Unlock()
-		return fmt.Errorf("%w, try again later", ErrAgentBusy)
-	}
-	m.resetting[agentID] = true
-	m.busyMu.Unlock()
-
-	defer func() {
-		m.busyMu.Lock()
-		delete(m.resetting, agentID)
-		m.busyMu.Unlock()
-	}()
-
-	switch tool {
-	case "claude":
-		clearClaudeSession(agentID)
-	case "gemini":
-		clearGeminiSession(agentID)
-	case "lm-studio":
-		m.lmStudio.ResetSession(agentID)
-		if m.lmsProxyPort > 0 {
-			clearClaudeSession(agentID)
-		}
-	}
-	// Codex uses ephemeral sessions — no persistent state to clear
-
-	m.logger.Info("CLI session reset", "agent", agentID, "tool", tool)
-	return nil
-}
-
-// Abort cancels any running chat for an agent.
-func (m *Manager) Abort(agentID string) {
-	m.busyMu.Lock()
-	if entry, ok := m.busy[agentID]; ok {
-		entry.cancel()
-	}
-	m.busyMu.Unlock()
-}
-
 // CronPaused returns whether all cron jobs are globally paused.
 func (m *Manager) CronPaused() bool {
 	m.mu.Lock()
@@ -1107,43 +841,6 @@ func (m *Manager) SetCronPaused(paused bool) {
 	m.mu.Unlock()
 	m.store.SaveCronPaused(paused)
 	m.logger.Info("cron pause toggled", "paused", paused)
-}
-
-// IsBusy returns true if the agent has an active chat.
-func (m *Manager) IsBusy(agentID string) bool {
-	m.busyMu.Lock()
-	defer m.busyMu.Unlock()
-	_, ok := m.busy[agentID]
-	return ok
-}
-
-// BusySince returns the time when the agent started its current chat.
-// Returns zero time and false if the agent is not busy.
-func (m *Manager) BusySince(agentID string) (time.Time, bool) {
-	m.busyMu.Lock()
-	defer m.busyMu.Unlock()
-	entry, ok := m.busy[agentID]
-	if !ok {
-		return time.Time{}, false
-	}
-	return entry.startedAt, true
-}
-
-// Subscribe returns a snapshot of all past events and a live channel for an
-// agent's ongoing chat. The caller must call unsub when done to free resources.
-// If the agent is not busy, busy is false and all other values are zero.
-func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEvent, live <-chan ChatEvent, unsub func(), busy bool) {
-	m.busyMu.Lock()
-	defer m.busyMu.Unlock()
-	entry, ok := m.busy[agentID]
-	if !ok {
-		return time.Time{}, nil, nil, func() {}, false
-	}
-	if entry.broadcaster == nil {
-		return entry.startedAt, nil, nil, func() {}, true
-	}
-	past, live, unsub = entry.broadcaster.Subscribe()
-	return entry.startedAt, past, live, unsub, true
 }
 
 // Messages returns recent messages for an agent.
@@ -1189,53 +886,6 @@ func (m *Manager) Shutdown() {
 	m.busyMu.Unlock()
 
 	m.save()
-}
-
-func (m *Manager) clearBusy(agentID string) {
-	m.busyMu.Lock()
-	delete(m.busy, agentID)
-	m.busyMu.Unlock()
-}
-
-// waitBusyClear waits up to 5 seconds for the agent's busy entry to be removed.
-// Returns ErrAgentBusy if the agent is still busy after the timeout.
-func (m *Manager) waitBusyClear(agentID string) error {
-	for i := 0; i < 50; i++ {
-		m.busyMu.Lock()
-		_, busy := m.busy[agentID]
-		m.busyMu.Unlock()
-		if !busy {
-			return nil
-		}
-		if i == 49 {
-			return fmt.Errorf("%w, try again later", ErrAgentBusy)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return nil
-}
-
-// acquireResetGuard marks the agent as resetting, cancels any active chat,
-// and returns a cleanup function that removes the resetting flag.
-// Returns ErrAgentBusy if the agent is already being reset.
-func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
-	m.busyMu.Lock()
-	if m.resetting[agentID] {
-		m.busyMu.Unlock()
-		return nil, fmt.Errorf("%w, try again later", ErrAgentBusy)
-	}
-	m.resetting[agentID] = true
-	if entry, busy := m.busy[agentID]; busy {
-		entry.cancel()
-	}
-	m.busyMu.Unlock()
-
-	cleanup := func() {
-		m.busyMu.Lock()
-		delete(m.resetting, agentID)
-		m.busyMu.Unlock()
-	}
-	return cleanup, nil
 }
 
 func (m *Manager) save() {

@@ -107,7 +107,7 @@ When you run `kojo` (without `--local`):
 ```bash
 $ kojo
 
-  kojo v0.9.0 running at:
+  kojo v0.10.0 running at:
 
     https://kojo.tail1234.ts.net
     https://100.x.y.z:8080
@@ -185,11 +185,12 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 - AI-assisted persona generation (Gemini API) and avatar generation
 - Interactive chat with streaming responses, thinking display, and tool-use cards
 - Markdown rendering in agent messages
-- Scheduled autonomous execution (10 min – 24 h intervals) with auto-staggering and cross-process dedup
+- Scheduled autonomous execution (10 min – 24 h intervals) with auto-staggering, per-agent timeout, and cross-process dedup
 - Persistent memory: long-term `MEMORY.md` + daily notes with full-text search (SQLite FTS5)
 - Encrypted credential vault (AES-256-GCM SQLite) with TOTP 2FA support
 - Public profile and agent directory for inter-agent discovery
 - Group DM: multi-agent conversations with notification-based messaging
+- Slack integration (Socket Mode) — per-agent bot with streaming replies, per-thread conversation context, and `<reply>` tag filtering
 - Agent data reset (clear conversations and memory while keeping settings, persona, avatar, and credentials)
 
 ## Tech Stack

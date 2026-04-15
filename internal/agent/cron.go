@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,12 +12,15 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-const cronTimeout = 10 * time.Minute
+const cronTimeout = 10 * time.Minute // default timeout; per-agent override via TimeoutMinutes
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 const cronLockFile = ".cron_last"
-func cronPrompt(nextRun time.Time) string {
+
+func cronPrompt(nextRun time.Time, timeoutMinutes int) string {
 	now := time.Now()
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
+
+	msg += fmt.Sprintf("（制限時間: %d分", timeoutMinutes)
 	if !nextRun.IsZero() {
 		var nextFmt string
 		if nextRun.YearDay() == now.YearDay() && nextRun.Year() == now.Year() {
@@ -24,8 +28,9 @@ func cronPrompt(nextRun time.Time) string {
 		} else {
 			nextFmt = nextRun.Format("1月2日 15:04")
 		}
-		msg += "（次回予定: " + nextFmt + "）"
+		msg += "、次回予定: " + nextFmt
 	}
+	msg += "）"
 	msg += "最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
 	return msg
 }
@@ -200,10 +205,12 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		return
 	}
 
-	// Check active hours
+	// Check active hours and read agent config
 	var activeStart, activeEnd string
+	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
+		timeoutMinutes = a.TimeoutMinutes
 		if !IsWithinActiveHours(activeStart, activeEnd) {
 			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
 				"activeStart", activeStart, "activeEnd", activeEnd)
@@ -221,10 +228,17 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 
 	nextRun := cs.nextRun(agentID, activeStart, activeEnd)
 
-	ctx, cancel := context.WithTimeout(context.Background(), cronTimeout)
+	// Per-agent timeout (0 = use default)
+	timeout := cronTimeout
+	if timeoutMinutes > 0 {
+		timeout = time.Duration(timeoutMinutes) * time.Minute
+	}
+	effectiveTimeoutMin := int(timeout / time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun), "system", nil)
+	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin), "system", nil)
 	if err != nil {
 		cs.logger.Warn("cron chat failed", "agent", agentID, "err", err)
 		return
@@ -234,5 +248,9 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	for range events {
 	}
 
-	cs.logger.Info("cron job completed", "agent", agentID)
+	if ctx.Err() == context.DeadlineExceeded {
+		cs.logger.Warn("cron job timed out", "agent", agentID, "timeout", timeout)
+	} else {
+		cs.logger.Info("cron job completed", "agent", agentID)
+	}
 }

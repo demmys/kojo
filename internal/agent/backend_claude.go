@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -38,7 +39,7 @@ func (b *ClaudeBackend) Available() bool {
 	return err == nil
 }
 
-func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error) {
+func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, fmt.Errorf("claude not found in PATH")
@@ -49,7 +50,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	args := b.buildClaudeArgs(agent, systemPrompt, dir)
+	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
@@ -57,6 +58,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
 	}
 	cmd.Dir = dir
+	// Send SIGTERM on context cancellation, then SIGKILL after 10s grace period.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 10 * time.Second
 
 	// Pass user message via stdin to avoid option injection when the message
 	// starts with "-" (which would be misinterpreted as a CLI flag).
@@ -92,9 +98,15 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 		result := parseClaudeStream(stdout, b.logger, send)
 
-		// If stream was cancelled (send returned false), clean up process.
+		// If stream was cancelled (send returned false), clean up process
+		// and emit a partial done event so the transcript is persisted.
 		if result.cancelled {
 			cmd.Wait()
+			content := result.fullText
+			if content == "" {
+				content = result.lastAssistantText
+			}
+			emitCancelDone(ctx, ch, content, result.thinking, result.toolUses, result.usage)
 			return
 		}
 
@@ -151,7 +163,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 }
 
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
-func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string) []string {
+func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool) []string {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -181,11 +193,16 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// time, causing cron check-ins and user messages to branch into parallel
 	// sessions — then the next --continue picks whichever branch was most
 	// recent, losing the other's context.
-	sessionID := agentIDToUUID(agent.ID)
-	if sessionFileUsable(dir, sessionID) {
-		args = append(args, "--resume", sessionID)
-	} else {
-		args = append(args, "--session-id", sessionID)
+	//
+	// OneShot mode (e.g. Slack conversations) skips session resumption entirely,
+	// running a fresh ephemeral session each time.
+	if !oneShot {
+		sessionID := agentIDToUUID(agent.ID)
+		if sessionFileUsable(dir, sessionID) {
+			args = append(args, "--resume", sessionID)
+		} else {
+			args = append(args, "--session-id", sessionID)
+		}
 	}
 
 	return args

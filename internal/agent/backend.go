@@ -6,11 +6,28 @@ import (
 	"strings"
 )
 
+// ErrMsgTimeout is the error message attached to a "done" event when
+// the backend process is terminated due to a context timeout.
+const ErrMsgTimeout = "timeout: process was terminated"
+
+// ErrMsgCancelled is the error message attached to a "done" event when
+// the backend process is terminated due to a user-initiated cancellation
+// (context.Canceled) rather than a deadline.
+const ErrMsgCancelled = "cancelled: process was terminated"
+
+// ChatOptions holds optional parameters for a chat invocation.
+type ChatOptions struct {
+	// OneShot skips session resumption, running a fresh ephemeral session.
+	// Used for Slack and other external platform conversations that have
+	// their own conversation context.
+	OneShot bool
+}
+
 // ChatBackend abstracts a CLI tool for agent chat.
 type ChatBackend interface {
 	// Chat sends a message and returns a channel of streaming events.
 	// The channel is closed when the response is complete.
-	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string) (<-chan ChatEvent, error)
+	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error)
 
 	// Name returns the tool identifier (e.g. "claude", "codex", "gemini").
 	Name() string
@@ -43,6 +60,28 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 		"AGENT_BROWSER_COOKIE_DIR="+dataDir,
 	)
 	return filtered
+}
+
+// emitCancelDone sends a partial "done" event when the backend process is
+// terminated due to context cancellation. The ErrorMessage distinguishes
+// timeout (context.DeadlineExceeded) from user-initiated abort
+// (context.Canceled), so the transcript does not mislabel aborts as timeouts.
+func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
+	msg := newAssistantMessage()
+	msg.Content = content
+	msg.Thinking = thinking
+	msg.ToolUses = toolUses
+	msg.Usage = usage
+	errMsg := ErrMsgTimeout
+	if ctx.Err() == context.Canceled {
+		errMsg = ErrMsgCancelled
+	}
+	ch <- ChatEvent{
+		Type:         "done",
+		Message:      msg,
+		Usage:        usage,
+		ErrorMessage: errMsg,
+	}
 }
 
 // matchToolOutput pairs a tool result with the most recent matching ToolUse

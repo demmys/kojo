@@ -5,6 +5,7 @@ import { api } from "../../lib/api";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
+import { SlackBotSettings } from "./SlackBotSettings";
 import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
 
 export function AgentSettings() {
@@ -20,6 +21,7 @@ export function AgentSettings() {
   const [tool, setTool] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
+  const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
   const [saving, setSaving] = useState(false);
@@ -55,6 +57,7 @@ export function AgentSettings() {
       setTool(a.tool);
       setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
+      setTimeoutMinutes(a.timeoutMinutes || 10);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
       setAllowedTools(a.allowedTools ?? []);
@@ -76,6 +79,7 @@ export function AgentSettings() {
         tool: tool.trim(),
         workDir: workDir.trim(),
         intervalMinutes,
+        timeoutMinutes,
         activeStart,
         activeEnd,
         allowedTools: tool === "lm-studio" ? allowedTools : undefined,
@@ -191,7 +195,11 @@ export function AgentSettings() {
         <h1 className="text-lg font-bold">Settings</h1>
       </header>
 
-      <main className="p-4 space-y-5 max-w-md mx-auto">
+      <main className="p-4 space-y-6 max-w-md mx-auto">
+        {/* ── Agent Settings ── */}
+        <section className="rounded-xl border border-neutral-800 p-5 space-y-5">
+          <h2 className="text-sm font-semibold text-neutral-300">Agent</h2>
+
         {/* Avatar */}
         <div className="flex items-center gap-4">
           <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
@@ -439,6 +447,8 @@ export function AgentSettings() {
         <ScheduleEditor
           intervalMinutes={intervalMinutes}
           onIntervalChange={setIntervalMinutes}
+          timeoutMinutes={timeoutMinutes}
+          onTimeoutChange={setTimeoutMinutes}
           activeStart={activeStart}
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}
@@ -463,43 +473,55 @@ export function AgentSettings() {
         >
           {saving ? "Saving..." : "Save Changes"}
         </button>
+        </section>
 
-        {/* Notifications */}
-        <NotifySourcesEditor agentId={id!} />
+        {/* ── Notifications ── */}
+        <section className="rounded-xl border border-neutral-800 p-5">
+          <NotifySourcesEditor agentId={id!} />
+        </section>
 
-        <div className="border-t border-neutral-800 pt-5">
+        {/* ── Slack Bot ── */}
+        <section className="rounded-xl border border-neutral-800 p-5">
+          <SlackBotSettings agentId={id!} />
+        </section>
+
+        {/* ── Credentials ── */}
+        <section className="rounded-xl border border-neutral-800 p-5">
           <button
             onClick={() => navigate(`/agents/${id}/credentials`)}
             className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 rounded-lg text-sm font-medium"
           >
-            Credentials
+            Manage Credentials
           </button>
-        </div>
+        </section>
 
-        <div className="border-t border-neutral-800 pt-5">
-          <button
-            onClick={handleResetSession}
-            disabled={resettingSession}
-            className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
-          >
-            {resettingSession ? "Resetting..." : "Reset CLI Session"}
-          </button>
-          <p className="text-xs text-neutral-600 mt-1">
-            Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
-          </p>
-        </div>
-
-        <div className="border-t border-neutral-800 pt-5 space-y-3">
-          <button
-            onClick={handleResetData}
-            disabled={resetting}
-            className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
-          >
-            {resetting ? "Resetting..." : "Reset Data"}
-          </button>
-          <p className="text-xs text-neutral-600">
-            Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
-          </p>
+        {/* ── Danger Zone ── */}
+        <section className="rounded-xl border border-red-900/30 bg-red-950/10 p-5 space-y-4">
+          <h2 className="text-sm font-semibold text-red-400/80">Danger Zone</h2>
+          <div>
+            <button
+              onClick={handleResetSession}
+              disabled={resettingSession}
+              className="w-full py-3 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg text-sm font-medium disabled:opacity-40"
+            >
+              {resettingSession ? "Resetting..." : "Reset CLI Session"}
+            </button>
+            <p className="text-xs text-neutral-600 mt-1">
+              Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
+            </p>
+          </div>
+          <div>
+            <button
+              onClick={handleResetData}
+              disabled={resetting}
+              className="w-full py-3 bg-amber-950 hover:bg-amber-900 border border-amber-800 rounded-lg text-sm font-medium text-amber-300 disabled:opacity-40"
+            >
+              {resetting ? "Resetting..." : "Reset Data"}
+            </button>
+            <p className="text-xs text-neutral-600 mt-1">
+              Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
+            </p>
+          </div>
           <button
             onClick={handleDelete}
             disabled={deleting}
@@ -507,7 +529,7 @@ export function AgentSettings() {
           >
             {deleting ? "Deleting..." : "Delete Agent"}
           </button>
-        </div>
+        </section>
 
         {/* Info */}
         <div className="text-xs text-neutral-600 space-y-1">

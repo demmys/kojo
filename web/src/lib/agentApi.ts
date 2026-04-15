@@ -11,6 +11,16 @@ export const INTERVAL_PRESETS = [
   { label: "24h", value: 1440 },
 ] as const;
 
+export const TIMEOUT_PRESETS = [
+  { label: "5m", value: 5 },
+  { label: "10m", value: 10 },
+  { label: "15m", value: 15 },
+  { label: "20m", value: 20 },
+  { label: "30m", value: 30 },
+  { label: "45m", value: 45 },
+  { label: "1h", value: 60 },
+] as const;
+
 export interface AgentInfo {
   id: string;
   name: string;
@@ -20,6 +30,7 @@ export interface AgentInfo {
   tool: string;
   workDir: string;
   intervalMinutes: number;
+  timeoutMinutes: number;
   activeStart?: string;
   activeEnd?: string;
   createdAt: string;
@@ -45,6 +56,7 @@ export interface AgentConfig {
   tool?: string;
   workDir?: string;
   intervalMinutes?: number;
+  timeoutMinutes?: number;
   activeStart?: string;
   activeEnd?: string;
 }
@@ -125,7 +137,7 @@ export interface OTPEntry {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -144,6 +156,27 @@ export interface AgentTask {
   status: "open" | "done";
   createdAt: string;
   updatedAt: string;
+}
+
+export interface SlackBotStatus {
+  enabled: boolean;
+  threadReplies: boolean;
+  respondDM: boolean;
+  respondMention: boolean;
+  respondThread: boolean;
+  hasAppToken: boolean;
+  hasBotToken: boolean;
+  connected: boolean;
+}
+
+export interface SlackBotSetRequest {
+  enabled: boolean;
+  appToken?: string;
+  botToken?: string;
+  threadReplies?: boolean;
+  respondDM?: boolean;
+  respondMention?: boolean;
+  respondThread?: boolean;
 }
 
 export const agentApi = {
@@ -345,4 +378,21 @@ export const agentApi = {
     get<{ types: NotifySourceType[] }>("/api/v1/notify-source-types").then(
       (r) => r.types ?? [],
     ),
+
+  slackBot: {
+    get: (agentId: string) =>
+      get<SlackBotStatus>(`/api/v1/agents/${agentId}/slackbot`),
+
+    set: (agentId: string, cfg: SlackBotSetRequest) =>
+      put<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`, cfg),
+
+    delete: (agentId: string) =>
+      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`),
+
+    test: (agentId: string, tokens?: { appToken?: string; botToken?: string }) =>
+      post<{ ok: boolean; team: string; botUser: string }>(
+        `/api/v1/agents/${agentId}/slackbot/test`,
+        tokens,
+      ),
+  },
 };

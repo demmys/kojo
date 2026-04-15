@@ -64,6 +64,19 @@ type Manager struct {
 
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
+
+	// chatWatchers tracks per-agent channels notified when a new chat starts.
+	chatWatchers   map[string]map[*chatWatcher]struct{}
+	chatWatchersMu sync.Mutex
+
+	// oneShotCancels tracks cancel functions for in-flight one-shot chats
+	// (e.g. Slack) so they can be cleaned up on Shutdown or agent Delete.
+	// Unlike busy (which allows only one chat per agent), multiple one-shot
+	// chats may run concurrently for the same agent.
+	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
+	oneShotSeq       int64
+	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
+	oneShotCancelsMu sync.Mutex
 }
 
 // NewManager creates a new agent manager.
@@ -81,13 +94,15 @@ func NewManager(logger *slog.Logger) *Manager {
 			"gemini":    NewGeminiBackend(logger),
 			"lm-studio": NewLMStudioBackend(logger),
 		},
-		store:     newStore(logger),
-		creds:     creds,
-		logger:    logger,
-		busy:       make(map[string]busyEntry),
-		resetting:  make(map[string]bool),
-		profileGen: make(map[string]bool),
-		memIndexes: make(map[string]*MemoryIndex),
+		store:        newStore(logger),
+		creds:        creds,
+		logger:       logger,
+		busy:         make(map[string]busyEntry),
+		resetting:    make(map[string]bool),
+		profileGen:   make(map[string]bool),
+		memIndexes:   make(map[string]*MemoryIndex),
+		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
+		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
 	}
 
 	// Expose LM Studio backend for model listing
@@ -461,6 +476,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedInterval, *cfg.IntervalMinutes)
 	}
+	if cfg.TimeoutMinutes != nil && !ValidTimeout(*cfg.TimeoutMinutes) {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %d minutes", ErrUnsupportedTimeout, *cfg.TimeoutMinutes)
+	}
 	{
 		s, e := a.ActiveStart, a.ActiveEnd
 		if cfg.ActiveStart != nil {
@@ -478,6 +497,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	oldInterval := a.IntervalMinutes
 	if cfg.IntervalMinutes != nil {
 		a.IntervalMinutes = *cfg.IntervalMinutes
+	}
+	if cfg.TimeoutMinutes != nil {
+		a.TimeoutMinutes = *cfg.TimeoutMinutes
 	}
 	if cfg.ActiveStart != nil {
 		a.ActiveStart = *cfg.ActiveStart
@@ -532,6 +554,23 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 	return nil
 }
 
+// UpdateSlackBot updates the Slack bot configuration for an agent.
+// Pass nil to remove the configuration.
+func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	a.SlackBot = cfg
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+
+	m.save()
+	return nil
+}
+
 // Credentials returns the credential store. Returns nil if the store failed to initialize.
 func (m *Manager) Credentials() *CredentialStore {
 	return m.creds
@@ -542,11 +581,18 @@ func (m *Manager) HasCredentials() bool {
 	return m.creds != nil
 }
 
-// Chat sends a message to an agent and returns a channel of streaming events.
-// The role parameter controls how the input message is stored in the transcript
-// ("user" for interactive chat, "system" for cron-triggered messages).
-func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
-	// Sync persona.md → Agent.Persona before chat
+// chatPrep holds the common setup result shared by Chat and ChatOneShot.
+type chatPrep struct {
+	agentCopy   Agent
+	backend     ChatBackend
+	useLMSProxy bool
+	sysPrompt   string
+}
+
+// prepareChat performs the common setup for Chat and ChatOneShot:
+// persona sync, agent snapshot, backend resolution, system prompt construction,
+// and memory context injection.
+func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*chatPrep, error) {
 	m.syncPersona(agentID)
 
 	m.mu.Lock()
@@ -555,9 +601,50 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
-	// Copy agent data under lock
 	agentCopy := *a
 	m.mu.Unlock()
+
+	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
+	if err != nil {
+		return nil, err
+	}
+
+	var apiBase string
+	var groups []*GroupDM
+	if m.groupdms != nil {
+		apiBase = m.groupdms.APIBase()
+		groups = m.groupdms.GroupsForAgent(agentID)
+	}
+	if agentCopy.Tool == "claude" || useLMSProxy {
+		PrepareClaudeSettings(agentID, apiBase, m.logger)
+	}
+
+	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+
+	// Inject relevant memory context. IndexNewMessages is called for
+	// interactive chat (so the index is current) but skipped for one-shot
+	// chats which don't persist to the main transcript.
+	if idx := m.getOrOpenIndex(agentID); idx != nil {
+		idx.IndexFilesIfStale(agentID)
+		if indexNewMessages {
+			idx.IndexNewMessages(agentID)
+		}
+		if memCtx := idx.BuildContextFromQuery(query); memCtx != "" {
+			sysPrompt += "\n\n" + memCtx
+		}
+	}
+
+	return &chatPrep{agentCopy: agentCopy, backend: backend, useLMSProxy: useLMSProxy, sysPrompt: sysPrompt}, nil
+}
+
+// Chat sends a message to an agent and returns a channel of streaming events.
+// The role parameter controls how the input message is stored in the transcript
+// ("user" for interactive chat, "system" for cron-triggered messages).
+func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
+	prep, err := m.prepareChat(agentID, userMessage, true)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if agent is busy or being reset
 	m.busyMu.Lock()
@@ -578,63 +665,36 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
 	m.busyMu.Unlock()
 
-	// Resolve backend (may configure LMS proxy and clear agentCopy.Model)
-	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
-	if err != nil {
-		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
-		close(outCh)
-		m.clearBusy(agentID)
-		cancel()
-		return nil, err
-	}
-
-	atts := attachments
-
-	// Build system prompt with group DM context
-	var apiBase string
-	var groups []*GroupDM
-	if m.groupdms != nil {
-		apiBase = m.groupdms.APIBase()
-		groups = m.groupdms.GroupsForAgent(agentID)
-	}
-	// Prepare Claude settings (persona override + PreCompact hook) before backend starts
-	if agentCopy.Tool == "claude" || useLMSProxy {
-		PrepareClaudeSettings(agentID, apiBase, m.logger)
-	}
-
-	systemPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
-
-	// Update memory index and inject relevant context BEFORE saving input
-	// to avoid the current message appearing in search results (prompt injection).
-	if idx := m.getOrOpenIndex(agentID); idx != nil {
-		idx.IndexFilesIfStale(agentID)
-		idx.IndexNewMessages(agentID)
-		if memCtx := idx.BuildContextFromQuery(userMessage); memCtx != "" {
-			systemPrompt += "\n\n" + memCtx
-		}
-	}
+	// Notify any WebSocket clients watching this agent.
+	m.notifyChatStart(agentID)
 
 	// Save input message to transcript (after memory search to avoid self-injection)
 	var inputMsg *Message
 	if role == "system" {
 		inputMsg = newSystemMessage(userMessage)
 	} else {
-		inputMsg = newUserMessage(userMessage, atts)
+		inputMsg = newUserMessage(userMessage, attachments)
 	}
 	if err := appendMessage(agentID, inputMsg); err != nil {
 		m.logger.Warn("failed to save input message", "err", err)
+	}
+	// Stream the system message to WebSocket clients so it appears before
+	// the assistant response. User messages are added optimistically by the
+	// frontend, so only system messages need injection here.
+	if role == "system" {
+		outCh <- ChatEvent{Type: "message", Message: inputMsg}
 	}
 
 	// Build the effective message for the backend.
 	// When attachments are present, prepend file references so the CLI
 	// can access them (e.g. via Read tool for images/text).
 	effectiveMessage := userMessage
-	if len(atts) > 0 {
-		effectiveMessage = formatMessageWithAttachments(userMessage, atts)
+	if len(attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(userMessage, attachments)
 	}
 
 	// Start chat
-	backendCh, err := backend.Chat(chatCtx, &agentCopy, effectiveMessage, systemPrompt)
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
@@ -659,6 +719,92 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	return callerCh, nil
 }
 
+// ChatOneShot runs a one-shot chat that does not save to transcript
+// (messages.jsonl) and does not resume the CLI session. Used for external
+// platform conversations (Slack, Discord) that carry their own context.
+// Memory (MEMORY.md, diary) access is still available via system prompt.
+func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string) (<-chan ChatEvent, error) {
+	prep, err := m.prepareChat(agentID, userMessage, false)
+	if err != nil {
+		return nil, err
+	}
+
+	m.busyMu.Lock()
+	if m.resetting[agentID] {
+		m.busyMu.Unlock()
+		return nil, ErrAgentResetting
+	}
+	m.busyMu.Unlock()
+
+	chatCtx, cancel := context.WithCancel(ctx)
+	osID := m.trackOneShot(agentID, cancel)
+	outCh := make(chan ChatEvent, 64)
+
+	// Slack messages: instruct the agent to separate thinking from reply.
+	if strings.Contains(userMessage, "[Slack @") {
+		prep.sysPrompt += "\n\n## Slack Response Format\n\n" +
+			"This message is from Slack. Your text output will be posted to Slack.\n" +
+			"Wrap ONLY your final reply in <reply>...</reply> tags.\n" +
+			"Text outside these tags is your internal workspace — use it freely to think, reason, plan, and execute tools.\n" +
+			"Only the content inside <reply> will be shown to the Slack user.\n" +
+			"Always include exactly one <reply> block at the end of your response.\n"
+	}
+
+	// NOTE: No appendMessage — one-shot chats are not saved to transcript.
+
+	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, userMessage, prep.sysPrompt, ChatOptions{OneShot: true})
+	if err != nil {
+		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
+		close(outCh)
+		cancel()
+		m.untrackOneShot(agentID, osID)
+		return nil, err
+	}
+
+	go func() {
+		defer close(outCh)
+		defer cancel()
+		defer m.untrackOneShot(agentID, osID)
+		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
+	}()
+
+	return outCh, nil
+}
+
+// processOneShotEvents is like processChatEvents but does not persist
+// messages to the transcript. It still forwards events to outCh.
+func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	for {
+		select {
+		case event, ok := <-backendCh:
+			if !ok {
+				return
+			}
+			// Terminal events use blocking send; streaming events are non-blocking.
+			if event.Type == "done" || event.Type == "error" {
+				// Sync persona in case agent edited it during this chat
+				if event.Type == "done" {
+					m.syncPersona(agentID)
+				}
+				select {
+				case outCh <- event:
+				case <-ctx.Done():
+					return
+				}
+			} else {
+				select {
+				case outCh <- event:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			for range backendCh {
+			}
+			return
+		}
+	}
+}
+
 // processChatEvents reads events from the backend channel, persists messages,
 // and forwards events to outCh for the broadcaster.
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
@@ -671,16 +817,27 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 
 	defer func() {
 		if receivedDone {
+			if ctx.Err() == context.DeadlineExceeded {
+				errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+				if err := appendMessage(agentID, errMsg); err != nil {
+					m.logger.Warn("failed to save timeout message", "err", err)
+				}
+			}
 			return
 		}
-		if accText.Len() == 0 && accThinking.Len() == 0 && len(accToolUses) == 0 {
-			return
+		if accText.Len() > 0 || accThinking.Len() > 0 || len(accToolUses) > 0 {
+			msg := newAssistantMessage()
+			msg.Content = accText.String()
+			msg.Thinking = accThinking.String()
+			msg.ToolUses = accToolUses
+			m.persistDoneEvent(agentID, msg)
 		}
-		msg := newAssistantMessage()
-		msg.Content = accText.String()
-		msg.Thinking = accThinking.String()
-		msg.ToolUses = accToolUses
-		m.persistDoneEvent(agentID, msg)
+		if ctx.Err() == context.DeadlineExceeded {
+			errMsg := newSystemMessage("⚠️ この定期チェックインは制限時間超過により中断されました。")
+			if err := appendMessage(agentID, errMsg); err != nil {
+				m.logger.Warn("failed to save timeout message", "err", err)
+			}
+		}
 	}()
 
 	// accumulate records streaming data for abort recovery.
@@ -850,6 +1007,94 @@ func (m *Manager) SetCronPaused(paused bool) {
 	m.logger.Info("cron pause toggled", "paused", paused)
 }
 
+// trackOneShot registers a one-shot chat's cancel func so it can be
+// cleaned up on Shutdown or agent Delete. Returns an ID for untracking.
+func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc) int64 {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	m.oneShotSeq++
+	id := m.oneShotSeq
+	if m.oneShotCancels[agentID] == nil {
+		m.oneShotCancels[agentID] = make(map[int64]context.CancelFunc)
+	}
+	m.oneShotCancels[agentID][id] = cancel
+	return id
+}
+
+// untrackOneShot removes a one-shot chat's cancel func after it completes.
+func (m *Manager) untrackOneShot(agentID string, id int64) {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	if set, ok := m.oneShotCancels[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotCancels, agentID)
+		}
+	}
+}
+
+// cancelOneShots cancels all in-flight one-shot chats for an agent.
+func (m *Manager) cancelOneShots(agentID string) {
+	m.oneShotCancelsMu.Lock()
+	cancels := m.oneShotCancels[agentID]
+	delete(m.oneShotCancels, agentID)
+	m.oneShotCancelsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// cancelAllOneShots cancels all in-flight one-shot chats across all agents.
+func (m *Manager) cancelAllOneShots() {
+	m.oneShotCancelsMu.Lock()
+	all := m.oneShotCancels
+	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancelsMu.Unlock()
+	for _, cancels := range all {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}
+}
+
+// chatWatcher is a handle for a chat-start notification subscription.
+type chatWatcher struct {
+	ch chan struct{}
+}
+
+// WatchChatStart returns a channel that receives a signal whenever a new chat
+// starts for the given agent. Call the returned function to unsubscribe.
+func (m *Manager) WatchChatStart(agentID string) (<-chan struct{}, func()) {
+	w := &chatWatcher{ch: make(chan struct{}, 1)}
+	m.chatWatchersMu.Lock()
+	if m.chatWatchers[agentID] == nil {
+		m.chatWatchers[agentID] = make(map[*chatWatcher]struct{})
+	}
+	m.chatWatchers[agentID][w] = struct{}{}
+	m.chatWatchersMu.Unlock()
+	return w.ch, func() {
+		m.chatWatchersMu.Lock()
+		delete(m.chatWatchers[agentID], w)
+		if len(m.chatWatchers[agentID]) == 0 {
+			delete(m.chatWatchers, agentID)
+		}
+		m.chatWatchersMu.Unlock()
+	}
+}
+
+// notifyChatStart signals all watchers that a new chat has started for agentID.
+func (m *Manager) notifyChatStart(agentID string) {
+	m.chatWatchersMu.Lock()
+	watchers := m.chatWatchers[agentID]
+	for w := range watchers {
+		select {
+		case w.ch <- struct{}{}:
+		default:
+		}
+	}
+	m.chatWatchersMu.Unlock()
+}
+
 // Messages returns recent messages for an agent.
 func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 	return loadMessages(agentID, limit)
@@ -892,7 +1137,16 @@ func (m *Manager) Shutdown() {
 	}
 	m.busyMu.Unlock()
 
+	m.cancelAllOneShots()
+
 	m.save()
+}
+
+// AgentDir returns the data directory path for the given agent ID.
+// Exported for use by external subsystems (e.g. slackbot Hub) that need
+// to resolve agent data directories without importing agent internals.
+func AgentDir(id string) string {
+	return agentDir(id)
 }
 
 func (m *Manager) save() {
@@ -911,6 +1165,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.LastMessage != nil {
 		lm := *a.LastMessage
 		cp.LastMessage = &lm
+	}
+	if a.SlackBot != nil {
+		sb := *a.SlackBot
+		cp.SlackBot = &sb
 	}
 	if len(a.NotifySources) > 0 {
 		cp.NotifySources = make([]notifysource.Config, len(a.NotifySources))

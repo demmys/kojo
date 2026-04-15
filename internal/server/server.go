@@ -22,6 +22,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/notify"
 	gmailpkg "github.com/loppo-llc/kojo/internal/notifysource/gmail"
 	"github.com/loppo-llc/kojo/internal/session"
+	"github.com/loppo-llc/kojo/internal/slackbot"
 )
 
 func init() {
@@ -50,6 +51,7 @@ type Server struct {
 	sessions *session.Manager
 	agents   *agent.Manager
 	groupdms *agent.GroupDMManager
+	slackHub *slackbot.Hub
 	files    *filebrowser.Browser
 	git      *gitpkg.Manager
 	notify   *notify.Manager
@@ -100,6 +102,21 @@ func New(cfg Config) *Server {
 		logger:   logger,
 		devMode:  cfg.DevMode,
 		version:  cfg.Version,
+	}
+
+	// Initialize Slack bot hub — server owns the lifecycle.
+	if s.agents != nil {
+		creds := s.agents.Credentials()
+		s.slackHub = slackbot.NewHub(
+			s.agents, creds,
+			func(id string) string { return agent.AgentDir(id) },
+			logger,
+		)
+		for _, a := range s.agents.List() {
+			if a.SlackBot != nil && a.SlackBot.Enabled {
+				s.slackHub.StartBot(a.ID, *a.SlackBot)
+			}
+		}
 	}
 
 	// send push notification when an agent finishes its response
@@ -225,6 +242,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Session reset (CLI session only, keeps conversation history)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset-session", s.handleResetSession)
 
+	// Slack bot
+	mux.HandleFunc("GET /api/v1/agents/{id}/slackbot", s.handleGetSlackBot)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/slackbot", s.handleSetSlackBot)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/slackbot", s.handleDeleteSlackBot)
+	mux.HandleFunc("POST /api/v1/agents/{id}/slackbot/test", s.handleTestSlackBot)
+
 	// Notify sources
 	mux.HandleFunc("GET /api/v1/agents/{id}/notify-sources", s.handleListNotifySources)
 	mux.HandleFunc("POST /api/v1/agents/{id}/notify-sources", s.handleCreateNotifySource)
@@ -309,6 +332,9 @@ func (s *Server) SetTLSConfig(tlsCfg *tls.Config) {
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("shutting down...")
+	if s.slackHub != nil {
+		s.slackHub.Stop()
+	}
 	s.sessions.StopAll()
 	s.sessions.SaveAll()
 	if s.agents != nil {

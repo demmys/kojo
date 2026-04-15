@@ -56,6 +56,12 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Watch for new chats started by cron/notify while this WS is idle.
+	// (Slack-driven chats use ChatOneShot and intentionally do not trigger
+	// this signal — they have their own platform transcript.)
+	chatStarted, unwatchChat := s.agents.WatchChatStart(agentID)
+	defer unwatchChat()
+
 	// Channel for client messages (read goroutine → main loop)
 	clientMsgs := make(chan agentWSClientMsg, 8)
 
@@ -116,6 +122,19 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 			_ = writeJSON(ctx, conn, event)
 			if event.Type == "done" || event.Type == "error" {
 				bgEvents = nil // terminal event, stop reading
+			}
+		case <-chatStarted:
+			// A new chat was started (e.g. by cron or notification) while idle.
+			if bgEvents != nil {
+				continue // already streaming a chat
+			}
+			newBgEvents, newBgUnsub := s.resumeBackgroundChat(ctx, conn, agentID)
+			if newBgEvents != nil {
+				bgEvents = newBgEvents
+				if bgUnsub != nil {
+					bgUnsub()
+				}
+				bgUnsub = newBgUnsub
 			}
 		case msg := <-clientMsgs:
 			switch msg.Type {

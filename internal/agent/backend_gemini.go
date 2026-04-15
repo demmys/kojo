@@ -179,7 +179,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 		if cancelled {
 			cmd.Wait()
-			emitTimeoutDone(ch, fullText.String(), "", toolUses, usage)
+			emitCancelDone(ctx, ch, fullText.String(), "", toolUses, usage)
 			return
 		}
 

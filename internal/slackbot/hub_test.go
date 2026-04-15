@@ -24,6 +24,7 @@ func (m *mockTokens) GetToken(_, _, _, key string) (string, error) {
 	return m.tokens[key], nil
 }
 func (m *mockTokens) SetToken(_, _, _, _, _ string, _ time.Time) error { return nil }
+func (m *mockTokens) DeleteToken(_, _, _, _ string) error              { return nil }
 func (m *mockTokens) DeleteTokensBySource(_, _, _ string) error        { return nil }
 
 type mockMgr struct{}

@@ -106,7 +106,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			if content == "" {
 				content = result.lastAssistantText
 			}
-			emitTimeoutDone(ch, content, result.thinking, result.toolUses, result.usage)
+			emitCancelDone(ctx, ch, content, result.thinking, result.toolUses, result.usage)
 			return
 		}
 

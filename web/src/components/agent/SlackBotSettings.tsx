@@ -216,7 +216,11 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
             </button>
             <button
               onClick={handleTest}
-              disabled={testing || (!status?.hasAppToken && !appToken)}
+              disabled={
+                testing ||
+                (!status?.hasAppToken && !appToken) ||
+                (!status?.hasBotToken && !botToken)
+              }
               className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 rounded text-xs font-medium disabled:opacity-40"
             >
               {testing ? "Testing..." : "Test Connection"}

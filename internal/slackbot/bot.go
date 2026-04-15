@@ -271,32 +271,42 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	// Resolve user display name
 	displayName := b.resolveUserName(userID)
 
-	// Fetch conversation history from Slack for context injection
-	var history []chathistory.HistoryMessage
-	if threadTS != "" {
-		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, threadTS, b.resolveUserName, b.logger)
-	} else {
-		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
-	}
-
-	// Build enriched message with conversation history
-	var sb strings.Builder
-	if len(history) > 0 {
-		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
-		sb.WriteString("\n---\n\n")
-	}
-	sb.WriteString(fmt.Sprintf("[Slack @%s] %s", displayName, text))
-	formattedMsg := sb.String()
-
 	// Determine reply thread: use existing thread or start new one
 	replyTS := threadTS
 	if replyTS == "" && b.config.ThreadReplies {
 		replyTS = messageTS // reply in a thread starting from this message
 	}
 
-	// When creating a new thread (threadTS was empty), save the user's message
-	// to the thread history file so it appears as the first entry.
-	if threadTS == "" && replyTS != "" && b.agentDataDir != "" {
+	select {
+	case b.sem <- struct{}{}:
+		go func() {
+			defer func() { <-b.sem }()
+			b.sendToAgent(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID)
+		}()
+	default:
+		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
+		b.postMessage(ctx, channel, replyTS, "I'm currently handling too many conversations. Please try again shortly.")
+	}
+}
+
+// streamAppendInterval is the minimum interval between AppendStream calls.
+const streamAppendInterval = 1 * time.Second
+
+func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string) {
+	// Serialize processing within the same thread to maintain history
+	// consistency. The lock must cover both history fetching and prompt
+	// construction so that concurrent messages to the same thread observe
+	// each other's updates rather than building prompts from stale history.
+	tl := b.acquireThreadLock(channel, replyTS)
+	tl.mu.Lock()
+	defer func() {
+		tl.mu.Unlock()
+		b.releaseThreadLock(channel, replyTS, tl)
+	}()
+
+	// When creating a new thread (origThreadTS was empty), save the user's
+	// message to the thread history file so it appears as the first entry.
+	if origThreadTS == "" && replyTS != "" && b.agentDataDir != "" {
 		userMsg := chathistory.HistoryMessage{
 			Platform:  platformSlack,
 			ChannelID: channel,
@@ -314,29 +324,25 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		}
 	}
 
-	select {
-	case b.sem <- struct{}{}:
-		go func() {
-			defer func() { <-b.sem }()
-			b.sendToAgent(ctx, channel, replyTS, messageTS, formattedMsg)
-		}()
-	default:
-		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
-		b.postMessage(ctx, channel, replyTS, "I'm currently handling too many conversations. Please try again shortly.")
+	// Fetch conversation history from Slack for context injection.
+	var history []chathistory.HistoryMessage
+	if origThreadTS != "" {
+		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
+	} else {
+		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
 	}
-}
 
-// streamAppendInterval is the minimum interval between AppendStream calls.
-const streamAppendInterval = 1 * time.Second
+	// Build enriched message with conversation history.
+	var sb strings.Builder
+	if len(history) > 0 {
+		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+		sb.WriteString("\n---\n\n")
+	}
+	sb.WriteString(fmt.Sprintf("[Slack @%s] %s", displayName, text))
+	message := sb.String()
 
-func (b *Bot) sendToAgent(ctx context.Context, channel, threadTS, messageTS, message string) {
-	// Serialize processing within the same thread to maintain history consistency.
-	tl := b.acquireThreadLock(channel, threadTS)
-	tl.mu.Lock()
-	defer func() {
-		b.releaseThreadLock(channel, threadTS, tl)
-		tl.mu.Unlock()
-	}()
+	// From here on, the thread handle used for posting/streaming.
+	threadTS := replyTS
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
 	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
@@ -522,7 +528,7 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 
-	for attempt := range maxRateLimitRetry {
+	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
 		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
 		if err == nil {
 			return

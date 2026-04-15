@@ -10,6 +10,11 @@ import (
 // the backend process is terminated due to a context timeout.
 const ErrMsgTimeout = "timeout: process was terminated"
 
+// ErrMsgCancelled is the error message attached to a "done" event when
+// the backend process is terminated due to a user-initiated cancellation
+// (context.Canceled) rather than a deadline.
+const ErrMsgCancelled = "cancelled: process was terminated"
+
 // ChatOptions holds optional parameters for a chat invocation.
 type ChatOptions struct {
 	// OneShot skips session resumption, running a fresh ephemeral session.
@@ -57,20 +62,25 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	return filtered
 }
 
-// emitTimeoutDone sends a partial "done" event with ErrMsgTimeout when the
-// backend process is terminated due to context cancellation. Used by all
-// backends to avoid duplicating the same timeout-done construction logic.
-func emitTimeoutDone(ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
+// emitCancelDone sends a partial "done" event when the backend process is
+// terminated due to context cancellation. The ErrorMessage distinguishes
+// timeout (context.DeadlineExceeded) from user-initiated abort
+// (context.Canceled), so the transcript does not mislabel aborts as timeouts.
+func emitCancelDone(ctx context.Context, ch chan<- ChatEvent, content, thinking string, toolUses []ToolUse, usage *Usage) {
 	msg := newAssistantMessage()
 	msg.Content = content
 	msg.Thinking = thinking
 	msg.ToolUses = toolUses
 	msg.Usage = usage
+	errMsg := ErrMsgTimeout
+	if ctx.Err() == context.Canceled {
+		errMsg = ErrMsgCancelled
+	}
 	ch <- ChatEvent{
 		Type:         "done",
 		Message:      msg,
 		Usage:        usage,
-		ErrorMessage: ErrMsgTimeout,
+		ErrorMessage: errMsg,
 	}
 }
 

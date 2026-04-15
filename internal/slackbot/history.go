@@ -99,12 +99,42 @@ func FetchThreadHistory(ctx context.Context, api *slack.Client, agentDataDir, ch
 	}
 
 	if len(newMsgs) > 0 {
-		if lastRealTS == "" || forceFullFetch {
-			// First fetch or re-fetch: write the full thread
+		switch {
+		case lastRealTS == "" || forceFullFetch:
+			// First fetch or re-fetch: write the full thread (newMsgs already
+			// has the incomplete marker prepended when fetchComplete is false).
 			if err := chathistory.WriteMessages(path, newMsgs); err != nil {
 				logger.Warn("failed to save thread history", "path", path, "err", err)
 			}
-		} else {
+		case !fetchComplete:
+			// Partial delta fetch: rewrite the file so the incomplete marker
+			// sits at the first position. AppendMessages would place the marker
+			// at the end, but isIncomplete only inspects the first entry, so
+			// the force-refetch signal would be lost on the next run.
+			existing, loadErr := chathistory.LoadHistory(path)
+			if loadErr != nil {
+				// The file is unreadable via the JSONL loader (real I/O
+				// failure — LoadHistory skips corrupt lines silently and
+				// treats "not found" as nil,nil). Overwrite with newMsgs so
+				// the marker is still at the first position and the force-
+				// refetch signal is preserved. Unreadable pre-existing data
+				// is unrecoverable regardless.
+				logger.Warn("failed to load existing thread history, overwriting", "path", path, "err", loadErr)
+				if err := chathistory.WriteMessages(path, newMsgs); err != nil {
+					logger.Warn("failed to save thread history", "path", path, "err", err)
+				}
+				break
+			}
+			marker := newMsgs[0] // prepended above
+			tail := newMsgs[1:]
+			combined := make([]chathistory.HistoryMessage, 0, 1+len(existing)+len(tail))
+			combined = append(combined, marker)
+			combined = append(combined, existing...)
+			combined = append(combined, tail...)
+			if err := chathistory.WriteMessages(path, combined); err != nil {
+				logger.Warn("failed to save thread history", "path", path, "err", err)
+			}
+		default:
 			// Delta fetch: append new messages
 			if err := chathistory.AppendMessages(path, newMsgs); err != nil {
 				logger.Warn("failed to append thread history", "path", path, "err", err)

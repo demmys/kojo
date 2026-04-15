@@ -56,7 +56,9 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Watch for new chats started by cron/notify/Slack while this WS is idle.
+	// Watch for new chats started by cron/notify while this WS is idle.
+	// (Slack-driven chats use ChatOneShot and intentionally do not trigger
+	// this signal — they have their own platform transcript.)
 	chatStarted, unwatchChat := s.agents.WatchChatStart(agentID)
 	defer unwatchChat()
 

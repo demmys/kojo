@@ -181,7 +181,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ### AI Agents
 
-- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Gemini)
+- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Gemini, plus experimental LM Studio support)
 - AI-assisted persona generation (Gemini API) and avatar generation
 - Interactive chat with streaming responses, thinking display, and tool-use cards
 - Markdown rendering in agent messages
@@ -199,7 +199,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 |-------|-----------|
 | Server | Go, `net/http`, `coder/websocket`, `creack/pty` (Unix) / ConPTY (Windows), tmux (Unix), `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
-| Agents | Claude / Codex / Gemini backends, encrypted SQLite (credentials + FTS5 memory) |
+| Agents | Claude / Codex / Gemini backends (and experimental LM Studio backend), encrypted SQLite (credentials + FTS5 memory) |
 | Notifications | Web Push (VAPID) |
 | Network | Tailscale WireGuard P2P |
 

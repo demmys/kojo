@@ -6,7 +6,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { NotifySourcesEditor } from "./NotifySourcesEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
-import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
+import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 
 export function AgentSettings() {
   const { id } = useParams<{ id: string }>();
@@ -322,7 +322,11 @@ export function AgentSettings() {
             return models.length > 0 ? (
               <select
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => {
+                  const m = e.target.value;
+                  setModel(m);
+                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                }}
                 className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
               >
                 {model && !models.includes(model) && (
@@ -338,7 +342,11 @@ export function AgentSettings() {
               <input
                 type="text"
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => {
+                  const m = e.target.value;
+                  setModel(m);
+                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                }}
                 placeholder="model name"
                 className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
               />
@@ -355,8 +363,8 @@ export function AgentSettings() {
               onChange={(e) => setEffort(e.target.value)}
               className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
             >
-              <option value="">default (high)</option>
-              {effortLevels.map((e) => (
+              <option value="">default ({defaultEffortForModel(model)})</option>
+              {effortLevelsForModel(model).map((e) => (
                 <option key={e} value={e}>
                   {e}
                 </option>
@@ -375,11 +383,9 @@ export function AgentSettings() {
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    if (t === "lm-studio") {
-                      setModel(lmsModels[0] ?? "");
-                    } else {
-                      setModel(defaultModelForTool(t));
-                    }
+                    const m = t === "lm-studio" ? (lmsModels[0] ?? "") : defaultModelForTool(t);
+                    setModel(m);
+                    if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
                   }
                 }}
                 className={`flex-1 px-3 py-2 rounded text-sm font-mono ${

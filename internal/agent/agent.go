@@ -90,12 +90,29 @@ func ValidInterval(minutes int) bool {
 
 // allowedEfforts defines valid effort levels (claude only). Empty string is allowed (= default).
 var allowedEfforts = map[string]bool{
-	"": true, "low": true, "medium": true, "high": true, "max": true,
+	"": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
 }
 
 // ValidEffort returns true if the given effort level is valid.
 func ValidEffort(effort string) bool {
 	return allowedEfforts[effort]
+}
+
+// xhighModels lists models that support the "xhigh" effort level.
+var xhighModels = map[string]bool{
+	"opus": true, "claude-opus-4-7": true,
+}
+
+// ValidModelEffort returns true if the model+effort combination is valid.
+// xhigh is only allowed for specific models.
+func ValidModelEffort(model, effort string) bool {
+	if !ValidEffort(effort) {
+		return false
+	}
+	if effort == "xhigh" && !xhighModels[model] {
+		return false
+	}
+	return true
 }
 
 // allowedTimeouts defines the valid timeoutMinutes values.
@@ -115,7 +132,7 @@ type Agent struct {
 	Name            string `json:"name"`
 	Persona         string `json:"persona"`         // persona description (markdown)
 	Model           string `json:"model"`           // e.g. "sonnet", "opus"
-	Effort          string `json:"effort,omitempty"` // claude only: "low", "medium", "high", "max"
+	Effort          string `json:"effort,omitempty"` // claude only: "low", "medium", "high", "xhigh", "max"
 	Tool            string `json:"tool"`            // CLI tool: "claude", "codex", "gemini"
 	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	IntervalMinutes int    `json:"intervalMinutes"` // periodic execution interval in minutes (0 = disabled)
@@ -230,8 +247,8 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if err := ValidActiveHours(activeStart, activeEnd); err != nil {
 		return nil, err
 	}
-	if !ValidEffort(cfg.Effort) {
-		return nil, fmt.Errorf("unsupported effort level: %q", cfg.Effort)
+	if !ValidModelEffort(cfg.Model, cfg.Effort) {
+		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
 	if cfg.WorkDir != "" {
 		if !filepath.IsAbs(cfg.WorkDir) {

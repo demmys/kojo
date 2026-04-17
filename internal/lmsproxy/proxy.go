@@ -196,6 +196,8 @@ func (p *Proxy) forwardToLMS(ctx context.Context, oaiReq *OAIRequest) (*http.Res
 // claudeModelIDs lists Claude model identifiers that Claude Code CLI may use.
 // The proxy returns these so the CLI's model validation passes.
 var claudeModelIDs = []string{
+	"claude-opus-4-7",
+	"claude-opus-4-7[1m]",
 	"claude-opus-4-6",
 	"claude-opus-4-6[1m]",
 	"claude-sonnet-4-6",

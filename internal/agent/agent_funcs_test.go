@@ -112,7 +112,7 @@ func TestValidInterval(t *testing.T) {
 }
 
 func TestValidEffort(t *testing.T) {
-	valid := []string{"", "low", "medium", "high", "max"}
+	valid := []string{"", "low", "medium", "high", "xhigh", "max"}
 	for _, v := range valid {
 		if !ValidEffort(v) {
 			t.Errorf("expected %q to be valid", v)
@@ -120,5 +120,26 @@ func TestValidEffort(t *testing.T) {
 	}
 	if ValidEffort("extreme") {
 		t.Error("expected 'extreme' to be invalid")
+	}
+}
+
+func TestValidModelEffort(t *testing.T) {
+	// xhigh is valid for opus models
+	for _, m := range []string{"opus", "claude-opus-4-7"} {
+		if !ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be valid for %q", m)
+		}
+	}
+	// xhigh is invalid for non-opus models
+	for _, m := range []string{"sonnet", "claude-opus-4-6", "haiku", ""} {
+		if ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be invalid for %q", m)
+		}
+	}
+	// other effort levels are valid for any model
+	for _, e := range []string{"", "low", "medium", "high", "max"} {
+		if !ValidModelEffort("sonnet", e) {
+			t.Errorf("expected %q to be valid for sonnet", e)
+		}
 	}
 }

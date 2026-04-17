@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import { agentApi } from "../../lib/agentApi";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { api, type ServerInfo } from "../../lib/api";
-import { defaultModelForTool, modelsForTool, effortLevels, supportsEffort } from "../../lib/toolModels";
+import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
@@ -416,11 +416,9 @@ export function AgentCreate() {
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    if (t === "lm-studio") {
-                      setModel(info?.lmStudioModels?.[0] ?? "");
-                    } else {
-                      setModel(defaultModelForTool(t));
-                    }
+                    const m = t === "lm-studio" ? (info?.lmStudioModels?.[0] ?? "") : defaultModelForTool(t);
+                    setModel(m);
+                    if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
                   }
                 }}
                 disabled={info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false}
@@ -444,7 +442,11 @@ export function AgentCreate() {
             return models.length > 0 ? (
               <select
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => {
+                  const m = e.target.value;
+                  setModel(m);
+                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                }}
                 className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
               >
                 {model && !models.includes(model) && (
@@ -460,7 +462,11 @@ export function AgentCreate() {
               <input
                 type="text"
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => {
+                  const m = e.target.value;
+                  setModel(m);
+                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                }}
                 placeholder="model name"
                 className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
               />
@@ -477,8 +483,8 @@ export function AgentCreate() {
               onChange={(e) => setEffort(e.target.value)}
               className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
             >
-              <option value="">default (high)</option>
-              {effortLevels.map((e) => (
+              <option value="">default ({defaultEffortForModel(model)})</option>
+              {effortLevelsForModel(model).map((e) => (
                 <option key={e} value={e}>
                   {e}
                 </option>

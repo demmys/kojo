@@ -28,6 +28,7 @@ export interface AgentInfo {
   model: string;
   effort: string;
   tool: string;
+  customBaseURL?: string;
   workDir: string;
   intervalMinutes: number;
   timeoutMinutes: number;
@@ -54,6 +55,7 @@ export interface AgentConfig {
   model?: string;
   effort?: string;
   tool?: string;
+  customBaseURL?: string;
   workDir?: string;
   intervalMinutes?: number;
   timeoutMinutes?: number;

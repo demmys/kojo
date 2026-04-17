@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -81,15 +82,8 @@ func New(cfg Config) *Server {
 	}
 
 	sessMgr := session.NewManager(logger)
-	if cfg.AgentManager != nil {
-		if port := cfg.AgentManager.LMSProxyPort(); port > 0 {
-			models := cfg.AgentManager.LMStudioModels()
-			defaultModel := ""
-			if len(models) > 0 {
-				defaultModel = models[0]
-			}
-			sessMgr.SetLMSProxy(port, defaultModel)
-		}
+	if baseURL := os.Getenv("CUSTOM_API_BASE_URL"); baseURL != "" {
+		sessMgr.SetCustomBaseURL(baseURL)
 	}
 
 	s := &Server{
@@ -167,6 +161,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 
 	// Directory suggestions
 	mux.HandleFunc("GET /api/v1/dirs", s.handleDirSuggest)
+
+	// Custom API model discovery
+	mux.HandleFunc("GET /api/v1/custom-models", s.handleCustomModels)
 
 	// File browser
 	mux.HandleFunc("GET /api/v1/files", s.handleListFiles)

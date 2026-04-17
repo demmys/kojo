@@ -15,6 +15,8 @@ export function AgentCreate() {
   const [model, setModel] = useState("sonnet");
   const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("claude");
+  const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
+  const [customModels, setCustomModels] = useState<string[]>([]);
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
@@ -40,6 +42,24 @@ export function AgentCreate() {
   useEffect(() => {
     api.info().then(setInfo).catch(console.error);
   }, []);
+
+  const needsCustomURL = tool === "custom" || tool === "llama.cpp";
+
+  // Fetch models when custom/llama.cpp tool is selected or base URL changes
+  useEffect(() => {
+    if (!needsCustomURL) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api.customModels(customBaseURL).then((models) => {
+        if (cancelled) return;
+        setCustomModels(models);
+        if (models.length > 0) {
+          setModel((prev) => models.includes(prev) ? prev : models[0]);
+        }
+      }).catch(() => { if (!cancelled) setCustomModels([]); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [needsCustomURL, customBaseURL]);
 
   // Revoke blob URL on unmount
   useEffect(() => {
@@ -212,6 +232,7 @@ export function AgentCreate() {
         model,
         effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
+        customBaseURL: needsCustomURL ? customBaseURL : undefined,
         workDir: workDir.trim() || undefined,
         intervalMinutes,
         timeoutMinutes,
@@ -409,20 +430,24 @@ export function AgentCreate() {
         {/* Tool */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
-          <div className="flex gap-2">
-            {["claude", "codex", "gemini", "lm-studio"].map((t) => (
+          <div className="flex flex-wrap gap-2">
+            {["claude", "codex", "gemini", "custom", "llama.cpp"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    const m = t === "lm-studio" ? (info?.lmStudioModels?.[0] ?? "") : defaultModelForTool(t);
-                    setModel(m);
-                    if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                    if (t === "custom" || t === "llama.cpp") {
+                      setModel("");
+                    } else {
+                      const m = defaultModelForTool(t);
+                      setModel(m);
+                      if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                    }
                   }
                 }}
                 disabled={info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false}
-                className={`flex-1 px-3 py-2 rounded text-sm font-mono ${
+                className={`px-3 py-2 rounded text-sm font-mono ${
                   tool === t
                     ? "bg-neutral-700 border border-neutral-500"
                     : "bg-neutral-900 border border-neutral-800"
@@ -434,11 +459,25 @@ export function AgentCreate() {
           </div>
         </div>
 
+        {/* Custom Base URL */}
+        {needsCustomURL && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">API Base URL</label>
+            <input
+              type="text"
+              value={customBaseURL}
+              onChange={(e) => setCustomBaseURL(e.target.value)}
+              placeholder="http://localhost:8080"
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+            />
+          </div>
+        )}
+
         {/* Model */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Model</label>
           {(() => {
-            const models = tool === "lm-studio" ? (info?.lmStudioModels ?? []) : modelsForTool(tool);
+            const models = needsCustomURL ? customModels : modelsForTool(tool);
             return models.length > 0 ? (
               <select
                 value={model}

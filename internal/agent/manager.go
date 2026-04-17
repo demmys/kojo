@@ -1,19 +1,15 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/loppo-llc/kojo/internal/lmsproxy"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
 )
@@ -29,7 +25,6 @@ type Manager struct {
 	mu       sync.Mutex
 	agents   map[string]*Agent
 	backends map[string]ChatBackend
-	lmStudio *LMStudioBackend
 	store    *store
 	creds    *CredentialStore
 	cron     *cronScheduler
@@ -57,10 +52,6 @@ type Manager struct {
 
 	// notifyPoller polls external notification sources.
 	notifyPoller *notifyPoller
-
-	// lmsProxyPort/Stop manage the LM Studio proxy lifecycle (Anthropic → OAI Responses API).
-	lmsProxyPort int
-	lmsProxyStop context.CancelFunc
 
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
@@ -92,7 +83,8 @@ func NewManager(logger *slog.Logger) *Manager {
 			"claude":    NewClaudeBackend(logger),
 			"codex":     NewCodexBackend(logger),
 			"gemini":    NewGeminiBackend(logger),
-			"lm-studio": NewLMStudioBackend(logger),
+			"custom":    NewCustomBackend(logger),
+			"llama.cpp": NewLlamaCppBackend(logger),
 		},
 		store:        newStore(logger),
 		creds:        creds,
@@ -103,27 +95,6 @@ func NewManager(logger *slog.Logger) *Manager {
 		memIndexes:   make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
-	}
-
-	// Expose LM Studio backend for model listing
-	m.lmStudio = m.backends["lm-studio"].(*LMStudioBackend)
-
-	// Start LMS proxy if LM Studio is available.
-	if m.lmStudio.Available() {
-		// Ensure loaded models have sufficient context for Claude Code's tools.
-		lmsproxy.EnsureModelContext(logger)
-
-		proxyCtx, proxyCancel := context.WithCancel(context.Background())
-		proxy := lmsproxy.New(lmsproxy.DetectLMSBaseURL(), logger)
-		port, err := proxy.Start(proxyCtx, 19234)
-		if err != nil {
-			logger.Warn("failed to start lmsproxy", "err", err)
-			proxyCancel()
-		} else {
-			m.lmsProxyPort = port
-			m.lmsProxyStop = proxyCancel
-			logger.Info("lmsproxy started", "port", port)
-		}
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -174,11 +145,6 @@ func NewManager(logger *slog.Logger) *Manager {
 	}
 
 	return m
-}
-
-// LMSProxyPort returns the LMS proxy port (0 if not running).
-func (m *Manager) LMSProxyPort() int {
-	return m.lmsProxyPort
 }
 
 // SetGroupDMManager sets the group DM manager reference.
@@ -511,6 +477,17 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ActiveEnd != nil {
 		a.ActiveEnd = *cfg.ActiveEnd
 	}
+	{
+		finalBaseURL := a.CustomBaseURL
+		if cfg.CustomBaseURL != nil {
+			finalBaseURL = *cfg.CustomBaseURL
+		}
+		if (a.Tool == "custom" || a.Tool == "llama.cpp") && finalBaseURL == "" {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("customBaseURL is required for %s tool", a.Tool)
+		}
+		a.CustomBaseURL = finalBaseURL
+	}
 	if cfg.AllowedTools != nil {
 		a.AllowedTools = cfg.AllowedTools
 	}
@@ -587,10 +564,9 @@ func (m *Manager) HasCredentials() bool {
 
 // chatPrep holds the common setup result shared by Chat and ChatOneShot.
 type chatPrep struct {
-	agentCopy   Agent
-	backend     ChatBackend
-	useLMSProxy bool
-	sysPrompt   string
+	agentCopy Agent
+	backend   ChatBackend
+	sysPrompt string
 }
 
 // prepareChat performs the common setup for Chat and ChatOneShot:
@@ -608,7 +584,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*ch
 	agentCopy := *a
 	m.mu.Unlock()
 
-	backend, useLMSProxy, err := m.resolveBackend(agentID, &agentCopy)
+	backend, err := m.resolveBackend(agentID, &agentCopy)
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +595,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*ch
 		apiBase = m.groupdms.APIBase()
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
-	if agentCopy.Tool == "claude" || useLMSProxy {
+	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
 		PrepareClaudeSettings(agentID, apiBase, m.logger)
 	}
 
@@ -638,7 +614,7 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool) (*ch
 		}
 	}
 
-	return &chatPrep{agentCopy: agentCopy, backend: backend, useLMSProxy: useLMSProxy, sysPrompt: sysPrompt}, nil
+	return &chatPrep{agentCopy: agentCopy, backend: backend, sysPrompt: sysPrompt}, nil
 }
 
 // Chat sends a message to an agent and returns a channel of streaming events.
@@ -950,32 +926,12 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 }
 
 // resolveBackend selects the ChatBackend for the agent's tool.
-// When lm-studio is selected and the LMS proxy is running, it configures
-// a Claude backend with ANTHROPIC_BASE_URL pointing at the proxy and
-// clears agentCopy.Model so the proxy controls model selection.
-// Returns the backend, whether the LMS proxy is used, and any error.
-func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend, bool, error) {
-	claudeBackend := m.backends["claude"]
-	useLMSProxy := agentCopy.Tool == "lm-studio" && m.lmsProxyPort > 0 && claudeBackend != nil && claudeBackend.Available()
-	if useLMSProxy {
-		cb := NewClaudeBackend(m.logger)
-		proxyBase := fmt.Sprintf("http://localhost:%d", m.lmsProxyPort)
-		cfgBody, _ := json.Marshal(map[string]interface{}{
-			"model":        agentCopy.Model,
-			"allowedTools": agentCopy.AllowedTools,
-		})
-		sessionPath := "/session/" + agentID
-		http.Post(proxyBase+sessionPath+"/config", "application/json", bytes.NewReader(cfgBody))
-		cb.SetProxyURL(proxyBase + sessionPath)
-		agentCopy.Model = ""
-		return cb, true, nil
-	}
-
+func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend, error) {
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
-		return nil, false, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
 	}
-	return backend, false, nil
+	return backend, nil
 }
 
 // updatePostChatIndex updates the memory index after a chat completes.
@@ -1118,22 +1074,10 @@ func (m *Manager) BackendAvailability() map[string]bool {
 	return result
 }
 
-// LMStudioModels returns the list of LLM models from LM Studio (via lms CLI).
-func (m *Manager) LMStudioModels() []string {
-	if m.lmStudio == nil {
-		return nil
-	}
-	return m.lmStudio.ListModels()
-}
-
 // Shutdown stops all cron jobs, notify polling, and cancels active chats.
 func (m *Manager) Shutdown() {
 	m.cron.Stop()
-	m.notifyPoller.Stop() // cancels in-flight delivery goroutines via stopCtx
-
-	if m.lmsProxyStop != nil {
-		m.lmsProxyStop()
-	}
+	m.notifyPoller.Stop()
 
 	m.busyMu.Lock()
 	for _, entry := range m.busy {

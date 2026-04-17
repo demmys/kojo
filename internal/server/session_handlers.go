@@ -3,10 +3,15 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/session"
 )
@@ -20,14 +25,81 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		"version":   s.version,
 		"hostname":  hostname,
 		"homeDir":   homeDir,
-		"tools":     session.ToolAvailability(s.sessions.GetLMSProxyPort()),
+		"tools":     session.ToolAvailability(),
 		"shellTool": session.ShellToolName(),
 	}
 	if s.agents != nil {
 		resp["agentBackends"] = s.agents.BackendAvailability()
-		resp["lmStudioModels"] = s.agents.LMStudioModels()
 	}
 	writeJSONResponse(w, http.StatusOK, resp)
+}
+
+// handleCustomModels queries a custom Anthropic Messages API endpoint for available models.
+func (s *Server) handleCustomModels(w http.ResponseWriter, r *http.Request) {
+	baseURL := r.URL.Query().Get("baseURL")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid baseURL")
+		return
+	}
+	host := parsed.Hostname()
+	if !isLoopback(host) {
+		writeError(w, http.StatusForbidden, "forbidden", "only loopback addresses are allowed")
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(baseURL + "/v1/models")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "connection_error", fmt.Sprintf("cannot reach %s: %v", baseURL, err))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, "upstream_error", fmt.Sprintf("endpoint returned %d", resp.StatusCode))
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "read_error", err.Error())
+		return
+	}
+
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		writeError(w, http.StatusBadGateway, "parse_error", "invalid JSON from models endpoint")
+		return
+	}
+	if len(result.Data) == 0 {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"models": []string{}})
+		return
+	}
+
+	models := make([]string, 0, len(result.Data))
+	for _, m := range result.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"models": models})
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {

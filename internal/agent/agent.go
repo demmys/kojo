@@ -156,8 +156,12 @@ type Agent struct {
 	PublicProfile         string `json:"publicProfile,omitempty"`
 	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
 
-	// AllowedTools is a whitelist of tool names for the LMS proxy.
-	// If non-empty, only listed tools are forwarded to the local model.
+	// CustomBaseURL is the base URL for a custom Anthropic Messages API endpoint
+	// (e.g., llama-server). Only used when Tool is "custom".
+	CustomBaseURL string `json:"customBaseURL,omitempty"`
+
+	// AllowedTools is a whitelist of tool names forwarded to a custom endpoint.
+	// If non-empty, only listed tools are forwarded.
 	// If empty, all tools are forwarded.
 	AllowedTools []string `json:"allowedTools,omitempty"`
 
@@ -192,6 +196,7 @@ type AgentConfig struct {
 	Model           string  `json:"model"`
 	Effort          string  `json:"effort"`
 	Tool            string  `json:"tool"`
+	CustomBaseURL   string  `json:"customBaseURL"`
 	WorkDir         string  `json:"workDir"`
 	IntervalMinutes *int    `json:"intervalMinutes"` // nil = use default (30)
 	TimeoutMinutes  *int    `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
@@ -214,6 +219,7 @@ type AgentUpdateConfig struct {
 	TimeoutMinutes        *int      `json:"timeoutMinutes"`
 	ActiveStart           *string   `json:"activeStart"`
 	ActiveEnd             *string   `json:"activeEnd"`
+	CustomBaseURL         *string   `json:"customBaseURL"`
 	AllowedTools          []string  `json:"allowedTools"`
 }
 
@@ -250,6 +256,9 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidModelEffort(cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
+	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {
+		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
+	}
 	if cfg.WorkDir != "" {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
@@ -265,6 +274,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		Model:           cfg.Model,
 		Effort:          cfg.Effort,
 		Tool:            cfg.Tool,
+		CustomBaseURL:   cfg.CustomBaseURL,
 		WorkDir:         cfg.WorkDir,
 		IntervalMinutes: interval,
 		TimeoutMinutes:  timeoutMin,

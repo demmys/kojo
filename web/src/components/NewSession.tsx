@@ -121,11 +121,7 @@ export function NewSession() {
                     disabled={!t.available}
                     onChange={() => {
                       setTool(name);
-                      if (name === "lm-studio") {
-                        setModel(info?.lmStudioModels?.[0] ?? "");
-                      } else {
-                        setModel("");
-                      }
+                      setModel("");
                     }}
                     className="accent-neutral-400"
                   />
@@ -137,22 +133,6 @@ export function NewSession() {
               ))}
           </div>
         </div>
-
-        {/* Model (lm-studio) */}
-        {tool === "lm-studio" && info?.lmStudioModels && info.lmStudioModels.length > 0 && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Model</label>
-            <select
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            >
-              {info.lmStudioModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-          </div>
-        )}
 
         {/* Working directory */}
         <div ref={wrapperRef} className="relative">

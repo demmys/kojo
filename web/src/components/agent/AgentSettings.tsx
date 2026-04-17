@@ -19,6 +19,8 @@ export function AgentSettings() {
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
   const [tool, setTool] = useState("");
+  const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
+  const [customModels, setCustomModels] = useState<string[]>([]);
   const [workDir, setWorkDir] = useState("");
   const [intervalMinutes, setIntervalMinutes] = useState(30);
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
@@ -34,15 +36,8 @@ export function AgentSettings() {
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
-  const [lmsModels, setLmsModels] = useState<string[]>([]);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    api.info().then((info) => {
-      if (info.lmStudioModels?.length) setLmsModels(info.lmStudioModels);
-    }).catch(() => {});
-  }, []);
 
   useEffect(() => {
     if (!id) return;
@@ -55,6 +50,7 @@ export function AgentSettings() {
       setModel(a.model);
       setEffort(a.effort || "");
       setTool(a.tool);
+      setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
       setWorkDir(a.workDir ?? "");
       setIntervalMinutes(a.intervalMinutes);
       setTimeoutMinutes(a.timeoutMinutes || 10);
@@ -63,6 +59,23 @@ export function AgentSettings() {
       setAllowedTools(a.allowedTools ?? []);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
+
+  const needsCustomURL = tool === "custom" || tool === "llama.cpp";
+
+  useEffect(() => {
+    if (!needsCustomURL) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      api.customModels(customBaseURL).then((models) => {
+        if (cancelled) return;
+        setCustomModels(models);
+        if (models.length > 0) {
+          setModel((prev) => models.includes(prev) ? prev : models[0]);
+        }
+      }).catch(() => { if (!cancelled) setCustomModels([]); });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [needsCustomURL, customBaseURL]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -77,12 +90,13 @@ export function AgentSettings() {
         model: model.trim(),
         effort: supportsEffort(tool) ? effort : undefined,
         tool: tool.trim(),
+        customBaseURL: needsCustomURL ? customBaseURL.trim() : undefined,
         workDir: workDir.trim(),
         intervalMinutes,
         timeoutMinutes,
         activeStart,
         activeEnd,
-        allowedTools: tool === "lm-studio" ? allowedTools : undefined,
+        allowedTools: (tool === "custom") ? allowedTools : undefined,
       });
       setAgent(updated);
       setPublicProfile(updated.publicProfile ?? "");
@@ -318,7 +332,7 @@ export function AgentSettings() {
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Model</label>
           {(() => {
-            const models = tool === "lm-studio" ? lmsModels : modelsForTool(tool);
+            const models = needsCustomURL ? customModels : modelsForTool(tool);
             return models.length > 0 ? (
               <select
                 value={model}
@@ -376,19 +390,23 @@ export function AgentSettings() {
         {/* Tool */}
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Tool</label>
-          <div className="flex gap-2">
-            {["claude", "codex", "gemini", "lm-studio"].map((t) => (
+          <div className="flex flex-wrap gap-2">
+            {["claude", "codex", "gemini", "custom", "llama.cpp"].map((t) => (
               <button
                 key={t}
                 onClick={() => {
                   if (t !== tool) {
                     setTool(t);
-                    const m = t === "lm-studio" ? (lmsModels[0] ?? "") : defaultModelForTool(t);
-                    setModel(m);
-                    if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                    if (t === "custom" || t === "llama.cpp") {
+                      setModel("");
+                    } else {
+                      const m = defaultModelForTool(t);
+                      setModel(m);
+                      if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
+                    }
                   }
                 }}
-                className={`flex-1 px-3 py-2 rounded text-sm font-mono ${
+                className={`px-3 py-2 rounded text-sm font-mono ${
                   tool === t
                     ? "bg-neutral-700 border border-neutral-500"
                     : "bg-neutral-900 border border-neutral-800"
@@ -400,8 +418,23 @@ export function AgentSettings() {
           </div>
         </div>
 
-        {/* Allowed Tools (lm-studio only) */}
-        {tool === "lm-studio" && (
+        {/* Custom Base URL */}
+        {needsCustomURL && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Custom Base URL</label>
+            <input
+              type="text"
+              value={customBaseURL}
+              onChange={(e) => setCustomBaseURL(e.target.value)}
+              placeholder="http://localhost:8080"
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
+            />
+            <p className="text-xs text-neutral-600 mt-1">Anthropic Messages API compatible endpoint</p>
+          </div>
+        )}
+
+        {/* Allowed Tools (custom only) */}
+        {tool === "custom" && (
           <div>
             <label className="block text-sm text-neutral-400 mb-2">
               Allowed Tools

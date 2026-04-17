@@ -181,7 +181,7 @@ $ kojo
 
 ### AI エージェント
 
-- カスタム名・性格・アバター・バックエンド（Claude / Codex / Gemini、加えて LM Studio を実験的サポート）を持つ永続 AI ペルソナの作成
+- カスタム名・性格・アバター・バックエンド（Claude / Codex / Gemini、加えてカスタム Anthropic Messages API エンドポイント対応）を持つ永続 AI ペルソナの作成
 - AI によるペルソナ自動生成（Gemini API）とアバター生成
 - ストリーミング応答・思考表示・ツール使用カード付きのインタラクティブチャット
 - エージェントメッセージの Markdown レンダリング
@@ -199,7 +199,7 @@ $ kojo
 |---------|------|
 | サーバー | Go, `net/http`, `coder/websocket`, `creack/pty` (Unix) / ConPTY (Windows), tmux (Unix), `tsnet` |
 | Web UI | React 19, Vite, TypeScript, Tailwind CSS, xterm.js |
-| エージェント | Claude / Codex / Gemini バックエンド（および LM Studio バックエンドを実験的サポート）、暗号化 SQLite（クレデンシャル + FTS5 記憶） |
+| エージェント | Claude / Codex / Gemini / Custom API バックエンド、暗号化 SQLite（クレデンシャル + FTS5 記憶） |
 | 通知 | Web Push (VAPID) |
 | ネットワーク | Tailscale WireGuard P2P |
 

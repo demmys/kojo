@@ -86,7 +86,6 @@ func (m *Manager) ResetData(id string) error {
 	// Clear global CLI session stores
 	clearClaudeSession(id)
 	clearGeminiSession(id)
-	m.lmStudio.ResetSession(id)
 
 	// Recreate empty memory directory and MEMORY.md (required for agent to function)
 	if err := os.MkdirAll(filepath.Join(dir, "memory"), 0o755); err != nil {
@@ -204,11 +203,8 @@ func (m *Manager) ResetSession(agentID string) error {
 		clearClaudeSession(agentID)
 	case "gemini":
 		clearGeminiSession(agentID)
-	case "lm-studio":
-		m.lmStudio.ResetSession(agentID)
-		if m.lmsProxyPort > 0 {
-			clearClaudeSession(agentID)
-		}
+	case "custom":
+		clearClaudeSession(agentID)
 	}
 	// Codex uses ephemeral sessions — no persistent state to clear
 

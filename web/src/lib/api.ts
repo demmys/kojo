@@ -22,7 +22,6 @@ export interface ServerInfo {
   tools: Record<string, { available: boolean; path: string }>;
   shellTool: string; // "tmux" on Unix, "shell" on Windows
   agentBackends?: Record<string, boolean>;
-  lmStudioModels?: string[];
 }
 
 export interface DirEntry {
@@ -70,6 +69,8 @@ export const api = {
   info: () => get<ServerInfo>("/api/v1/info"),
   dirSuggest: (prefix: string) =>
     get<{ dirs: string[] }>(`/api/v1/dirs?prefix=${encodeURIComponent(prefix)}`).then((r) => r.dirs),
+  customModels: (baseURL: string) =>
+    get<{ models: string[] }>(`/api/v1/custom-models?baseURL=${encodeURIComponent(baseURL)}`).then((r) => r.models),
 
   sessions: {
     list: () => get<{ sessions: SessionInfo[] }>("/api/v1/sessions").then((r) => r.sessions),

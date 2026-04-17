@@ -31,7 +31,11 @@ export const toolModels: Record<string, ToolModelConfig> = {
       "gemini-2.5-flash-lite",
     ],
   },
-  "lm-studio": {
+  custom: {
+    default: "",
+    models: [],
+  },
+  "llama.cpp": {
     default: "",
     models: [],
   },

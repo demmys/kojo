@@ -56,6 +56,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 	if b.proxyURL != "" {
 		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
+		if os.Getenv("ANTHROPIC_API_KEY") == "" {
+			cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY=dummy")
+		}
 	}
 	cmd.Dir = dir
 	// Send SIGTERM on context cancellation, then SIGKILL after 10s grace period.
@@ -180,6 +183,9 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	}
 	if agent.Effort != "" {
 		args = append(args, "--effort", agent.Effort)
+	}
+	if len(agent.AllowedTools) > 0 {
+		args = append(args, "--allowedTools", strings.Join(agent.AllowedTools, ","))
 	}
 
 	// Remove CLAUDE.local.md to prevent persona autoload hook from

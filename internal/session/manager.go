@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,10 +54,10 @@ const (
 )
 
 var userTools = map[string]bool{
-	"claude":    true,
-	"codex":     true,
-	"gemini":    true,
-	"lm-studio": true,
+	"claude": true,
+	"codex":  true,
+	"gemini": true,
+	"custom": true,
 }
 
 // internalTools is populated by platform-specific init() functions.
@@ -86,51 +85,25 @@ type Manager struct {
 
 	shuttingDown bool
 
-	// lmsProxyPort is the port of the LMS proxy (Anthropic → OAI Responses).
-	// Set by the caller when the proxy is active.
-	lmsProxyPort int
-	// lmsDefaultModel is the default LM Studio model for CLI sessions.
-	lmsDefaultModel string
+	// customBaseURL is the base URL for a custom Anthropic Messages API endpoint.
+	customBaseURL string
 
 	// callback for session events
 	OnSessionExit func(s *Session)
 }
 
-// SetLMSProxy configures the LMS proxy port and default model for CLI sessions.
-func (m *Manager) SetLMSProxy(port int, defaultModel string) {
+// SetCustomBaseURL configures the base URL for custom Anthropic API sessions.
+func (m *Manager) SetCustomBaseURL(baseURL string) {
 	m.mu.Lock()
-	m.lmsProxyPort = port
-	m.lmsDefaultModel = defaultModel
+	m.customBaseURL = baseURL
 	m.mu.Unlock()
 }
 
-// GetLMSProxyPort returns the LMS proxy port (0 if not running).
-func (m *Manager) GetLMSProxyPort() int {
+// GetCustomBaseURL returns the custom API base URL (empty if not configured).
+func (m *Manager) GetCustomBaseURL() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.lmsProxyPort
-}
-
-// configureLMSSession sets the model override for an LMS proxy session via its config API.
-func (m *Manager) configureLMSSession(proxyBaseURL, model string) {
-	configURL := proxyBaseURL + "/config"
-	body := fmt.Sprintf(`{"model":%q}`, model)
-	req, err := http.NewRequest("PUT", configURL, strings.NewReader(body))
-	if err != nil {
-		m.logger.Warn("failed to create LMS config request", "err", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		m.logger.Warn("failed to configure LMS session", "url", configURL, "err", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		m.logger.Warn("LMS session config failed", "status", resp.StatusCode, "body", string(respBody))
-	}
+	return m.customBaseURL
 }
 
 func NewManager(logger *slog.Logger) *Manager {
@@ -149,13 +122,10 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
 
-	// Resolve lm-studio → claude proxy setup; may modify args to extract --model.
-	lmsResult, err := m.resolveLMSProxy(tool, args, "")
-	if err != nil {
-		return nil, err
-	}
-	actualTool := lmsResult.actualTool
-	args = lmsResult.args
+	// Resolve custom → claude with ANTHROPIC_BASE_URL; may modify args to extract --model.
+	customResult := m.resolveCustomAPI(tool, args)
+	actualTool := customResult.actualTool
+	args = customResult.args
 
 	toolPath, err := resolveToolPath(tool, actualTool)
 	if err != nil {
@@ -177,11 +147,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		toolSessionID, runArgs = assignClaudeSessionID(actualTool, args)
 	}
 
-	// codex: session ID is captured from PTY output in readLoop
-	// gemini: no session ID mechanism; uses --resume latest on restart
-
-	// Build extra environment variables for the tool process.
-	extraEnv := m.buildLMSEnv(lmsResult, id)
+	extraEnv := m.buildCustomEnv(customResult)
 
 	var res *startResult
 	if userTools[tool] {
@@ -280,13 +246,8 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("unsupported tool: %s", tool)
 	}
 
-	// Resolve lm-studio → claude proxy setup.
-	lmsResult, err := m.resolveLMSProxy(tool, args, id)
-	if err != nil {
-		clearRestarting()
-		return nil, err
-	}
-	actualTool := lmsResult.actualTool
+	customResult := m.resolveCustomAPI(tool, args)
+	actualTool := customResult.actualTool
 
 	toolPath, err := resolveToolPath(tool, actualTool)
 	if err != nil {
@@ -299,7 +260,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 
 	restartArgs := buildRestartArgs(actualTool, args, toolSessionID)
 
-	extraEnv := m.buildLMSEnv(lmsResult, id)
+	extraEnv := m.buildCustomEnv(customResult)
 
 	var res *startResult
 	if userTools[tool] {
@@ -622,75 +583,42 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	}
 }
 
-// lmsProxyResult holds the result of resolving lm-studio proxy configuration.
-type lmsProxyResult struct {
-	actualTool    string   // the actual tool to execute ("claude" if lm-studio)
-	args          []string // args with --model extracted (only for Create)
-	proxyURLTmpl  string   // proxy URL template (contains %s for session ID) or fixed URL
-	modelOverride string   // model to configure on the proxy
+// customAPIResult holds the result of resolving custom API configuration.
+type customAPIResult struct {
+	actualTool string   // the actual tool to execute ("claude" if custom)
+	args       []string // args (unchanged for non-custom)
+	baseURL    string   // custom API base URL
 }
 
-// resolveLMSProxy resolves lm-studio → claude proxy setup.
-// If sessionID is non-empty, produces a fixed proxy URL (for Restart);
-// otherwise produces a template URL with %s placeholder (for Create).
-// May modify args to extract --model flag.
-func (m *Manager) resolveLMSProxy(tool string, args []string, sessionID string) (lmsProxyResult, error) {
-	result := lmsProxyResult{actualTool: tool, args: args}
-	if tool != "lm-studio" {
-		return result, nil
+// resolveCustomAPI resolves custom → claude with ANTHROPIC_BASE_URL.
+func (m *Manager) resolveCustomAPI(tool string, args []string) customAPIResult {
+	result := customAPIResult{actualTool: tool, args: args}
+	if tool != "custom" {
+		return result
 	}
 
 	m.mu.Lock()
-	port := m.lmsProxyPort
-	defaultModel := m.lmsDefaultModel
+	baseURL := m.customBaseURL
 	m.mu.Unlock()
 
-	if port == 0 {
-		return result, fmt.Errorf("LM Studio proxy is not running")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
 	}
 
 	result.actualTool = "claude"
-	result.modelOverride = defaultModel
-
-	// Extract the first --model/-m from args (matches original Create behavior).
-	outArgs := make([]string, len(args))
-	copy(outArgs, args)
-	for i, a := range outArgs {
-		if (a == "--model" || a == "-m") && i+1 < len(outArgs) {
-			result.modelOverride = outArgs[i+1]
-			outArgs = append(outArgs[:i], outArgs[i+2:]...)
-			break
-		}
-	}
-	result.args = outArgs
-
-	if sessionID != "" {
-		result.proxyURLTmpl = fmt.Sprintf("http://localhost:%d/session/%s", port, sessionID)
-	} else {
-		result.proxyURLTmpl = fmt.Sprintf("http://localhost:%d/session/%%s", port)
-	}
-
-	return result, nil
+	result.baseURL = baseURL
+	return result
 }
 
-// buildLMSEnv builds extra environment variables for LMS proxy sessions.
-// For Create (template URL), sessionID is used to fill the template.
-// For Restart (fixed URL), the template is used as-is.
-func (m *Manager) buildLMSEnv(lms lmsProxyResult, sessionID string) []string {
-	if lms.proxyURLTmpl == "" {
+// buildCustomEnv builds extra environment variables for custom API sessions.
+func (m *Manager) buildCustomEnv(r customAPIResult) []string {
+	if r.baseURL == "" {
 		return nil
 	}
-
-	proxyBaseURL := lms.proxyURLTmpl
-	if strings.Contains(proxyBaseURL, "%s") {
-		proxyBaseURL = fmt.Sprintf(lms.proxyURLTmpl, sessionID)
+	return []string{
+		"ANTHROPIC_BASE_URL=" + r.baseURL,
+		"ANTHROPIC_API_KEY=dummy",
 	}
-
-	if lms.modelOverride != "" {
-		m.configureLMSSession(proxyBaseURL, lms.modelOverride)
-	}
-
-	return []string{"ANTHROPIC_BASE_URL=" + proxyBaseURL}
 }
 
 // resolveToolPath resolves the executable path for a tool.
@@ -801,20 +729,13 @@ func generateID() string {
 }
 
 // ToolAvailability checks which user-facing tools are available on this system.
-// lmsProxyPort should be >0 when the LMS proxy is running.
-func ToolAvailability(lmsProxyPort int) map[string]ToolInfo {
+func ToolAvailability() map[string]ToolInfo {
 	result := make(map[string]ToolInfo)
 	for tool := range userTools {
-		if tool == "lm-studio" {
-			// lm-studio requires: lms CLI + claude CLI + proxy running.
-			_, lmsErr := exec.LookPath("lms")
-			claudePath, claudeErr := exec.LookPath("claude")
-			available := lmsErr == nil && claudeErr == nil && lmsProxyPort > 0
-			path := ""
-			if available {
-				path = claudePath
-			}
-			result[tool] = ToolInfo{Available: available, Path: path}
+		if tool == "custom" {
+			// custom requires claude CLI (used as client with ANTHROPIC_BASE_URL).
+			claudePath, err := exec.LookPath("claude")
+			result[tool] = ToolInfo{Available: err == nil, Path: claudePath}
 			continue
 		}
 		path, err := exec.LookPath(tool)

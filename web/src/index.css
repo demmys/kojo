@@ -127,6 +127,24 @@ html, body, #root {
   letter-spacing: 0.05em;
   user-select: none;
 }
+.md-code-copy {
+  position: absolute;
+  top: 0.3em;
+  right: 0.4em;
+  padding: 0.25em;
+  border-radius: 4px;
+  color: #666;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  line-height: 0;
+}
+.md-code-wrap:hover .md-code-copy { opacity: 1; }
+.md-code-copy:hover { color: #ccc; background: rgba(255, 255, 255, 0.08); }
+/* When lang label is present, shift copy button left */
+.md-code-wrap:has(.md-code-lang) .md-code-copy { right: auto; left: 0.4em; }
 
 /* Tables */
 .md-content table {

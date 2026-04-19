@@ -189,11 +189,11 @@ export function GroupDMChat() {
             {group.members.map((m) => m.agentName).join(", ")}
           </div>
         </div>
-        {/* Style toggle */}
-        <button
-          onClick={async () => {
-            const cur = group.style || "efficient";
-            const next: GroupDMStyle = cur === "efficient" ? "expressive" : "efficient";
+        {/* Style selector */}
+        <select
+          value={group.style || "efficient"}
+          onChange={async (e) => {
+            const next = e.target.value as GroupDMStyle;
             try {
               const updated = await groupdmApi.setStyle(group.id, next);
               setGroup(updated);
@@ -201,16 +201,12 @@ export function GroupDMChat() {
               console.error("Failed to set style", err);
             }
           }}
-          className="shrink-0 text-sm text-neutral-600 hover:text-neutral-400 px-1.5 py-0.5 rounded"
-          aria-label={(group.style || "efficient") === "efficient"
-            ? "Token-saving mode (click to switch to expressive)"
-            : "Expressive mode (click to switch to efficient)"}
-          title={(group.style || "efficient") === "efficient"
-            ? "Token-saving mode (click to switch to expressive)"
-            : "Expressive mode (click to switch to efficient)"}
+          className="shrink-0 text-xs bg-neutral-800 border border-neutral-700 text-neutral-400 rounded px-1.5 py-0.5 cursor-pointer hover:text-neutral-200"
+          title="Communication style"
         >
-          {(group.style || "efficient") === "efficient" ? "\u26A1" : "\uD83D\uDCAC"}
-        </button>
+          <option value="efficient">⚡ Efficient</option>
+          <option value="expressive">💬 Expressive</option>
+        </select>
         {/* Cooldown setting */}
         <div className="shrink-0">
           {editingCooldown ? (

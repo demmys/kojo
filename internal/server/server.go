@@ -266,6 +266,9 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/api-keys/{provider}", s.handleSetAPIKey)
 	mux.HandleFunc("DELETE /api/v1/api-keys/{provider}", s.handleDeleteAPIKey)
 
+	// Embedding model setting
+	mux.HandleFunc("PUT /api/v1/embedding-model", s.handleSetEmbeddingModel)
+
 	// Notify source types
 	mux.HandleFunc("GET /api/v1/notify-source-types", s.handleListNotifySourceTypes)
 

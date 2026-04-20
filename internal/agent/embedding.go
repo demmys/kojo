@@ -13,17 +13,16 @@ import (
 )
 
 const (
-	embeddingModel    = "text-embedding-004"
-	embeddingDims     = 768
-	embeddingAPI      = "https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s"
-	batchEmbedAPI     = "https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s"
-	maxEmbedInputChars = 8000 // ~2048 tokens safe limit
-	maxBatchSize       = 100  // Gemini batch limit
+	defaultEmbeddingModel = "gemini-embedding-001"
+	embeddingAPI          = "https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s"
+	batchEmbedAPI         = "https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s"
+	maxEmbedInputChars    = 8000 // ~2048 tokens safe limit
+	maxBatchSize          = 100  // Gemini batch limit
 )
 
 // getEmbedding generates an embedding vector for the given text using Gemini API.
-func getEmbedding(apiKey string, text string) ([]float32, error) {
-	vecs, err := getBatchEmbeddings(apiKey, []string{text})
+func getEmbedding(apiKey, model, text string) ([]float32, error) {
+	vecs, err := getBatchEmbeddings(apiKey, model, []string{text})
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +34,7 @@ func getEmbedding(apiKey string, text string) ([]float32, error) {
 
 // getBatchEmbeddings generates embeddings for multiple texts in one API call.
 // Automatically splits into batches of maxBatchSize.
-func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
+func getBatchEmbeddings(apiKey, model string, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, nil
 	}
@@ -46,7 +45,7 @@ func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
 		if end > len(texts) {
 			end = len(texts)
 		}
-		batch, err := batchEmbedCall(apiKey, texts[i:end])
+		batch, err := batchEmbedCall(apiKey, model, texts[i:end])
 		if err != nil {
 			return nil, err
 		}
@@ -55,8 +54,8 @@ func getBatchEmbeddings(apiKey string, texts []string) ([][]float32, error) {
 	return all, nil
 }
 
-func batchEmbedCall(apiKey string, texts []string) ([][]float32, error) {
-	url := fmt.Sprintf(batchEmbedAPI, embeddingModel, apiKey)
+func batchEmbedCall(apiKey, model string, texts []string) ([][]float32, error) {
+	url := fmt.Sprintf(batchEmbedAPI, model, apiKey)
 
 	requests := make([]map[string]any, len(texts))
 	for i, text := range texts {
@@ -65,7 +64,7 @@ func batchEmbedCall(apiKey string, texts []string) ([][]float32, error) {
 			text = string([]rune(text)[:maxEmbedInputChars])
 		}
 		requests[i] = map[string]any{
-			"model": "models/" + embeddingModel,
+			"model": "models/" + model,
 			"content": map[string]any{
 				"parts": []map[string]string{
 					{"text": text},

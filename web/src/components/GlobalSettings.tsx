@@ -22,11 +22,20 @@ export function GlobalSettings() {
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
   const [savingKey, setSavingKey] = useState(false);
 
+  // Embedding model state
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [embeddingModelInput, setEmbeddingModelInput] = useState("");
+  const [savingModel, setSavingModel] = useState(false);
+
   useEffect(() => {
     agentApi.oauthClients.list().then(setClients).catch(() => {});
-    agentApi.apiKeys.get("gemini").then((r: { configured: boolean; hasFallback?: boolean }) => {
+    agentApi.apiKeys.get("gemini").then((r: { configured: boolean; hasFallback?: boolean; embeddingModel?: string }) => {
       setGeminiKeyConfigured(r.configured);
       setGeminiHasFallback(r.hasFallback ?? false);
+      if (r.embeddingModel) {
+        setEmbeddingModel(r.embeddingModel);
+        setEmbeddingModelInput(r.embeddingModel);
+      }
     }).catch(() => {});
   }, []);
 
@@ -78,6 +87,23 @@ export function GlobalSettings() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSavingKey(false);
+    }
+  };
+
+  const handleSaveEmbeddingModel = async () => {
+    const model = embeddingModelInput.trim();
+    if (!model) return;
+    setSavingModel(true);
+    setError("");
+    try {
+      await agentApi.embeddingModel.set(model);
+      setEmbeddingModel(model);
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingModel(false);
     }
   };
 
@@ -171,6 +197,31 @@ export function GlobalSettings() {
                 </button>
               </div>
             )}
+
+            <div className="mt-3 border-t border-neutral-800 pt-3">
+              <div className="text-xs text-neutral-500 mb-1.5">Embedding Model</div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={embeddingModelInput}
+                  onChange={(e) => setEmbeddingModelInput(e.target.value)}
+                  placeholder="gemini-embedding-001"
+                  className="flex-1 px-3 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-xs font-mono focus:outline-none focus:border-neutral-500"
+                />
+                <button
+                  onClick={handleSaveEmbeddingModel}
+                  disabled={savingModel || !embeddingModelInput.trim() || embeddingModelInput.trim() === embeddingModel}
+                  className="px-3 py-1.5 bg-neutral-700 hover:bg-neutral-600 rounded text-xs font-medium disabled:opacity-40"
+                >
+                  {savingModel ? "..." : "Save"}
+                </button>
+              </div>
+              {embeddingModelInput.trim() && embeddingModelInput.trim() !== embeddingModel && embeddingModel && (
+                <div className="text-xs text-amber-500 mt-1">
+                  Changing model will clear existing embeddings
+                </div>
+              )}
+            </div>
           </div>
         </div>
 

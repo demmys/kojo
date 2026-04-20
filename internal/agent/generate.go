@@ -318,6 +318,17 @@ func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	return key, nil
 }
 
+// loadEmbeddingModel returns the configured embedding model name.
+// Falls back to defaultEmbeddingModel if not set.
+func loadEmbeddingModel(creds *CredentialStore) string {
+	if creds != nil {
+		if model, err := creds.GetToken("gemini", "", "", "embedding_model"); err == nil && model != "" {
+			return model
+		}
+	}
+	return defaultEmbeddingModel
+}
+
 // geminiHTTPClient is used for all Gemini API calls with a 60s timeout.
 var geminiHTTPClient = &http.Client{Timeout: 60 * time.Second}
 

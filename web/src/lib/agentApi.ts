@@ -2,6 +2,7 @@ import { get, post, del, patch, put, upload } from "./httpClient";
 
 export const INTERVAL_PRESETS = [
   { label: "Off", value: 0 },
+  { label: "5m", value: 5 },
   { label: "10m", value: 10 },
   { label: "30m", value: 30 },
   { label: "1h", value: 60 },

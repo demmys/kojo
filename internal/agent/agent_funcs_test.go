@@ -2,7 +2,36 @@ package agent
 
 import (
 	"testing"
+	"time"
 )
+
+func TestFormatUntil(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"past returns 1分", -time.Minute, "1分"},
+		{"zero returns 1分", 0, "1分"},
+		{"29s rounds down to 1分", 29 * time.Second, "1分"},
+		{"30s rounds to 1分", 30 * time.Second, "1分"},
+		{"5m exact", 5 * time.Minute, "5分"},
+		{"59m29s → 59分", 59*time.Minute + 29*time.Second, "59分"},
+		{"59m30s → 1時間", 59*time.Minute + 30*time.Second, "1時間"},
+		{"60m → 1時間", 60 * time.Minute, "1時間"},
+		{"60m30s → 1時間1分", 60*time.Minute + 30*time.Second, "1時間1分"},
+		{"2h15m", 2*time.Hour + 15*time.Minute, "2時間15分"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatUntil(now.Add(tt.d), now)
+			if got != tt.want {
+				t.Errorf("formatUntil(+%v) = %q, want %q", tt.d, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestIntervalToCron(t *testing.T) {
 	tests := []struct {
@@ -13,6 +42,7 @@ func TestIntervalToCron(t *testing.T) {
 	}{
 		{"zero returns empty", 0, "ag_test", true},
 		{"negative returns empty", -1, "ag_test", true},
+		{"5 min produces sub-hourly", 5, "ag_test", false},
 		{"10 min produces sub-hourly", 10, "ag_test", false},
 		{"30 min produces sub-hourly", 30, "ag_test", false},
 		{"60 min produces hourly", 60, "ag_test", false},
@@ -97,13 +127,13 @@ func TestValidActiveHours(t *testing.T) {
 }
 
 func TestValidInterval(t *testing.T) {
-	valid := []int{0, 10, 30, 60, 180, 360, 720, 1440}
+	valid := []int{0, 5, 10, 30, 60, 180, 360, 720, 1440}
 	for _, v := range valid {
 		if !ValidInterval(v) {
 			t.Errorf("expected %d to be valid", v)
 		}
 	}
-	invalid := []int{-1, 1, 5, 15, 20, 45, 90, 120, 240}
+	invalid := []int{-1, 1, 15, 20, 45, 90, 120, 240}
 	for _, v := range invalid {
 		if ValidInterval(v) {
 			t.Errorf("expected %d to be invalid", v)

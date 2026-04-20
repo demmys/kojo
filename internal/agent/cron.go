@@ -20,7 +20,7 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int) string {
 	now := time.Now()
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
 
-	msg += fmt.Sprintf("（制限時間: %d分", timeoutMinutes)
+	msg += fmt.Sprintf("（今回のタイムアウトは%d分", timeoutMinutes)
 	if !nextRun.IsZero() {
 		var nextFmt string
 		if nextRun.YearDay() == now.YearDay() && nextRun.Year() == now.Year() {
@@ -28,11 +28,29 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int) string {
 		} else {
 			nextFmt = nextRun.Format("1月2日 15:04")
 		}
-		msg += "、次回予定: " + nextFmt
+		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
 	}
 	msg += "）"
 	msg += "最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
 	return msg
+}
+
+// formatUntil returns a Japanese-formatted duration from now until t,
+// rounded to the nearest minute (minimum 1分).
+func formatUntil(t, now time.Time) string {
+	mins := int((t.Sub(now) + 30*time.Second) / time.Minute)
+	if mins < 1 {
+		mins = 1
+	}
+	if mins < 60 {
+		return fmt.Sprintf("%d分", mins)
+	}
+	h := mins / 60
+	m := mins % 60
+	if m == 0 {
+		return fmt.Sprintf("%d時間", h)
+	}
+	return fmt.Sprintf("%d時間%d分", h, m)
 }
 
 // cronScheduler manages periodic agent executions.

@@ -79,7 +79,7 @@ func IsWithinActiveHours(start, end string) bool {
 // allowedIntervals defines the valid intervalMinutes values.
 // Sub-hourly values must divide 60; hourly values must divide 24 (in hours).
 var allowedIntervals = map[int]bool{
-	0: true, 10: true, 30: true, 60: true,
+	0: true, 5: true, 10: true, 30: true, 60: true,
 	180: true, 360: true, 720: true, 1440: true,
 }
 
@@ -351,7 +351,7 @@ func intervalToCron(intervalMinutes int, agentID string) string {
 		return fmt.Sprintf("%d %s * * *", minuteOffset, strings.Join(hourList, ","))
 	}
 
-	// Sub-hourly (10 or 30 — both divide 60 evenly)
+	// Sub-hourly (5, 10, 30 — all divide 60 evenly)
 	offset := hash % intervalMinutes
 	mins := make([]string, 0, 60/intervalMinutes)
 	for m := offset; m < 60; m += intervalMinutes {

@@ -173,6 +173,10 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 		"--verbose",
 		"--include-partial-messages",
 		"--dangerously-skip-permissions",
+		// Scheduling tools don't make sense in kojo's non-interactive agent
+		// context — the scheduled job would fire against the user's claude,
+		// not this agent's session.
+		"--disallowedTools", "CronCreate,CronDelete,CronList,ScheduleWakeup",
 	}
 
 	if systemPrompt != "" {

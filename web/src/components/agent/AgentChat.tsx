@@ -21,6 +21,7 @@ export function AgentChat() {
   const [streamTools, setStreamTools] = useState<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
   const [streamStatus, setStreamStatus] = useState("");
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
+  const [streamViewMode, setStreamViewMode] = useState<"markdown" | "plain">("markdown");
   const [hasMore, setHasMore] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -554,6 +555,8 @@ export function AgentChat() {
             status={streamStatus}
             avatarHash={agent.avatarHash}
             startTime={streamStartTime}
+            viewMode={streamViewMode}
+            onViewModeChange={setStreamViewMode}
           />
         )}
         <div ref={messagesEndRef} />

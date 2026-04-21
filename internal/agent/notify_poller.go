@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/notifysource"
 )
 
@@ -417,7 +418,7 @@ func (p *notifyPoller) saveCursorsLocked() {
 }
 
 func configDir() string {
-	return kojoConfigDir()
+	return configdir.Path()
 }
 
 // formatNotifyMessage builds a system message from notification items.

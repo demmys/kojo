@@ -12,10 +12,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/configdir"
 	_ "modernc.org/sqlite"
 )
 
@@ -61,23 +61,9 @@ type CredentialStore struct {
 	gcm cipher.AEAD
 }
 
-// kojoConfigDir returns the kojo config root directory.
-func kojoConfigDir() string {
-	if runtime.GOOS == "windows" {
-		if appData := os.Getenv("APPDATA"); appData != "" {
-			return filepath.Join(appData, "kojo")
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "kojo")
-	}
-	return filepath.Join(home, ".config", "kojo")
-}
-
 // NewCredentialStore opens or creates the encrypted credential store.
 func NewCredentialStore() (*CredentialStore, error) {
-	dir := kojoConfigDir()
+	dir := configdir.Path()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create config dir: %w", err)
 	}

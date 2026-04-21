@@ -20,6 +20,7 @@ import (
 	"net/netip"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/notify"
 	"github.com/loppo-llc/kojo/internal/server"
 	"github.com/loppo-llc/kojo/internal/session"
@@ -33,6 +34,7 @@ func main() {
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
 	dev := flag.Bool("dev", false, "enable dev mode (proxy to Vite)")
 	local := flag.Bool("local", false, "listen on localhost only (no Tailscale)")
+	configDir := flag.String("config-dir", "", "override config directory (default: ~/.config/kojo)")
 	showVersion := flag.Bool("version", false, "show version")
 	flag.Parse()
 
@@ -48,6 +50,25 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: logLevel,
 	}))
+
+	// Resolve the config directory before any subsystem reads it.
+	if *configDir != "" {
+		configdir.Set(*configDir)
+	}
+	resolvedDir := configdir.Path()
+	logger.Info("config directory", "path", resolvedDir)
+
+	// Acquire an exclusive advisory lock on the config dir so a second kojo
+	// instance cannot attach to the same directory and clobber shared state
+	// (agents.json, credentials.db, vapid.json).
+	lock, err := configdir.Acquire(resolvedDir)
+	if err != nil {
+		logger.Error("could not lock config directory — another kojo instance may be running", "dir", resolvedDir, "err", err)
+		fmt.Fprintf(os.Stderr, "\nAnother kojo instance is already using %s.\n", resolvedDir)
+		fmt.Fprintf(os.Stderr, "Use --config-dir to point this instance at a different directory.\n\n")
+		os.Exit(1)
+	}
+	defer lock.Release()
 
 	// tmux is required for user tool sessions on Unix
 	if runtime.GOOS != "windows" {

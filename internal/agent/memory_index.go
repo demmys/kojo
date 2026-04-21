@@ -124,12 +124,19 @@ func (idx *MemoryIndex) Close() error {
 
 // ClearEmbeddings resets all embeddings to NULL and clears the embedding cache.
 // Called when the embedding model changes (dimensions may differ).
+// Errors are logged rather than returned because callers are best-effort
+// (an HTTP handler invalidating state on config change), but silent failure
+// would leave the index in an inconsistent state.
 func (idx *MemoryIndex) ClearEmbeddings() {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	idx.db.Exec("UPDATE chunks SET embedding = NULL")
-	idx.db.Exec("DELETE FROM embedding_cache")
+	if _, err := idx.db.Exec("UPDATE chunks SET embedding = NULL"); err != nil {
+		idx.logger.Warn("ClearEmbeddings: failed to null chunks.embedding", "err", err)
+	}
+	if _, err := idx.db.Exec("DELETE FROM embedding_cache"); err != nil {
+		idx.logger.Warn("ClearEmbeddings: failed to clear embedding_cache", "err", err)
+	}
 }
 
 // indexWriter wraps prepared FTS and chunk insert statements to eliminate

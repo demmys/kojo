@@ -91,6 +91,17 @@ export function GlobalSettings() {
       setGeminiKeyInput("");
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
+
+      // The page may have loaded with no key configured, in which case we
+      // never fetched the model list on mount. Fetch it now so the
+      // Embedding Model dropdown appears without requiring a manual refresh.
+      setAvailableModels([]);
+      setLoadingModels(true);
+      agentApi.embeddingModel
+        .list()
+        .then(setAvailableModels)
+        .catch(() => {})
+        .finally(() => setLoadingModels(false));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

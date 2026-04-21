@@ -135,26 +135,78 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
   );
 }
 
+/**
+ * copyToClipboard writes `text` to the user's clipboard, falling back to a
+ * legacy execCommand path when the async Clipboard API is unavailable
+ * (non-secure contexts, older browsers, missing permissions). Returns true
+ * when the copy appears to have succeeded.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to legacy fallback
+    }
+  }
+
+  if (typeof document === "undefined") return false;
+
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-9999px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  try {
+    ta.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    // Always remove the textarea, even if execCommand threw.
+    ta.remove();
+  }
+}
+
 /** Small copy button rendered inside code blocks. */
 function CodeCopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+    // void: deliberately not awaiting — the promise's result flows through
+    // setState below, and an unhandled rejection is not possible because
+    // copyToClipboard catches internally.
+    void copyToClipboard(text).then((ok) => {
+      if (ok) {
+        setCopied(true);
+        setFailed(false);
+        setTimeout(() => setCopied(false), 1500);
+      } else {
+        setFailed(true);
+        setTimeout(() => setFailed(false), 1500);
+      }
     });
   }, [text]);
 
+  const title = failed ? "Copy failed" : "Copy code";
   return (
     <button
       onClick={handleCopy}
       className="md-code-copy"
-      title="Copy code"
-      aria-label="Copy code"
+      title={title}
+      aria-label={title}
     >
       {copied ? (
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M13.25 4.75 6 12 2.75 8.75" />
+        </svg>
+      ) : failed ? (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="8" cy="8" r="6.5" />
+          <path d="M8 5v3.5M8 11v.01" />
         </svg>
       ) : (
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

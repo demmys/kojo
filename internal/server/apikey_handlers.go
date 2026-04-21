@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +11,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/agent"
 )
+
+// geminiListHTTPClient has an explicit timeout so a stuck upstream can't
+// tie up server goroutines indefinitely.
+var geminiListHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // handleGetAPIKey returns whether an API key is configured for the given provider.
 // Does NOT return the actual key — only a configured/not-configured status.
@@ -44,7 +51,7 @@ func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 	if provider == "gemini" {
 		embModel := creds.GetSetting("embedding_model")
 		if embModel == "" {
-			embModel = "gemini-embedding-001"
+			embModel = agent.DefaultEmbeddingModel
 		}
 		resp["embeddingModel"] = embModel
 	}
@@ -104,16 +111,24 @@ func (s *Server) handleSetEmbeddingModel(w http.ResponseWriter, r *http.Request)
 
 	creds := s.agents.Credentials()
 
-	// Check if model changed
+	// Check if the effective model changed. When no model was explicitly
+	// configured, existing embeddings were generated with the default model,
+	// so treat an empty oldModel as the default rather than as "no embeddings
+	// exist" — otherwise the first time a user picks a different model we'd
+	// leave stale embeddings with mismatched dimensions.
 	oldModel := creds.GetSetting("embedding_model")
-	modelChanged := oldModel != "" && oldModel != req.Model
+	effectiveOld := oldModel
+	if effectiveOld == "" {
+		effectiveOld = agent.DefaultEmbeddingModel
+	}
+	modelChanged := effectiveOld != req.Model
 
 	if err := creds.SetSetting("embedding_model", req.Model); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to save: "+err.Error())
 		return
 	}
 
-	// Clear all embeddings if model changed (dimensions may differ)
+	// Clear all embeddings if the effective model changed (dimensions may differ)
 	if modelChanged {
 		s.agents.ClearAllEmbeddings()
 	}
@@ -152,7 +167,7 @@ func (s *Server) handleListEmbeddingModels(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	models, err := fetchGeminiEmbeddingModels(apiKey)
+	models, err := fetchGeminiEmbeddingModels(r.Context(), apiKey)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "api_error", err.Error())
 		return
@@ -161,18 +176,26 @@ func (s *Server) handleListEmbeddingModels(w http.ResponseWriter, r *http.Reques
 	writeJSONResponse(w, http.StatusOK, map[string]any{"models": models})
 }
 
+// maxListModelsErrorBody caps how much of an error response we read back to
+// avoid a malicious/misbehaving upstream exhausting memory.
+const maxListModelsErrorBody = 16 * 1024
+
 // fetchGeminiEmbeddingModels calls the Gemini ListModels API and returns
 // model names that support embedContent.
-func fetchGeminiEmbeddingModels(apiKey string) ([]string, error) {
+func fetchGeminiEmbeddingModels(ctx context.Context, apiKey string) ([]string, error) {
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s&pageSize=100", apiKey)
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := geminiListHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxListModelsErrorBody))
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, body)
 	}
 

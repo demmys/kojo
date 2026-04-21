@@ -13,7 +13,12 @@ import (
 )
 
 const (
-	defaultEmbeddingModel = "gemini-embedding-001"
+	// DefaultEmbeddingModel is the Gemini embedding model used when no model
+	// has been explicitly configured. Exported so HTTP handlers can present
+	// the same fallback without duplicating the string.
+	DefaultEmbeddingModel = "gemini-embedding-001"
+	// defaultEmbeddingModel is kept for internal readability.
+	defaultEmbeddingModel = DefaultEmbeddingModel
 	embeddingAPI          = "https://generativelanguage.googleapis.com/v1beta/models/%s:embedContent?key=%s"
 	batchEmbedAPI         = "https://generativelanguage.googleapis.com/v1beta/models/%s:batchEmbedContents?key=%s"
 	maxEmbedInputChars    = 8000 // ~2048 tokens safe limit
@@ -74,7 +79,15 @@ func batchEmbedCall(apiKey, model string, texts []string) ([][]float32, error) {
 	}
 
 	body, _ := json.Marshal(map[string]any{"requests": requests})
-	resp, err := http.Post(url, "application/json", strings.NewReader(string(body)))
+	// Use the shared Gemini HTTP client so embedding requests inherit a
+	// timeout instead of inheriting http.DefaultClient's (no-timeout) default
+	// and hanging indefinitely on a stuck upstream.
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("embedding API build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := geminiHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embedding API request: %w", err)
 	}

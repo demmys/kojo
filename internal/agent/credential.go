@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -558,16 +559,24 @@ func (s *CredentialStore) migrateLegacy() {
 	}
 }
 
-// GetSetting retrieves a global setting value. Returns "" if not found.
+// GetSetting retrieves a global setting value. Returns "" if the key is not
+// found. Unexpected database errors (connection issues, schema drift, etc.)
+// are logged rather than silently swallowed so they don't masquerade as a
+// missing value.
 func (s *CredentialStore) GetSetting(key string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var val string
-	if err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val); err != nil {
+	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&val)
+	if err == nil {
+		return val
+	}
+	if errors.Is(err, sql.ErrNoRows) {
 		return ""
 	}
-	return val
+	slog.Warn("GetSetting: unexpected db error", "key", key, "err", err)
+	return ""
 }
 
 // SetSetting stores a global setting value.

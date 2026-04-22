@@ -1,4 +1,5 @@
 import { get, post, del, patch, put, upload } from "./httpClient";
+import type { DirEntry, FileView } from "./api";
 
 export const INTERVAL_PRESETS = [
   { label: "Off", value: 0 },
@@ -198,6 +199,26 @@ export const agentApi = {
     put<{ paused: boolean }>("/api/v1/agents/cron-paused", { paused }),
 
   get: (id: string) => get<AgentInfo>(`/api/v1/agents/${id}`),
+
+  files: {
+    list: (agentId: string, relPath: string, hidden?: boolean) => {
+      const params = new URLSearchParams();
+      if (relPath) params.set("path", relPath);
+      if (hidden) params.set("hidden", "true");
+      const qs = params.toString();
+      return get<{ path: string; absPath: string; entries: DirEntry[] }>(
+        `/api/v1/agents/${agentId}/files${qs ? "?" + qs : ""}`,
+      );
+    },
+    view: (agentId: string, relPath: string) =>
+      get<FileView>(
+        `/api/v1/agents/${agentId}/files/view?path=${encodeURIComponent(relPath)}`,
+      ),
+    rawUrl: (agentId: string, relPath: string, download = false) => {
+      const base = `/api/v1/agents/${agentId}/files/raw?path=${encodeURIComponent(relPath)}`;
+      return download ? `${base}&download=1` : base;
+    },
+  },
 
   create: (cfg: AgentConfig) => post<AgentInfo>("/api/v1/agents", cfg),
 

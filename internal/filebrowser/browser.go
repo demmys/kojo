@@ -71,6 +71,7 @@ func New(logger *slog.Logger) *Browser {
 type DirEntry struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"` // "dir" or "file"
+	Size    int64  `json:"size"` // 0 for directories
 	ModTime string `json:"modTime"`
 }
 
@@ -138,12 +139,17 @@ func (b *Browser) List(dir string, hidden bool) (*ListResult, error) {
 		}
 		info, _ := e.Info()
 		modTime := time.Time{}
+		var size int64
 		if info != nil {
 			modTime = info.ModTime()
+			if !info.IsDir() {
+				size = info.Size()
+			}
 		}
 		result.Entries = append(result.Entries, DirEntry{
 			Name:    e.Name(),
 			Type:    entryType,
+			Size:    size,
 			ModTime: modTime.Format(time.RFC3339),
 		})
 	}

@@ -9,6 +9,7 @@ import { AgentChat } from "./components/agent/AgentChat";
 import { AgentCreate } from "./components/agent/AgentCreate";
 import { AgentSettings } from "./components/agent/AgentSettings";
 import { AgentCredentials } from "./components/agent/AgentCredentials";
+import { AgentDataBrowser } from "./components/agent/AgentDataBrowser";
 import { GroupDMChat } from "./components/groupdm/GroupDMChat";
 import { GlobalSettings } from "./components/GlobalSettings";
 import "./index.css";
@@ -30,6 +31,7 @@ createRoot(document.getElementById("root")!).render(
         <Route path="/agents/:id" element={<AgentChat />} />
         <Route path="/agents/:id/settings" element={<AgentSettings />} />
         <Route path="/agents/:id/credentials" element={<AgentCredentials />} />
+        <Route path="/agents/:id/data" element={<AgentDataBrowser />} />
         <Route path="/groupdms/:id" element={<GroupDMChat />} />
         <Route path="/settings" element={<GlobalSettings />} />
       </Routes>

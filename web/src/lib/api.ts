@@ -27,6 +27,7 @@ export interface ServerInfo {
 export interface DirEntry {
   name: string;
   type: "dir" | "file";
+  size: number;
   modTime: string;
 }
 
@@ -38,6 +39,7 @@ export interface FileView {
   mime?: string;
   size: number;
   url?: string;
+  absPath?: string; // present on agent-scoped view responses
 }
 
 export interface Attachment {

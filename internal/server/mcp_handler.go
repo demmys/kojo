@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -55,6 +57,82 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 		mcp.WithString("text", mcp.Required(), mcp.Description("Message text (supports Slack mrkdwn formatting)")),
 	)
 	srv.AddTool(postTool, slackPostMessageHandler(agents, logger))
+
+	// --- slack_reply_to_thread ---
+	replyTool := mcp.NewTool("slack_reply_to_thread",
+		mcp.WithDescription("Post a reply to a specific thread in a Slack channel. Use this when you want to reply in a thread rather than posting a new top-level message."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name where the thread exists")),
+		mcp.WithString("thread_ts", mcp.Required(), mcp.Description("Timestamp of the parent message (thread root)")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("Reply text (supports Slack mrkdwn formatting)")),
+		mcp.WithBoolean("broadcast", mcp.Description("If true, also post the reply to the channel (default false)")),
+	)
+	srv.AddTool(replyTool, slackReplyToThreadHandler(agents, logger))
+
+	// --- slack_add_reaction ---
+	addReactionTool := mcp.NewTool("slack_add_reaction",
+		mcp.WithDescription("Add an emoji reaction to a message. The emoji name should NOT include colons (e.g. use 'thumbsup' not ':thumbsup:')."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID where the message is")),
+		mcp.WithString("timestamp", mcp.Required(), mcp.Description("Timestamp of the message to react to")),
+		mcp.WithString("emoji", mcp.Required(), mcp.Description("Emoji name without colons (e.g. 'thumbsup', 'heart', 'eyes')")),
+	)
+	srv.AddTool(addReactionTool, slackAddReactionHandler(agents, logger))
+
+	// --- slack_remove_reaction ---
+	removeReactionTool := mcp.NewTool("slack_remove_reaction",
+		mcp.WithDescription("Remove an emoji reaction from a message."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID where the message is")),
+		mcp.WithString("timestamp", mcp.Required(), mcp.Description("Timestamp of the message")),
+		mcp.WithString("emoji", mcp.Required(), mcp.Description("Emoji name without colons (e.g. 'thumbsup')")),
+	)
+	srv.AddTool(removeReactionTool, slackRemoveReactionHandler(agents, logger))
+
+	// --- slack_list_emoji ---
+	listEmojiTool := mcp.NewTool("slack_list_emoji",
+		mcp.WithDescription("List custom emoji available in the Slack workspace. Returns emoji names and their image URLs or aliases. Standard Unicode emoji (like :thumbsup:) are always available and not included in this list."),
+		mcp.WithString("name_contains", mcp.Description("Filter emoji whose name contains this substring (case-insensitive)")),
+	)
+	srv.AddTool(listEmojiTool, slackListEmojiHandler(agents, logger))
+
+	// --- slack_get_channel_history ---
+	historyTool := mcp.NewTool("slack_get_channel_history",
+		mcp.WithDescription("Get recent messages from a Slack channel. Returns messages in reverse chronological order (newest first)."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name")),
+		mcp.WithNumber("limit", mcp.Description("Number of messages to retrieve (default 20, max 100)")),
+		mcp.WithString("oldest", mcp.Description("Only messages after this Unix timestamp")),
+		mcp.WithString("latest", mcp.Description("Only messages before this Unix timestamp")),
+	)
+	srv.AddTool(historyTool, slackGetChannelHistoryHandler(agents, logger))
+
+	// --- slack_get_thread_replies ---
+	threadRepliesTool := mcp.NewTool("slack_get_thread_replies",
+		mcp.WithDescription("Get all replies in a message thread."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID where the thread exists")),
+		mcp.WithString("thread_ts", mcp.Required(), mcp.Description("Timestamp of the parent message (thread root)")),
+		mcp.WithNumber("limit", mcp.Description("Maximum number of replies to return (default 50, max 200)")),
+	)
+	srv.AddTool(threadRepliesTool, slackGetThreadRepliesHandler(agents, logger))
+
+	// --- slack_list_users ---
+	listUsersTool := mcp.NewTool("slack_list_users",
+		mcp.WithDescription("List users in the Slack workspace. Returns user ID, display name, real name, and status. Useful for resolving @mentions or finding user IDs."),
+		mcp.WithString("name_contains", mcp.Description("Filter users whose name or display name contains this substring (case-insensitive)")),
+		mcp.WithNumber("limit", mcp.Description("Maximum number of users to return (default 200, max 500)")),
+		mcp.WithBoolean("include_bots", mcp.Description("If true, include bot users in the result (default false)")),
+	)
+	srv.AddTool(listUsersTool, slackListUsersHandler(agents, logger))
+
+	// --- slack_upload_file ---
+	uploadFileTool := mcp.NewTool("slack_upload_file",
+		mcp.WithDescription("Upload a file to a Slack channel. The file content is provided as base64-encoded data or as plain text (for snippets/text files)."),
+		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name to upload to")),
+		mcp.WithString("filename", mcp.Required(), mcp.Description("Name of the file (e.g. 'report.csv', 'image.png')")),
+		mcp.WithString("content", mcp.Description("Plain text content for the file (for text/code snippets). Use this OR base64_content, not both.")),
+		mcp.WithString("base64_content", mcp.Description("Base64-encoded binary content (for images, PDFs, etc). Use this OR content, not both.")),
+		mcp.WithString("title", mcp.Description("Title of the file (defaults to filename)")),
+		mcp.WithString("initial_comment", mcp.Description("Message to post alongside the file")),
+		mcp.WithString("thread_ts", mcp.Description("Thread timestamp to upload the file as a reply")),
+	)
+	srv.AddTool(uploadFileTool, slackUploadFileHandler(agents, logger))
 
 	httpSrv := mcpserver.NewStreamableHTTPServer(srv,
 		mcpserver.WithStateLess(true),
@@ -478,4 +556,551 @@ func resolveSlackChannel(ctx context.Context, api *slack.Client, channel string)
 	}
 
 	return "", fmt.Errorf("channel %q not found", channel)
+}
+
+// ---------------------------------------------------------------------------
+// slack_reply_to_thread
+// ---------------------------------------------------------------------------
+
+func slackReplyToThreadHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		threadTS, _ := args["thread_ts"].(string)
+		text, _ := args["text"].(string)
+		broadcast, _ := args["broadcast"].(bool)
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_reply_to_thread",
+			"channel", channel, "threadTS", threadTS, "textLen", len(text),
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			logger.Warn("mcp tool aborted", "reqID", reqID, "agent", agentID, "tool", "slack_reply_to_thread", "err", errMsg)
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" || threadTS == "" || text == "" {
+			return mcp.NewToolResultError("'channel', 'thread_ts', and 'text' are all required"), nil
+		}
+
+		resolvedChannel, err := resolveSlackChannel(ctx, api, channel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve channel %q: %v", channel, err)), nil
+		}
+
+		opts := []slack.MsgOption{
+			slack.MsgOptionText(text, false),
+			slack.MsgOptionTS(threadTS),
+		}
+		if broadcast {
+			opts = append(opts, slack.MsgOptionBroadcast())
+		}
+
+		_, ts, err := api.PostMessageContext(ctx, resolvedChannel, opts...)
+		if err != nil {
+			logger.Warn("mcp tool post failed", "reqID", reqID, "agent", agentID, "tool", "slack_reply_to_thread", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("failed to post reply: %v", err)), nil
+		}
+
+		logger.Info("mcp tool result",
+			"reqID", reqID, "agent", agentID, "tool", "slack_reply_to_thread",
+			"channel", resolvedChannel, "ts", ts,
+		)
+
+		result := map[string]string{
+			"channel":   resolvedChannel,
+			"timestamp": ts,
+			"thread_ts": threadTS,
+			"status":    "replied",
+		}
+		data, _ := json.Marshal(result)
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_add_reaction
+// ---------------------------------------------------------------------------
+
+func slackAddReactionHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		timestamp, _ := args["timestamp"].(string)
+		emoji, _ := args["emoji"].(string)
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_add_reaction",
+			"channel", channel, "timestamp", timestamp, "emoji", emoji,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" || timestamp == "" || emoji == "" {
+			return mcp.NewToolResultError("'channel', 'timestamp', and 'emoji' are all required"), nil
+		}
+
+		// Strip colons if the caller includes them (e.g. ":thumbsup:" → "thumbsup")
+		emoji = strings.Trim(emoji, ":")
+
+		ref := slack.NewRefToMessage(channel, timestamp)
+		if err := api.AddReactionContext(ctx, emoji, ref); err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_add_reaction", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("failed to add reaction: %v", err)), nil
+		}
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_add_reaction", "status", "added")
+
+		result := map[string]string{"status": "added", "emoji": emoji}
+		data, _ := json.Marshal(result)
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_remove_reaction
+// ---------------------------------------------------------------------------
+
+func slackRemoveReactionHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		timestamp, _ := args["timestamp"].(string)
+		emoji, _ := args["emoji"].(string)
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_remove_reaction",
+			"channel", channel, "timestamp", timestamp, "emoji", emoji,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" || timestamp == "" || emoji == "" {
+			return mcp.NewToolResultError("'channel', 'timestamp', and 'emoji' are all required"), nil
+		}
+
+		emoji = strings.Trim(emoji, ":")
+
+		ref := slack.NewRefToMessage(channel, timestamp)
+		if err := api.RemoveReactionContext(ctx, emoji, ref); err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_remove_reaction", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("failed to remove reaction: %v", err)), nil
+		}
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_remove_reaction", "status", "removed")
+
+		result := map[string]string{"status": "removed", "emoji": emoji}
+		data, _ := json.Marshal(result)
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_list_emoji
+// ---------------------------------------------------------------------------
+
+// emojiInfo is the JSON shape returned by slack_list_emoji.
+type emojiInfo struct {
+	Name  string `json:"name"`
+	Value string `json:"value"` // URL or "alias:name"
+}
+
+func slackListEmojiHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		nameFilter, _ := args["name_contains"].(string)
+		nameFilter = strings.ToLower(nameFilter)
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_list_emoji",
+			"nameFilter", nameFilter,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		emojiMap, err := api.GetEmojiContext(ctx)
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_emoji", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
+		}
+
+		var emojis []emojiInfo
+		for name, value := range emojiMap {
+			if nameFilter != "" && !strings.Contains(strings.ToLower(name), nameFilter) {
+				continue
+			}
+			emojis = append(emojis, emojiInfo{Name: name, Value: value})
+		}
+
+		// Sort by name for deterministic output.
+		sort.Slice(emojis, func(i, j int) bool { return emojis[i].Name < emojis[j].Name })
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_list_emoji", "emojiCount", len(emojis))
+
+		data, _ := json.MarshalIndent(emojis, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_get_channel_history
+// ---------------------------------------------------------------------------
+
+const (
+	historyDefaultLimit = 20
+	historyMaxLimit     = 100
+)
+
+// messageInfo is the JSON shape returned by slack_get_channel_history and
+// slack_get_thread_replies.
+type messageInfo struct {
+	User      string `json:"user"`
+	Text      string `json:"text"`
+	Timestamp string `json:"timestamp"`
+	ThreadTS  string `json:"thread_ts,omitempty"`
+	ReplyCount int   `json:"reply_count,omitempty"`
+	SubType   string `json:"subtype,omitempty"`
+}
+
+func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		oldest, _ := args["oldest"].(string)
+		latest, _ := args["latest"].(string)
+
+		limit := historyDefaultLimit
+		if v, ok := args["limit"].(float64); ok && v > 0 {
+			limit = int(v)
+			if limit > historyMaxLimit {
+				limit = historyMaxLimit
+			}
+		}
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_get_channel_history",
+			"channel", channel, "limit", limit,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" {
+			return mcp.NewToolResultError("'channel' is required"), nil
+		}
+
+		resolvedChannel, err := resolveSlackChannel(ctx, api, channel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve channel %q: %v", channel, err)), nil
+		}
+
+		params := &slack.GetConversationHistoryParameters{
+			ChannelID: resolvedChannel,
+			Limit:     limit,
+			Oldest:    oldest,
+			Latest:    latest,
+		}
+
+		resp, err := api.GetConversationHistoryContext(ctx, params)
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_get_channel_history", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
+		}
+
+		messages := make([]messageInfo, 0, len(resp.Messages))
+		for _, m := range resp.Messages {
+			messages = append(messages, messageInfo{
+				User:       m.User,
+				Text:       m.Text,
+				Timestamp:  m.Timestamp,
+				ThreadTS:   m.ThreadTimestamp,
+				ReplyCount: m.ReplyCount,
+				SubType:    m.SubType,
+			})
+		}
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_get_channel_history", "messageCount", len(messages))
+
+		data, _ := json.MarshalIndent(messages, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_get_thread_replies
+// ---------------------------------------------------------------------------
+
+const (
+	threadRepliesDefaultLimit = 50
+	threadRepliesMaxLimit     = 200
+)
+
+func slackGetThreadRepliesHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		threadTS, _ := args["thread_ts"].(string)
+
+		limit := threadRepliesDefaultLimit
+		if v, ok := args["limit"].(float64); ok && v > 0 {
+			limit = int(v)
+			if limit > threadRepliesMaxLimit {
+				limit = threadRepliesMaxLimit
+			}
+		}
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_get_thread_replies",
+			"channel", channel, "threadTS", threadTS, "limit", limit,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" || threadTS == "" {
+			return mcp.NewToolResultError("'channel' and 'thread_ts' are required"), nil
+		}
+
+		params := &slack.GetConversationRepliesParameters{
+			ChannelID: channel,
+			Timestamp: threadTS,
+			Limit:     limit,
+		}
+
+		msgs, _, _, err := api.GetConversationRepliesContext(ctx, params)
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_get_thread_replies", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
+		}
+
+		messages := make([]messageInfo, 0, len(msgs))
+		for _, m := range msgs {
+			messages = append(messages, messageInfo{
+				User:      m.User,
+				Text:      m.Text,
+				Timestamp: m.Timestamp,
+				ThreadTS:  m.ThreadTimestamp,
+				SubType:   m.SubType,
+			})
+		}
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_get_thread_replies", "messageCount", len(messages))
+
+		data, _ := json.MarshalIndent(messages, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_list_users
+// ---------------------------------------------------------------------------
+
+const (
+	listUsersDefaultLimit = 200
+	listUsersMaxLimit     = 500
+)
+
+// userInfo is the JSON shape returned by slack_list_users.
+type userInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	RealName    string `json:"realName"`
+	DisplayName string `json:"displayName"`
+	IsBot       bool   `json:"isBot,omitempty"`
+	IsAdmin     bool   `json:"isAdmin,omitempty"`
+	Deleted     bool   `json:"deleted,omitempty"`
+}
+
+func slackListUsersHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		nameFilter, _ := args["name_contains"].(string)
+		nameFilter = strings.ToLower(nameFilter)
+		includeBots, _ := args["include_bots"].(bool)
+
+		limit := listUsersDefaultLimit
+		if v, ok := args["limit"].(float64); ok && v > 0 {
+			limit = int(v)
+			if limit > listUsersMaxLimit {
+				limit = listUsersMaxLimit
+			}
+		}
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_list_users",
+			"nameFilter", nameFilter, "limit", limit, "includeBots", includeBots,
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		allUsers, err := api.GetUsersContext(ctx)
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_list_users", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("Slack API error: %v", err)), nil
+		}
+
+		var users []userInfo
+		for _, u := range allUsers {
+			// Skip deleted users unless they match a name search
+			if u.Deleted {
+				continue
+			}
+			// Skip bots unless requested
+			if (u.IsBot || u.ID == "USLACKBOT") && !includeBots {
+				continue
+			}
+			// Apply name filter
+			if nameFilter != "" {
+				match := strings.Contains(strings.ToLower(u.Name), nameFilter) ||
+					strings.Contains(strings.ToLower(u.RealName), nameFilter) ||
+					strings.Contains(strings.ToLower(u.Profile.DisplayName), nameFilter)
+				if !match {
+					continue
+				}
+			}
+
+			users = append(users, userInfo{
+				ID:          u.ID,
+				Name:        u.Name,
+				RealName:    u.RealName,
+				DisplayName: u.Profile.DisplayName,
+				IsBot:       u.IsBot,
+				IsAdmin:     u.IsAdmin,
+			})
+
+			if len(users) >= limit {
+				break
+			}
+		}
+
+		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_list_users", "userCount", len(users))
+
+		data, _ := json.MarshalIndent(users, "", "  ")
+		return mcp.NewToolResultText(string(data)), nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// slack_upload_file
+// ---------------------------------------------------------------------------
+
+func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		reqID := reqIDFromCtx(ctx)
+		agentID, _ := ctx.Value(mcpAgentIDKey).(string)
+		args := req.GetArguments()
+		channel, _ := args["channel"].(string)
+		filename, _ := args["filename"].(string)
+		content, _ := args["content"].(string)
+		b64Content, _ := args["base64_content"].(string)
+		title, _ := args["title"].(string)
+		initialComment, _ := args["initial_comment"].(string)
+		threadTS, _ := args["thread_ts"].(string)
+
+		logger.Info("mcp tool invoked",
+			"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
+			"channel", channel, "filename", filename,
+			"contentLen", len(content), "b64Len", len(b64Content),
+		)
+
+		api, errMsg := getSlackClient(ctx, agents)
+		if api == nil {
+			return mcp.NewToolResultError(errMsg), nil
+		}
+
+		if channel == "" || filename == "" {
+			return mcp.NewToolResultError("'channel' and 'filename' are required"), nil
+		}
+		if content == "" && b64Content == "" {
+			return mcp.NewToolResultError("one of 'content' or 'base64_content' is required"), nil
+		}
+		if content != "" && b64Content != "" {
+			return mcp.NewToolResultError("provide either 'content' or 'base64_content', not both"), nil
+		}
+
+		resolvedChannel, err := resolveSlackChannel(ctx, api, channel)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to resolve channel %q: %v", channel, err)), nil
+		}
+
+		if title == "" {
+			title = filename
+		}
+
+		var fileContent string
+		var fileSize int
+		if b64Content != "" {
+			decoded, err := base64.StdEncoding.DecodeString(b64Content)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid base64_content: %v", err)), nil
+			}
+			fileContent = string(decoded)
+			fileSize = len(decoded)
+		} else {
+			fileContent = content
+			fileSize = len(content)
+		}
+
+		params := slack.UploadFileParameters{
+			Filename:        filename,
+			Title:           title,
+			Content:         fileContent,
+			FileSize:        fileSize,
+			Channel:         resolvedChannel,
+			InitialComment:  initialComment,
+			ThreadTimestamp: threadTS,
+		}
+
+		fileSummary, err := api.UploadFileContext(ctx, params)
+		if err != nil {
+			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_upload_file", "err", err)
+			return mcp.NewToolResultError(fmt.Sprintf("failed to upload file: %v", err)), nil
+		}
+
+		logger.Info("mcp tool result",
+			"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
+			"fileID", fileSummary.ID, "channel", resolvedChannel,
+		)
+
+		result := map[string]string{
+			"status":   "uploaded",
+			"file_id":  fileSummary.ID,
+			"title":    fileSummary.Title,
+			"channel":  resolvedChannel,
+		}
+		data, _ := json.Marshal(result)
+		return mcp.NewToolResultText(string(data)), nil
+	}
 }

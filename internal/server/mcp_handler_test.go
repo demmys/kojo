@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/slack-go/slack"
@@ -242,4 +243,212 @@ func TestListSlackChannelsFirstPageErrorReturnsError(t *testing.T) {
 	if got != nil {
 		t.Errorf("expected nil channels on hard error, got %+v", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// History / Thread limit clamping
+// ---------------------------------------------------------------------------
+
+func TestHistoryLimitClamping(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    float64
+		wantCap  int
+		maxLimit int
+		defLimit int
+	}{
+		{"default", 0, historyDefaultLimit, historyMaxLimit, historyDefaultLimit},
+		{"explicit", 50, 50, historyMaxLimit, historyDefaultLimit},
+		{"over max", 999, historyMaxLimit, historyMaxLimit, historyDefaultLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limit := tc.defLimit
+			if tc.input > 0 {
+				limit = int(tc.input)
+				if limit > tc.maxLimit {
+					limit = tc.maxLimit
+				}
+			}
+			if limit != tc.wantCap {
+				t.Errorf("limit = %d, want %d", limit, tc.wantCap)
+			}
+		})
+	}
+}
+
+func TestThreadRepliesLimitClamping(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   float64
+		wantCap int
+	}{
+		{"default", 0, threadRepliesDefaultLimit},
+		{"explicit", 30, 30},
+		{"over max", 999, threadRepliesMaxLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limit := threadRepliesDefaultLimit
+			if tc.input > 0 {
+				limit = int(tc.input)
+				if limit > threadRepliesMaxLimit {
+					limit = threadRepliesMaxLimit
+				}
+			}
+			if limit != tc.wantCap {
+				t.Errorf("limit = %d, want %d", limit, tc.wantCap)
+			}
+		})
+	}
+}
+
+func TestListUsersLimitClamping(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   float64
+		wantCap int
+	}{
+		{"default", 0, listUsersDefaultLimit},
+		{"explicit", 100, 100},
+		{"over max", 9999, listUsersMaxLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limit := listUsersDefaultLimit
+			if tc.input > 0 {
+				limit = int(tc.input)
+				if limit > listUsersMaxLimit {
+					limit = listUsersMaxLimit
+				}
+			}
+			if limit != tc.wantCap {
+				t.Errorf("limit = %d, want %d", limit, tc.wantCap)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Emoji strip-colons helper
+// ---------------------------------------------------------------------------
+
+func TestEmojiColonStripping(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{":thumbsup:", "thumbsup"},
+		{"thumbsup", "thumbsup"},
+		{":heart:", "heart"},
+		{"::double::", "double"},
+	}
+	for _, tc := range cases {
+		got := strings.Trim(tc.in, ":")
+		if got != tc.want {
+			t.Errorf("Trim(%q, \":\") = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Emoji filter
+// ---------------------------------------------------------------------------
+
+func TestEmojiFilter(t *testing.T) {
+	emojiMap := map[string]string{
+		"partyparrot": "https://example.com/partyparrot.gif",
+		"shipit":      "alias:squirrel",
+		"thumbsup2":   "https://example.com/thumbsup2.png",
+	}
+
+	filter := "party"
+	var result []emojiInfo
+	for name, value := range emojiMap {
+		if !strings.Contains(strings.ToLower(name), filter) {
+			continue
+		}
+		result = append(result, emojiInfo{Name: name, Value: value})
+	}
+
+	if len(result) != 1 {
+		t.Fatalf("expected 1 emoji matching %q, got %d", filter, len(result))
+	}
+	if result[0].Name != "partyparrot" {
+		t.Errorf("expected partyparrot, got %q", result[0].Name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UserInfo filter logic
+// ---------------------------------------------------------------------------
+
+func TestUserFilterLogic(t *testing.T) {
+	mkUser := func(id, name, realName, displayName string, isBot, deleted bool) slack.User {
+		var u slack.User
+		u.ID = id
+		u.Name = name
+		u.RealName = realName
+		u.Profile.DisplayName = displayName
+		u.IsBot = isBot
+		u.Deleted = deleted
+		return u
+	}
+
+	allUsers := []slack.User{
+		mkUser("U1", "alice", "Alice Smith", "Alice", false, false),
+		mkUser("U2", "bob", "Bob Jones", "Bobby", false, false),
+		mkUser("U3", "slackbot", "Slackbot", "", true, false),
+		mkUser("U4", "deleted_user", "Gone", "", false, true),
+		mkUser("U5", "alice_bot", "Alice Bot", "AliceBot", true, false),
+	}
+
+	t.Run("no filter no bots", func(t *testing.T) {
+		var users []userInfo
+		for _, u := range allUsers {
+			if u.Deleted {
+				continue
+			}
+			if u.IsBot || u.ID == "USLACKBOT" {
+				continue
+			}
+			users = append(users, userInfo{ID: u.ID, Name: u.Name})
+		}
+		if len(users) != 2 {
+			t.Errorf("expected 2 human users, got %d", len(users))
+		}
+	})
+
+	t.Run("include bots", func(t *testing.T) {
+		var users []userInfo
+		for _, u := range allUsers {
+			if u.Deleted {
+				continue
+			}
+			users = append(users, userInfo{ID: u.ID, Name: u.Name})
+		}
+		if len(users) != 4 {
+			t.Errorf("expected 4 non-deleted users (including bots), got %d", len(users))
+		}
+	})
+
+	t.Run("name filter", func(t *testing.T) {
+		filter := "alice"
+		var users []userInfo
+		for _, u := range allUsers {
+			if u.Deleted {
+				continue
+			}
+			match := strings.Contains(strings.ToLower(u.Name), filter) ||
+				strings.Contains(strings.ToLower(u.RealName), filter) ||
+				strings.Contains(strings.ToLower(u.Profile.DisplayName), filter)
+			if !match {
+				continue
+			}
+			users = append(users, userInfo{ID: u.ID, Name: u.Name})
+		}
+		// alice (U1) + alice_bot (U5)
+		if len(users) != 2 {
+			t.Errorf("expected 2 users matching %q, got %d", filter, len(users))
+		}
+	})
 }

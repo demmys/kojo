@@ -192,16 +192,40 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 	prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 	today := time.Now().In(jst).Format("2006-01-02")
+	dir := agentDir(a.ID)
+	todayDiary := dir + "/memory/" + today + ".md"
+
 	mustContain := []string{
 		"Memory Write — MANDATORY",
 		"kojo will reset it automatically",
-		"memory/" + today + ".md",
+		todayDiary, // absolute path, not relative — prevents cwd-dependent writes
 		"Short exchanges count",
-		"MEMORY.md",
+		// Lean-index rules — MEMORY.md hygiene guardrails
+		"LEAN index, not a dumping ground",
+		"~200 lines",
+		"archive/YYYY-MM.md",
+		dir + "/memory/projects/",
+		dir + "/memory/topics/",
+		"Don't pile new on top of stale",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(prompt, s) {
 			t.Errorf("system prompt missing mandatory directive fragment %q", s)
+		}
+	}
+
+	// Relative memory path must not appear as a standalone instruction —
+	// a prior version used `memory/%s.md` which broke when agents chdir'd.
+	// We still allow the substring (the absolute path contains it); instead
+	// assert that the daily diary fragment is always preceded by the dir
+	// prefix, meaning no bare `memory/...md` instructions leaked through.
+	for _, line := range strings.Split(prompt, "\n") {
+		if !strings.Contains(line, today+".md") {
+			continue
+		}
+		// Every mention of today's diary in the prompt must be absolute.
+		if !strings.Contains(line, todayDiary) {
+			t.Errorf("line mentions today's diary but not absolutely: %q", line)
 		}
 	}
 }

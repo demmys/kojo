@@ -116,15 +116,13 @@ func New(cfg Config) *Server {
 	// send push notification when an agent finishes its response
 	if s.notify != nil && s.agents != nil {
 		s.agents.OnChatDone = func(ag *agent.Agent, msg *agent.Message) {
-			preview := msg.Content
-			if len(preview) > 200 {
-				preview = preview[:200] + "..."
-			}
 			payload, _ := json.Marshal(map[string]any{
 				"type":    "agent_chat_done",
 				"agentId": ag.ID,
-				"name":    ag.Name,
-				"preview": preview,
+				// cap name and preview to stay well under the 2048-byte
+				// encrypted record budget enforced by the push provider.
+				"name":    truncateUTF8(ag.Name, 80),
+				"preview": truncateUTF8(msg.Content, 200),
 			})
 			s.notify.Send(payload)
 		}
@@ -373,4 +371,33 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 			"message": message,
 		},
 	})
+}
+
+// truncateUTF8 returns s clipped so the resulting string never exceeds
+// maxBytes bytes. If truncation is needed an ellipsis ("...") is appended,
+// and the cut is rolled back to a UTF-8 rune boundary so no multi-byte
+// sequence is split. maxBytes <= 0 returns "".
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	const ellipsis = "..."
+	if maxBytes <= len(ellipsis) {
+		// no room for the ellipsis: return a hard byte-aligned slice
+		cut := maxBytes
+		for cut > 0 && (s[cut]&0xC0) == 0x80 {
+			cut--
+		}
+		return s[:cut]
+	}
+	cut := maxBytes - len(ellipsis)
+	// walk back over UTF-8 continuation bytes (10xxxxxx) so we land on a
+	// rune boundary
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut] + ellipsis
 }

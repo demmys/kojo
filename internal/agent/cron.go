@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,8 +17,19 @@ const cronTimeout = 10 * time.Minute // default timeout; per-agent override via 
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 const cronLockFile = ".cron_last"
 
-func cronPrompt(nextRun time.Time, timeoutMinutes int) string {
-	now := time.Now()
+// cronPrompt builds the periodic check-in prompt. See cronPromptAt for details.
+func cronPrompt(nextRun time.Time, timeoutMinutes int, customMessage string) string {
+	return cronPromptAt(time.Now(), nextRun, timeoutMinutes, customMessage)
+}
+
+// cronPromptAt is the time-injectable form of cronPrompt for unit testing.
+// If customMessage is non-empty it replaces the default trailing instruction;
+// the literal "{date}" inside customMessage is replaced with today's date in
+// YYYY-MM-DD form. The custom section is separated from the meta header by a
+// blank line so an injected "[system message]" prefix cannot blend in with the
+// surrounding meta text.
+func cronPromptAt(now, nextRun time.Time, timeoutMinutes int, customMessage string) string {
+	today := now.Format("2006-01-02")
 	msg := "[system message] " + now.Format("2006年1月2日 15:04") + "の定期チェックインです。"
 
 	msg += fmt.Sprintf("（今回のタイムアウトは%d分", timeoutMinutes)
@@ -31,7 +43,14 @@ func cronPrompt(nextRun time.Time, timeoutMinutes int) string {
 		msg += "。完了後の次回のチェックインは最短" + formatUntil(nextRun, now) + "後 (" + nextFmt + ")"
 	}
 	msg += "）"
-	msg += "最近の出来事や気づきがあれば memory/" + now.Format("2006-01-02") + ".md に記録し、必要なタスクを実行してください。"
+	if trimmed := strings.TrimSpace(customMessage); trimmed != "" {
+		// Blank line + heading make the user-supplied section visually
+		// distinguishable from the meta header even if the value contains
+		// "[system message]" or similar prompt-bracketing.
+		msg += "\n\n--- 指示 ---\n" + strings.ReplaceAll(trimmed, "{date}", today)
+	} else {
+		msg += "最近の出来事や気づきがあれば memory/" + today + ".md に記録し、必要なタスクを実行してください。"
+	}
 	return msg
 }
 
@@ -224,11 +243,12 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	}
 
 	// Check active hours and read agent config
-	var activeStart, activeEnd string
+	var activeStart, activeEnd, cronMessage string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
 		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
 		timeoutMinutes = a.TimeoutMinutes
+		cronMessage = a.CronMessage
 		if !IsWithinActiveHours(activeStart, activeEnd) {
 			cs.logger.Debug("cron job skipped (outside active hours)", "agent", agentID,
 				"activeStart", activeStart, "activeEnd", activeEnd)
@@ -256,7 +276,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin), "system", nil)
+	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin, cronMessage), "system", nil)
 	if err != nil {
 		cs.logger.Warn("cron chat failed", "agent", agentID, "err", err)
 		return

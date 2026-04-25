@@ -132,6 +132,24 @@ func ValidModelEffort(model, effort string) bool {
 	return true
 }
 
+// MaxCronMessageRunes caps the per-agent cron check-in custom message at
+// 4096 Unicode code points. The limit is in runes (not bytes) so Japanese
+// users can write the same number of characters as ASCII users; the resulting
+// byte size can be up to ~16 KiB worst case for 4-byte runes. The message is
+// re-injected on every cron run so an unbounded value would inflate every
+// prompt and the on-disk agent record.
+const MaxCronMessageRunes = 4096
+
+// validateCronMessage trims surrounding whitespace and rejects values that
+// exceed MaxCronMessageRunes.
+func validateCronMessage(s string) (string, error) {
+	trimmed := strings.TrimSpace(s)
+	if n := len([]rune(trimmed)); n > MaxCronMessageRunes {
+		return "", fmt.Errorf("cronMessage too long: %d runes (max %d)", n, MaxCronMessageRunes)
+	}
+	return trimmed, nil
+}
+
 // allowedTimeouts defines the valid timeoutMinutes values.
 // 0 means "use default" (10 minutes at runtime) for backward compatibility.
 var allowedTimeouts = map[int]bool{
@@ -156,6 +174,10 @@ type Agent struct {
 	TimeoutMinutes  int    `json:"timeoutMinutes"`  // max duration per cron run in minutes (0 = default 10)
 	ActiveStart     string `json:"activeStart,omitempty"` // HH:MM — start of active window (empty = no restriction)
 	ActiveEnd       string `json:"activeEnd,omitempty"`   // HH:MM — end of active window (empty = no restriction)
+	// CronMessage overrides the trailing instruction in the periodic check-in
+	// prompt. Empty = use the default ("最近の出来事や気づきがあれば memory/...md に記録し、必要なタスクを実行してください。").
+	// The literal string "{date}" is replaced with today's date in YYYY-MM-DD form.
+	CronMessage string `json:"cronMessage,omitempty"`
 	CreatedAt       string `json:"createdAt"`       // RFC3339
 	UpdatedAt       string `json:"updatedAt"`       // RFC3339
 
@@ -230,6 +252,7 @@ type AgentConfig struct {
 	TimeoutMinutes  *int    `json:"timeoutMinutes"`  // nil = use default (0 = 10 min)
 	ActiveStart     *string `json:"activeStart"`     // HH:MM or empty
 	ActiveEnd       *string `json:"activeEnd"`       // HH:MM or empty
+	CronMessage     *string `json:"cronMessage"`     // nil/empty = use default trailing instruction
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -247,6 +270,10 @@ type AgentUpdateConfig struct {
 	TimeoutMinutes        *int      `json:"timeoutMinutes"`
 	ActiveStart           *string   `json:"activeStart"`
 	ActiveEnd             *string   `json:"activeEnd"`
+	// CronMessage follows the standard *string PATCH convention used by every
+	// other field on this struct: nil/omitted = leave unchanged, "" = clear
+	// back to the built-in default trailing instruction.
+	CronMessage           *string   `json:"cronMessage"`
 	CustomBaseURL         *string   `json:"customBaseURL"`
 	ThinkingMode          *string   `json:"thinkingMode"`
 	AllowedTools          []string  `json:"allowedTools"`
@@ -279,6 +306,14 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	}
 	if cfg.ActiveEnd != nil {
 		activeEnd = *cfg.ActiveEnd
+	}
+	var cronMessage string
+	if cfg.CronMessage != nil {
+		v, err := validateCronMessage(*cfg.CronMessage)
+		if err != nil {
+			return nil, err
+		}
+		cronMessage = v
 	}
 	if err := ValidActiveHours(activeStart, activeEnd); err != nil {
 		return nil, err
@@ -314,6 +349,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		TimeoutMinutes:  timeoutMin,
 		ActiveStart:     activeStart,
 		ActiveEnd:       activeEnd,
+		CronMessage:     cronMessage,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}

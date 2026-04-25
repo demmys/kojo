@@ -10,7 +10,12 @@ interface Props {
   activeEnd: string;
   onActiveStartChange: (v: string) => void;
   onActiveEndChange: (v: string) => void;
+  cronMessage: string;
+  onCronMessageChange: (v: string) => void;
 }
+
+const DEFAULT_CRON_MESSAGE_HINT =
+  "最近の出来事や気づきがあれば memory/{date}.md に記録し、必要なタスクを実行してください。";
 
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
@@ -49,6 +54,8 @@ export function ScheduleEditor({
   activeEnd,
   onActiveStartChange,
   onActiveEndChange,
+  cronMessage,
+  onCronMessageChange,
 }: Props) {
   // Separate enabled state so toggling off doesn't hide inputs mid-edit
   const [enabled, setEnabled] = useState(activeStart !== "" && activeEnd !== "");
@@ -205,6 +212,31 @@ export function ScheduleEditor({
           )}
         </div>
       )}
+
+      {/* Custom Check-in Message — always editable; only consumed when interval > 0 */}
+      <div>
+        <label className="block text-sm text-neutral-400 mb-2">
+          Check-in Message
+          {intervalMinutes === 0 && (
+            <span className="ml-2 text-[11px] text-neutral-600">
+              (applied when interval is enabled)
+            </span>
+          )}
+        </label>
+        <textarea
+          value={cronMessage}
+          onChange={(e) => onCronMessageChange(e.target.value)}
+          rows={3}
+          maxLength={4096}
+          placeholder={DEFAULT_CRON_MESSAGE_HINT}
+          className="w-full px-2.5 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 resize-none focus:outline-none focus:border-amber-700/60"
+        />
+        <p className="mt-1.5 text-[11px] text-neutral-600">
+          Replaces the trailing instruction in the periodic check-in prompt.
+          Use <code className="text-neutral-500">{"{date}"}</code> as a
+          placeholder for today (YYYY-MM-DD). Leave blank for the default.
+        </p>
+      </div>
     </div>
   );
 }

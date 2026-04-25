@@ -377,6 +377,20 @@ func (m *Manager) regeneratePublicProfile(agentID, persona string) {
 
 // Update updates an agent's configuration. Only non-nil fields are applied.
 func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
+	// Pure-input validations that don't depend on existing state run first so
+	// a malformed payload can't trigger any I/O (persona.md write, avatar
+	// fetch) or partial in-memory mutations below.
+	var nextCronMessage string
+	cronMessageDirty := false
+	if cfg.CronMessage != nil {
+		v, err := validateCronMessage(*cfg.CronMessage)
+		if err != nil {
+			return nil, err
+		}
+		nextCronMessage = v
+		cronMessageDirty = true
+	}
+
 	// Check agent exists before any file I/O
 	m.mu.Lock()
 	a, ok := m.agents[id]
@@ -469,7 +483,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 			return nil, err
 		}
 	}
-
 	oldInterval := a.IntervalMinutes
 	if cfg.IntervalMinutes != nil {
 		a.IntervalMinutes = *cfg.IntervalMinutes
@@ -506,6 +519,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 			return nil, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 		}
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
+	}
+	if cronMessageDirty {
+		a.CronMessage = nextCronMessage
 	}
 	newInterval := a.IntervalMinutes
 	a.UpdatedAt = time.Now().Format(time.RFC3339)

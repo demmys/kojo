@@ -27,6 +27,7 @@ export function AgentSettings() {
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
+  const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -64,6 +65,7 @@ export function AgentSettings() {
       setTimeoutMinutes(a.timeoutMinutes || 10);
       setActiveStart(a.activeStart ?? "");
       setActiveEnd(a.activeEnd ?? "");
+      setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
     }).catch(() => navigate("/"));
@@ -106,6 +108,7 @@ export function AgentSettings() {
         timeoutMinutes,
         activeStart,
         activeEnd,
+        cronMessage,
         allowedTools: (tool === "custom") ? allowedTools : undefined,
         allowProtectedPaths: (tool === "claude" || tool === "custom") ? allowProtectedPaths : undefined,
       });
@@ -577,6 +580,8 @@ export function AgentSettings() {
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}
           onActiveEndChange={setActiveEnd}
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {error && (

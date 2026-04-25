@@ -23,6 +23,7 @@ export function AgentCreate() {
   const [timeoutMinutes, setTimeoutMinutes] = useState(10);
   const [activeStart, setActiveStart] = useState("");
   const [activeEnd, setActiveEnd] = useState("");
+  const [cronMessage, setCronMessage] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
@@ -240,6 +241,7 @@ export function AgentCreate() {
         timeoutMinutes,
         activeStart: activeStart || undefined,
         activeEnd: activeEnd || undefined,
+        cronMessage: cronMessage.trim() || undefined,
       });
 
       // Upload avatar (best-effort — agent is already created)
@@ -590,6 +592,8 @@ export function AgentCreate() {
           activeEnd={activeEnd}
           onActiveStartChange={setActiveStart}
           onActiveEndChange={setActiveEnd}
+          cronMessage={cronMessage}
+          onCronMessageChange={setCronMessage}
         />
 
         {error && (

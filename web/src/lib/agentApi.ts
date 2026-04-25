@@ -36,6 +36,7 @@ export interface AgentInfo {
   timeoutMinutes: number;
   activeStart?: string;
   activeEnd?: string;
+  cronMessage?: string;
   createdAt: string;
   updatedAt: string;
   publicProfile: string;
@@ -66,6 +67,7 @@ export interface AgentConfig {
   timeoutMinutes?: number;
   activeStart?: string;
   activeEnd?: string;
+  cronMessage?: string;
 }
 
 export interface AgentUpdateParams extends Partial<AgentConfig> {

@@ -242,6 +242,51 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, g)
 }
 
+// handleSetGroupMemberSettings updates per-member notification preferences:
+// notifyMode ("realtime" | "digest" | "muted") and digestWindow (seconds).
+// Members that opt out of realtime pings cut a large chunk of the per-turn
+// token cost that DM notifications otherwise impose on busy groups.
+//
+// Authorization mirrors PATCH /api/v1/groupdms/{id}:
+//   - If callerAgentId is supplied it must be a member of the group. Any
+//     member may change any other member's preference — agents negotiate
+//     quiet hours among themselves the same way they negotiate rename/style.
+//   - An empty callerAgentId is treated as an admin/UI call and skips the
+//     membership check, matching SetStyle's convention.
+func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	agentID := r.PathValue("agentId")
+	if agentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
+		return
+	}
+	var req struct {
+		NotifyMode    string `json:"notifyMode"`
+		DigestWindow  int    `json:"digestWindow"`
+		CallerAgentID string `json:"callerAgentId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.NotifyMode == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "notifyMode is required")
+		return
+	}
+	if req.CallerAgentID != "" {
+		if err := s.groupdms.CheckMembership(id, req.CallerAgentID); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+	}
+	g, err := s.groupdms.SetMemberNotifyMode(id, agentID, agent.NotifyMode(req.NotifyMode), req.DigestWindow)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, g)
+}
+
 func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	agentID := r.PathValue("agentId")

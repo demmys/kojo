@@ -2,9 +2,12 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestClampCooldown(t *testing.T) {
@@ -470,6 +473,400 @@ func TestGroupDMManager_SetStyleNoCallerSkipsCheck(t *testing.T) {
 	}
 	if updated.Style != GroupDMStyleExpressive {
 		t.Errorf("style = %q, want %q", updated.Style, GroupDMStyleExpressive)
+	}
+}
+
+func TestGroupDMManager_SetMemberNotifyMode(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alice *GroupMember
+	for i := range updated.Members {
+		if updated.Members[i].AgentID == "ag_alice" {
+			alice = &updated.Members[i]
+		}
+	}
+	if alice == nil {
+		t.Fatal("alice missing from updated group")
+	}
+	if alice.NotifyMode != NotifyDigest {
+		t.Errorf("notifyMode = %q, want %q", alice.NotifyMode, NotifyDigest)
+	}
+	if alice.DigestWindow != 600 {
+		t.Errorf("digestWindow = %d, want 600", alice.DigestWindow)
+	}
+
+	// Verify persistence via memberNotifySettings.
+	mode, window := gdm.memberNotifySettings(g.ID, "ag_alice")
+	if mode != NotifyDigest || window != 600 {
+		t.Errorf("memberNotifySettings = (%q, %d), want (digest, 600)", mode, window)
+	}
+}
+
+func TestGroupDMManager_SetMemberNotifyModeInvalid(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", "bogus", 0); err == nil {
+		t.Error("expected error for invalid mode")
+	}
+}
+
+func TestGroupDMManager_SetMemberNotifyModeNotMember(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	_, err := gdm.SetMemberNotifyMode(g.ID, "ag_charlie", NotifyMuted, 0)
+	if !errors.Is(err, ErrGroupNotMember) {
+		t.Errorf("expected ErrGroupNotMember, got %v", err)
+	}
+}
+
+func TestGroupDMManager_SetMemberNotifyModeNotFound(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+
+	_, err := gdm.SetMemberNotifyMode("gd_nope", "ag_alice", NotifyMuted, 0)
+	if !errors.Is(err, ErrGroupNotFound) {
+		t.Errorf("expected ErrGroupNotFound, got %v", err)
+	}
+}
+
+func TestGroupDMManager_SetMemberNotifyModeDigestWindowClamped(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	// Oversized window is clamped to maxDigestWindow; negative goes to 0.
+	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 99999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mem := range updated.Members {
+		if mem.AgentID == "ag_alice" && mem.DigestWindow != maxDigestWindow {
+			t.Errorf("clamped digestWindow = %d, want %d", mem.DigestWindow, maxDigestWindow)
+		}
+	}
+
+	updated, err = gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, -10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mem := range updated.Members {
+		if mem.AgentID == "ag_alice" && mem.DigestWindow != 0 {
+			t.Errorf("clamped digestWindow = %d, want 0", mem.DigestWindow)
+		}
+	}
+}
+
+func TestGroupDMManager_MemberNotifySettingsDefault(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	mode, window := gdm.memberNotifySettings(g.ID, "ag_alice")
+	if mode != NotifyRealtime {
+		t.Errorf("default mode = %q, want realtime", mode)
+	}
+	if window != 0 {
+		t.Errorf("default window = %d, want 0", window)
+	}
+
+	// Unknown agent -> realtime default, not an error.
+	mode, _ = gdm.memberNotifySettings(g.ID, "ag_unknown")
+	if mode != NotifyRealtime {
+		t.Errorf("unknown agent mode = %q, want realtime", mode)
+	}
+}
+
+func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyMuted, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := newGroupMessage("ag_bob", "Bob", "ping")
+	// notifyAgent must return without touching notify state for a muted member.
+	gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+
+	gdm.notifyMu.Lock()
+	_, exists := gdm.notify[g.ID+":ag_alice"]
+	gdm.notifyMu.Unlock()
+	if exists {
+		t.Error("muted member should have no notify state entry")
+	}
+}
+
+func TestGroupDMManager_EffectiveCooldown(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 120, "")
+
+	// Realtime respects group cooldown.
+	if got := gdm.effectiveCooldown(g.ID, NotifyRealtime, 0); got != 120*time.Second {
+		t.Errorf("realtime cooldown = %v, want 120s", got)
+	}
+
+	// Digest takes the larger of group cooldown and window.
+	if got := gdm.effectiveCooldown(g.ID, NotifyDigest, 60); got != 120*time.Second {
+		t.Errorf("digest window<cooldown = %v, want 120s", got)
+	}
+	if got := gdm.effectiveCooldown(g.ID, NotifyDigest, 600); got != 600*time.Second {
+		t.Errorf("digest window>cooldown = %v, want 600s", got)
+	}
+
+	// Digest with zero window falls back to defaultDigestWindow.
+	g2, _ := gdm.Create("G2", []string{"ag_alice", "ag_bob"}, 0, "")
+	want := time.Duration(defaultDigestWindow) * time.Second
+	if got := gdm.effectiveCooldown(g2.ID, NotifyDigest, 0); got != want {
+		t.Errorf("digest zero-window = %v, want %v", got, want)
+	}
+}
+
+func TestGroupDMManager_RenderNotificationInlinesContent(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	gdm.SetAPIBase("https://example/ts.net")
+
+	pending := []pendingMsg{
+		{sender: "Bob", content: "hi there", timestamp: "2026-04-25T00:00:00Z"},
+		{sender: "User", content: "ping", timestamp: "2026-04-25T00:00:01Z", senderIsUser: true},
+	}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+	if !strings.Contains(out, "2 new message(s)") {
+		t.Errorf("missing batch count: %s", out)
+	}
+	if !strings.Contains(out, "Bob: hi there") {
+		t.Errorf("missing bob content: %s", out)
+	}
+	if !strings.Contains(out, "User (human operator): ping") {
+		t.Errorf("missing user operator label: %s", out)
+	}
+	if !strings.Contains(out, "Reply: curl -sk") {
+		t.Errorf("missing reply curl (https should use -sk): %s", out)
+	}
+	// Full-transcript pointer appears only when truncation/omission kicked in.
+	if strings.Contains(out, "Full transcript:") {
+		t.Error("unexpected full-transcript pointer for small inline batch")
+	}
+}
+
+func TestGroupDMManager_RenderNotificationLargeMessageInlinedFully(t *testing.T) {
+	// A multi-KB message that fits inside notifyMaxBatchBytes must be
+	// inlined verbatim — the per-message char cap was removed because
+	// truncating defeats the inlining win (agent has to curl anyway).
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+	gdm.SetAPIBase("http://localhost:8080")
+
+	const size = 3000 // > old 500-cap, < notifyMaxSingleContent and < batch budget
+	long := strings.Repeat("x", size)
+	pending := []pendingMsg{{sender: "Bob", content: long, timestamp: "t"}}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+	if !strings.Contains(out, long) {
+		t.Error("expected full content inlined without truncation")
+	}
+	if strings.Contains(out, "…[truncated]") {
+		t.Error("unexpected truncation marker for in-budget content")
+	}
+	if strings.Contains(out, "Full transcript:") {
+		t.Error("unexpected transcript pointer for fully-inlined content")
+	}
+	if !strings.Contains(out, "Reply: curl -s ") {
+		t.Errorf("http base should use -s not -sk: %s", out)
+	}
+}
+
+func TestGroupDMManager_RenderNotificationDropsOldWhenBatchTooBig(t *testing.T) {
+	// Selection is newest-first under the byte budget. When the queued
+	// total exceeds notifyMaxBatchBytes, the oldest messages are dropped
+	// (whole-message) rather than each being truncated mid-content.
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	// Each message ~2KB; 12 of them (~24KB) overflow the 16KB budget.
+	chunk := strings.Repeat("y", 2000)
+	pending := make([]pendingMsg, 12)
+	for i := range pending {
+		pending[i] = pendingMsg{
+			sender:    "Bob",
+			content:   fmt.Sprintf("%d-%s", i, chunk),
+			timestamp: "t",
+		}
+	}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+
+	// Newest message must be present in full.
+	newestPrefix := fmt.Sprintf("%d-", len(pending)-1)
+	if !strings.Contains(out, newestPrefix) {
+		t.Errorf("newest message %q missing: %s", newestPrefix, out[:200])
+	}
+	// At least the oldest must be omitted.
+	if !strings.Contains(out, "earlier message(s) omitted") {
+		t.Error("expected omission marker when batch overflowed budget")
+	}
+	if !strings.Contains(out, "Full transcript:") {
+		t.Error("expected transcript pointer when older messages dropped")
+	}
+	// No mid-message truncation — kept messages render untruncated.
+	if strings.Contains(out, "…[truncated]") {
+		t.Error("unexpected truncation marker — drop-old policy should not clip")
+	}
+}
+
+func TestGroupDMManager_RenderNotificationSingleHugeMessageClipped(t *testing.T) {
+	// Pathological case: a single message bigger than the entire batch
+	// budget. We still inline it (clipped to notifyMaxSingleContent) so
+	// the agent has *something* to react to without a curl round-trip.
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	huge := strings.Repeat("z", notifyMaxBatchBytes+5000)
+	pending := []pendingMsg{{sender: "Bob", content: huge, timestamp: "t"}}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+	if !strings.Contains(out, "…[truncated]") {
+		t.Error("expected truncation marker for single huge message")
+	}
+	if !strings.Contains(out, "Full transcript:") {
+		t.Error("expected transcript pointer when single message was clipped")
+	}
+	// Should clip to notifyMaxSingleContent, not pass full content.
+	if strings.Count(out, "z") > notifyMaxSingleContent+10 {
+		t.Errorf("clipped content too long: %d 'z' chars", strings.Count(out, "z"))
+	}
+}
+
+// TestGroupDMManager_RenderedSizeRespectsBudget feeds the renderer a
+// worst-case load (max batch count, each message close to the line budget,
+// API base + group/agent IDs at realistic length, transcript footer
+// included) and asserts the resulting system-prompt string stays within
+// notifyMaxBatchBytes. If this fails it means notifyHeaderFooterReserve is
+// too small for the current header/footer text and needs to grow.
+func TestGroupDMManager_RenderedSizeRespectsBudget(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("Long Realistic Group Name For Headroom", []string{"ag_alice", "ag_bob"}, 0, "")
+	gdm.SetAPIBase("https://kojo.tail451b50.ts.net:8080")
+
+	// Build a queue that selectBatch is likely to fill: lots of medium-sized
+	// messages so the line budget is the binding cap, plus enough total
+	// volume to force the "Full transcript" footer.
+	chunk := strings.Repeat("a", 800)
+	pending := make([]pendingMsg, 30) // > notifyMaxBatch so selectBatch drops oldest
+	for i := range pending {
+		pending[i] = pendingMsg{
+			sender:       "BobWithAReasonablyLongName",
+			content:      fmt.Sprintf("%d-%s", i, chunk),
+			timestamp:    "2026-04-25T00:00:00Z",
+			senderIsUser: i%5 == 0, // sprinkle "(human operator)" labels
+		}
+	}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+	if len(out) > notifyMaxBatchBytes {
+		t.Fatalf("rendered notification = %d bytes, exceeds notifyMaxBatchBytes=%d. "+
+			"Bump notifyHeaderFooterReserve.", len(out), notifyMaxBatchBytes)
+	}
+	// Sanity: the test should actually be exercising the cap, not just
+	// rendering a tiny payload that trivially fits.
+	if len(out) < notifyMaxBatchBytes/2 {
+		t.Errorf("rendered output too small (%d bytes) — test does not exercise budget", len(out))
+	}
+}
+
+func TestGroupDMManager_RenderNotificationBatchLimit(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	many := make([]pendingMsg, notifyMaxBatch+5)
+	for i := range many {
+		many[i] = pendingMsg{sender: "Bob", content: "x", timestamp: "t"}
+	}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, many)
+	if !strings.Contains(out, "5 earlier message(s) omitted") {
+		t.Errorf("expected omission marker: %s", out)
+	}
+	if !strings.Contains(out, "Full transcript:") {
+		t.Error("expected full-transcript pointer when batch overflowed")
+	}
+}
+
+func TestCapPending(t *testing.T) {
+	// Below the cap: returned slice is the input unchanged.
+	small := []pendingMsg{{sender: "a"}, {sender: "b"}}
+	if got := capPending(small); len(got) != 2 || got[0].sender != "a" || got[1].sender != "b" {
+		t.Errorf("small slice mangled: %+v", got)
+	}
+
+	// Empty is a no-op.
+	if got := capPending(nil); got != nil {
+		t.Errorf("nil input should stay nil, got %+v", got)
+	}
+
+	// Above the cap: drops the oldest, keeps the newest notifyMaxPending.
+	over := make([]pendingMsg, notifyMaxPending+30)
+	for i := range over {
+		over[i] = pendingMsg{sender: fmt.Sprintf("s-%d", i)}
+	}
+	got := capPending(over)
+	if len(got) != notifyMaxPending {
+		t.Fatalf("cap len = %d, want %d", len(got), notifyMaxPending)
+	}
+	// Oldest kept is index 30 of the input.
+	if got[0].sender != fmt.Sprintf("s-%d", 30) {
+		t.Errorf("oldest kept = %q, want s-30", got[0].sender)
+	}
+	if got[len(got)-1].sender != fmt.Sprintf("s-%d", notifyMaxPending+30-1) {
+		t.Errorf("newest kept = %q", got[len(got)-1].sender)
+	}
+
+	// Capped result must not alias the input's backing array — otherwise
+	// a later append to the returned slice could stomp on the original.
+	// We verify by mutating the returned slice and checking the input.
+	first := over[30]
+	got[0] = pendingMsg{sender: "mutated"}
+	if over[30].sender != first.sender {
+		t.Error("capPending should return a copy that does not alias input storage")
+	}
+}
+
+func TestGroupDMManager_PendingBufferCap(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	// Put the (group, agent) key into a state that defers all further
+	// notifyAgent calls without actually invoking the agent backend: mark
+	// the slot as inFlight so notifyAgent unconditionally buffers. This
+	// isolates the cap behavior from the Chat() plumbing.
+	key := g.ID + ":ag_alice"
+	gdm.notifyMu.Lock()
+	gdm.notify[key] = &notifyState{inFlight: true}
+	gdm.notifyMu.Unlock()
+
+	// Push twice the cap; expect the oldest half to be dropped.
+	for i := 0; i < notifyMaxPending*2; i++ {
+		msg := newGroupMessage("ag_bob", "Bob", fmt.Sprintf("msg-%d", i))
+		gdm.notifyAgent("ag_alice", g.ID, g.Name, msg, false)
+	}
+
+	gdm.notifyMu.Lock()
+	ns := gdm.notify[key]
+	got := len(ns.pendingMsgs)
+	first := ns.pendingMsgs[0].content
+	last := ns.pendingMsgs[len(ns.pendingMsgs)-1].content
+	gdm.notifyMu.Unlock()
+
+	if got != notifyMaxPending {
+		t.Errorf("pending len = %d, want %d", got, notifyMaxPending)
+	}
+	// Oldest kept should be msg-notifyMaxPending, newest should be the last.
+	wantFirst := fmt.Sprintf("msg-%d", notifyMaxPending)
+	if first != wantFirst {
+		t.Errorf("oldest kept = %q, want %q", first, wantFirst)
+	}
+	wantLast := fmt.Sprintf("msg-%d", notifyMaxPending*2-1)
+	if last != wantLast {
+		t.Errorf("newest kept = %q, want %q", last, wantLast)
 	}
 }
 

@@ -288,6 +288,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("PATCH /api/v1/groupdms/{id}", s.handleRenameGroupDM)
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}", s.handleDeleteGroupDM)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/members", s.handleAddGroupMember)
+		mux.HandleFunc("PATCH /api/v1/groupdms/{id}/members/{agentId}", s.handleSetGroupMemberSettings)
 		mux.HandleFunc("DELETE /api/v1/groupdms/{id}/members/{agentId}", s.handleLeaveGroup)
 		mux.HandleFunc("GET /api/v1/groupdms/{id}/messages", s.handleGetGroupMessages)
 		mux.HandleFunc("POST /api/v1/groupdms/{id}/messages", s.handlePostGroupMessage)

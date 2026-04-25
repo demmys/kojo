@@ -23,6 +23,35 @@ var ValidGroupDMStyles = map[GroupDMStyle]bool{
 	GroupDMStyleExpressive: true,
 }
 
+// NotifyMode controls how a specific member receives group-DM notifications.
+//
+//   - "realtime" (default): notify as soon as the group-level cooldown allows.
+//   - "digest":  collect messages for up to DigestWindow seconds (or the group
+//     cooldown, whichever is larger) before delivering a single batched turn.
+//   - "muted":   do not notify this member at all. The member can still read
+//     messages via the API on their own initiative.
+type NotifyMode string
+
+const (
+	NotifyRealtime NotifyMode = "realtime"
+	NotifyDigest   NotifyMode = "digest"
+	NotifyMuted    NotifyMode = "muted"
+)
+
+// ValidNotifyModes is the set of accepted notify-mode values.
+var ValidNotifyModes = map[NotifyMode]bool{
+	NotifyRealtime: true,
+	NotifyDigest:   true,
+	NotifyMuted:    true,
+}
+
+// defaultDigestWindow is the fallback digest window when a member opts into
+// "digest" mode without specifying DigestWindow explicitly.
+const defaultDigestWindow = 300 // 5 minutes
+
+// maxDigestWindow caps the digest window to 1 hour.
+const maxDigestWindow = 3600
+
 type GroupDM struct {
 	ID        string        `json:"id"`
 	Name      string        `json:"name"`
@@ -37,6 +66,12 @@ type GroupDM struct {
 type GroupMember struct {
 	AgentID   string `json:"agentId"`
 	AgentName string `json:"agentName"`
+	// NotifyMode is the per-member delivery mode. Empty string is treated as
+	// NotifyRealtime on read but omitted from JSON to keep legacy groups small.
+	NotifyMode NotifyMode `json:"notifyMode,omitempty"`
+	// DigestWindow is the digest-batching window in seconds. Only meaningful
+	// when NotifyMode == NotifyDigest. 0 means "use defaultDigestWindow".
+	DigestWindow int `json:"digestWindow,omitempty"`
 }
 
 // GroupMessage is a single message in a group DM transcript.

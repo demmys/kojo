@@ -142,14 +142,113 @@ func appendGroupMessage(groupID string, msg *GroupMessage) error {
 	return jsonlAppend(filepath.Join(dir, messagesFile), msg)
 }
 
-// loadGroupMessages reads messages from a group's JSONL transcript with pagination.
-func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessage, bool, error) {
+// loadGroupMessages reads messages from a group's JSONL transcript with
+// pagination, plus the current head ID derived from the *same* on-disk
+// read. Returning the head from the same snapshot is what lets the
+// HTTP-level GET expose a `latestMessageId` that is guaranteed to be
+// consistent with the `messages` slice — without that, a concurrent
+// PostMessage between two separate reads could surface a head that is
+// not represented in either `messages` or the cache.
+//
+// head is "" when the transcript is empty or missing.
+func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessage, bool, string, error) {
 	path := filepath.Join(groupDir(groupID), messagesFile)
-	msgs, hasMore, err := jsonlLoadPaginated(path, limit, before, func(m *GroupMessage) string { return m.ID })
-	for _, m := range msgs {
+	all, _, err := jsonlLoadPaginated(path, 0, "", func(m *GroupMessage) string { return m.ID })
+	if err != nil {
+		return nil, false, "", err
+	}
+	for _, m := range all {
 		m.Timestamp = normalizeTimestamp(m.Timestamp)
 	}
-	return msgs, hasMore, err
+
+	head := ""
+	if len(all) > 0 {
+		head = all[len(all)-1].ID
+	}
+
+	// Apply `before` cursor: keep only entries strictly older than the
+	// given ID. Mirrors the original jsonlLoadPaginated behaviour.
+	if before != "" {
+		idx := -1
+		for i, v := range all {
+			if v.ID == before {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			all = all[:idx]
+		}
+	}
+
+	hasMore := false
+	if limit > 0 && len(all) > limit {
+		hasMore = true
+		all = all[len(all)-limit:]
+	}
+	return all, hasMore, head, nil
+}
+
+// loadLatestGroupMessageID returns the ID of the newest message in a group's
+// transcript. Returns ("", nil) if the file does not exist or is empty —
+// callers treat that as "no head yet" rather than an error so brand-new
+// groups stay consistent with on-disk state.
+func loadLatestGroupMessageID(groupID string) (string, error) {
+	_, _, head, err := loadGroupMessages(groupID, 0, "")
+	return head, err
+}
+
+// loadGroupMessagesAfter returns messages strictly newer than afterID, capped
+// to the newest `limit` entries. hasMore is true when older diff entries had
+// to be dropped to fit the cap (so the caller can hint that the full
+// transcript is needed).
+//
+// If afterID is empty, returns the newest `limit` messages from the
+// transcript. If afterID is not found in the transcript, the caller-supplied
+// cursor is treated as stale: the function returns the newest `limit`
+// messages with hasMore=true so the caller can render "we couldn't locate
+// your cursor, here's the latest state."
+func loadGroupMessagesAfter(groupID, afterID string, limit int) ([]*GroupMessage, bool, error) {
+	path := filepath.Join(groupDir(groupID), messagesFile)
+	all, _, err := jsonlLoadPaginated(path, 0, "", func(m *GroupMessage) string { return m.ID })
+	if err != nil {
+		return nil, false, err
+	}
+	for _, m := range all {
+		m.Timestamp = normalizeTimestamp(m.Timestamp)
+	}
+
+	if afterID == "" {
+		hasMore := false
+		if limit > 0 && len(all) > limit {
+			hasMore = true
+			all = all[len(all)-limit:]
+		}
+		return all, hasMore, nil
+	}
+
+	idx := -1
+	for i, m := range all {
+		if m.ID == afterID {
+			idx = i
+			break
+		}
+	}
+	var diff []*GroupMessage
+	hasMore := false
+	if idx < 0 {
+		// afterID is unknown (cursor older than the file remembers, or just
+		// wrong). Fall back to the newest `limit` and flag hasMore.
+		diff = all
+		hasMore = true
+	} else {
+		diff = all[idx+1:]
+	}
+	if limit > 0 && len(diff) > limit {
+		hasMore = true
+		diff = diff[len(diff)-limit:]
+	}
+	return diff, hasMore, nil
 }
 
 func newGroupMessage(agentID, agentName, content string) *GroupMessage {

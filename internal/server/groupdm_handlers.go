@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -160,7 +161,7 @@ func (s *Server) handleGetGroupMessages(w http.ResponseWriter, r *http.Request) 
 	}
 	before := r.URL.Query().Get("before")
 
-	msgs, hasMore, err := s.groupdms.Messages(id, limit, before)
+	msgs, hasMore, latestID, err := s.groupdms.Messages(id, limit, before)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 		return
@@ -169,8 +170,9 @@ func (s *Server) handleGetGroupMessages(w http.ResponseWriter, r *http.Request) 
 		msgs = []*agent.GroupMessage{}
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{
-		"messages": msgs,
-		"hasMore":  hasMore,
+		"messages":        msgs,
+		"hasMore":         hasMore,
+		"latestMessageId": latestID,
 	})
 }
 
@@ -179,6 +181,12 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		AgentID string `json:"agentId"`
 		Content string `json:"content"`
+		// ExpectedLatestMessageID is the CAS guard. When non-empty, the
+		// server rejects the post with 409 Conflict if any other member
+		// posted after this ID, and returns the diff so the agent can
+		// decide whether to retry. Empty value skips the check (legacy
+		// or admin-style callers stay supported).
+		ExpectedLatestMessageID string `json:"expectedLatestMessageId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -203,8 +211,25 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 	// Always notify on API-initiated messages (user or agent-initiated).
 	// Notifications trigger chats that may produce follow-up messages,
 	// but the busy check in Manager.Chat naturally breaks infinite loops.
-	msg, err := s.groupdms.PostMessage(r.Context(), id, req.AgentID, req.Content, true)
+	msg, err := s.groupdms.PostMessage(r.Context(), id, req.AgentID, req.Content, req.ExpectedLatestMessageID, true)
 	if err != nil {
+		// Stale CAS cursor — return 409 with the new head and the diff so
+		// the caller has everything they need to decide whether to repost.
+		var staleErr *agent.StaleExpectedIDError
+		if errors.As(err, &staleErr) {
+			newMsgs := staleErr.NewMessages
+			if newMsgs == nil {
+				newMsgs = []*agent.GroupMessage{}
+			}
+			writeJSONResponse(w, http.StatusConflict, map[string]any{
+				"error":           "stale_expected_message_id",
+				"message":         staleErr.Error(),
+				"latestMessageId": staleErr.Latest,
+				"newMessages":     newMsgs,
+				"hasMore":         staleErr.HasMore,
+			})
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}

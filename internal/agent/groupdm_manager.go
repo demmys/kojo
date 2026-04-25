@@ -894,8 +894,21 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName string, 
 
 	shown, omitted, clipSingle := selectBatch(pending)
 
+	// Latest sender is rendered into the header so trusted code (e.g. the
+	// Web UI) can recover it without parsing the untrusted message block.
+	// Pending is in chronological order, so the last entry is newest.
+	var fromSuffix string
+	if n := len(pending); n > 0 {
+		latest := pending[n-1]
+		if latest.senderIsUser {
+			fromSuffix = fmt.Sprintf(" from %s (human operator)", latest.sender)
+		} else {
+			fromSuffix = fmt.Sprintf(" from %s", latest.sender)
+		}
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, "[Group DM: %s] %d new message(s).\n", groupName, len(pending))
+	fmt.Fprintf(&b, "[Group DM: %s] %d new message(s)%s.\n", groupName, len(pending), fromSuffix)
 	b.WriteString(styleHint)
 	b.WriteString("\n")
 	if omitted > 0 {

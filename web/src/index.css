@@ -171,13 +171,23 @@ html, body, #root {
 /* Strong / em */
 .md-content strong { color: #f5f5f5; font-weight: 600; }
 
-/* Links */
+/* Links
+ *
+ * Long URLs (especially autolinked ones like
+ * https://example.com/very/deep/path/with/many/segments) lack natural break
+ * opportunities, so default wrapping leaves them on a single line and
+ * overflows the bubble. overflow-wrap:anywhere lets the browser break the
+ * link at any character *only when needed* to fit, while leaving normal
+ * link text and Japanese labels with their natural word/CJK wrap behavior.
+ * Avoid word-break:break-all here — it would split prose and CJK link
+ * labels mid-character even when the link would otherwise fit cleanly. */
 .md-link {
   color: #60a5fa;
   text-decoration: underline;
   text-decoration-color: rgba(96, 165, 250, 0.3);
   text-underline-offset: 2px;
   transition: text-decoration-color 0.15s;
+  overflow-wrap: anywhere;
 }
 .md-link:hover {
   text-decoration-color: rgba(96, 165, 250, 0.7);

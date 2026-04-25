@@ -635,8 +635,8 @@ func TestGroupDMManager_RenderNotificationInlinesContent(t *testing.T) {
 		{sender: "User", content: "ping", timestamp: "2026-04-25T00:00:01Z", senderIsUser: true},
 	}
 	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
-	if !strings.Contains(out, "2 new message(s)") {
-		t.Errorf("missing batch count: %s", out)
+	if !strings.Contains(out, "2 new message(s) from User (human operator)") {
+		t.Errorf("missing batch count + latest-sender suffix: %s", out)
 	}
 	if !strings.Contains(out, "Bob: hi there") {
 		t.Errorf("missing bob content: %s", out)
@@ -650,6 +650,33 @@ func TestGroupDMManager_RenderNotificationInlinesContent(t *testing.T) {
 	// Full-transcript pointer appears only when truncation/omission kicked in.
 	if strings.Contains(out, "Full transcript:") {
 		t.Error("unexpected full-transcript pointer for small inline batch")
+	}
+}
+
+func TestGroupDMManager_RenderNotificationHeaderHasLatestSender(t *testing.T) {
+	// The "from <latest_sender>" suffix lives in the trusted header so the
+	// Web UI can extract the latest sender without parsing the untrusted
+	// message block. Verify both agent senders and human-user senders.
+	gdm, _ := setupGroupDMTest(t)
+	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "")
+
+	pending := []pendingMsg{
+		{sender: "Old", content: "first", timestamp: "t"},
+		{sender: "Bob", content: "second", timestamp: "t"},
+	}
+	out := gdm.renderNotification("ag_alice", g.ID, g.Name, pending)
+	if !strings.Contains(out, "from Bob.") {
+		t.Errorf("expected 'from Bob.' suffix from newest pending entry: %s", out)
+	}
+	if strings.Contains(out, "from Old") {
+		t.Errorf("header should reference newest sender, not oldest: %s", out)
+	}
+
+	// Human-user message gets the explicit operator tag in the header too.
+	pendingUser := []pendingMsg{{sender: "User", content: "ping", timestamp: "t", senderIsUser: true}}
+	out = gdm.renderNotification("ag_alice", g.ID, g.Name, pendingUser)
+	if !strings.Contains(out, "from User (human operator).") {
+		t.Errorf("expected '(human operator)' tag in header: %s", out)
 	}
 }
 

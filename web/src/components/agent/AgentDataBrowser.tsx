@@ -240,12 +240,27 @@ export function AgentDataBrowser() {
     return cleanup;
   }, [loadEntries]);
 
-  const setSub = (next: string) => {
+  const setSub = (next: string, opts?: { replace?: boolean }) => {
     const clean = sanitizeSub(next);
     const params = new URLSearchParams(searchParams);
     if (clean) params.set("sub", clean);
     else params.delete("sub");
-    setSearchParams(params, { replace: false });
+    setSearchParams(params, { replace: opts?.replace ?? false });
+  };
+
+  // Header ← behaviour:
+  // - if we're inside a sub-folder, climb one level (parent dir)
+  // - if we're at the data root, go back to the agent chat
+  // Both cases use replace:true so pressing ← then a browser-back/swipe
+  // doesn't bounce the user back into a deeper folder they just left.
+  const handleBack = () => {
+    if (subPath) {
+      const parts = subPath.split(SEP).filter(Boolean);
+      parts.pop();
+      setSub(parts.join(SEP), { replace: true });
+      return;
+    }
+    navigate(`/agents/${id}`, { replace: true });
   };
 
   const breadcrumbs = useMemo(() => {
@@ -327,7 +342,7 @@ export function AgentDataBrowser() {
       {/* Header */}
       <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800 shrink-0">
         <button
-          onClick={() => navigate(`/agents/${id}`)}
+          onClick={handleBack}
           className="text-neutral-400 hover:text-neutral-200"
           aria-label="Back"
         >

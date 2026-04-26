@@ -31,6 +31,7 @@ export function AgentSettings() {
   const [cronMessage, setCronMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [archiving, setArchiving] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
   const [error, setError] = useState("");
@@ -192,6 +193,23 @@ export function AgentSettings() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setDeleting(false);
+    }
+  };
+
+  const handleArchive = async () => {
+    if (
+      !confirm(
+        "Archive this agent? Runtime activity stops; data is kept and can be restored from Settings.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
+      )
+    )
+      return;
+    setArchiving(true);
+    try {
+      await agentApi.archive(id!);
+      navigate("/", { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setArchiving(false);
     }
   };
 
@@ -668,6 +686,18 @@ export function AgentSettings() {
             </button>
             <p className="text-xs text-neutral-600 mt-1">
               Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
+            </p>
+          </div>
+          <div>
+            <button
+              onClick={handleArchive}
+              disabled={archiving}
+              className="w-full py-3 bg-neutral-900 hover:bg-neutral-800 border border-neutral-700 rounded-lg text-sm font-medium text-neutral-300 disabled:opacity-40"
+            >
+              {archiving ? "Archiving..." : "Archive Agent"}
+            </button>
+            <p className="text-xs text-neutral-600 mt-1">
+              Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).
             </p>
           </div>
           <button

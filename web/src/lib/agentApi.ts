@@ -69,6 +69,10 @@ export interface AgentInfo {
     role: string;
     timestamp: string;
   };
+  // Archived agents are dormant: runtime activity stopped, hidden from
+  // the main list, but all data retained on disk for restore.
+  archived?: boolean;
+  archivedAt?: string;
 }
 
 export interface AgentConfig {
@@ -209,8 +213,16 @@ export interface SlackBotSetRequest {
 }
 
 export const agentApi = {
+  // list returns active agents only (archived are excluded by the server).
   list: () =>
     get<{ agents: AgentInfo[] }>("/api/v1/agents").then((r) => r.agents ?? []),
+
+  // listArchived returns archived agents only — used by the Archived
+  // section in global Settings.
+  listArchived: () =>
+    get<{ agents: AgentInfo[] }>("/api/v1/agents?archived=true").then(
+      (r) => r.agents ?? [],
+    ),
 
   cronPaused: () =>
     get<{ paused: boolean }>("/api/v1/agents/cron-paused").then((r) => r.paused),
@@ -246,6 +258,14 @@ export const agentApi = {
     patch<AgentInfo>(`/api/v1/agents/${id}`, cfg),
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
+
+  // archive: keeps all on-disk data but stops runtime activity. Reversible
+  // via unarchive. Hidden from the main list; surfaced in global Settings.
+  archive: (id: string) =>
+    del<{ ok: boolean }>(`/api/v1/agents/${id}?archive=true`),
+
+  unarchive: (id: string) =>
+    post<AgentInfo>(`/api/v1/agents/${id}/unarchive`),
 
   resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
 

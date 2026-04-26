@@ -246,6 +246,13 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	var activeStart, activeEnd, cronMessage string
 	var timeoutMinutes int
 	if a, ok := cs.mgr.Get(agentID); ok {
+		// Archived guard: a tick may have queued just before Archive ran
+		// cron.Remove. Bail out before ever calling Chat (which would log a
+		// warn for ErrAgentArchived).
+		if a.Archived {
+			cs.logger.Debug("cron job skipped (archived)", "agent", agentID)
+			return
+		}
 		activeStart, activeEnd = a.ActiveStart, a.ActiveEnd
 		timeoutMinutes = a.TimeoutMinutes
 		cronMessage = a.CronMessage

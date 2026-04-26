@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -148,6 +149,28 @@ func (p *notifyPoller) RemoveAgent(agentID string) {
 	p.purgeAgentStateLocked(agentID)
 }
 
+// DetachAgent stops polling for an agent's sources but preserves cursors and
+// lastPoll so that resuming via RebuildSources later doesn't replay
+// already-delivered notifications. Used by Manager.Archive: archived agents
+// are dormant, but their progress markers stay valid for when they wake up.
+// Pending retry deliveries for the agent are dropped — the agent can't
+// receive them while archived.
+func (p *notifyPoller) DetachAgent(agentID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.sources, agentID)
+
+	filtered := p.pending[:0]
+	for _, pn := range p.pending {
+		if pn.agentID == agentID {
+			continue
+		}
+		filtered = append(filtered, pn)
+	}
+	p.pending = filtered
+}
+
 // purgeAgentStateLocked removes all cursors, lastPoll, and pending for an agent.
 // Caller must hold p.mu.
 func (p *notifyPoller) purgeAgentStateLocked(agentID string) {
@@ -279,7 +302,28 @@ func (p *notifyPoller) pollSource(agentID, sourceID string, src notifysource.Sou
 		return
 	}
 
+	// If the agent was archived (or its source was removed / re-attached as
+	// a fresh instance via RebuildSources) while we were polling, skip both
+	// the cursor advance and the delivery: the items we just fetched will
+	// be redelivered from the same cursor on the next poll, instead of
+	// being silently dropped or attributed to a now-replaced source.
+	if a, ok := p.mgr.Get(agentID); !ok || a.Archived {
+		p.mu.Lock()
+		p.lastPoll[key] = time.Now()
+		p.mu.Unlock()
+		return
+	}
 	p.mu.Lock()
+	current, stillAttached := p.sources[agentID][sourceID]
+	// Compare the actual source pointer, not just the key: an Archive →
+	// Unarchive cycle (or RebuildSources after a config change) replaces
+	// the source instance under the same key, and an in-flight poll on the
+	// old instance must not advance the new instance's cursor.
+	if !stillAttached || current != src {
+		p.lastPoll[key] = time.Now()
+		p.mu.Unlock()
+		return
+	}
 	p.lastPoll[key] = time.Now()
 	if result.Cursor != "" {
 		p.cursors[key] = result.Cursor
@@ -361,6 +405,14 @@ func (p *notifyPoller) sendSystemMessage(agentID, sourceID, message string, retr
 
 	events, err := p.mgr.Chat(ctx, agentID, message, "system", nil)
 	if err != nil {
+		// Archived is a terminal state: re-queueing would just spin on
+		// retries until the cap. Drop without warn — DetachAgent already
+		// preserves cursors so the message will not be redelivered after
+		// Unarchive.
+		if errors.Is(err, ErrAgentArchived) {
+			p.logger.Debug("notification dropped: agent archived", "agent", agentID)
+			return
+		}
 		retries++
 		if retries >= notifyMaxRetries {
 			p.logger.Warn("notification dropped after max retries", "agent", agentID)

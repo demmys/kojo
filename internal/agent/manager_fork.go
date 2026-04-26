@@ -80,6 +80,11 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	fork.SlackBot = nil
 	fork.NotifySources = nil
 	fork.LegacyCronExpr = ""
+	// Forking an archived agent must produce an *active* fork. Otherwise the
+	// new agent would be born dormant and silently inherit ArchivedAt from
+	// the source.
+	fork.Archived = false
+	fork.ArchivedAt = ""
 	// Clear WorkDir so the fork does not share an external file storage
 	// directory with the source (would cross-contaminate generated files).
 	fork.WorkDir = ""

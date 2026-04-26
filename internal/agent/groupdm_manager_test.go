@@ -481,7 +481,7 @@ func TestGroupDMManager_SetMemberNotifyMode(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
-	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 600)
+	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 600, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func TestGroupDMManager_SetMemberNotifyModeInvalid(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
-	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", "bogus", 0); err == nil {
+	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", "bogus", 0, ""); err == nil {
 		t.Error("expected error for invalid mode")
 	}
 }
@@ -521,7 +521,7 @@ func TestGroupDMManager_SetMemberNotifyModeNotMember(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
-	_, err := gdm.SetMemberNotifyMode(g.ID, "ag_charlie", NotifyMuted, 0)
+	_, err := gdm.SetMemberNotifyMode(g.ID, "ag_charlie", NotifyMuted, 0, "")
 	if !errors.Is(err, ErrGroupNotMember) {
 		t.Errorf("expected ErrGroupNotMember, got %v", err)
 	}
@@ -530,7 +530,7 @@ func TestGroupDMManager_SetMemberNotifyModeNotMember(t *testing.T) {
 func TestGroupDMManager_SetMemberNotifyModeNotFound(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 
-	_, err := gdm.SetMemberNotifyMode("gd_nope", "ag_alice", NotifyMuted, 0)
+	_, err := gdm.SetMemberNotifyMode("gd_nope", "ag_alice", NotifyMuted, 0, "")
 	if !errors.Is(err, ErrGroupNotFound) {
 		t.Errorf("expected ErrGroupNotFound, got %v", err)
 	}
@@ -541,7 +541,7 @@ func TestGroupDMManager_SetMemberNotifyModeDigestWindowClamped(t *testing.T) {
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
 	// Oversized window is clamped to maxDigestWindow; negative goes to 0.
-	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 99999)
+	updated, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, 99999, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +551,7 @@ func TestGroupDMManager_SetMemberNotifyModeDigestWindowClamped(t *testing.T) {
 		}
 	}
 
-	updated, err = gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, -10)
+	updated, err = gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyDigest, -10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestGroupDMManager_MutedMemberDropsNotification(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	g, _ := gdm.Create("G", []string{"ag_alice", "ag_bob"}, 0, "", "")
 
-	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyMuted, 0); err != nil {
+	if _, err := gdm.SetMemberNotifyMode(g.ID, "ag_alice", NotifyMuted, 0, ""); err != nil {
 		t.Fatal(err)
 	}
 

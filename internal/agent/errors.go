@@ -4,9 +4,10 @@ import "errors"
 
 // Sentinel errors for the agent package.
 var (
-	ErrAgentNotFound = errors.New("agent not found")
-	ErrAgentBusy     = errors.New("agent is busy")
+	ErrAgentNotFound  = errors.New("agent not found")
+	ErrAgentBusy      = errors.New("agent is busy")
 	ErrAgentResetting = errors.New("agent is being reset")
+	ErrAgentArchived  = errors.New("agent is archived")
 
 	ErrGroupNotFound      = errors.New("group not found")
 	ErrGroupNotMember     = errors.New("agent is not a member of group")

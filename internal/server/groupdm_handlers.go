@@ -317,13 +317,10 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", "notifyMode is required")
 		return
 	}
-	if req.CallerAgentID != "" {
-		if err := s.groupdms.CheckMembership(id, req.CallerAgentID); err != nil {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-			return
-		}
-	}
-	g, err := s.groupdms.SetMemberNotifyMode(id, agentID, agent.NotifyMode(req.NotifyMode), req.DigestWindow)
+	// SetMemberNotifyMode does its own caller membership + active check
+	// inside the lock, which closes the race window between the membership
+	// check and the mutation. The handler no longer pre-checks.
+	g, err := s.groupdms.SetMemberNotifyMode(id, agentID, agent.NotifyMode(req.NotifyMode), req.DigestWindow, req.CallerAgentID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

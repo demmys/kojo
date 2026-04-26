@@ -135,9 +135,13 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reconcile running bot with new config
+	// Reconcile running bot with new config — but only if the agent is
+	// active. Reconfigure on an archived agent would start the bot we
+	// intentionally stopped at archive time.
 	if s.slackHub != nil {
-		s.slackHub.Reconfigure(agentID, cfg)
+		if a, ok := s.agents.Get(agentID); ok && !a.Archived {
+			s.slackHub.Reconfigure(agentID, cfg)
+		}
 	}
 
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true})

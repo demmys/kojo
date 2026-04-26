@@ -210,6 +210,13 @@ func getSlackClient(ctx context.Context, agents *agent.Manager) (*slack.Client, 
 		return nil, "agent ID not found in request context"
 	}
 
+	// Refuse archived agents: their Slack token is retained on disk so the
+	// agent can be unarchived later, but while archived the agent must not
+	// be allowed to call Slack APIs (or any other tool) through MCP.
+	if a, ok := agents.Get(agentID); ok && a.Archived {
+		return nil, fmt.Sprintf("agent %s is archived", agentID)
+	}
+
 	creds := agents.Credentials()
 	if creds == nil {
 		return nil, "credential store not available"

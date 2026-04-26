@@ -248,6 +248,19 @@ type Agent struct {
 
 	// LastMessage is a preview of the most recent message (for list display).
 	LastMessage *MessagePreview `json:"lastMessage,omitempty"`
+
+	// Archived is true when the agent has been archived via DELETE
+	// /api/v1/agents/{id}?archive=true. Archived agents retain most on-disk
+	// data (agent dir, credentials, notify tokens, messages, memory) but
+	// have all runtime activity stopped: cron, notify polling, one-shot
+	// chats, Slack bot, and inbound chats are refused with ErrAgentArchived.
+	// Group DM memberships are an exception — they are removed on archive
+	// (2-person groups are dissolved) and NOT restored on Unarchive.
+	// Restored via POST /api/v1/agents/{id}/unarchive.
+	Archived bool `json:"archived,omitempty"`
+	// ArchivedAt is the RFC3339 timestamp when Archived was last set.
+	// Cleared on unarchive.
+	ArchivedAt string `json:"archivedAt,omitempty"`
 }
 
 // ResumeIdleDuration returns the configured idle window for keeping an

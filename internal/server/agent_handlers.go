@@ -34,8 +34,33 @@ func (s *Server) handleSetCronPaused(w http.ResponseWriter, r *http.Request) {
 // --- Agent CRUD Handlers ---
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	agents := s.agents.List()
-	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": agents})
+	// Default: hide archived agents from the main list. Pass
+	// ?includeArchived=true to fetch archived alongside active (used by the
+	// "Archived agents" section in global Settings) or ?archived=true to
+	// fetch only archived. The two flags are mutually exclusive — combining
+	// them is a caller bug, not something we want to silently resolve in
+	// favor of one or the other.
+	q := r.URL.Query()
+	includeArchived := q.Get("includeArchived") == "true"
+	onlyArchived := q.Get("archived") == "true"
+	if includeArchived && onlyArchived {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"archived and includeArchived are mutually exclusive")
+		return
+	}
+
+	all := s.agents.List()
+	out := make([]*agent.Agent, 0, len(all))
+	for _, a := range all {
+		switch {
+		case onlyArchived && !a.Archived:
+			continue
+		case !onlyArchived && !includeArchived && a.Archived:
+			continue
+		}
+		out = append(out, a)
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
 }
 
 func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
@@ -147,11 +172,30 @@ func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	// Stop Slack bot before deleting the agent so it doesn't keep running.
+	// ?archive=true keeps all on-disk data but stops runtime activity.
+	// Restored later via POST /api/v1/agents/{id}/unarchive.
+	archive := r.URL.Query().Get("archive") == "true"
+
+	// Stop Slack bot before either operation so it doesn't keep running.
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
-	if err := s.agents.Delete(id); err != nil {
+
+	var err error
+	if archive {
+		err = s.agents.Archive(id)
+	} else {
+		err = s.agents.Delete(id)
+	}
+	if err != nil {
+		// Roll back the StopBot above on failure: the agent is still active
+		// (Archive/Delete refused), so its Slack bot must be restored to
+		// avoid a silent disconnect.
+		if s.slackHub != nil {
+			if a, ok := s.agents.Get(id); ok && !a.Archived && a.SlackBot != nil && a.SlackBot.Enabled {
+				s.slackHub.StartBot(id, *a.SlackBot)
+			}
+		}
 		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else if errors.Is(err, agent.ErrAgentBusy) {
@@ -159,6 +203,37 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleUnarchiveAgent restores an archived agent. Re-arms cron, notify
+// poller, and (if previously enabled) the Slack bot.
+func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.agents.Unarchive(id); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			// Concurrent Archive/Unarchive/reset still in progress — caller
+			// can retry. Map both to 409 so the client knows to back off.
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do this
+	// — slackHub lives on the server, not the manager.
+	if s.slackHub != nil {
+		if a, ok := s.agents.Get(id); ok && a.SlackBot != nil && a.SlackBot.Enabled {
+			s.slackHub.StartBot(id, *a.SlackBot)
+		}
+	}
+	if a, ok := s.agents.Get(id); ok {
+		writeJSONResponse(w, http.StatusOK, a)
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
@@ -300,6 +375,8 @@ func writeTranscriptEditError(w http.ResponseWriter, err error, msgID string) {
 		writeError(w, http.StatusForbidden, "forbidden", err.Error())
 	case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
 		writeError(w, http.StatusConflict, "busy", err.Error())
+	case errors.Is(err, agent.ErrAgentArchived):
+		writeError(w, http.StatusConflict, "archived", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 	}
@@ -829,6 +906,12 @@ func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.agents.Get(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found: "+id)
+		return
+	}
+	// Archived agents must not have summaries appended to their diary —
+	// nothing should be writing into their persisted state while dormant.
+	if a.Archived {
+		writeError(w, http.StatusConflict, "conflict", "agent is archived")
 		return
 	}
 	// Run synchronously — the PreCompact hook blocks until this returns

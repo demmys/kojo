@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import { useNavigate } from "react-router";
 import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
+import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
 import { OAuthClientsSection } from "./globalsettings/OAuthClientsSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
@@ -51,6 +52,7 @@ export function GlobalSettings() {
         <ApiKeysSection gemini={gemini} embedding={embedding} />
         <OAuthClientsSection oauth={oauth} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
+        <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
 
         {error && (
           <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">

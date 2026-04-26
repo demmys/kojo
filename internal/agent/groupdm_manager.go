@@ -197,6 +197,24 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 	}
 
 	m.mu.Lock()
+	// Re-check that every member is still active. Archive.RemoveAgent and
+	// group registration are not serialized by a shared lock, so a concurrent
+	// Archive (or Delete) can land between resolveMembers and here. Without
+	// this re-check we'd publish a group containing a now-archived (and
+	// already-removed-from-other-groups) or now-deleted agent.
+	for _, mem := range members {
+		a, ok := m.agentMgr.Get(mem.AgentID)
+		if !ok {
+			m.mu.Unlock()
+			os.RemoveAll(groupDir(g.ID))
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, mem.AgentID)
+		}
+		if a.Archived {
+			m.mu.Unlock()
+			os.RemoveAll(groupDir(g.ID))
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, mem.AgentID)
+		}
+	}
 	m.groups[g.ID] = g
 	m.mu.Unlock()
 
@@ -248,6 +266,9 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 	if name == "" {
 		return nil, errors.New("name must not be empty")
 	}
+	if err := m.requireActiveCaller(callerAgentID); err != nil {
+		return nil, err
+	}
 
 	m.mu.Lock()
 	g, ok := m.groups[id]
@@ -268,6 +289,16 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 		if !isMember {
 			m.mu.Unlock()
 			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+		// Re-check archived under the lock — Archive can flip the flag in
+		// the window between requireActiveCaller (outside the lock) and
+		// here.
+		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
 		}
 	}
 
@@ -351,7 +382,7 @@ func (m *GroupDMManager) sendSystemNotification(agentID, notification, logContex
 
 	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
 	if err != nil {
-		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) {
+		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) && !errors.Is(err, ErrAgentArchived) {
 			m.logger.Warn("failed to send notification", "agent", agentID, "context", logContext, "err", err)
 		}
 		return
@@ -413,6 +444,18 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 	if !isMember {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, groupID)
+	}
+
+	// Archived/deleted members can't author messages. The agent process is
+	// dormant (or gone), so this only happens if a third party (or stale
+	// tooling) calls the API with an out-of-date agent ID — refuse rather
+	// than letting them impersonate.
+	if a, ok := m.agentMgr.Get(agentID); !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	} else if a.Archived {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 
 	// CAS check. Skipped when expectedLatestID is empty so the older
@@ -661,7 +704,11 @@ func clampDigestWindow(seconds int) int {
 // SetMemberNotifyMode updates a single member's notify mode and digest window.
 // Muting a member cancels any pending buffer / timer so queued noise does not
 // reach them after the switch.
-func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode NotifyMode, digestWindow int) (*GroupDM, error) {
+//
+// callerAgentID, when non-empty, must be a current member of the group AND
+// must be active (not archived / not deleted). Empty callerAgentID is the
+// admin/UI path and skips the check, matching the SetStyle/SetVenue convention.
+func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode NotifyMode, digestWindow int, callerAgentID string) (*GroupDM, error) {
 	if mode == "" {
 		mode = NotifyRealtime
 	}
@@ -671,11 +718,38 @@ func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode Notif
 	}
 	digestWindow = clampDigestWindow(digestWindow)
 
+	if err := m.requireActiveCaller(callerAgentID); err != nil {
+		return nil, err
+	}
+
 	m.mu.Lock()
 	g, ok := m.groups[groupID]
 	if !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrGroupNotFound, groupID)
+	}
+	// Verify caller membership inside the lock.
+	if callerAgentID != "" {
+		callerOK := false
+		for _, mem := range g.Members {
+			if mem.AgentID == callerAgentID {
+				callerOK = true
+				break
+			}
+		}
+		if !callerOK {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, groupID)
+		}
+		// Re-check archived/deleted under the lock — Archive can flip the
+		// flag in the window between requireActiveCaller and here.
+		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
+		}
 	}
 	found := false
 	for i := range g.Members {
@@ -744,6 +818,9 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 	if !ValidGroupDMStyles[style] {
 		return nil, fmt.Errorf("invalid style: %q (must be %q or %q)", style, GroupDMStyleEfficient, GroupDMStyleExpressive)
 	}
+	if err := m.requireActiveCaller(callerAgentID); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	g, ok := m.groups[id]
 	if !ok {
@@ -761,6 +838,13 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 		if !found {
 			m.mu.Unlock()
 			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
 		}
 	}
 	g.Style = style
@@ -783,6 +867,9 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 		return nil, fmt.Errorf("invalid venue: %q (must be %q or %q)",
 			venue, GroupDMVenueChatroom, GroupDMVenueColocated)
 	}
+	if err := m.requireActiveCaller(callerAgentID); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	g, ok := m.groups[id]
 	if !ok {
@@ -800,6 +887,13 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 		if !found {
 			m.mu.Unlock()
 			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+		}
+		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
 		}
 	}
 	g.Venue = venue
@@ -1299,7 +1393,13 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 			})
 		}
 		m.notifyMu.Unlock()
-		m.logger.Warn("failed to notify agent", "agent", agentID, "group", groupID, "err", err)
+		// Archived is an expected terminal state, not an error worth warning
+		// about — the agent is intentionally dormant.
+		if errors.Is(err, ErrAgentArchived) {
+			m.logger.Debug("skipping group notification for archived agent", "agent", agentID, "group", groupID)
+		} else {
+			m.logger.Warn("failed to notify agent", "agent", agentID, "group", groupID, "err", err)
+		}
 		return
 	}
 
@@ -1314,6 +1414,24 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	// Drain events.
 	for range events {
 	}
+}
+
+// requireActiveCaller refuses callers who are archived or deleted. Empty
+// callerAgentID (admin/UI path) is allowed. Used by mutation endpoints that
+// take a caller-agent argument so a third party can't drive group state
+// changes using a dormant or stale agent's ID.
+func (m *GroupDMManager) requireActiveCaller(callerAgentID string) error {
+	if callerAgentID == "" {
+		return nil
+	}
+	a, ok := m.agentMgr.Get(callerAgentID)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+	}
+	if a.Archived {
+		return fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
+	}
+	return nil
 }
 
 // resolveMembers validates member IDs and resolves their names.
@@ -1334,6 +1452,12 @@ func (m *GroupDMManager) resolveMembers(ids []string) ([]GroupMember, error) {
 		a, ok := m.agentMgr.Get(id)
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+		}
+		// Refuse adding archived agents to a NEW membership: existing
+		// memberships are preserved across archive/unarchive, but adding a
+		// dormant agent to a fresh group is meaningless — they can't reply.
+		if a.Archived {
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, id)
 		}
 		members = append(members, GroupMember{AgentID: a.ID, AgentName: a.Name})
 	}
@@ -1367,10 +1491,16 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	if newAgentID == UserSenderID {
 		return nil, fmt.Errorf("agent id %q is reserved for the human user", newAgentID)
 	}
+	if err := m.requireActiveCaller(callerAgentID); err != nil {
+		return nil, err
+	}
 	// Resolve the new member first (outside lock)
 	a, ok := m.agentMgr.Get(newAgentID)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
+	}
+	if a.Archived {
+		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, newAgentID)
 	}
 	newMember := GroupMember{AgentID: a.ID, AgentName: a.Name}
 
@@ -1397,6 +1527,31 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	if callerAgentID == "" || !callerOK {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
+	}
+
+	// Re-check that the new member is still active right before append: a
+	// concurrent Archive (or Delete) can flip the flag / remove the agent
+	// between the outer check and this lock acquisition. Without this we'd
+	// append an agent right after Archive's RemoveAgent removed it from
+	// everywhere else, or append a deleted agent that will never receive
+	// notifications.
+	if a2, ok := m.agentMgr.Get(newAgentID); !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
+	} else if a2.Archived {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, newAgentID)
+	}
+	// Re-check the caller too — Archive on the caller in the same window
+	// would otherwise let an archived caller drive a mutation through.
+	if callerAgentID != "" {
+		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
+		} else if c.Archived {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
+		}
 	}
 
 	g.Members = append(g.Members, newMember)

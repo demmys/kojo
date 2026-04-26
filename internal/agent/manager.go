@@ -132,9 +132,13 @@ func NewManager(logger *slog.Logger) *Manager {
 		m.agents[a.ID] = a
 	}
 
-	// Start cron schedules
+	// Start cron schedules. Skip archived agents — their cron stays detached
+	// until Unarchive re-schedules.
 	m.cron.Start()
 	for _, a := range m.agents {
+		if a.Archived {
+			continue
+		}
 		if expr := intervalToCron(a.IntervalMinutes, a.ID); expr != "" {
 			if err := m.cron.Schedule(a.ID, expr); err != nil {
 				logger.Warn("failed to schedule cron", "agent", a.ID, "err", err)
@@ -142,9 +146,12 @@ func NewManager(logger *slog.Logger) *Manager {
 		}
 	}
 
-	// Start notify poller and rebuild sources for all agents
+	// Start notify poller and rebuild sources for all agents (skip archived).
 	m.notifyPoller.Start()
 	for _, a := range m.agents {
+		if a.Archived {
+			continue
+		}
 		if len(a.NotifySources) > 0 {
 			m.notifyPoller.RebuildSources(a.ID, a.NotifySources)
 		}
@@ -264,11 +271,20 @@ func (m *Manager) syncPersona(agentID string) {
 
 // Get returns a deep copy of an agent by ID.
 func (m *Manager) Get(id string) (*Agent, bool) {
-	m.syncPersona(id)
+	// Skip persona disk-sync (and the publicProfile regen it can spawn) for
+	// archived agents — they are dormant and we mustn't trigger LLM calls or
+	// state writes just because someone called Get to inspect an archived agent.
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	archived := ok && a.Archived
+	m.mu.Unlock()
+	if !archived {
+		m.syncPersona(id)
+	}
 	has, hash := avatarMeta(id)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	a, ok := m.agents[id]
+	a, ok = m.agents[id]
 	if !ok {
 		return nil, false
 	}
@@ -278,15 +294,19 @@ func (m *Manager) Get(id string) (*Agent, bool) {
 
 // List returns deep copies of all agents.
 func (m *Manager) List() []*Agent {
-	// Collect IDs first, then sync persona outside the main lock
+	// Collect IDs (skipping archived for syncPersona) outside the main lock
 	m.mu.Lock()
 	ids := make([]string, 0, len(m.agents))
-	for id := range m.agents {
+	syncIDs := make([]string, 0, len(m.agents))
+	for id, a := range m.agents {
 		ids = append(ids, id)
+		if !a.Archived {
+			syncIDs = append(syncIDs, id)
+		}
 	}
 	m.mu.Unlock()
 
-	for _, id := range ids {
+	for _, id := range syncIDs {
 		m.syncPersona(id)
 	}
 
@@ -315,10 +335,15 @@ func (m *Manager) List() []*Agent {
 
 // Directory returns minimal public info for all agents (for agent-to-agent discovery).
 func (m *Manager) Directory() []DirectoryEntry {
-	// Sync persona first (may trigger publicProfile regeneration)
+	// Sync persona first (may trigger publicProfile regeneration). Skip
+	// archived agents — they're hidden from the directory anyway and we
+	// mustn't trigger LLM calls / file writes on dormant agents.
 	m.mu.Lock()
 	ids := make([]string, 0, len(m.agents))
-	for id := range m.agents {
+	for id, a := range m.agents {
+		if a.Archived {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	m.mu.Unlock()
@@ -331,6 +356,11 @@ func (m *Manager) Directory() []DirectoryEntry {
 	defer m.mu.Unlock()
 	entries := make([]DirectoryEntry, 0, len(m.agents))
 	for _, a := range m.agents {
+		// Hide archived agents from agent-to-agent discovery so other
+		// agents don't try to DM or invite them to group chats.
+		if a.Archived {
+			continue
+		}
 		entries = append(entries, DirectoryEntry{
 			ID:            a.ID,
 			Name:          a.Name,
@@ -549,13 +579,40 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	m.mu.Unlock()
 
 	if oldInterval != newInterval {
-		expr := intervalToCron(newInterval, id)
-		if err := m.cron.Schedule(id, expr); err != nil {
-			m.logger.Warn("failed to update cron", "agent", id, "err", err)
+		// Pre-check + post-check pattern (mirrors UpdateNotifySources).
+		// We must NOT hold m.mu across cron.Schedule because cron callbacks
+		// reach back into the manager (runCronJob → Manager.Get) and would
+		// deadlock if Schedule's internal cs.mu happened to hold across a
+		// callback invocation. Cheap to re-verify after.
+		m.mu.Lock()
+		archived := false
+		if a, ok := m.agents[id]; ok {
+			archived = a.Archived
+		}
+		m.mu.Unlock()
+
+		if !archived {
+			expr := intervalToCron(newInterval, id)
+			if err := m.cron.Schedule(id, expr); err != nil {
+				m.logger.Warn("failed to update cron", "agent", id, "err", err)
+			}
+			// Undo if Archive raced in between.
+			m.mu.Lock()
+			racedArchive := false
+			if a, ok := m.agents[id]; ok && a.Archived {
+				racedArchive = true
+			}
+			m.mu.Unlock()
+			if racedArchive {
+				m.cron.Remove(id)
+			}
 		}
 	}
 
-	if needsRegen {
+	// Skip publicProfile regen for archived agents — generation calls the LLM
+	// (real cost) and writes back into agent state on a dormant agent.
+	// Unarchive can request regeneration explicitly if persona was edited.
+	if needsRegen && !cp.Archived {
 		go m.regeneratePublicProfile(id, currentPersona)
 	}
 
@@ -574,10 +631,32 @@ func (m *Manager) UpdateNotifySources(id string, sources []notifysource.Config) 
 	}
 	a.NotifySources = sources
 	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	archived := a.Archived
 	m.mu.Unlock()
 
 	m.save()
+
+	// Pre-check + post-check pattern. RebuildSources MUST NOT be called under
+	// m.mu — the poller's tick goroutine takes p.mu first and then calls
+	// Manager.Get (acquiring m.mu), so holding m.mu while taking p.mu would
+	// deadlock against an in-flight tick.
+	if archived {
+		return nil
+	}
 	m.notifyPoller.RebuildSources(id, sources)
+
+	// Defensive re-check: a concurrent Archive may have run between the
+	// snapshot above and the RebuildSources call. If so, undo the rebuild —
+	// DetachAgent and RebuildSources are both safe to call repeatedly.
+	m.mu.Lock()
+	racedArchive := false
+	if a, ok := m.agents[id]; ok && a.Archived {
+		racedArchive = true
+	}
+	m.mu.Unlock()
+	if racedArchive {
+		m.notifyPoller.DetachAgent(id)
+	}
 	return nil
 }
 
@@ -638,6 +717,21 @@ type chatPrep struct {
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
 func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skipMemoryContext bool) (*chatPrep, error) {
+	// Cheap pre-check: refuse archived agents (and unknown ones) before any
+	// disk I/O like syncPersona, so dormant agents don't leak side effects
+	// into persona files / publicProfile regeneration.
+	m.mu.Lock()
+	preA, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	}
+	if preA.Archived {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
+	}
+	m.mu.Unlock()
+
 	m.syncPersona(agentID)
 
 	m.mu.Lock()
@@ -645,6 +739,10 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 	if !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+	}
+	if a.Archived {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	agentCopy := *a
 	m.mu.Unlock()

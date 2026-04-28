@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
+import { bootstrapTokenFromURL } from "./lib/auth";
 import { Dashboard } from "./components/Dashboard";
 import { SessionPage } from "./components/SessionPage";
 import { NewSession } from "./components/NewSession";
@@ -13,6 +14,10 @@ import { AgentDataBrowser } from "./components/agent/AgentDataBrowser";
 import { GroupDMChat } from "./components/groupdm/GroupDMChat";
 import { GlobalSettings } from "./components/GlobalSettings";
 import "./index.css";
+
+// Pull the Owner token out of `?token=…` and stash it before any
+// component mounts and starts hitting /api/v1/*.
+bootstrapTokenFromURL();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

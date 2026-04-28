@@ -598,7 +598,7 @@ export function AgentChat() {
               >
                 {file.mime.startsWith("image/") ? (
                   <img
-                    src={`/api/v1/files/raw?path=${encodeURIComponent(file.path)}`}
+                    src={api.files.rawUrl(file.path)}
                     alt={file.name}
                     className="w-6 h-6 rounded object-cover"
                   />

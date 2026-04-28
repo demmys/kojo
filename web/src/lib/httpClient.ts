@@ -1,7 +1,23 @@
+import { getOwnerToken } from "./auth";
+
 const BASE = "";
 
+/**
+ * Merge the stashed Owner Bearer token into the request headers when
+ * one is available. The Tailscale listener is Owner-trusted by
+ * middleware so a missing token is fine; the auth-required (--local)
+ * listener requires it on every /api/v1/* call.
+ */
+function withAuth(init?: RequestInit): RequestInit | undefined {
+  const tok = getOwnerToken();
+  if (!tok) return init;
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${tok}`);
+  return { ...init, headers };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, init);
+  const res = await fetch(BASE + path, withAuth(init));
   if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
   if (res.status === 204 || res.headers.get("content-length") === "0") {
     return undefined as T;

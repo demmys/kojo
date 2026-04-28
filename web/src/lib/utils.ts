@@ -1,4 +1,5 @@
 import type { Terminal } from "@xterm/xterm";
+import { appendTokenQuery } from "./auth";
 
 /**
  * Restore scrollback into a terminal: hide → reset → write → restore visibility.
@@ -45,10 +46,23 @@ export function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Build a WebSocket URL from an API path (e.g. "/api/v1/ws?session=abc"). */
+/**
+ * Build a WebSocket URL from an API path (e.g. "/api/v1/ws?session=abc").
+ *
+ * Browsers cannot set custom headers on WebSocket handshakes, so the
+ * Owner token (when present) is appended as a `?token=…` query
+ * parameter. The kojo auth middleware accepts the same value via
+ * Authorization, X-Kojo-Token, or this query fallback. The token is
+ * read through the auth module's helper so an in-memory fallback
+ * (when localStorage is unavailable) still gets consulted.
+ */
 export function wsUrl(path: string): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}${path}`;
+  // Imported eagerly here — the auth module is tiny and pulling it
+  // through a dynamic import would force every WS-using component to
+  // be async-aware. The lazy `require` shim risks ESM/CJS divergence.
+  const p = appendTokenQuery(path);
+  return `${proto}//${location.host}${p}`;
 }
 
 /** Format a Date as RFC3339 with local timezone offset (e.g. +09:00). */

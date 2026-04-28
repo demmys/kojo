@@ -1,4 +1,5 @@
 import { get, post, del, patch, upload } from "./httpClient";
+import { appendTokenQuery } from "./auth";
 
 export interface SessionInfo {
   id: string;
@@ -100,6 +101,14 @@ export const api = {
       return get<{ path: string; entries: DirEntry[] }>(`/api/v1/files?${params}`);
     },
     view: (path: string) => get<FileView>(`/api/v1/files/view?path=${encodeURIComponent(path)}`),
+    // rawUrl returns the URL of the raw file with the Owner token
+    // appended when one is stored. Use this for `<img src>` /
+    // anchor-driven downloads. Fetch-driven callers should prefer
+    // rawPath + authHeaders() to keep the token out of URLs / logs.
+    rawUrl: (path: string) =>
+      appendTokenQuery(`/api/v1/files/raw?path=${encodeURIComponent(path)}`),
+    rawPath: (path: string) =>
+      `/api/v1/files/raw?path=${encodeURIComponent(path)}`,
   },
 
   git: {

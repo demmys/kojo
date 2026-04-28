@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -159,57 +160,50 @@ func main() {
 	defer stop()
 
 	if *local || *dev {
-		// local mode: a single localhost listener serves both the UI
-		// (Owner via OwnerOnlyMiddleware) and any agent that can reach
-		// loopback. When --no-auth is set we keep the public-trusted
-		// behavior and skip the auth listener entirely; otherwise we
-		// add a second loopback port that gates non-Owner principals.
 		ln, err := listenWithFallback("127.0.0.1", *port, 10, logger)
 		if err != nil {
 			logger.Error("failed to listen", "err", err)
 			os.Exit(1)
 		}
 		actualAddr := ln.Addr().String()
-		// Public-listener URL is the user-facing one only. The agent-facing
-		// API base (used by system prompts, PreCompact hooks, group DM notify
-		// curl examples) is set further below to the auth listener so agents
-		// never reach the Owner-trusted listener with their own credentials.
-		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n    http://%s\n", version, actualAddr)
-		go func() {
-			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-				logger.Error("server error", "err", err)
-				stop()
-			}
-		}()
-		if !*noAuth {
-			authLn, err := listenWithFallback("127.0.0.1", *port+1, 10, logger)
-			if err != nil {
-				logger.Error("failed to listen on auth port", "err", err)
-				os.Exit(1)
-			}
-			authAddr := authLn.Addr().String()
-			agentAPIBase := "http://" + authAddr
-			agent.SetKojoAPIBase(agentAPIBase)
-			groupDMMgr.SetAPIBase(agentAPIBase)
-			fmt.Fprintf(os.Stderr, "    agent API: %s  (Bearer required)\n", agentAPIBase)
+
+		if *noAuth {
+			// --no-auth (--local/--dev only): the loopback listener is
+			// Owner-trusted. Suitable for hacking on the UI itself; not
+			// suitable for running real agents because they can read
+			// the full API as Owner. Group DM curl examples stay
+			// pointed at this listener.
+			fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n    http://%s\n\n", version, actualAddr)
+			groupDMMgr.SetAPIBase("http://" + actualAddr)
+			logger.Warn("agent auth listener disabled via --no-auth — agents can read full API as Owner")
 			go func() {
-				if err := srv.ServeAuth(authLn, resolver); err != nil && err != http.ErrServerClosed {
-					logger.Error("auth listener error", "err", err)
-					// Crash hard so agents do not keep targeting a dead
-					// $KOJO_API_BASE: the supervisor restarts kojo and the
-					// agents' next chat picks up the fresh URL.
+				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					logger.Error("server error", "err", err)
 					stop()
 				}
 			}()
 		} else {
-			// --no-auth (--local/--dev only): agents talk to the public
-			// listener which is permanently Owner-trusted. Mirror that on
-			// the group DM curl examples so the docs do not point to a
-			// non-existent auth port.
-			groupDMMgr.SetAPIBase("http://" + actualAddr)
-			logger.Warn("agent auth listener disabled via --no-auth — agents can read full API as Owner")
+			// Single auth-required listener. The UI and agents share
+			// the same port; the difference is the Bearer token they
+			// present (Owner vs per-agent). On first visit the UI
+			// follows the printed URL whose ?token= query param
+			// bootstraps the Owner token into localStorage.
+			agentAPIBase := "http://" + actualAddr
+			agent.SetKojoAPIBase(agentAPIBase)
+			groupDMMgr.SetAPIBase(agentAPIBase)
+			// KOJO_OWNER_TOKEN may be a custom string; URL-escape so
+			// special chars (& # %) don't break the link.
+			ownerTok := url.QueryEscape(tokens.OwnerToken())
+			fmt.Fprintf(os.Stderr,
+				"\n  kojo v%s running at:\n\n    http://%s\n\n  open this URL once to authorize the UI:\n    http://%s/?token=%s\n\n",
+				version, actualAddr, actualAddr, ownerTok)
+			go func() {
+				if err := srv.ServeAuth(ln, resolver); err != nil && err != http.ErrServerClosed {
+					logger.Error("server error", "err", err)
+					stop()
+				}
+			}()
 		}
-		fmt.Fprintln(os.Stderr)
 	} else {
 		// tailscale mode: listen via tsnet with HTTPS
 		tsServer := &tsnet.Server{

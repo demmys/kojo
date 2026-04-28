@@ -167,10 +167,17 @@ func AuthMiddleware(resolver *Resolver) func(http.Handler) http.Handler {
 	}
 }
 
-// extractBearer reads the bearer token from `Authorization: Bearer X`
-// or, as a fallback, from the `X-Kojo-Token` header. The fallback
-// makes it easier for shells/curl invocations inside an agent to send
-// the token via a single header without quoting "Bearer ".
+// extractBearer reads the bearer token from `Authorization: Bearer X`,
+// the `X-Kojo-Token` header, or — only for GET / HEAD requests — the
+// `?token=` query parameter. The query-param fallback exists because
+// the browser WebSocket API cannot set custom headers and `<img>` /
+// `<a>` elements similarly drive their own GET requests; restricting
+// it to safe verbs keeps a leaked URL from being replayed against
+// state-changing endpoints (POST/PATCH/DELETE).
+//
+// Query-param tokens land in HTTP access logs. That is acceptable for
+// the spoiler-prevention threat model, and the UI strips the param
+// from window.location after consuming it on first load.
 func extractBearer(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); h != "" {
 		const prefix = "Bearer "
@@ -180,6 +187,12 @@ func extractBearer(r *http.Request) string {
 	}
 	if h := r.Header.Get("X-Kojo-Token"); h != "" {
 		return strings.TrimSpace(h)
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, "":
+		if t := r.URL.Query().Get("token"); t != "" {
+			return strings.TrimSpace(t)
+		}
 	}
 	return ""
 }

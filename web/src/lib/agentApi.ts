@@ -1,4 +1,5 @@
 import { get, post, del, patch, put, upload } from "./httpClient";
+import { appendTokenQuery } from "./auth";
 import type { DirEntry, FileView } from "./api";
 
 export const INTERVAL_PRESETS = [
@@ -252,7 +253,7 @@ export const agentApi = {
       ),
     rawUrl: (agentId: string, relPath: string, download = false) => {
       const base = `/api/v1/agents/${agentId}/files/raw?path=${encodeURIComponent(relPath)}`;
-      return download ? `${base}&download=1` : base;
+      return appendTokenQuery(download ? `${base}&download=1` : base);
     },
   },
 
@@ -293,7 +294,10 @@ export const agentApi = {
       del<{ ok: boolean }>(`/api/v1/agents/${agentId}/tasks/${taskId}`),
   },
 
-  avatarUrl: (id: string) => `/api/v1/agents/${id}/avatar`,
+  // Avatar / preview / files URLs go straight into <img src> so the
+  // token must travel as a query param — Authorization headers can't
+  // be set on element-driven fetches.
+  avatarUrl: (id: string) => appendTokenQuery(`/api/v1/agents/${id}/avatar`),
 
   uploadAvatar: (id: string, file: File) => {
     const form = new FormData();
@@ -336,7 +340,7 @@ export const agentApi = {
     }),
 
   previewAvatarUrl: (path: string) =>
-    `/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`,
+    appendTokenQuery(`/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`),
 
   credentials: {
     list: (agentId: string) =>

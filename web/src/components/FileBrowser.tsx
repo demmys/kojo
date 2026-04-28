@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type DirEntry, type FileView } from "../lib/api";
+import { appendTokenQuery } from "../lib/auth";
 import { formatSize } from "../lib/utils";
 
 interface FileBrowserProps {
@@ -79,7 +80,7 @@ export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
           )}
           {fileView.type === "image" && fileView.url && (
             <div className="flex flex-col items-center gap-4">
-              <img src={fileView.url} alt="" className="max-w-full rounded" />
+              <img src={appendTokenQuery(fileView.url)} alt="" className="max-w-full rounded" />
               <div className="text-xs text-neutral-500">
                 {formatSize(fileView.size)} &middot; {fileView.mime}
               </div>

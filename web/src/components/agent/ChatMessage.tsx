@@ -3,6 +3,8 @@ import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { api } from "../../lib/api";
+import { authHeaders } from "../../lib/auth";
 import { formatSize } from "../../lib/utils";
 
 // File extension categories
@@ -117,7 +119,7 @@ function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAtta
                 className="block rounded-lg overflow-hidden hover:opacity-80 transition-opacity"
               >
                 <img
-                  src={`/api/v1/files/raw?path=${encodeURIComponent(att.path)}`}
+                  src={api.files.rawUrl(att.path)}
                   alt={att.name}
                   className="max-w-[200px] max-h-[150px] object-cover rounded-lg"
                 />
@@ -177,7 +179,7 @@ function FilePathChip({
   const [hover, setHover] = useState(false);
   const [fileSize, setFileSize] = useState<string | null>(null);
   const fetchedRef = useRef(false);
-  const rawUrl = `/api/v1/files/raw?path=${encodeURIComponent(path)}`;
+  const rawUrl = api.files.rawUrl(path);
   const fileName = path.split(/[/\\]/).pop() || path;
 
   // Reset fetch state when path changes (e.g. streaming token extends path)
@@ -190,7 +192,8 @@ function FilePathChip({
   useEffect(() => {
     if (!hover || fileType === "image" || fetchedRef.current) return;
     fetchedRef.current = true;
-    fetch(rawUrl, { method: "HEAD" })
+    // HEAD via header auth — keeps the token out of the URL.
+    fetch(api.files.rawPath(path), { method: "HEAD", headers: authHeaders() })
       .then((res) => {
         const len = res.headers.get("content-length");
         setFileSize(len ? formatSize(Number(len)) : "—");
@@ -712,7 +715,7 @@ export function MediaOverlay({
   type: "image" | "video";
   onClose: () => void;
 }) {
-  const rawUrl = `/api/v1/files/raw?path=${encodeURIComponent(path)}`;
+  const rawUrl = api.files.rawUrl(path);
   const [videoError, setVideoError] = useState(false);
   const fileName = path.split(/[/\\]/).pop() || path;
 

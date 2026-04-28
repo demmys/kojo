@@ -7,7 +7,56 @@ import (
 	"strconv"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 )
+
+// bindAgentIdentity reconciles body-supplied agentId-style fields with
+// the request Principal:
+//
+//   - Owner: passes through whatever the body says (admin-style call).
+//   - Agent / PrivAgent: the value must be empty or match the
+//     Principal's AgentID. Mismatched / impersonating bodies get a
+//     hard 403 instead of silently being rewritten — silent rewrite
+//     would mask client bugs that try to post-as-someone-else.
+//   - Guest / unknown: 403.
+//
+// On success, returns the canonical agent ID to use (empty string when
+// the caller is Owner and supplied none).
+func (s *Server) bindAgentIdentity(w http.ResponseWriter, r *http.Request, supplied string) (string, bool) {
+	p := auth.FromContext(r.Context())
+	if p.IsOwner() {
+		return supplied, true
+	}
+	if !p.IsAgent() {
+		writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
+		return "", false
+	}
+	if supplied != "" && supplied != p.AgentID {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"agent id in body does not match authenticated principal")
+		return "", false
+	}
+	return p.AgentID, true
+}
+
+// requireMemberOrOwner blocks reads/writes on a group when the caller
+// is neither the Owner nor a current member of the group. Returns
+// false after writing the error response — caller should return.
+func (s *Server) requireMemberOrOwner(w http.ResponseWriter, r *http.Request, groupID string) bool {
+	p := auth.FromContext(r.Context())
+	if p.IsOwner() {
+		return true
+	}
+	if !p.IsAgent() {
+		writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
+		return false
+	}
+	if err := s.groupdms.CheckMembership(groupID, p.AgentID); err != nil {
+		writeError(w, http.StatusForbidden, "forbidden", "not a member of this group")
+		return false
+	}
+	return true
+}
 
 // --- Group DM Handlers ---
 
@@ -46,6 +95,9 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
 	g, ok := s.groupdms.Get(id)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "group not found: "+id)
@@ -67,6 +119,13 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// Pin the caller identity to the authenticated Principal — agents
+	// must not be able to PATCH a group "as" another member.
+	bound, ok := s.bindAgentIdentity(w, r, req.AgentID)
+	if !ok {
+		return
+	}
+	req.AgentID = bound
 
 	// Validate all fields before applying any changes to avoid partial writes.
 	if req.Name == "" && req.Cooldown == nil && req.Style == "" && req.Venue == "" {
@@ -153,6 +212,9 @@ func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetGroupMessages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
@@ -191,6 +253,15 @@ func (s *Server) handlePostGroupMessage(w http.ResponseWriter, r *http.Request) 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
+	}
+	// Bind the sender to the authenticated Principal — non-Owner
+	// callers cannot post as someone else, period.
+	bound, ok := s.bindAgentIdentity(w, r, req.AgentID)
+	if !ok {
+		return
+	}
+	if bound != "" {
+		req.AgentID = bound
 	}
 	if req.AgentID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
@@ -270,6 +341,17 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// Pin the caller to the authenticated Principal so agents cannot
+	// invite into a group on someone else's behalf. AgentID (the
+	// invitee) is left up to the body — Owner can invite anyone, an
+	// Agent caller can invite anyone but is recorded as the inviter.
+	bound, ok := s.bindAgentIdentity(w, r, req.CallerAgentID)
+	if !ok {
+		return
+	}
+	if bound != "" {
+		req.CallerAgentID = bound
+	}
 	if req.AgentID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
 		return
@@ -313,6 +395,17 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// Pin the caller to the authenticated Principal — agents may
+	// negotiate notify settings for any member of a group they belong
+	// to, but the request must be signed by their own identity, not
+	// claimed via callerAgentId in the body.
+	bound, ok := s.bindAgentIdentity(w, r, req.CallerAgentID)
+	if !ok {
+		return
+	}
+	if bound != "" {
+		req.CallerAgentID = bound
+	}
 	if req.NotifyMode == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "notifyMode is required")
 		return
@@ -331,6 +424,15 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	agentID := r.PathValue("agentId")
+	// Path agentId must match the calling Principal for non-Owner —
+	// nobody but the Owner gets to evict another member.
+	p := auth.FromContext(r.Context())
+	if !p.IsOwner() {
+		if !p.IsAgent() || p.AgentID != agentID {
+			writeError(w, http.StatusForbidden, "forbidden", "agents may only leave on behalf of themselves")
+			return
+		}
+	}
 	if err := s.groupdms.LeaveGroup(id, agentID); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

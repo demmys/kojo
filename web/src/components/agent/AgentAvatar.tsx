@@ -32,8 +32,13 @@ export function AgentAvatar({
   const ref = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
+  // avatarUrl already carries the ?token=… query when an Owner token
+  // is stored, so the cache-bust separator must be `&`, not `?`.
   const base = agentApi.avatarUrl(agentId);
-  const src = cacheBust != null ? `${base}?t=${cacheBust}` : base;
+  const src =
+    cacheBust != null
+      ? `${base}${base.includes("?") ? "&" : "?"}t=${cacheBust}`
+      : base;
 
   // Preload natural size once
   useEffect(() => {

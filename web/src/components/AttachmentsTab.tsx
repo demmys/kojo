@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type Attachment } from "../lib/api";
+import { authHeaders } from "../lib/auth";
 import { formatSize } from "../lib/utils";
 
 type SortField = "modTime" | "createdAt" | "name" | "size";
@@ -67,7 +68,11 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
   const handleCopyImage = async (att: Attachment) => {
     let objectUrl: string | undefined;
     try {
-      const res = await fetch(`/api/v1/files/raw?path=${encodeURIComponent(att.path)}`);
+      // Header-based auth keeps the Owner token out of the request
+      // URL / access logs for fetch-driven calls.
+      const res = await fetch(api.files.rawPath(att.path), {
+        headers: authHeaders(),
+      });
       if (!res.ok) {
         showFeedback(att.path, "Failed");
         return;
@@ -214,7 +219,7 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
                   className="w-full aspect-square bg-neutral-900 relative block"
                 >
                   <img
-                    src={`/api/v1/files/raw?path=${encodeURIComponent(att.path)}`}
+                    src={api.files.rawUrl(att.path)}
                     alt={att.name}
                     className="w-full h-full object-cover"
                     loading="lazy"
@@ -327,14 +332,14 @@ export function AttachmentsTab({ sessionId, attachments, onDelete }: Props) {
           <div className="max-w-full max-h-full p-4" onClick={(e) => e.stopPropagation()}>
             {isImage(previewAttachment.mime) && (
               <img
-                src={`/api/v1/files/raw?path=${encodeURIComponent(previewPath)}`}
+                src={api.files.rawUrl(previewPath)}
                 alt={previewAttachment.name}
                 className="max-w-full max-h-[85vh] object-contain"
               />
             )}
             {isVideo(previewAttachment.mime) && (
               <video
-                src={`/api/v1/files/raw?path=${encodeURIComponent(previewPath)}`}
+                src={api.files.rawUrl(previewPath)}
                 controls
                 className="max-w-full max-h-[85vh]"
               />

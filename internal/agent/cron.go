@@ -301,7 +301,7 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin, cronMessage), "system", nil)
+	events, err := cs.mgr.Chat(ctx, agentID, cronPrompt(nextRun, effectiveTimeoutMin, cronMessage), "system", nil, BusySourceCron)
 	if err != nil {
 		cs.logger.Warn("cron chat failed", "agent", agentID, "err", err)
 		return

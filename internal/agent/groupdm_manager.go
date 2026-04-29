@@ -380,7 +380,7 @@ func (m *GroupDMManager) sendSystemNotification(agentID, notification, logContex
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
-	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil, BusySourceNotification)
 	if err != nil {
 		if !errors.Is(err, ErrAgentBusy) && !errors.Is(err, ErrAgentResetting) && !errors.Is(err, ErrAgentArchived) {
 			m.logger.Warn("failed to send notification", "agent", agentID, "context", logContext, "err", err)
@@ -1379,7 +1379,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
 	defer cancel()
 
-	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil)
+	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil, BusySourceNotification)
 
 	m.notifyMu.Lock()
 	ns := m.notify[key]

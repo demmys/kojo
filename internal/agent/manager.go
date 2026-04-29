@@ -15,10 +15,24 @@ import (
 	"github.com/loppo-llc/kojo/internal/notifysource/gmail"
 )
 
+// BusySource identifies what triggered a busy state.
+type BusySource int
+
+const (
+	// BusySourceUser is an interactive chat initiated by the user.
+	BusySourceUser BusySource = iota
+	// BusySourceCron is a scheduled cron check-in.
+	BusySourceCron
+	// BusySourceNotification is an automated notification (group DM, etc.)
+	// that should not surface as "busy" in member status displays.
+	BusySourceNotification
+)
+
 type busyEntry struct {
 	cancel      context.CancelFunc
 	startedAt   time.Time
 	broadcaster *chatBroadcaster // fan-out for reconnecting clients
+	source      BusySource
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -895,7 +909,9 @@ func (m *Manager) prepareChat(agentID, query string, indexNewMessages bool, skip
 // Chat sends a message to an agent and returns a channel of streaming events.
 // The role parameter controls how the input message is stored in the transcript
 // ("user" for interactive chat, "system" for cron-triggered messages).
-func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment) (<-chan ChatEvent, error) {
+// An optional BusySource may be passed to tag the busy entry; defaults to
+// BusySourceUser when omitted.
+func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment, source ...BusySource) (<-chan ChatEvent, error) {
 	prep, err := m.prepareChat(agentID, userMessage, true, false)
 	if err != nil {
 		return nil, err
@@ -921,7 +937,11 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// WebSocket from falling back to polling during setup.
 	outCh := make(chan ChatEvent, 64)
 	bc := newChatBroadcaster(outCh)
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc}
+	src := BusySourceUser
+	if len(source) > 0 {
+		src = source[0]
+	}
+	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src}
 	m.busyMu.Unlock()
 
 	// Notify any WebSocket clients watching this agent.
@@ -1301,7 +1321,7 @@ func (m *Manager) Checkin(agentID string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
 	prompt := checkinPrompt(time.Now(), effectiveTimeoutMin, cronMessage)
-	events, err := m.Chat(ctx, agentID, prompt, "system", nil)
+	events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceCron)
 	if err != nil {
 		cancel()
 		return err

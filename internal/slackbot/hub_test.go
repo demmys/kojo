@@ -29,7 +29,7 @@ func (m *mockTokens) DeleteTokensBySource(_, _, _ string) error        { return 
 
 type mockMgr struct{}
 
-func (m *mockMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment) (<-chan agent.ChatEvent, error) {
+func (m *mockMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
 	ch := make(chan agent.ChatEvent, 1)
 	ch <- agent.ChatEvent{Type: "done"}
 	close(ch)

@@ -19,7 +19,7 @@ import (
 // ChatManager is the interface the bot uses to interact with agents.
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
-	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment) (<-chan agent.ChatEvent, error)
+	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string) (<-chan agent.ChatEvent, error)
 }
 

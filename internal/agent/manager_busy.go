@@ -5,12 +5,26 @@ import (
 	"time"
 )
 
-// IsBusy returns true if the agent has an active chat.
+// IsBusy returns true if the agent has an active chat (any source).
 func (m *Manager) IsBusy(agentID string) bool {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	_, ok := m.busy[agentID]
 	return ok
+}
+
+// IsBusyForStatus returns true only when the agent is busy with a user
+// chat or cron job — automated notifications (group DM replies etc.) are
+// excluded so that members don't all appear "busy" when responding to a
+// broadcast notification.
+func (m *Manager) IsBusyForStatus(agentID string) bool {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	entry, ok := m.busy[agentID]
+	if !ok {
+		return false
+	}
+	return entry.source == BusySourceUser || entry.source == BusySourceCron
 }
 
 // BusySince returns the time when the agent started its current chat.

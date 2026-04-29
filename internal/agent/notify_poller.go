@@ -414,7 +414,7 @@ func (p *notifyPoller) sendSystemMessage(agentID, sourceID, message string, retr
 	ctx, cancel := context.WithTimeout(p.stopCtx, notifyTimeout)
 	defer cancel()
 
-	events, err := p.mgr.Chat(ctx, agentID, message, "system", nil)
+	events, err := p.mgr.Chat(ctx, agentID, message, "system", nil, BusySourceNotification)
 	if err != nil {
 		// Archived is a terminal state: re-queueing would just spin on
 		// retries until the cap. Drop without warn — DetachAgent already

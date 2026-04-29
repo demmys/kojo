@@ -152,7 +152,7 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 			status = "unknown"
 		} else if avail, found := s.agents.IsAgentDMAvailable(m.AgentID); !found {
 			status = "unknown"
-		} else if avail && s.agents.IsBusy(m.AgentID) {
+		} else if avail && s.agents.IsBusyForStatus(m.AgentID) {
 			status = "busy"
 		} else if avail {
 			status = "online"

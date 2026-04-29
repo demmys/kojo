@@ -78,6 +78,10 @@ export interface AgentInfo {
   // the main list, but all data retained on disk for restore.
   archived?: boolean;
   archivedAt?: string;
+  // Privileged grants the agent the ability to delete/reset other
+  // agents (NOT to fork or read their full record). Owner-only mutation
+  // via POST /api/v1/agents/{id}/privilege.
+  privileged?: boolean;
 }
 
 export interface AgentConfig {
@@ -280,6 +284,12 @@ export const agentApi = {
 
   fork: (id: string, params: { name: string; includeTranscript: boolean }) =>
     post<AgentInfo>(`/api/v1/agents/${id}/fork`, params),
+
+  setPrivileged: (id: string, privileged: boolean) =>
+    post<{ id: string; privileged: boolean }>(
+      `/api/v1/agents/${id}/privilege`,
+      { privileged },
+    ),
 
   tasks: {
     list: (agentId: string) =>

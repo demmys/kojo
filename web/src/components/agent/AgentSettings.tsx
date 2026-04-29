@@ -47,6 +47,8 @@ export function AgentSettings() {
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
   const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
+  const [privileged, setPrivileged] = useState(false);
+  const [privilegeSaving, setPrivilegeSaving] = useState(false);
   const [showForkDialog, setShowForkDialog] = useState(false);
   const [forkName, setForkName] = useState("");
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
@@ -76,6 +78,7 @@ export function AgentSettings() {
       setCronMessage(a.cronMessage ?? "");
       setAllowedTools(a.allowedTools ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
+      setPrivileged(a.privileged ?? false);
     }).catch(() => navigate("/"));
   }, [id, navigate]);
 
@@ -189,6 +192,22 @@ export function AgentSettings() {
       }
     } finally {
       setCheckingIn(false);
+    }
+  };
+
+  const handleTogglePrivileged = async (next: boolean) => {
+    // Privilege is mutated via a dedicated endpoint (not PATCH /agents/{id}),
+    // so this fires its own request rather than waiting on Save Changes.
+    setPrivilegeSaving(true);
+    setError("");
+    try {
+      await agentApi.setPrivileged(id!, next);
+      setPrivileged(next);
+      setAgent((a) => (a ? { ...a, privileged: next } : a));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPrivilegeSaving(false);
     }
   };
 
@@ -685,6 +704,35 @@ export function AgentSettings() {
           // server-side run actually gets going.
           checkingIn={checkingIn || checkinNotice !== ""}
         />
+
+        {/* Privilege.
+
+            POST /api/v1/agents/{id}/privilege is Owner-only. The web UI
+            is only ever served to Owner principals (the public listener
+            is OwnerOnlyMiddleware on Tailscale; --local requires the
+            Owner Bearer for asset delivery), so the toggle has no
+            non-Owner code path to worry about and there is no
+            client-side role gate. If the asset gating is ever relaxed
+            we'd need to hide this control too — keep that in mind when
+            touching index.html / the Bearer bootstrap. */}
+        <div>
+          <label className="flex items-start gap-3 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={privileged}
+              disabled={privilegeSaving}
+              onChange={(e) => handleTogglePrivileged(e.target.checked)}
+              className="mt-1 accent-amber-500"
+            />
+            <div className="flex-1">
+              <div className="text-sm text-neutral-300">Privileged Agent</div>
+              <p className="text-xs text-neutral-600 mt-0.5">
+                Allow this agent to delete / reset / archive other agents via
+                the API. Cannot fork or read other agents&apos; full record.
+              </p>
+            </div>
+          </label>
+        </div>
 
         {error && (
           <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300">

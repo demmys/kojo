@@ -41,8 +41,10 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //      PrivAgent.
 //
 // Owner-only routes (sessions, git, files browser, oauth, embedding,
-// push, custom-models, group DM CRUD, fork, /privilege, generate-*)
-// fall through and 403.
+// push, custom-models, group DM mutate-as-owner, fork, /privilege,
+// generate-*) fall through and 403. Note: POST /api/v1/groupdms
+// (group creation) is exposed to Agent / PrivAgent below — the handler
+// then enforces the caller-in-memberIds invariant.
 func AllowNonOwner(p Principal, method, path string) bool {
 	if p.IsOwner() {
 		return true
@@ -100,12 +102,19 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		return isSelfScopedRoute(method, sub)
 	}
 
+	// Bare `POST /api/v1/groupdms` (group creation) — agents may create
+	// groups they themselves are a member of. The handler enforces the
+	// caller-in-memberIds invariant; the policy layer only refuses
+	// non-Agent principals here.
+	if path == "/api/v1/groupdms" && method == http.MethodPost && p.IsAgent() {
+		return true
+	}
+
 	// Group DM API — allow members to read groups, post messages, and
 	// manage their own membership. The handler is responsible for
 	// confirming the principal is actually a member of the named
 	// group (and that {agentId} on member-scoped routes matches the
-	// caller). Bare `POST /api/v1/groupdms` (group creation) and the
-	// user-messages endpoint stay Owner-only.
+	// caller). The user-messages endpoint stays Owner-only.
 	if strings.HasPrefix(path, "/api/v1/groupdms/") && p.IsAgent() {
 		// Strip the static prefix and the {id} segment.
 		rest := path[len("/api/v1/groupdms/"):]

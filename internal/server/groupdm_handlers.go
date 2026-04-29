@@ -84,9 +84,38 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "at least 2 members required")
 		return
 	}
+	// Agents may only create groups they themselves belong to, so a stray
+	// agent can't conjure a room it has no business being in. Owners can
+	// create on anyone's behalf.
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		if !p.IsAgent() {
+			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
+			return
+		}
+		found := false
+		for _, m := range req.MemberIDs {
+			if m == p.AgentID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"caller must be one of the memberIds")
+			return
+		}
+	}
 	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown,
 		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue))
 	if err != nil {
+		// Don't leak whether a memberId names an unknown / archived agent
+		// to non-Owners — that would let an agent enumerate hidden or
+		// archived peers via the create endpoint.
+		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid memberIds")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}

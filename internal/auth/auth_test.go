@@ -192,6 +192,18 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		// global ws — owner only
 		{http.MethodGet, "/api/v1/ws", ag, false},
 		{http.MethodGet, "/api/v1/ws", priv, false},
+		// group DM creation — agents may create (handler enforces
+		// caller-in-memberIds); guests must 403.
+		{http.MethodPost, "/api/v1/groupdms", ag, true},
+		{http.MethodPost, "/api/v1/groupdms", priv, true},
+		{http.MethodPost, "/api/v1/groupdms", guest, false},
+		// Bare /api/v1/groupdms is POST-only for non-Owner. GET (list)
+		// and DELETE (the route doesn't exist but should still 403)
+		// must stay denied so the Agent path doesn't widen by accident.
+		{http.MethodGet, "/api/v1/groupdms", ag, false},
+		{http.MethodGet, "/api/v1/groupdms", priv, false},
+		{http.MethodDelete, "/api/v1/groupdms", ag, false},
+		{http.MethodPatch, "/api/v1/groupdms", ag, false},
 		// guest sees only directory/info
 		{http.MethodGet, "/api/v1/info", guest, true},
 		{http.MethodGet, "/api/v1/agents/directory", guest, true},

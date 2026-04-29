@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router";
-import { api, type DirEntry, type FileView } from "../lib/api";
-import { appendTokenQuery } from "../lib/auth";
-import { formatSize } from "../lib/utils";
+import { useMemo } from "react";
+import { useNavigate } from "react-router";
+import { api } from "../lib/api";
+import { FileDataBrowser } from "./FileDataBrowser";
 
 interface FileBrowserProps {
   embedded?: boolean;
@@ -11,140 +10,29 @@ interface FileBrowserProps {
 
 export function FileBrowser({ embedded, initialPath }: FileBrowserProps = {}) {
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [entries, setEntries] = useState<DirEntry[]>([]);
-  const [currentPath, setCurrentPath] = useState("");
-  const [fileView, setFileView] = useState<FileView | null>(null);
-  const [showHidden, setShowHidden] = useState(false);
-  const [internalPath, setInternalPath] = useState(initialPath ?? "");
-
-  const path = embedded ? internalPath : (searchParams.get("path") || "");
-  const setPath = (p: string) => {
-    if (embedded) {
-      setInternalPath(p);
-    } else {
-      setSearchParams({ path: p });
-    }
-  };
-
-  useEffect(() => {
-    if (embedded && !initialPath) return;
-    api.files
-      .list(path || undefined, showHidden)
-      .then((result) => {
-        setCurrentPath(result.path);
-        setEntries(result.entries);
-      })
-      .catch(console.error);
-  }, [path, showHidden, embedded, initialPath]);
-
-  useEffect(() => {
-    if (embedded && initialPath) {
-      setInternalPath(initialPath);
-    }
-  }, [initialPath]);
-
-  const navigateTo = (entry: DirEntry) => {
-    const newPath = currentPath + "/" + entry.name;
-    if (entry.type === "dir") {
-      setPath(newPath);
-      setFileView(null);
-    } else {
-      api.files.view(newPath).then(setFileView).catch(console.error);
-    }
-  };
-
-  const isAtRoot = embedded && initialPath ? currentPath === initialPath : false;
-
-  const goUp = () => {
-    if (isAtRoot) return;
-    const parent = currentPath.split("/").slice(0, -1).join("/") || "/";
-    setPath(parent);
-    setFileView(null);
-  };
-
-  if (fileView) {
-    return (
-      <div className="min-h-full bg-neutral-950 text-neutral-200">
-        <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-          <button onClick={() => setFileView(null)} className="text-neutral-400 hover:text-neutral-200">
-            &larr;
-          </button>
-          <span className="text-sm truncate">{fileView.path.split("/").pop()}</span>
-        </header>
-        <main className="p-4">
-          {fileView.type === "text" && (
-            <pre className="text-xs font-mono overflow-x-auto whitespace-pre p-4 bg-neutral-900 rounded-lg border border-neutral-800">
-              {fileView.content}
-            </pre>
-          )}
-          {fileView.type === "image" && fileView.url && (
-            <div className="flex flex-col items-center gap-4">
-              <img src={appendTokenQuery(fileView.url)} alt="" className="max-w-full rounded" />
-              <div className="text-xs text-neutral-500">
-                {formatSize(fileView.size)} &middot; {fileView.mime}
-              </div>
-            </div>
-          )}
-        </main>
-      </div>
-    );
-  }
+  const dataSource = useMemo(() => ({
+    list: (path: string, hidden: boolean) =>
+      api.files.list(path || undefined, hidden).then((result) => ({
+        path: result.path,
+        absPath: result.path,
+        entries: result.entries,
+      })),
+    view: (path: string) => api.files.view(path),
+    rawUrl: (path: string, download?: boolean) => api.files.rawUrl(path, download),
+  }), []);
 
   return (
-    <div className="min-h-full bg-neutral-950 text-neutral-200">
-      {!embedded && (
-        <header className="flex items-center gap-2 px-4 py-3 border-b border-neutral-800">
-          <button onClick={() => navigate("/")} className="text-neutral-400 hover:text-neutral-200">
-            &larr;
-          </button>
-          <span className="text-sm truncate flex-1">Files &mdash; {currentPath}</span>
-          <button
-            onClick={() => setShowHidden(!showHidden)}
-            className={`px-2 py-0.5 text-xs rounded ${
-              showHidden ? "bg-neutral-700 text-neutral-300" : "bg-neutral-800 text-neutral-500"
-            }`}
-          >
-            .*
-          </button>
-        </header>
-      )}
-      {embedded && (
-        <div className="flex items-center gap-2 px-4 py-2 border-b border-neutral-800">
-          <span className="text-xs text-neutral-500 truncate flex-1">{currentPath}</span>
-          <button
-            onClick={() => setShowHidden(!showHidden)}
-            className={`px-2 py-0.5 text-xs rounded ${
-              showHidden ? "bg-neutral-700 text-neutral-300" : "bg-neutral-800 text-neutral-500"
-            }`}
-          >
-            .*
-          </button>
-        </div>
-      )}
-      <main className="divide-y divide-neutral-800/50">
-        {!isAtRoot && (
-          <button
-            onClick={goUp}
-            className="w-full text-left px-4 py-3 hover:bg-neutral-900 text-sm flex items-center gap-2"
-          >
-            <span>&#x1F4C1;</span>
-            <span>..</span>
-          </button>
-        )}
-        {entries.map((entry) => (
-          <button
-            key={entry.name}
-            onClick={() => navigateTo(entry)}
-            className="w-full text-left px-4 py-3 hover:bg-neutral-900 text-sm flex items-center gap-2"
-          >
-            <span>{entry.type === "dir" ? "\u{1F4C1}" : "\u{1F4C4}"}</span>
-            <span className="truncate">{entry.name}</span>
-          </button>
-        ))}
-      </main>
-    </div>
+    <FileDataBrowser
+      dataSource={dataSource}
+      pathMode="absolute"
+      pathParam="path"
+      rootPath={embedded ? initialPath : undefined}
+      rootLabel={embedded ? "Workdir" : "Files"}
+      title="Files"
+      subtitle={embedded ? undefined : "Local filesystem"}
+      showHeader={!embedded}
+      ready={!embedded || Boolean(initialPath)}
+      onExit={() => navigate("/")}
+    />
   );
 }
-
-

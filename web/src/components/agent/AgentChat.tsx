@@ -437,7 +437,9 @@ export function AgentChat() {
           </button>
         )}
         <button
-          onClick={() => navigate(`/agents/${agent.id}/data`)}
+          onClick={() => navigate(`/agents/${agent.id}/data`, {
+            state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
+          })}
           className="p-2 text-neutral-500 hover:text-neutral-300 rounded"
           title="Data folder"
         >

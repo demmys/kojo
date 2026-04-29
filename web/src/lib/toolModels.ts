@@ -11,14 +11,13 @@ export const toolModels: Record<string, ToolModelConfig> = {
     models: ["sonnet", "opus", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
-    default: "gpt-5.4",
+    default: "gpt-5.5",
     models: [
-      "gpt-5.3-codex",
+      "gpt-5.5",
       "gpt-5.4",
-      "gpt-5.2-codex",
-      "gpt-5.1-codex-max",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex",
       "gpt-5.2",
-      "gpt-5.1-codex-mini",
     ],
   },
   gemini: {

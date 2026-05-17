@@ -734,6 +734,70 @@ func main() {
 				lockCtx, lockCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				agentLockGuard.Start(lockCtx, ids)
 				lockCancel()
+
+				// Restore agent_locks.allowed_proxy_peer for every
+				// seeded ID. AgentLockGuard.Stop wipes the lock rows
+				// on graceful shutdown, so the Start above just
+				// re-inserted them via fresh AcquireAgentLock —
+				// which defaults allowed_proxy_peer to self. The
+				// original orchestrator (stamped by finalize) was
+				// stashed in the arrived_proxy/<id> kv row at the
+				// time of arrival; replay it here so the next
+				// inbound Hub→target chat proxy passes the
+				// agentHolderAdmitMiddleware gate.
+				//
+				// Best-effort: a missing row means the agent
+				// arrived before this fix landed, or finalize never
+				// completed the proxy stamp. ErrFencingMismatch
+				// means another peer stole the lock between
+				// Start and here (concurrent operator action);
+				// either way log + skip, the next finalize / force-
+				// reclaim will re-stamp.
+				if agentMgr != nil && len(ids) > 0 {
+					restoreCtx, restoreCancel := context.WithTimeout(
+						context.Background(), 10*time.Second)
+					for _, id := range ids {
+						proxy, perr := agentMgr.GetAgentArrivedProxy(restoreCtx, id)
+						if perr != nil {
+							logger.Warn("restore allowed_proxy_peer: lookup failed",
+								"agent", id, "err", perr)
+							continue
+						}
+						if proxy == "" {
+							// Legacy detection: agent arrived
+							// before this fix landed, so no
+							// arrived_proxy/<id> row exists. If
+							// the current agent_locks row points
+							// allowed_proxy_peer at self, the
+							// Hub→target proxy is broken until
+							// the operator re-stamps via a fresh
+							// device-switch or direct SQL. Log
+							// loudly so the symptom (UI says
+							// "agent is busy" / 403) is debuggable.
+							if lock, lerr := st.GetAgentLock(restoreCtx, id); lerr == nil &&
+								lock != nil &&
+								lock.HolderPeer == peerIdentity.DeviceID &&
+								(lock.AllowedProxyPeer == "" || lock.AllowedProxyPeer == peerIdentity.DeviceID) {
+								logger.Warn("legacy arrival without proxy hint; orchestrator proxy may 403 until re-stamped",
+									"agent", id, "allowed_proxy_peer", lock.AllowedProxyPeer)
+							}
+							continue
+						}
+						if proxy == peerIdentity.DeviceID {
+							continue
+						}
+						if err := st.UpdateAgentLockAllowedProxy(
+							restoreCtx, id, peerIdentity.DeviceID, proxy,
+						); err != nil {
+							logger.Warn("restore allowed_proxy_peer: stamp failed",
+								"agent", id, "proxy", proxy, "err", err)
+							continue
+						}
+						logger.Info("restore allowed_proxy_peer: stamped",
+							"agent", id, "proxy", proxy)
+					}
+					restoreCancel()
+				}
 			}
 		}
 	}
@@ -861,7 +925,15 @@ func main() {
 			// ReleaseAgentLockByPeer on graceful shutdown wipes
 			// the agent_locks row.
 			if agentMgr != nil {
-				if err := agentMgr.MarkAgentArrivedHere(hookCtx, agentID); err != nil {
+				// sourceDeviceID becomes the allowed_proxy_peer that
+				// finalize stamps below via UpdateAgentLockAllowedProxy
+				// (peer_agent_sync_finalize_handler.go). Persist it now
+				// so a graceful-shutdown wipe of agent_locks doesn't
+				// strand the agent on the next boot — the fresh
+				// AcquireAgentLock would otherwise default allowed_proxy
+				// _peer back to self and the Hub→target chat proxy
+				// would 403 in agentHolderAdmitMiddleware.
+				if err := agentMgr.MarkAgentArrivedHere(hookCtx, agentID, sourceDeviceID); err != nil {
 					return fmt.Errorf("mark agent arrived: %w", err)
 				}
 				if err := agentMgr.ClearAgentReleasedHere(hookCtx, agentID); err != nil {

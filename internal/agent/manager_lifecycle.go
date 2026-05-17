@@ -719,6 +719,25 @@ func kvReleasedKey(agentID string) string { return "released/" + agentID }
 // would re-seed a phantom agent into the lock guard.
 func kvArrivedKey(agentID string) string { return "arrived/" + agentID }
 
+// kvArrivedProxyKey persists the allowed_proxy_peer that the finalize
+// handler stamped onto agent_locks for this arrival. AgentLockGuard.Stop
+// wipes agent_locks rows via ReleaseAgentLockByPeer on graceful shutdown,
+// so the column itself doesn't survive a restart — the next boot's fresh
+// AcquireAgentLock re-inserts with allowed_proxy_peer = self, which then
+// causes agentHolderAdmitMiddleware to reject the orchestrator's signed
+// proxy and the agent becomes unreachable from the UI.
+//
+// Pairing this kv row with the arrived marker lets the boot path restore
+// the original allowed_proxy_peer via UpdateAgentLockAllowedProxy after
+// AgentLockGuard.Start re-acquires. Key prefix differs from arrived/ and
+// released/ so latestHandoffMarkers naturally ignores it.
+//
+// Cleared by ClearAgentArrivedHere alongside the arrival marker — a
+// switch-away from this peer drops the proxy hint too. Older deployments
+// that arrived BEFORE this fix have no row written; restore is best-effort
+// and a missing row means "no override, leave fresh acquire default".
+func kvArrivedProxyKey(agentID string) string { return "arrived_proxy/" + agentID }
+
 // MarkAgentReleasedHere persists the §3.7 source-release marker for
 // agentID in the machine-scoped kv table. The value is the release
 // timestamp (RFC3339); the value isn't consulted by the eviction
@@ -795,7 +814,14 @@ const markReleasedCtxBudget = 3 * time.Second
 // ReleaseAgentLockByPeer) so a daemon restart can re-seed the
 // guard's desired set. Idempotent; deadline-driven retry mirrors
 // MarkAgentReleasedHere's durability story.
-func (m *Manager) MarkAgentArrivedHere(ctx context.Context, agentID string) error {
+//
+// allowedProxyPeer carries the source device_id that finalize stamped
+// onto agent_locks.allowed_proxy_peer. Stored in a sibling kv row so
+// the boot path can re-stamp the column after the post-restart fresh
+// AcquireAgentLock resets it to self. Pass empty when no proxy override
+// is desired (test fixtures / legacy callers); the boot path treats
+// missing rows as "leave fresh-acquire default."
+func (m *Manager) MarkAgentArrivedHere(ctx context.Context, agentID, allowedProxyPeer string) error {
 	if m == nil || agentID == "" {
 		return nil
 	}
@@ -810,6 +836,37 @@ func (m *Manager) MarkAgentArrivedHere(ctx context.Context, agentID string) erro
 		Type:      store.KVTypeString,
 		Scope:     store.KVScopeMachine,
 	}
+	if err := putKVWithRetry(ctx, st, rec); err != nil {
+		return fmt.Errorf("MarkAgentArrivedHere arrival: %w", err)
+	}
+	// Sibling row: allowed_proxy_peer override for restart-time restore.
+	// Order matters — the arrival marker is the authoritative "this peer
+	// hosts <id>" signal; if the proxy write fails after the arrival
+	// landed, the agent is still reachable for trusted peers and the
+	// next finalize retry / operator action can re-stamp the row. The
+	// reverse order would risk an arrived_proxy/<id> row with no
+	// corresponding arrived/<id> sibling, which the boot path would
+	// silently ignore but leaves clutter.
+	if allowedProxyPeer == "" {
+		return nil
+	}
+	proxyRec := &store.KVRecord{
+		Namespace: kvReleasedNamespace,
+		Key:       kvArrivedProxyKey(agentID),
+		Value:     allowedProxyPeer,
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}
+	if err := putKVWithRetry(ctx, st, proxyRec); err != nil {
+		return fmt.Errorf("MarkAgentArrivedHere proxy: %w", err)
+	}
+	return nil
+}
+
+// putKVWithRetry centralises the deadline-driven retry loop that
+// MarkAgentReleasedHere / MarkAgentArrivedHere share. Same constant
+// 100ms backoff, same "give up only when ctx fires" semantic.
+func putKVWithRetry(ctx context.Context, st *store.Store, rec *store.KVRecord) error {
 	var (
 		lastErr  error
 		attempts int
@@ -823,18 +880,24 @@ func (m *Manager) MarkAgentArrivedHere(ctx context.Context, agentID string) erro
 		lastErr = err
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("MarkAgentArrivedHere: %w after %d attempts (last: %v)",
+			return fmt.Errorf("%w after %d attempts (last: %v)",
 				ctx.Err(), attempts, lastErr)
 		case <-time.After(markReleasedBackoff):
 		}
 	}
 }
 
-// ClearAgentArrivedHere removes the §3.7 target-arrival marker.
-// Called by the source-release path so a switch-away from this
-// peer doesn't leave a stale arrival marker that would re-seed
-// AgentLockGuard against an agent we no longer own. Idempotent;
-// missing row is not an error.
+// ClearAgentArrivedHere removes the §3.7 target-arrival marker AND
+// the sibling allowed_proxy_peer row. Called by the source-release
+// path so a switch-away from this peer doesn't leave a stale arrival
+// marker that would re-seed AgentLockGuard against an agent we no
+// longer own. Idempotent; missing row on either key is not an error.
+//
+// The proxy sibling is dropped best-effort AFTER the arrival marker
+// goes — if the proxy delete fails the row becomes orphaned, but the
+// boot restore path looks up by agent_id only when an arrival marker
+// is present, so an orphaned proxy row is dead data the next
+// MarkAgentArrivedHere will overwrite.
 func (m *Manager) ClearAgentArrivedHere(ctx context.Context, agentID string) error {
 	if m == nil || agentID == "" {
 		return nil
@@ -844,10 +907,48 @@ func (m *Manager) ClearAgentArrivedHere(ctx context.Context, agentID string) err
 		return nil
 	}
 	err := st.DeleteKV(ctx, kvReleasedNamespace, kvArrivedKey(agentID), "")
-	if errors.Is(err, store.ErrNotFound) {
-		return nil
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
 	}
-	return err
+	if perr := st.DeleteKV(ctx, kvReleasedNamespace, kvArrivedProxyKey(agentID), ""); perr != nil &&
+		!errors.Is(perr, store.ErrNotFound) {
+		// Sibling delete failure logs and falls through — see
+		// orphaned-row note above. Surface as warn rather than
+		// error so the caller's release sequence still proceeds.
+		if m.logger != nil {
+			m.logger.Warn("clear arrived-proxy sibling failed; orphan tolerated",
+				"agent", agentID, "err", perr)
+		}
+	}
+	return nil
+}
+
+// GetAgentArrivedProxy returns the allowed_proxy_peer override that
+// MarkAgentArrivedHere stashed alongside the arrival marker. Used by
+// the boot path to restore agent_locks.allowed_proxy_peer after a
+// graceful-shutdown wipe + fresh AcquireAgentLock. Returns ("", nil)
+// when no row exists — caller treats that as "leave fresh-acquire
+// default" rather than erroring out (legacy arrivals predate this
+// kv row).
+func (m *Manager) GetAgentArrivedProxy(ctx context.Context, agentID string) (string, error) {
+	if m == nil || agentID == "" {
+		return "", nil
+	}
+	st := m.Store()
+	if st == nil {
+		return "", nil
+	}
+	rec, err := st.GetKV(ctx, kvReleasedNamespace, kvArrivedProxyKey(agentID))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if rec == nil {
+		return "", nil
+	}
+	return rec.Value, nil
 }
 
 // ListArrivedAgents returns every agent_id whose LATEST handoff

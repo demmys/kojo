@@ -112,27 +112,26 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			// Stale-row self-heal: a holder ≠ source row blocks
 			// every retry of the orchestrator's switch (the
 			// agent-sync handler's existingLock guard 409s) and
-			// can only be opened by tearing the row down. We do
-			// that here so the operator's "re-run device-switch"
-			// from the Hub UI converges without manual SQL.
+			// can only be opened by tearing the row down.
 			//
-			// Trust model: pairing IS the trust anchor for this
-			// admit. Any peer that signed a valid RolePeer
-			// request has a row in peer_registry — operator
-			// approval at pairing time. PurgeAgentRuntimeStateFor
-			// Retry is NON-destructive in the operator's data
-			// sense: it only forgets local lock + handoff
-			// markers; agent rows / messages / personas survive,
-			// and the orchestrator's follow-up agent-sync
-			// reseeds everything from the source. Worst-case
-			// abuse is a transient DoS where a paired peer
-			// flushes this host's view of the agent until the
-			// next switch — far below the bar an untrusted
-			// agents/* admit (credentials / persona leak) would
-			// cross. Trading the per-row PeerTrusted gate for
-			// the pairing gate is what stops the operator from
-			// having to flip trust on every paired peer just to
-			// run device-switch.
+			// Trust gate: REQUIRED here despite the operator
+			// inconvenience. Purge deletes the lock row, and
+			// the next agent-sync from the same signer admits
+			// because peer_agent_sync_handler treats a nil lock
+			// as "first-time switch" — which means any paired
+			// RolePeer that wins the purge race can ALSO replay
+			// agent / persona / messages / memory with forged
+			// content. That's a credentials / persona leak path,
+			// not just a transient DoS. p.PeerTrusted is the
+			// per-row gate the operator already set at pairing
+			// time via --peer-add-trusted / `--peer-trust
+			// <device_id>` / the UI Trust button; without it we
+			// refuse the purge and the operator must run that
+			// one-line CLI on this host:
+			//
+			//     kojo --peer-trust <source-device-id>
+			//
+			// before retrying the switch.
 			//
 			// PurgeAgentRuntimeStateForRetry DELETEs the lock
 			// row (no upsert) — the subsequent agent-sync's
@@ -141,6 +140,13 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			// (holder=self, allowed=self) row, finalize's
 			// UpdateAllowedProxy stamps source as
 			// allowed_proxy_peer.
+			if !p.PeerTrusted {
+				writeError(w, http.StatusForbidden, "wrong_holder",
+					"agent_locks.holder_peer does not match source_device_id; "+
+						"self-heal requires the source peer to be marked trusted on this host. "+
+						"Run `kojo --peer-trust "+req.SourceDeviceID+"` on this peer (or flip Trust in the Peers UI) and retry.")
+				return
+			}
 			s.logger.Warn("state probe: purging stale agent runtime state on target",
 				"agent", req.AgentID, "source", req.SourceDeviceID,
 				"stale_holder", lock.HolderPeer,

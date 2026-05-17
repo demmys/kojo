@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -306,8 +307,31 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 		HTTPClient: s.httpClient, // nil OK; websocket uses http.DefaultClient
 		HTTPHeader: req.Header,
 	}
-	conn, _, err := websocket.Dial(ctx, target.String(), dialOpts)
+	conn, resp, err := websocket.Dial(ctx, target.String(), dialOpts)
 	if err != nil {
+		// On a failed upgrade the server's JSON error body is the
+		// only diagnostic that pins which peer-auth check failed
+		// ("audience does not match local peer", "unknown peer",
+		// "bad signature", …). Without this peek the upstream
+		// caller sees only "got 401" and the operator has to add
+		// ad-hoc instrumentation to find the cause.
+		//
+		// coder/websocket v1.8.14 already truncates the upstream
+		// body to 1024 bytes (and returns an io.NopCloser around
+		// it) so a higher LimitReader cap here would be misleading
+		// — match the upstream cap exactly. Body is escaped via
+		// %+q so NUL / ESC / CR / invalid UTF-8 in a hostile or
+		// corrupted response can't smuggle ANSI sequences into the
+		// operator's terminal or break log-line parsing.
+		if resp != nil {
+			body, rErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			resp.Body.Close()
+			if rErr == nil && len(body) > 0 {
+				return fmt.Errorf("dial: %w: status=%d body=%+q",
+					err, resp.StatusCode, string(body))
+			}
+			return fmt.Errorf("dial: %w: status=%d", err, resp.StatusCode)
+		}
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")

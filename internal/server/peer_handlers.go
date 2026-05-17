@@ -720,28 +720,45 @@ func (s *Server) handleDeletePeer(w http.ResponseWriter, r *http.Request) {
 // upper-bounded wall time per peer.
 const peerRegisterPushBroadcastTimeout = 10 * time.Second
 
-// broadcastPeerRegistration sends THIS host's self-row to the
-// freshly-registered peer (and to every other known peer) so the
-// cluster's registries converge without the operator having to
-// run `--peer-add` on every host. Detached goroutine — the
-// operator's POST /api/v1/peers response has already been
-// written by the time this runs.
+// broadcastPeerRegistration fans the cluster topology out so every
+// paired peer's registry converges on the same view without the
+// operator running `--peer-add` on every host. Detached goroutine —
+// the operator's POST /api/v1/peers (or the approve handler's)
+// response has already been written by the time this runs.
 //
-// Scope: the broadcast carries only the LOCAL self-row. Pushing
-// a third-party peer's row would let any cluster member with a
-// peer signing key rewrite that row's url/name (a Hub→peer
-// routing hijack). The receiver-side handler enforces
-// signer-equals-row so the scoped self-row push refuses any
-// identity change it shouldn't be allowed to make.
+// Payload per target:
+//
+//   - For target == newRow (the freshly-paired / freshly-approved
+//     peer): push EVERY paired peer's row (cluster snapshot, minus
+//     newRow itself). Without this, the new peer would only know
+//     the Hub (via its own discovery upsertHubIntoRegistry) and
+//     inbound signed requests from any sibling peer would fail
+//     auth with "unknown device_id" until the operator manually
+//     re-broadcast every existing peer.
+//
+//   - For target ≠ newRow (existing peers): push [selfRec,
+//     newRow]. selfRec keeps the cluster's view of THIS host's
+//     url/name fresh through topology changes; newRow teaches
+//     the existing peer about the newly-paired one.
+//
+// Trust model: register-push receivers admit a third-party row
+// only when the signer carries the trusted bit (see
+// handlePeerRegisterPush). The Hub is trusted on every peer it
+// approves (discovery sets trusted=true on the Hub row), so the
+// new-peer-payload path lands cleanly. A non-Hub broadcast that
+// includes third-party rows would get 403'd at trust gate, so the
+// cluster snapshot only converges when broadcast originates from
+// a host trusted on the receiving peer — that's the Hub or a
+// peer explicitly trusted via `--peer-trust`.
 //
 // Bootstrap chicken-and-egg: a brand-new peer doesn't have this
 // host's public_key in its registry yet, so the very first push
 // fails at the receiver's PeerAuth middleware with 401 — that's
-// expected. Operator pairing is bidirectional: run `--peer-add`
-// on BOTH hosts (Hub stores the peer; peer stores the Hub).
-// Once paired, subsequent broadcasts land cleanly and keep the
-// peer's view of the Hub's url/name fresh through topology
-// changes.
+// expected. The auto-pairing flow (docs/peer-onboarding-plan.md)
+// closes the gap: discovery on the peer side writes the Hub into
+// its registry BEFORE join-request fires, so by the time
+// broadcastPeerRegistration runs on approve the receiver
+// recognises the Hub's signature.
 // peerRegisterPushFanoutConcurrency bounds the number of in-flight
 // register-push dials. A serial loop would multiply the total
 // fan-out wall time by N peers × 10s timeout when several targets
@@ -785,16 +802,36 @@ func (s *Server) runBroadcastPeerRegistration(newRow *store.PeerRecord) {
 		s.logger.Warn("broadcastPeerRegistration: self lookup", "err", err)
 		return
 	}
-	// Push payload: this host's self-row + the freshly-paired
-	// newRow. Receivers admit the self-row (signer == row) and
-	// the third-party newRow (signer is trusted at the receiver,
-	// see handlePeerRegisterPush's trust gate). Each row reaches
-	// every paired peer once.
-	payload := []*store.PeerRecord{selfRec}
+	// Existing-peer payload: this host's self-row + the freshly-
+	// paired newRow. Receivers admit the self-row (signer == row)
+	// and the third-party newRow (signer is trusted at the
+	// receiver, see handlePeerRegisterPush's trust gate). Each row
+	// reaches every existing paired peer once.
+	existingPayload := []*store.PeerRecord{selfRec}
 	if newRow.DeviceID != selfRec.DeviceID {
-		payload = append(payload, newRow)
+		existingPayload = append(existingPayload, newRow)
 	}
-	s.fanOutPeerRegistrations(rows, payload)
+	// New-peer payload: every paired peer EXCEPT newRow itself.
+	// Without this, the freshly-approved peer learns only the
+	// Hub (via its own discovery upsertHubIntoRegistry) but has
+	// no way to learn about its sibling peers — inbound signed
+	// requests from any non-Hub peer hit AuthMiddleware's
+	// peer_registry lookup and 401 with "unknown device_id".
+	// Sending the whole cluster on approve closes the gap so
+	// every sibling can talk to the new peer immediately.
+	newPeerPayload := make([]*store.PeerRecord, 0, len(rows))
+	for _, r := range rows {
+		if r == nil || r.DeviceID == newRow.DeviceID || r.DeviceID == "" {
+			continue
+		}
+		newPeerPayload = append(newPeerPayload, r)
+	}
+	s.fanOutPeerRegistrationsPerTarget(rows, func(t *store.PeerRecord) []*store.PeerRecord {
+		if t != nil && t.DeviceID == newRow.DeviceID {
+			return newPeerPayload
+		}
+		return existingPayload
+	})
 }
 
 func containsPeer(rows []*store.PeerRecord, id string) bool {
@@ -807,7 +844,32 @@ func containsPeer(rows []*store.PeerRecord, id string) bool {
 }
 
 func (s *Server) fanOutPeerRegistrations(targets []*store.PeerRecord, rows []*store.PeerRecord) {
+	// Preserve the historical len(rows)==0 fast-path: callers
+	// passing a precomputed empty slice expect the function to
+	// no-op without touching targets at all. Without this guard
+	// the per-target variant would still iterate every target
+	// (skip-URL warnings, peerID lookups) for zero work.
 	if len(rows) == 0 {
+		return
+	}
+	s.fanOutPeerRegistrationsPerTarget(targets, func(_ *store.PeerRecord) []*store.PeerRecord {
+		return rows
+	})
+}
+
+// fanOutPeerRegistrationsPerTarget dispatches register-push with a
+// per-target row selector. The selector lets the caller send the
+// freshly-approved peer a different payload (the whole cluster
+// view, so it can answer inbound signed requests) than the rest of
+// the cluster receives (just selfRec + newRow, the existing
+// behavior). Passing a constant selector recovers the original
+// fan-out semantics — fanOutPeerRegistrations stays the
+// fixed-payload entry point for non-approval call sites.
+func (s *Server) fanOutPeerRegistrationsPerTarget(
+	targets []*store.PeerRecord,
+	rowsFor func(*store.PeerRecord) []*store.PeerRecord,
+) {
+	if rowsFor == nil {
 		return
 	}
 	sem := make(chan struct{}, peerRegisterPushFanoutConcurrency)
@@ -823,6 +885,10 @@ func (s *Server) fanOutPeerRegistrations(targets []*store.PeerRecord, rows []*st
 		if err != nil {
 			s.logger.Warn("broadcastPeerRegistration: skip target",
 				"device_id", t.DeviceID, "err", err)
+			continue
+		}
+		rows := rowsFor(t)
+		if len(rows) == 0 {
 			continue
 		}
 		for _, row := range rows {

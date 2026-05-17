@@ -2,14 +2,12 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
@@ -209,14 +207,12 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 	client := peer.NewPullClient(s.peerID, nil, s.logger)
 	src := peer.PullSource{DeviceID: req.SourceDeviceID, Address: srcAddr}
 
-	// Bound the batch with our own context so a request body
-	// containing thousands of items can't pin the handler
-	// indefinitely if the parent context is the loose
-	// request-scoped one.
-	ctx, cancel := context.WithTimeout(r.Context(), peerPullBatchTimeout)
-	defer cancel()
-
-	results, err := client.PullMany(ctx, src, items, s.blob)
+	// No batch timeout: large blob handoffs (multi-GiB) over slow
+	// links easily blow past any fixed ceiling. The parent
+	// request context is the deadline; the orchestrator side
+	// (switchDeviceOpTimeout) and the client disconnect provide
+	// the upper bounds.
+	results, err := client.PullMany(r.Context(), src, items, s.blob)
 	if err != nil {
 		// Local-fatal (context cancel, sign failure, etc.).
 		// Surface as 500 with the partial result list so the
@@ -244,8 +240,3 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, peerPullResponse{Results: results})
 }
 
-// peerPullBatchTimeout bounds one batch of pull dispatches. The
-// orchestrator side has its own 5-minute ceiling
-// (switchDeviceOpTimeout); this is the inner bound that protects
-// the handler when the orchestrator's deadline is loose.
-const peerPullBatchTimeout = 4 * time.Minute

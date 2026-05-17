@@ -102,11 +102,11 @@ type PullClient struct {
 // sizes — vs the 401 that aborts the whole switch.
 func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PullClient {
 	if httpClient == nil {
-		// 60s per-blob ceiling. Big blobs over Tailscale should
-		// still fit; the caller-supplied context provides the
-		// overall batch deadline.
+		// No per-blob HTTP ceiling: a multi-GiB blob over a slow
+		// Tailscale link easily exceeds any fixed timeout, and the
+		// caller-supplied context already provides the overall
+		// batch deadline (cancel via ctx, not via Client.Timeout).
 		httpClient = &http.Client{
-			Timeout:   60 * time.Second,
 			Transport: noKeepAliveTransport(),
 		}
 	}

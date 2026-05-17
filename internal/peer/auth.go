@@ -2,7 +2,6 @@ package peer
 
 import (
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -27,10 +26,14 @@ import (
 // signed by peer A's private key can be verified by any other
 // peer that has A's peer_registry row.
 //
-// Wire format: four headers per request.
+// Wire format: five headers per request.
 //
 //	X-Kojo-Peer-ID    : <device_id> (UUID v4 hex, no dashes per
 //	                    peer_registry).
+//	X-Kojo-Peer-Aud   : <device_id> of the intended receiver.
+//	                    Binds the signature to one target peer so a
+//	                    header set captured from A→B can't be
+//	                    replayed against A→C.
 //	X-Kojo-Peer-TS    : <unix millis>. Receiver rejects values
 //	                    outside ±AuthMaxClockSkew so a replay
 //	                    captured days ago can't be re-played.
@@ -40,26 +43,33 @@ import (
 //	X-Kojo-Peer-Sig   : base64 Ed25519 signature over the
 //	                    canonical payload defined by SigningInput.
 //
-// Canonical signing payload is:
+// Canonical signing payload (v2 — no body hash):
 //
-//	"kojo-peer-auth-v1\n" ||
+//	"kojo-peer-auth-v2\n" ||
 //	device_id || "\n" ||
+//	audience  || "\n" ||
 //	ts        || "\n" ||
 //	nonce     || "\n" ||
 //	method    || "\n" ||
 //	path      || "\n" ||
-//	hex(sha256(body))
+//	raw_query
 //
-// The domain prefix "kojo-peer-auth-v1\n" prevents an Ed25519
-// signature lifted from any other context (a future
-// kojo-blob-attest-v1 etc.) from validating here.
+// The domain prefix "kojo-peer-auth-v2\n" prevents an Ed25519
+// signature lifted from any other context (or the older v1
+// body-hashing variant) from validating here.
 //
-// Why include the body hash: without it, a replay against a
-// different POST payload would still verify. The hash is over the
-// FULL body — handlers that stream large bodies must buffer or
-// reject signed POST/PUT > AuthMaxBodyBytes. Phase 1 (status WS)
-// only signs GETs so the body hash is the empty-string sha256;
-// Phase 2 (blob handoff) reads the whole body anyway.
+// Body integrity is intentionally NOT covered by the signature. The
+// previous v1 wire format hashed the full body so a man-in-the-middle
+// couldn't substitute a different POST payload — but that protection
+// forced every signed request to buffer its full body for hashing,
+// which capped cross-peer uploads at AuthMaxBodyBytes (16 MiB). kojo
+// rides on Tailscale-only transport with mutually-authenticated TLS
+// at the tsnet layer, so the threat model treats the wire as
+// confidential and non-malleable. Dropping body hashing lets large
+// uploads stream straight through. Endpoints that genuinely need
+// content-binding (e.g. blob PUT) can opt into the per-handler
+// X-Kojo-Expected-SHA256 header, which gives the same guarantee
+// without bouncing through the auth middleware.
 
 const (
 	// AuthHeaderID is the device_id header.
@@ -81,8 +91,11 @@ const (
 
 	// AuthDomainPrefix is the canonical first line of the signing
 	// payload — domain separation across protocol versions /
-	// kojo subsystems.
-	AuthDomainPrefix = "kojo-peer-auth-v1\n"
+	// kojo subsystems. v2 dropped the body-hash field; bumping the
+	// prefix means a v1 signature deliberately won't validate
+	// against a v2 verifier (and vice-versa), so a mixed-version
+	// peer fleet fails loud rather than appearing to authenticate.
+	AuthDomainPrefix = "kojo-peer-auth-v2\n"
 
 	// AuthMaxClockSkew bounds both the timestamp window (a request
 	// older or newer than this is refused) and the nonce cache
@@ -123,14 +136,18 @@ var ErrAuthBadSignature = errors.New("peer: signature verification failed")
 // the URL-encoded request path. RawQuery is the URL's raw query
 // string (without the '?'); an empty string is signed as the
 // empty byte slice — distinct from "?" being present but empty,
-// which net/url normalises identically. Body is the raw bytes;
-// an empty body yields the sha256 of "" which is stable.
+// which net/url normalises identically.
 //
 // Including RawQuery in the signature was added in the round-1
 // review fix: without it, a peer route like
 // /api/v1/peers/blobs/X?since=N could have N mutated by an
 // attacker without breaking the signature. We sign the full
 // reconstructed request URI now.
+//
+// Body bytes are NOT part of the signature in v2 — see the package
+// doc-comment in auth.go for the rationale and the per-handler
+// X-Kojo-Expected-SHA256 escape hatch for endpoints that need
+// content binding.
 type SigningInput struct {
 	DeviceID string
 	// Audience is the device_id of the intended receiver. The
@@ -147,7 +164,6 @@ type SigningInput struct {
 	Method   string
 	Path     string
 	RawQuery string
-	Body     []byte
 }
 
 // CanonicalPayload returns the bytes a signer should sign /
@@ -169,9 +185,6 @@ func (in SigningInput) CanonicalPayload() []byte {
 	b.WriteString(in.Path)
 	b.WriteByte('\n')
 	b.WriteString(in.RawQuery)
-	b.WriteByte('\n')
-	hash := sha256.Sum256(in.Body)
-	b.WriteString(fmt.Sprintf("%x", hash[:]))
 	return []byte(b.String())
 }
 

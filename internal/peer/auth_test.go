@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 )
@@ -37,7 +36,6 @@ func freshInput(t *testing.T) (SigningInput, ed25519.PublicKey, ed25519.PrivateK
 		Nonce:    mustNonce(t),
 		Method:   "GET",
 		Path:     "/api/v1/peers/events",
-		Body:     nil,
 	}
 	return in, pub, priv
 }
@@ -69,13 +67,18 @@ func TestVerifyFailsOnTamperedRawQuery(t *testing.T) {
 	}
 }
 
-func TestVerifyFailsOnTamperedBody(t *testing.T) {
+// v2 deliberately does NOT cover the request body. This test pins
+// that property so a future refactor that re-introduces body-hash
+// signing has to delete this test (rather than silently re-adding
+// a 16 MiB hidden cap).
+func TestVerifyIgnoresBody(t *testing.T) {
 	in, pub, priv := freshInput(t)
-	in.Body = []byte("original")
 	sig := Sign(priv, in)
-	in.Body = []byte("tampered")
-	if err := Verify(pub, sig, in); !errors.Is(err, ErrAuthBadSignature) {
-		t.Errorf("tampered body: want ErrAuthBadSignature, got %v", err)
+	// The canonical payload no longer references the body, so a
+	// signature minted with no body in mind must still validate
+	// no matter what the receiver later sees on r.Body.
+	if err := Verify(pub, sig, in); err != nil {
+		t.Errorf("v2 must ignore body: %v", err)
 	}
 }
 
@@ -91,12 +94,15 @@ func TestVerifyFailsOnWrongPublicKey(t *testing.T) {
 func TestVerifyFailsOnCrossDomainSignature(t *testing.T) {
 	// A signature minted by a DIFFERENT domain prefix must not
 	// validate under this verifier — that's the whole point of
-	// AuthDomainPrefix's "kojo-peer-auth-v1\n" line.
+	// AuthDomainPrefix's "kojo-peer-auth-v2\n" line. (Also closes
+	// rolling-upgrade ambiguity: a v1 signature, which hashed the
+	// body into the canonical payload, is just one specific case
+	// of "wrong domain" the same way an entirely fake prefix is.)
 	in, pub, priv := freshInput(t)
 	// Build a fake "v0" payload that omits the domain prefix —
 	// what an older signing impl would have produced. We sign it
 	// directly with raw ed25519 and submit it through Verify which
-	// uses the v1 payload shape.
+	// uses the v2 payload shape.
 	rawPayload := []byte(in.DeviceID + "\n" + "0\n" + in.Nonce + "\n" + in.Method + "\n" + in.Path + "\n")
 	fakeSig := ed25519.Sign(priv, rawPayload)
 	sigB64 := base64.StdEncoding.EncodeToString(fakeSig)
@@ -242,16 +248,10 @@ func TestCanonicalPayloadIsStable(t *testing.T) {
 		Method:   "get",
 		Path:     "/p",
 		RawQuery: "q=1",
-		Body:     []byte("hi"),
 	}
 	got := string(in.CanonicalPayload())
-	wantHead := "kojo-peer-auth-v1\nabc\nxyz\n42\nn\nGET\n/p\nq=1\n"
-	if !strings.HasPrefix(got, wantHead) {
-		t.Errorf("payload head mismatch:\nwant prefix: %q\ngot: %q", wantHead, got)
-	}
-	// 64 hex chars of sha256("hi") + nothing else.
-	bodyHashPart := got[len(wantHead):]
-	if len(bodyHashPart) != 64 {
-		t.Errorf("body hash suffix length = %d, want 64", len(bodyHashPart))
+	want := "kojo-peer-auth-v2\nabc\nxyz\n42\nn\nGET\n/p\nq=1"
+	if got != want {
+		t.Errorf("payload mismatch:\nwant: %q\ngot:  %q", want, got)
 	}
 }

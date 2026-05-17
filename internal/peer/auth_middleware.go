@@ -1,13 +1,11 @@
 package peer
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -16,20 +14,11 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-// AuthMaxBodyBytes caps the request body size the auth middleware
-// will buffer for hashing. This is the WIRE size after any
-// Content-Encoding compression the sender applied — the
-// middleware hashes the raw bytes the handler will see on
-// r.Body, not the decompressed JSON. The §3.7 agent-sync
-// payload — the largest signed body in practice — uses
-// Content-Encoding: gzip to compress a full transcript +
-// memory_entries + claude session JSONLs (raw ~60 MiB
-// JSON-encoded → ~6-10 MiB gzipped for typical agent state) so
-// it fits inside this cap. Stays at 16 MiB so an unrelated
-// peer-signed endpoint can't be coerced into buffering huge
-// bodies; the handler-side peerAgentSyncMaxBody bounds the
-// DECOMPRESSED size.
-const AuthMaxBodyBytes = 16 << 20
+// v2 of the peer-auth wire format dropped body hashing from the
+// signature (see auth.go). The middleware no longer buffers the
+// request body, so there is no AuthMaxBodyBytes constant — each
+// handler enforces its own per-route body cap via http.MaxBytesReader
+// just like a non-peer request would.
 
 // AuthMiddleware is the HTTP middleware that resolves an
 // Ed25519-signed peer request to an auth.Principal{Role:RolePeer}.
@@ -54,11 +43,10 @@ const AuthMaxBodyBytes = 16 << 20
 // AuthMiddleware so its principal isn't clobbered. The downstream
 // middlewares respect a pre-existing non-Guest principal.
 //
-// Body handling: the middleware reads the full body to compute
-// the canonical signing payload's body-hash. Bodies are bounded
-// by AuthMaxBodyBytes; over-size yields 413. After reading, the
-// body is re-attached as a bytes.Reader so the handler can read
-// it normally.
+// Body handling: v2 dropped body-hash signing, so the middleware
+// passes r.Body through unchanged to the handler. Per-route body
+// limits live on each handler (e.g. http.MaxBytesReader in the
+// upload / blob PUT paths).
 type AuthMiddleware struct {
 	store  *store.Store
 	nonces *NonceCache
@@ -194,23 +182,9 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 				"peer_registry public_key shape invalid")
 			return
 		}
-		// Step 5: body buffering for hash. Bounded by
-		// AuthMaxBodyBytes. The buffered bytes are re-attached
-		// to r.Body so the handler reads them normally.
-		body, err := readCappedBody(r, AuthMaxBodyBytes)
-		if err != nil {
-			var oversize *bodyOversizeError
-			if errors.As(err, &oversize) {
-				writePeerAuthError(w, http.StatusRequestEntityTooLarge,
-					"signed body exceeds cap")
-				return
-			}
-			writePeerAuthError(w, http.StatusBadRequest,
-				"body read: "+err.Error())
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		// Step 6: signature verification.
+		// Step 5: signature verification. v2 doesn't cover the
+		// body, so r.Body is passed through to the handler
+		// untouched — no buffering, no per-middleware size cap.
 		in := SigningInput{
 			DeviceID: dev,
 			Audience: aud,
@@ -223,7 +197,6 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 			// verifier. RawQuery is already raw-encoded.
 			Path:     r.URL.EscapedPath(),
 			RawQuery: r.URL.RawQuery,
-			Body:     body,
 		}
 		if err := Verify(ed25519.PublicKey(pub), sig, in); err != nil {
 			writePeerAuthError(w, http.StatusUnauthorized,
@@ -271,35 +244,6 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 	})
 }
 
-// bodyOversizeError is the sentinel that readCappedBody returns
-// when the body exceeds the cap. The error type lets the caller
-// distinguish "client sent too much" (413) from a generic read
-// failure (400).
-type bodyOversizeError struct{ Cap int64 }
-
-func (e *bodyOversizeError) Error() string {
-	return fmt.Sprintf("body exceeds %d byte cap", e.Cap)
-}
-
-// readCappedBody reads up to cap+1 bytes and returns the body if
-// the read landed at or under cap. One extra byte is the
-// "over-cap" signal — without it we'd accept exactly-cap-sized
-// bodies and also exactly-(cap+1) which silently truncates.
-func readCappedBody(r *http.Request, cap int64) ([]byte, error) {
-	if r.Body == nil {
-		return nil, nil
-	}
-	limited := io.LimitReader(r.Body, cap+1)
-	buf, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(buf)) > cap {
-		return nil, &bodyOversizeError{Cap: cap}
-	}
-	return buf, nil
-}
-
 // writePeerAuthError emits a JSON error body the test suite + the
 // peer-side client can parse uniformly. status is the HTTP code;
 // msg goes into the JSON.
@@ -337,15 +281,7 @@ func SignRequest(req *http.Request, deviceID string, priv ed25519.PrivateKey, no
 	if nonce == "" {
 		return errors.New("peer.SignRequest: nonce required")
 	}
-	var body []byte
-	if req.Body != nil {
-		var err error
-		body, err = io.ReadAll(req.Body)
-		if err != nil {
-			return fmt.Errorf("peer.SignRequest: read body: %w", err)
-		}
-		req.Body = io.NopCloser(bytes.NewReader(body))
-	}
+	// v2 doesn't cover the body; nothing to read here.
 	ts := time.Now().UnixMilli()
 	in := SigningInput{
 		DeviceID: deviceID,
@@ -355,7 +291,6 @@ func SignRequest(req *http.Request, deviceID string, priv ed25519.PrivateKey, no
 		Method:   req.Method,
 		Path:     req.URL.EscapedPath(),
 		RawQuery: req.URL.RawQuery,
-		Body:     body,
 	}
 	sig := Sign(priv, in)
 	req.Header.Set(AuthHeaderID, deviceID)

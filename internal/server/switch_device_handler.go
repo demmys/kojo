@@ -476,24 +476,15 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	resp.OpID = syncReq.OpID
 
 	// Step 0.5: serialize + gzip the agent-sync wire body BEFORE
-	// begin. If the gzipped size exceeds the peer auth
-	// middleware's wire cap, target will reject with HTTP 413
-	// after begin has already marked handoff_pending — costing a
-	// round-trip and forcing an orchestrateAbort cycle. Doing
-	// the marshal/gzip here lets us fail FAST with a clean
-	// "agent state too large" error before any state change. The
-	// resulting bytes are reused by dispatchPeerAgentSync (no
-	// double work).
+	// begin. The receiver still enforces a decompressed-size cap
+	// (peerAgentSyncMaxBody) and a gzip-bomb LimitReader, so doing
+	// the marshal/gzip here lets us fail FAST with a clean error
+	// before flipping handoff_pending. The resulting bytes are
+	// reused by dispatchPeerAgentSync (no double work).
 	syncWireBody, syncRawLen, werr := encodeAgentSyncWire(syncReq)
 	if werr != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"encode agent-sync wire: "+werr.Error())
-		return
-	}
-	if int64(len(syncWireBody)) > int64(peer.AuthMaxBodyBytes) {
-		writeError(w, http.StatusRequestEntityTooLarge, "agent_too_large",
-			fmt.Sprintf("agent state too large for single agent-sync (gzipped %d bytes > peer auth cap %d); chunked sync not yet supported in v1",
-				len(syncWireBody), peer.AuthMaxBodyBytes))
 		return
 	}
 	if int64(syncRawLen) > int64(peerAgentSyncMaxBody) {

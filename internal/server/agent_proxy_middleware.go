@@ -1,11 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
@@ -173,31 +171,16 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		targetURL += "?" + encoded
 	}
 
-	// Buffer the request body (capped at 10 MB — covers avatar
-	// uploads and JSON mutations). Read one extra byte so we can
-	// detect overflow (io.LimitReader silently returns EOF at the
-	// cap; reading cap+1 bytes distinguishes "exactly fits" from
-	// "too large"). For streaming endpoints a future enhancement
-	// can use io.TeeReader.
-	const maxProxyBody = 10 << 20
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxProxyBody+1))
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "body_read",
-			"failed to buffer request body: "+err.Error())
-		return
-	}
-	if int64(len(body)) > maxProxyBody {
-		writeError(w, http.StatusRequestEntityTooLarge, "body_too_large",
-			"request body exceeds proxy limit")
-		return
-	}
-
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
+	// v2 peer-auth no longer hashes the body, so we stream the
+	// request straight through instead of buffering it. Downstream
+	// handlers apply their own per-route MaxBytesReader.
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "proxy_build",
 			"failed to build proxy request: "+err.Error())
 		return
 	}
+	proxyReq.ContentLength = r.ContentLength
 
 	// Preserve content metadata so the target handler parses
 	// the body correctly (JSON, multipart, etc.).
@@ -218,17 +201,10 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		return
 	}
 
-	// Proxy timeout split: API calls are fast (60s covers avatar
-	// uploads + heavy mutations); raw / view fetches stream
-	// multi-MB bodies and would clip mid-transfer on a 60s
-	// budget. Match session_proxy_middleware's 5-minute raw
-	// ceiling so the two surfaces behave the same.
-	_, sub, _ := auth.SplitAgentIDPath(r.URL.Path)
-	proxyTimeout := 60 * time.Second
-	if isRawAgentSubpath(sub) {
-		proxyTimeout = 5 * time.Minute
-	}
-	client := peer.NoKeepAliveHTTPClient(proxyTimeout)
+	// No HTTP client timeout: avatar uploads can be 128 MiB and
+	// raw fetches stream arbitrary body sizes. The request
+	// context cancels the dispatch when the caller disconnects.
+	client := peer.NoKeepAliveHTTPClient(0)
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		if s.logger != nil {

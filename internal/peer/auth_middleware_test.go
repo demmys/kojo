@@ -244,31 +244,55 @@ func TestAuthMiddleware_RejectsSelfLoopback(t *testing.T) {
 	}
 }
 
-func TestAuthMiddleware_BodyHashCoversPayload(t *testing.T) {
+// v2 deliberately does NOT bind the body into the signature. A body
+// swapped after signing must therefore reach the handler unchanged
+// — that's the property we trade against being able to stream
+// multi-GiB uploads.
+func TestAuthMiddleware_BodySwapStillPasses(t *testing.T) {
 	mw, priv, dev, _ := newAuthFixture(t)
 	body := []byte(`{"x":1}`)
 	r := signedRequest(t, http.MethodPost, "/api/v1/peers/blobs/foo", body, dev, priv)
-	// Tamper with the body AFTER signing. Verification must fail.
-	r.Body = io.NopCloser(bytes.NewReader([]byte(`{"x":2}`)))
+	swapped := []byte(`{"x":2}`)
+	r.Body = io.NopCloser(bytes.NewReader(swapped))
+	r.ContentLength = int64(len(swapped))
 	w := httptest.NewRecorder()
-	mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("handler reached on tampered body")
+	var seen []byte
+	mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		seen, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("handler read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
 	})).ServeHTTP(w, r)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401 on tampered body", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if string(seen) != string(swapped) {
+		t.Errorf("handler body = %q, want %q", seen, swapped)
 	}
 }
 
-func TestAuthMiddleware_OversizeBodyReturns413(t *testing.T) {
+// v2 doesn't buffer the body, so there is no per-middleware body
+// cap. Big bodies pass through; the per-route MaxBytesReader on the
+// downstream handler is what enforces a limit. We assert the
+// middleware itself doesn't 413.
+func TestAuthMiddleware_NoMiddlewareBodyCap(t *testing.T) {
 	mw, priv, dev, _ := newAuthFixture(t)
-	big := make([]byte, AuthMaxBodyBytes+1)
+	// 32 MiB — far above the v1 16 MiB cap we just removed.
+	big := make([]byte, 32<<20)
 	r := signedRequest(t, http.MethodPost, "/api/v1/peers/blobs/foo", big, dev, priv)
 	w := httptest.NewRecorder()
+	reached := false
 	mw.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("handler reached on oversize body")
+		reached = true
+		w.WriteHeader(http.StatusOK)
 	})).ServeHTTP(w, r)
-	if w.Code != http.StatusRequestEntityTooLarge {
-		t.Errorf("status = %d, want 413", w.Code)
+	if !reached {
+		t.Fatalf("handler not reached: status=%d body=%s", w.Code, w.Body.String())
+	}
+	if w.Code == http.StatusRequestEntityTooLarge {
+		t.Errorf("middleware rejected large body — v2 must not cap it here")
 	}
 }
 

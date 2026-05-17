@@ -1,11 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
@@ -69,20 +67,13 @@ func isPeerProxyPath(p string) bool {
 	return false
 }
 
-const sessionProxyTimeout = 30 * time.Second
-
-// sessionProxyRawTimeout bounds raw / download proxies. Large
-// file fetches (raw, view of a big log, attachment download)
-// cannot fit in the JSON-API budget — a multi-MB pull over a
-// slow tailnet would otherwise hit the 30s ceiling mid-stream.
-// 5 minutes mirrors the orchestrator's switch-device window.
-const sessionProxyRawTimeout = 5 * time.Minute
-
 // isRawProxyPath returns true when the request reads bulk body
-// data (raw file, view, download). These paths get the
-// sessionProxyRawTimeout client; everything else uses the
-// short sessionProxyTimeout so a stuck JSON write doesn't pin
-// a peer connection for minutes.
+// data (raw file, view, download). Kept around so callers that
+// want to distinguish "API ping" from "stream a body" still can,
+// but with the v2 peer-auth refactor every proxied request uses
+// the no-timeout HTTP client — a multi-GiB upload over a slow
+// tailnet can't fit in any sensible fixed budget, and the
+// caller's request context already cancels the dispatch.
 func isRawProxyPath(p string) bool {
 	switch p {
 	case "/api/v1/files/raw", "/api/v1/files/view":
@@ -131,35 +122,18 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 		target += "?" + rawQuery
 	}
 
-	// Body cap chosen to fit the receiver's PeerAuth budget: the
-	// signing middleware buffers the body to hash it (16 MiB cap
-	// in internal/peer.AuthMaxBodyBytes). We stay under that with
-	// a small margin so legitimate uploads land. The local upload
-	// handler accepts up to 20 MiB; cross-peer uploads are
-	// effectively capped lower because we cannot raise PeerAuth's
-	// hash budget without weakening the body-tamper guarantee.
-	// Surface the difference explicitly in the 413 message so the
-	// user sees why a file that uploads locally fails over the
-	// peer route.
-	const maxBody = 15 << 20
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "body_read",
-			"failed to buffer request body: "+err.Error())
-		return
-	}
-	if int64(len(body)) > maxBody {
-		writeError(w, http.StatusRequestEntityTooLarge, "body_too_large",
-			"request body exceeds 15 MiB cross-peer upload cap (local upload cap is 20 MiB; the cross-peer limit is tied to the receiver's signed-body hash budget)")
-		return
-	}
-
+	// v2 peer-auth no longer hashes the body, so there is no
+	// signing-budget reason to cap the proxy stream. Forward r.Body
+	// straight through; the local upload / blob handlers downstream
+	// apply their own per-route MaxBytesReader. ContentLength is
+	// copied so the receiver gets the same framing the client sent.
 	ctx := r.Context()
-	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, target, r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "proxy_build", err.Error())
 		return
 	}
+	proxyReq.ContentLength = r.ContentLength
 	for _, h := range []string{"Content-Type", "If-Match", "Idempotency-Key"} {
 		if v := r.Header.Get(h); v != "" {
 			proxyReq.Header.Set(h, v)
@@ -174,15 +148,11 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 		writeError(w, http.StatusInternalServerError, "internal", "sign: "+err.Error())
 		return
 	}
-	// Raw / view paths can carry multi-MB bodies; a 30s ceiling
-	// would clip them mid-stream over a slow tailnet. JSON ops
-	// stay on the short timeout so a stuck handler doesn't pin
-	// a peer connection for minutes.
-	clientTimeout := sessionProxyTimeout
-	if isRawProxyPath(r.URL.Path) {
-		clientTimeout = sessionProxyRawTimeout
-	}
-	client := peer.NoKeepAliveHTTPClient(clientTimeout)
+	// No HTTP client timeout: large uploads (multi-GiB blobs,
+	// attachments) easily blow past any fixed budget. The
+	// request context (request-scoped, cancelled when the
+	// client disconnects) provides the upper bound.
+	client := peer.NoKeepAliveHTTPClient(0)
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway", "peer unreachable: "+err.Error())

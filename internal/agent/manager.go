@@ -1358,7 +1358,14 @@ func (m *Manager) Checkin(agentID string) error {
 	timeoutMinutes := a.TimeoutMinutes
 	m.mu.Unlock()
 
-	cronMessage := readCheckinFile(agentID)
+	cronMessage, err := readCheckinFile(agentID)
+	if err != nil {
+		// Abort the manual check-in instead of running with the default
+		// prompt: if the operator wrote a custom check-in but we can't
+		// read it (permission denied, disk failure, etc.), executing the
+		// default would silently violate the configured rules.
+		return fmt.Errorf("read checkin.md: %w", err)
+	}
 
 	timeout := cronTimeout
 	if timeoutMinutes > 0 {

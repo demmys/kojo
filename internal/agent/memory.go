@@ -101,13 +101,29 @@ func longestBacktickRun(data []byte) int {
 const DefaultCheckinContent = "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks."
 
 // readCheckinFile reads checkin.md for an agent.
-// Returns "" if the file doesn't exist (caller uses default behavior).
-func readCheckinFile(agentID string) string {
-	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
-	if err != nil {
-		return ""
+// Returns ("", nil) when the file entry is genuinely absent, or when it
+// exists but is empty — the caller (cronPromptAt / ReadCheckinFileOrDefault)
+// TrimSpace-checks the content and substitutes DefaultCheckinContent in both
+// cases. Any other I/O error — permission denied, partial disk failure,
+// broken symlink, etc. — is propagated so cron / manual check-ins can abort
+// instead of silently running with the default prompt. If the operator
+// authored a custom check-in but we can't read it, executing the default
+// would violate the configured rules; aborting is the safer behavior.
+//
+// Distinguishing "absent" from "entry exists but is unreadable" requires
+// Lstat (not Stat), because os.IsNotExist on a ReadFile error is true for
+// broken symlinks as well — those should be treated as a read failure, not
+// as "file not set".
+func readCheckinFile(agentID string) (string, error) {
+	p := filepath.Join(agentDir(agentID), "checkin.md")
+	data, err := os.ReadFile(p)
+	if err == nil {
+		return string(data), nil
 	}
-	return string(data)
+	if _, statErr := os.Lstat(p); statErr != nil && os.IsNotExist(statErr) {
+		return "", nil
+	}
+	return "", err
 }
 
 // WriteCheckinFile writes checkin content to checkin.md.
@@ -134,19 +150,28 @@ func WriteCheckinFile(agentID string, content string) error {
 
 // ReadCheckinFileOrDefault reads checkin.md, returning DefaultCheckinContent
 // if the file doesn't exist. Used by the API to show a template in the UI.
-// Returns (content, isDefault, err). Only os.IsNotExist falls back to the
-// default template; other I/O errors (permission denied, partial disk failure,
-// etc.) are surfaced so the API layer can respond with 500 instead of silently
-// masking the failure.
+// Returns (content, isDefault, err).
+//
+// Delegates "absent vs unreadable" classification to readCheckinFile so that
+// the UI/API surface and the cron/manual check-in surface agree: a broken
+// symlink or otherwise unreadable entry surfaces as an error in both places,
+// instead of one showing the default template while the other aborts.
+//
+// An empty or whitespace-only checkin.md is treated as absent here (returns
+// the default template, isDefault=true). WriteCheckinFile removes the file
+// rather than writing empty content, so this case does not arise under normal
+// operation; matching cronPromptAt's TrimSpace fallback keeps the UI and the
+// actual cron/manual prompt in agreement even if a user manually places a
+// blank file.
 func ReadCheckinFileOrDefault(agentID string) (string, bool, error) {
-	data, err := os.ReadFile(filepath.Join(agentDir(agentID), "checkin.md"))
+	content, err := readCheckinFile(agentID)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return DefaultCheckinContent, true, nil
-		}
 		return "", false, err
 	}
-	return string(data), false, nil
+	if strings.TrimSpace(content) == "" {
+		return DefaultCheckinContent, true, nil
+	}
+	return content, false, nil
 }
 
 // readPersonaFile reads the full content of persona.md for an agent.

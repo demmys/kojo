@@ -281,7 +281,15 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		}
 	}
 
-	cronMessage := readCheckinFile(agentID)
+	cronMessage, err := readCheckinFile(agentID)
+	if err != nil {
+		// Refuse to run with the default prompt when a custom check-in
+		// exists but is unreadable: that would silently violate the
+		// operator's configured rules. Surfacing via Warn surfaces the
+		// permission / disk failure in logs.
+		cs.logger.Warn("cron job skipped (checkin read failed)", "agent", agentID, "err", err)
+		return
+	}
 
 	// Cross-process guard: atomic lock file prevents duplicate execution
 	if !acquireCronLock(agentID) {

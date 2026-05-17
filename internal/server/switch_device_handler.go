@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -790,9 +791,34 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// stall past switchDeviceOpTimeout — the switch is already
 	// irreversible at this point, finalize is best-effort
 	// runtime activation.
-	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-	finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
-	finalizeCancel()
+	// Bounded retry: finalize's `lock_not_self` (target's
+	// AcquireAgentLock hit a still-live source row) is the
+	// recoverable race — the AgentLockGuard refresh loop will
+	// re-acquire as the lease expires, then a retry of finalize
+	// succeeds. Three short attempts cover the typical drain
+	// window without blocking the operator's UI indefinitely.
+	// Non-recoverable errors (network, 4xx other than
+	// lock_not_self) bail on the first attempt.
+	const finalizeAttempts = 3
+	const finalizeRetryBackoff = 500 * time.Millisecond
+	var finalizeErr error
+	for attempt := 0; attempt < finalizeAttempts; attempt++ {
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
+		finalizeCancel()
+		if finalizeErr == nil {
+			break
+		}
+		// Only retry the lock-not-self race; everything else is
+		// either fatal (4xx that won't fix itself) or fits the
+		// "operator manual retry / force-reclaim" path.
+		if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+			break
+		}
+		if attempt+1 < finalizeAttempts {
+			time.Sleep(finalizeRetryBackoff)
+		}
+	}
 	if finalizeErr != nil {
 		s.logger.Warn("switch-device: agent-sync finalize failed; operator may need to retry",
 			"agent", agentID, "target", req.TargetPeerID,

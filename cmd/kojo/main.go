@@ -881,6 +881,31 @@ func main() {
 			if capturedGuard != nil {
 				capturedGuard.AddAgent(hookCtx, agentID)
 			}
+			// Verify the lock actually transferred to this host
+			// before activating runtime side channels. AddAgent
+			// internally calls AcquireAgentLock; ErrLockHeld
+			// (stale source row still alive) leaves holder ≠
+			// self. Activating cron / notify / arrival chat
+			// against an agent we don't actually hold would let
+			// the runtime mutate state the source still owns,
+			// then surfacing 5xx at finalize would leave a
+			// half-active target. Return an error so the
+			// finalize handler keeps pending and the orchestrator
+			// can retry.
+			if agentMgr != nil && agentMgr.Store() != nil && peerIdentity != nil {
+				lock, lerr := agentMgr.Store().GetAgentLock(hookCtx, agentID)
+				if lerr != nil {
+					return fmt.Errorf("post-AddAgent lock lookup: %w", lerr)
+				}
+				if lock == nil || lock.HolderPeer != peerIdentity.DeviceID {
+					holder := ""
+					if lock != nil {
+						holder = lock.HolderPeer
+					}
+					return fmt.Errorf("agent_lock did not transfer (holder=%q, self=%q); orchestrator should retry finalize",
+						holder, peerIdentity.DeviceID)
+				}
+			}
 			// Activate runtime side channels (cron + notify) AFTER the
 			// lock guard has adopted us. Phase-1 (onAgentSynced) only
 			// refreshes the in-memory cache; firing schedules before

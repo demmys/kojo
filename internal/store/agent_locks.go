@@ -805,14 +805,27 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allo
 // lock row (which would bump the fencing_token and invalidate the
 // agent's just-adopted runtime tokens).
 //
-// Returns ErrNotFound when no row matches the agent_id.
-func (s *Store) UpdateAgentLockAllowedProxy(ctx context.Context, agentID, allowedProxyPeer string) error {
+// expectedHolder is a precondition: the UPDATE only fires when
+// agent_locks.holder_peer matches it. A concurrent steal that
+// flipped the holder between the caller's verify and this call
+// will leave the row's allowed_proxy_peer untouched and return
+// ErrFencingMismatch — the finalize handler treats that the same
+// as lock_not_self.
+//
+// Returns ErrNotFound when no row matches the agent_id;
+// ErrFencingMismatch when the row exists but holder_peer no
+// longer matches expectedHolder.
+func (s *Store) UpdateAgentLockAllowedProxy(ctx context.Context, agentID, expectedHolder, allowedProxyPeer string) error {
 	if agentID == "" {
 		return errors.New("store.UpdateAgentLockAllowedProxy: agent_id required")
 	}
+	if expectedHolder == "" {
+		return errors.New("store.UpdateAgentLockAllowedProxy: expected_holder required")
+	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE agent_locks SET allowed_proxy_peer = ? WHERE agent_id = ?`,
-		allowedProxyPeer, agentID,
+		`UPDATE agent_locks SET allowed_proxy_peer = ?
+		  WHERE agent_id = ? AND holder_peer = ?`,
+		allowedProxyPeer, agentID, expectedHolder,
 	)
 	if err != nil {
 		return fmt.Errorf("store.UpdateAgentLockAllowedProxy: %w", err)
@@ -822,7 +835,15 @@ func (s *Store) UpdateAgentLockAllowedProxy(ctx context.Context, agentID, allowe
 		return fmt.Errorf("store.UpdateAgentLockAllowedProxy: rows affected: %w", err)
 	}
 	if n == 0 {
-		return ErrNotFound
+		// Diagnose which precondition failed so the caller can
+		// surface the right error (lock missing vs holder
+		// mismatch). Read outside a tx is fine — both error
+		// types are advisory; the real authorisation happens
+		// in the next request through the middleware.
+		if _, gerr := s.GetAgentLock(ctx, agentID); errors.Is(gerr, ErrNotFound) {
+			return ErrNotFound
+		}
+		return ErrFencingMismatch
 	}
 	return nil
 }

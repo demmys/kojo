@@ -109,45 +109,48 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if lock != nil && lock.HolderPeer != "" && lock.HolderPeer != req.SourceDeviceID {
-			// Stale-row self-heal: if the recorded holder isn't
-			// the source AND the lease has expired, the row is
-			// orphan state from a prior half-switch (source
-			// reclaimed via force-reclaim while this peer was
-			// offline, etc.). Purge every per-agent artefact in
-			// one tx and let the probe fall through as if the
-			// row never existed — first-time-switch path on the
-			// orchestrator side will replay the sync cleanly.
+			// Stale-row self-heal: a holder ≠ source row blocks
+			// every retry of the orchestrator's switch (the
+			// agent-sync handler's existingLock guard 409s) and
+			// can only be opened by tearing the row down. We do
+			// that here so the operator's "re-run device-switch"
+			// from the Hub UI converges on its own.
 			//
-			// A LIVE lease ALSO triggers self-heal here: the
-			// orchestrator has explicitly asked to switch the
-			// agent again, so the prior holder's lease is no
-			// longer authoritative even if the wall-clock hasn't
-			// caught up to expiry. Without this, a peer that
-			// keeps refreshing its own stale lease (e.g.
-			// AgentLockGuard tick) blocks every retry until the
-			// operator pries the row open manually.
+			// Trust gate: refuse the purge unless the signer is
+			// operator-trusted on this host. Without the gate
+			// any paired RolePeer could probe a fabricated
+			// agent_id and wipe its lock/blob_refs/kv state —
+			// p.PeerTrusted is the same per-row trust bit
+			// agentHolderAdmitMiddleware reads for the full
+			// agents/* surface. operator pairing prerequisites
+			// (--peer-add --trusted on this host, or UI Trust
+			// button) already required for device-switch to
+			// land here in the first place.
+			//
+			// PurgeAgentRuntimeStateForRetry intentionally
+			// DELETEs the row (no upsert) — the subsequent
+			// agent-sync's existingLock check sees row=nil and
+			// admits the sync, AgentLockGuard.AddAgent then
+			// minted a clean (holder=self, allowed=self) row,
+			// and finalize's UpdateAllowedProxy stamps source
+			// as allowed_proxy_peer.
+			if !p.PeerTrusted {
+				writeError(w, http.StatusForbidden, "wrong_holder",
+					"agent_locks.holder_peer does not match source_device_id; self-heal refused for untrusted signer")
+				return
+			}
 			s.logger.Warn("state probe: purging stale agent runtime state on target",
 				"agent", req.AgentID, "source", req.SourceDeviceID,
 				"stale_holder", lock.HolderPeer,
 				"lease_expires_at", lock.LeaseExpiresAt)
-			if s.peerID != nil {
-				// Reset to "this peer doesn't know the agent yet"
-				// by routing through the operator-equivalent
-				// recovery path. We pick selfPeerID as the
-				// transient holder so the upsert leaves the row
-				// in a coherent shape; the orchestrator's
-				// upcoming agent-sync immediately rewrites it to
-				// (holder=self, allowed=source).
-				if _, err := s.agents.Store().ForceReclaimAgentToLocal(
-					r.Context(), req.AgentID, s.peerID.DeviceID,
-					store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
-				); err != nil {
-					s.logger.Error("state probe: stale state purge failed",
-						"agent", req.AgentID, "err", err)
-					writeError(w, http.StatusInternalServerError, "internal",
-						"stale state purge: "+err.Error())
-					return
-				}
+			if err := s.agents.Store().PurgeAgentRuntimeStateForRetry(
+				r.Context(), req.AgentID,
+			); err != nil {
+				s.logger.Error("state probe: stale state purge failed",
+					"agent", req.AgentID, "err", err)
+				writeError(w, http.StatusInternalServerError, "internal",
+					"stale state purge: "+err.Error())
+				return
 			}
 		}
 	}

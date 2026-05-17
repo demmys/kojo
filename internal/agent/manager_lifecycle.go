@@ -622,7 +622,16 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		// No artificial timeout: the arrival prompt asks the
+		// agent to resume mid-thought after a device switch, and
+		// claude regularly takes longer than a few minutes on
+		// the recap. The previous 3-minute WithTimeout truncated
+		// every long arrival with a "⚠️ 制限時間超過により中断されました"
+		// system message in the transcript — visible to the user
+		// as "timeouts are firing on every switch". A plain
+		// Background context drops the deadline; the chat is
+		// still aborted on agent teardown via Manager.Abort.
+		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"

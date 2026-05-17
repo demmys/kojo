@@ -147,6 +147,14 @@ type Manager struct {
 	// don't wire blob still work.
 	blobStore *blob.Store
 
+	// attachForwarder is the hub-push callback used by the kojo-attach
+	// flow (attach_scan.go). nil on hub installs (no forwarding
+	// needed — the local Put IS the canonical copy); non-nil on
+	// --peer-mode daemons so an attachment generated locally is
+	// also pushed to the hub blob store. Set via
+	// SetAttachmentForwarder from cmd/kojo after peer identity boot.
+	attachForwarder AttachmentForwarder
+
 	// patchMus serializes If-Match-gated mutations per agent. The HTTP
 	// PATCH handler holds the per-agent lock across precondition-check
 	// → Manager.Update → ETag echo so two concurrent requests carrying
@@ -1629,6 +1637,15 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		// SKILL.md when the toggle is off or the last peer was
 		// dropped.
 		SyncDeviceSwitchSkill(agentID, agentCopy.IsDeviceSwitchEnabled(), m.logger)
+		// kojo-attach skill: agent writes files into
+		// <agentDir>/.kojo/attach/ during the turn and kojo
+		// surfaces them as MessageAttachment chips on the
+		// assistant reply. Gated on blob store presence
+		// because without a blob.Store there is no canonical
+		// place to store the bytes and the user UI cannot
+		// fetch them. No operator toggle yet — the feature is
+		// always-on when the store is wired.
+		SyncAttachSkill(agentID, m.blobStore != nil, m.logger)
 	}
 
 	// Build MCP server list (backend-agnostic, URL-based).
@@ -1950,6 +1967,18 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			msg.Content = accText.String()
 			msg.Thinking = accThinking.String()
 			msg.ToolUses = accToolUses
+			// kojo-attach abort path: any files the agent had
+			// already written into .kojo/attach/ before the
+			// abort still belong to this partial reply. Use a
+			// background ctx with the same cap as the normal
+			// done path so the hub forward (if any) gets a
+			// fair shot even though the parent ctx is already
+			// cancelled.
+			scanCtx, scanCancel := context.WithTimeout(context.Background(), attachScanCeiling)
+			if atts := m.scanAndIngestAttachments(scanCtx, agentID, msg.ID); len(atts) > 0 {
+				msg.Attachments = atts
+			}
+			scanCancel()
 			m.persistDoneEvent(agentID, msg)
 		}
 		if ctx.Err() == context.DeadlineExceeded {
@@ -1998,6 +2027,27 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			if !stillHere {
 				return
 			}
+			// kojo-attach: drain <agentDir>/.kojo/attach/ before
+			// persisting so the assistant Message that lands in
+			// the transcript already carries its attachments.
+			// Use a background ctx with a generous cap so the
+			// scan still runs (and the hub forward still gets a
+			// fair shot) even when this terminal event arrives
+			// via the post-cancel drain loop — passing the parent
+			// ctx there would deadline-cancel forwardTimeoutFor
+			// immediately and silently drop every attachment on
+			// any aborted turn. The cap is large enough to cover
+			// multi-GiB forwards but bounded so a hung scan can't
+			// leak the goroutine across shutdown.
+			scanCtx, scanCancel := context.WithTimeout(context.Background(), attachScanCeiling)
+			if atts := m.scanAndIngestAttachments(scanCtx, agentID, event.Message.ID); len(atts) > 0 {
+				if len(event.Message.Attachments) == 0 {
+					event.Message.Attachments = atts
+				} else {
+					event.Message.Attachments = append(event.Message.Attachments, atts...)
+				}
+			}
+			scanCancel()
 			m.persistDoneEvent(agentID, event.Message)
 
 			if m.OnChatDone != nil && event.ErrorMessage == "" {

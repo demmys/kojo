@@ -137,6 +137,44 @@ export const api = {
       withPeer(`/api/v1/files/raw?path=${encodeURIComponent(path)}`, peerId),
   },
 
+  // blob serves the native blob store. Used by attachments that
+  // originate as kojo:// URIs (agent-generated files, hub-ingested
+  // peer pushes). Pass the URI verbatim; the helper parses scope +
+  // path and constructs `/api/v1/blob/{scope}/{path}` with the
+  // Owner token appended for `<img src>` / anchor download.
+  //
+  // Returns `null` if the input is not a kojo:// URI so the caller
+  // can fall back to the files-raw URL helper for legacy local-path
+  // attachments.
+  blob: {
+    // urlFromKojoURI converts a kojo://<scope>/<path> URI into the
+    // hub-side download URL (/api/v1/blob/<scope>/<path>?token=...).
+    // Returns null for non-kojo inputs so callers can fall back to
+    // the files-raw helper for legacy filesystem-path attachments.
+    //
+    // The blob handler has no ?download=1 switch — use the anchor's
+    // `download` attribute on the link element to force save-as
+    // instead of inline display.
+    urlFromKojoURI: (uri: string): string | null => {
+      if (!uri.startsWith("kojo://")) return null;
+      const rest = uri.slice("kojo://".length);
+      const slash = rest.indexOf("/");
+      if (slash <= 0) return null;
+      const scope = rest.slice(0, slash);
+      // Path segments are already percent-encoded inside the URI
+      // (blob.BuildURI emits the canonical form). Decoding then
+      // re-encoding each segment normalises any double encoding
+      // (`%2520` → `%20`) that an upstream serializer might have
+      // introduced.
+      const pathSegs = rest
+        .slice(slash + 1)
+        .split("/")
+        .map((s) => encodeURIComponent(decodeURIComponent(s)));
+      const url = `/api/v1/blob/${encodeURIComponent(scope)}/${pathSegs.join("/")}`;
+      return appendTokenQuery(url);
+    },
+  },
+
   git: {
     status: (workDir: string, peerId?: string) =>
       get<GitStatus>(withPeer(`/api/v1/git/status?workDir=${encodeURIComponent(workDir)}`, peerId)),

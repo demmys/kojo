@@ -281,6 +281,23 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString("- The current date and time is supplied at the top of each user message in a `<context>` block. Read it from there when you need it — it intentionally is NOT in this system prompt so the prompt cache stays warm across turns.\n")
 
+	// kojo-attach contract. Backends that natively load `.claude/skills/`
+	// (claude / custom) ALSO see the dedicated kojo-attach SKILL.md
+	// installed by SyncAttachSkill; this short block in the system
+	// prompt is for the rest of the backends (codex / gemini /
+	// llama.cpp) so they can also surface attachments without
+	// depending on the claude-specific skills mechanism. Costs a
+	// handful of tokens that stay cached as long as the agentDir
+	// path is stable.
+	attachStage := filepath.Join(dir, attachStagingSubpath)
+	sb.WriteString("\n## Sending file attachments to the user\n\n")
+	sb.WriteString(fmt.Sprintf("To send a file (image, audio, video, PDF, archive — anything) as a downloadable attachment on your NEXT reply, write the file into `%s/<basename>`. kojo scans this directory the moment your turn ends, moves every regular file out of it, and attaches them to the message you just sent. The user sees image / video thumbnails inline and a download chip for other types.\n", attachStage))
+	sb.WriteString("Rules:\n")
+	sb.WriteString(fmt.Sprintf("- `mkdir -p %s` before the first write of a turn (the daemon empties the directory between turns).\n", attachStage))
+	sb.WriteString("- Plain filenames only. Subdirectories under the staging dir are ignored. Dotfiles are rejected.\n")
+	sb.WriteString("- Per-file cap is 10 GiB. Empty files are skipped.\n")
+	sb.WriteString("- You do NOT need to repeat the path or post a curl command in your reply — the UI surfaces the attachment automatically.\n")
+
 	// Memory paths.
 	// Use absolute paths everywhere so the agent doesn't rely on cwd being
 	// correct when it Edits or Greps the diary. Relative paths silently

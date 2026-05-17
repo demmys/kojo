@@ -203,6 +203,14 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		if !p.PeerTrusted {
 			return false
 		}
+		// kojo-attach hub-ingest: peer pushes agent-generated
+		// attachment bytes into hub's blob store via a PUT here.
+		// Hub-side handler enforces the body's sha256 against
+		// the X-Kojo-Expected-SHA256 header so a leaked peer
+		// signing key cannot scribble arbitrary content.
+		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
+			return true
+		}
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}

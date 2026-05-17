@@ -179,6 +179,22 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// run inside the handler.
 			return true
 		}
+		// kojo-attach hub-ingest: admitted BEFORE the PeerTrusted
+		// gate. The handler-side guards (regex-locked path under
+		// `agents/<id>/attach/<msg>/<filename>`, mandatory
+		// X-Kojo-Expected-SHA256, existing-row sha256-conflict
+		// check, home_peer cross-overwrite refusal) make this
+		// surface narrow enough that requiring the operator to
+		// also flip `--peer-trust` would just produce silent
+		// "attachment vanished" failures in the common case where
+		// a peer was auto-paired via discovery but never
+		// explicitly trusted on hub. Any RolePeer signer that
+		// completed pairing can push attachments scoped to its
+		// own agent runtime; the body digest is the integrity
+		// gate, not the trust bit.
+		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
+			return true
+		}
 		// Trust gate. Every privileged peer surface — sessions,
 		// ws, info, dirs, files, git, upload, AND the §3.7 agent
 		// proxy paths — requires the per-row peer_registry.trusted
@@ -202,14 +218,6 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// sessions/files/git through this admit.
 		if !p.PeerTrusted {
 			return false
-		}
-		// kojo-attach hub-ingest: peer pushes agent-generated
-		// attachment bytes into hub's blob store via a PUT here.
-		// Hub-side handler enforces the body's sha256 against
-		// the X-Kojo-Expected-SHA256 header so a leaked peer
-		// signing key cannot scribble arbitrary content.
-		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
-			return true
 		}
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true

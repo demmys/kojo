@@ -261,8 +261,18 @@ func (m *Manager) ingestOneAttachment(
 			cancel()
 			fwdFile.Close()
 			if fwdErr != nil {
-				logger.Warn("attach scan: hub forward failed; keeping attachment for later sync",
-					"uri", uri, "err", fwdErr)
+				// Error elevated to Error (not Warn) so it
+				// surfaces in default-level operator log
+				// scraping. Includes the full error chain
+				// from the push retry loop so the failure
+				// mode (no peers / TLS handshake / 4xx with
+				// body / hub side regex reject / ...) is
+				// visible without enabling debug logs.
+				logger.Error("attach scan: hub forward failed; keeping attachment for later sync",
+					"uri", uri,
+					"size", obj.Size,
+					"sha256", obj.SHA256,
+					"err", fwdErr)
 				// Same rationale as the openErr branch above —
 				// retain the metadata so the user-visible chat
 				// is honest about what the agent produced, even

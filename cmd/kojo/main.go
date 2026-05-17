@@ -969,6 +969,29 @@ func main() {
 		// re-activated. Both live outside the store, so the hook
 		// runs them here.
 		srv.SetOnAgentForceReclaimed(func(hookCtx context.Context, agentID string) {
+			// Re-hydrate the in-memory cache FIRST. Without this
+			// ActivateAgentRuntime's Manager.Get returns ok=false
+			// (the agent was evicted when we released it as
+			// source) and the call is a silent no-op — cron /
+			// notify never wake up and the UI still treats the
+			// agent as remote on the next list. Reload pulls the
+			// row from the store, including any updates that
+			// landed during the release.
+			if agentMgr != nil {
+				if err := agentMgr.ReloadAgentFromStore(agentID); err != nil && logger != nil {
+					logger.Warn("force-reclaim: reload from store failed",
+						"agent", agentID, "err", err)
+				}
+				// Clear the prior "this peer released the agent
+				// as source" marker so the next daemon restart
+				// doesn't evict the row we just reclaimed. Best-
+				// effort: a stale marker only matters on the
+				// next boot.
+				if err := agentMgr.ClearAgentReleasedHere(hookCtx, agentID); err != nil && logger != nil {
+					logger.Warn("force-reclaim: clear released marker failed",
+						"agent", agentID, "err", err)
+				}
+			}
 			if capturedGuard != nil {
 				capturedGuard.AddAgent(hookCtx, agentID)
 			}

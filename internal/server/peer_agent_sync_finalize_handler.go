@@ -3,12 +3,10 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 
 	"github.com/loppo-llc/kojo/internal/auth"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.7 — agent-sync finalize.
@@ -124,45 +122,66 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	// Hook succeeded: NOW remove the pending entry so a
-	// subsequent retry surfaces as the 404 idempotent path.
-	// A kv delete failure surfaces as 500 — leaving a sealed
-	// token row in place while telling the orchestrator the
-	// op completed would let a later boot consume the same
-	// (agent_id, op_id) and replay every hook side effect
-	// (token adopt / arrived marker / lock guard add). All
-	// three are idempotent on retry, so the orchestrator's
-	// next finalize call can re-fire the hook and re-attempt
-	// the delete until kv is reachable again. The memory-cache
-	// entry stays present too (commit clears memory only
-	// after a successful kv delete), so the local retry path
-	// stays consistent with the kv state.
+	// Lock verification + allowed_proxy stamp must succeed BEFORE
+	// we delete the pending entry. Otherwise a finalize whose
+	// AddAgent failed (e.g. ErrLockHeld against a stale row
+	// pointing at the source) would commit with holder ≠ self
+	// AND allowed_proxy_peer = source — middleware then 403s
+	// every subsequent Hub→target proxy and the pending is gone,
+	// so the orchestrator cannot retry. Surfacing 5xx here keeps
+	// pending in place for the next finalize call.
+	//
+	// agentHolderAdmitMiddleware gates agents/* on
+	// `holder_peer == self AND allowed_proxy_peer == signer`.
+	// AcquireAgentLock fresh-row insert lands allowed_proxy_peer
+	// = self; we rewrite it to source so the Hub→target proxy
+	// admits. Scoped to a single agent — no peer_registry.trusted
+	// flip, so a paired-but-untrusted source can NOT use this as
+	// a stepping-stone to sessions/files/git.
+	if s.agents != nil && s.agents.Store() != nil && s.peerID != nil {
+		lock, lerr := s.agents.Store().GetAgentLock(r.Context(), req.AgentID)
+		if lerr != nil {
+			s.logger.Error("peer agent-sync finalize: lock lookup failed; pending retained",
+				"agent", req.AgentID, "op_id", req.OpID, "err", lerr)
+			writeError(w, http.StatusServiceUnavailable, "lock_lookup",
+				"lock lookup: "+lerr.Error())
+			return
+		}
+		if lock == nil || lock.HolderPeer != s.peerID.DeviceID {
+			holder := ""
+			if lock != nil {
+				holder = lock.HolderPeer
+			}
+			s.logger.Error("peer agent-sync finalize: holder did not transfer to local peer; pending retained",
+				"agent", req.AgentID, "op_id", req.OpID,
+				"holder", holder, "self", s.peerID.DeviceID)
+			writeError(w, http.StatusServiceUnavailable, "lock_not_self",
+				"agent_locks.holder_peer is not the local peer; finalize aborted, orchestrator may retry")
+			return
+		}
+		if err := s.agents.Store().UpdateAgentLockAllowedProxy(
+			r.Context(), req.AgentID, req.SourceDeviceID,
+		); err != nil {
+			s.logger.Error("peer agent-sync finalize: allowed-proxy stamp failed; pending retained",
+				"agent", req.AgentID, "source", req.SourceDeviceID, "err", err)
+			writeError(w, http.StatusInternalServerError, "internal",
+				"allowed-proxy stamp: "+err.Error())
+			return
+		}
+	}
+	// Hook + admit gate both succeeded — NOW remove the pending
+	// entry so a subsequent retry surfaces as the 404 idempotent
+	// path. A kv delete failure still surfaces as 500: leaving
+	// the sealed token in place while telling the orchestrator
+	// the op completed would let a later boot consume the same
+	// (agent_id, op_id) and replay every hook side effect. All
+	// hook steps are idempotent on retry.
 	if err := s.commitPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
 		s.logger.Error("peer agent-sync finalize: commit kv delete failed; surface 500 for retry",
 			"agent", req.AgentID, "op_id", req.OpID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"commit kv delete: "+err.Error())
 		return
-	}
-	// agentHolderAdmitMiddleware gates the agents/* surface on
-	// `holder_peer == self AND allowed_proxy_peer == signer`.
-	// The lock row the AgentLockGuard.AddAgent path inside the
-	// hook just minted (or refreshed) carries
-	// allowed_proxy_peer = self by default; the Hub→target proxy
-	// whose signer IS the source would 403 against that. Stamp
-	// the source as the authorised orchestrator for THIS agent
-	// so post-switch chat / messages / persona writes admit.
-	//
-	// Scoped to a single agent (no peer_registry.trusted flip),
-	// so paired-but-untrusted source can NOT use this as a
-	// stepping-stone to sessions/files/git.
-	if s.agents != nil && s.agents.Store() != nil {
-		if err := s.agents.Store().UpdateAgentLockAllowedProxy(
-			r.Context(), req.AgentID, req.SourceDeviceID,
-		); err != nil && !errors.Is(err, store.ErrNotFound) {
-			s.logger.Warn("peer agent-sync finalize: allowed-proxy stamp failed",
-				"agent", req.AgentID, "source", req.SourceDeviceID, "err", err)
-		}
 	}
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})

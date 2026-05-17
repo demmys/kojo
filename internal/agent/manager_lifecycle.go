@@ -596,6 +596,19 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 // agentID-only key was overly broad.
 var arrivalNotified sync.Map
 
+// arrivalCancels tracks the in-flight cancel func of every
+// NotifyDeviceSwitchArrival goroutine so a target-side teardown
+// (releaseAgentLocallyCore / TeardownAgentRuntime) can drop the
+// long-running arrival chat alongside the rest of the agent's
+// in-memory state. Without this the goroutine outlives teardown
+// (the chat runs under context.Background until WithCancel) and
+// keeps writing to the transcript even though the agent has
+// already been purged or re-adopted by another switch — surfacing
+// as duplicate / "ghost" assistant turns. Keyed by agent_id
+// (only the latest arrival chat per agent needs cancelling; a
+// duplicate finalize is deduped upstream by arrivalNotified).
+var arrivalCancels sync.Map // map[string]context.CancelFunc
+
 type arrivalDedupKey struct {
 	agentID string
 	opID    string
@@ -629,9 +642,23 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 		// every long arrival with a "⚠️ 制限時間超過により中断されました"
 		// system message in the transcript — visible to the user
 		// as "timeouts are firing on every switch". A plain
-		// Background context drops the deadline; the chat is
-		// still aborted on agent teardown via Manager.Abort.
+		// Background context drops the deadline.
 		ctx, cancel := context.WithCancel(context.Background())
+		// Register the cancel func so a target-side teardown
+		// (TeardownAgentRuntime when state-probe purge fires,
+		// or source-release when the switch flips back) can
+		// stop this chat instead of letting it keep writing to
+		// a transcript the agent no longer owns. The defer
+		// clears the entry on normal completion so a stale
+		// cancel doesn't fire for a later, unrelated arrival.
+		// Wrap cancel in a uniquely-addressable value so a stale
+		// goroutine's defer can CompareAndDelete its OWN entry
+		// without blowing away a fresh arrival's cancel that
+		// overwrote ours. Comparing the bare CancelFunc would
+		// fall back to func-value == which panics in Go.
+		myEntry := &cancel
+		arrivalCancels.Store(agentID, myEntry)
+		defer arrivalCancels.CompareAndDelete(agentID, myEntry)
 		defer cancel()
 
 		prompt := "デバイス転移完了。転移元: " + sourcePeerName + "。このデバイスで作業を継続してください。直前の会話の流れを確認し、中断された作業があれば再開してください。"
@@ -1147,6 +1174,19 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, withDBCleanup, markRel
 		}
 	}
 	m.cancelOneShots(agentID)
+	// Stop any in-flight arrival chat. It runs under
+	// context.Background until WithCancel; without this it
+	// outlives every teardown path (source-release, target-
+	// purge, EvictAtStartup) and keeps writing to a transcript
+	// the agent no longer owns. Best-effort — a finished
+	// goroutine cleared the map entry itself; a concurrent
+	// newer arrival uses CompareAndDelete to keep its own
+	// cancel registered.
+	if v, ok := arrivalCancels.LoadAndDelete(agentID); ok {
+		if cfp, ok := v.(*context.CancelFunc); ok && cfp != nil && *cfp != nil {
+			(*cfp)()
+		}
+	}
 	m.closeIndex(agentID)
 	if withDBCleanup && m.groupdms != nil {
 		m.groupdms.RemoveAgent(agentID)

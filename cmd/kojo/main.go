@@ -833,6 +833,20 @@ func main() {
 		agentMgr.StartSchedulers()
 	}
 
+	// kojo-attach hub forwarder. In --peer mode the daemon may
+	// host an agent runtime (post device-switch) that generates
+	// attachments locally; the bytes must also reach hub so the
+	// UI (hub-only) can serve them via /api/v1/blob/.... The
+	// forwarder is a closure over the live store + peer identity
+	// so a peer_registry edit (operator promotes a different hub
+	// via `--peer-trust`) is picked up on the next attachment
+	// without a daemon restart.
+	if agentMgr != nil && *peerMode && peerIdentity != nil {
+		if st := agentMgr.Store(); st != nil {
+			wireAttachForwarder(agentMgr, st, peerIdentity, logger)
+		}
+	}
+
 	// Invalidation broadcaster (§3.5). Process-local; cross-peer fan-out
 	// happens via the WebSocket subscriber pump in handleEventsWS. Closed
 	// from Server.Shutdown after the HTTP listeners drain.

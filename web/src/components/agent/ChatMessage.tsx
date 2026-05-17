@@ -185,6 +185,15 @@ function TTSPlayButton({
   );
 }
 
+// attachmentURL resolves an attachment's path to a downloadable
+// URL. kojo:// URIs (agent-generated attachments, hub-ingested peer
+// pushes) route to /api/v1/blob/<scope>/<path>; everything else is
+// treated as a legacy filesystem path and served via the file
+// browser raw endpoint.
+function attachmentURL(path: string): string {
+  return api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path);
+}
+
 /** Display file attachments on a message */
 export function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
@@ -193,6 +202,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
     <>
       <div className="flex flex-wrap gap-1.5 mb-2">
         {attachments.map((att) => {
+          const url = attachmentURL(att.path);
           const extType = getFileType(att.name || att.path);
           const isImage = att.mime.startsWith("image/") || extType === "image";
           const isVideo = !isImage && (att.mime.startsWith("video/") || extType === "video");
@@ -202,9 +212,10 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
                 key={att.path}
                 onClick={() => setPreview({ path: att.path, type: "image" })}
                 className="block rounded-lg overflow-hidden hover:opacity-80 transition-opacity"
+                title={att.name}
               >
                 <img
-                  src={api.files.rawUrl(att.path)}
+                  src={url}
                   alt={att.name}
                   className="max-w-[200px] max-h-[150px] object-cover rounded-lg"
                 />
@@ -228,19 +239,25 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               </button>
             );
           }
+          // Non-image/non-video: render as a download anchor so the
+          // user can save the file. Anchor's `download` attribute
+          // hints at save-as while still rendering inline-clickable.
           return (
-            <div
+            <a
               key={att.path}
-              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs ${
-                isUser ? "bg-blue-500/30" : "bg-neutral-700/50"
+              href={url}
+              download={att.name}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs hover:opacity-80 transition-opacity no-underline ${
+                isUser ? "bg-blue-500/30 text-white" : "bg-neutral-700/50 text-neutral-200"
               }`}
+              title={`Download ${att.name}`}
             >
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 opacity-60">
                 <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
               </svg>
               <span className="max-w-[150px] truncate">{att.name}</span>
               <span className="opacity-50">{formatSize(att.size)}</span>
-            </div>
+            </a>
           );
         })}
       </div>
@@ -803,7 +820,9 @@ export function MediaOverlay({
   type: "image" | "video";
   onClose: () => void;
 }) {
-  const rawUrl = api.files.rawUrl(path);
+  // attachmentURL routes kojo:// → /api/v1/blob/... and falls back
+  // to the file browser raw endpoint for legacy filesystem paths.
+  const rawUrl = attachmentURL(path);
   const [videoError, setVideoError] = useState(false);
   const fileName = path.split(/[/\\]/).pop() || path;
 

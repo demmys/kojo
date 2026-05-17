@@ -596,6 +596,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// to serve.
 		if s.blob != nil {
 			mux.HandleFunc("GET /api/v1/peers/blobs/", s.handlePeerBlobGet)
+			// kojo-attach hub ingest: peer-mode daemons PUT
+			// agent-generated attachment bodies here so the
+			// hub UI can serve them via the regular
+			// /api/v1/blob/{scope}/{path} route. Auth is
+			// RolePeer + peer_registry.trusted (policy.go);
+			// the handler enforces a mandatory body digest.
+			mux.HandleFunc("PUT /api/v1/peers/blobs-ingest/", s.handlePeerBlobIngest)
 		}
 		// Device-switch orchestration (§3.7). Owner-only. The
 		// begin/complete/abort triplet drives the blob_refs +

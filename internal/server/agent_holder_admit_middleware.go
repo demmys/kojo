@@ -7,30 +7,40 @@ import (
 	"github.com/loppo-llc/kojo/internal/auth"
 )
 
-// agentHolderAdmitMiddleware narrowly promotes an untrusted RolePeer
-// request to the agent-proxy surface when the agent_locks row says
-// the SIGNER currently holds the lock on the targeted agent. The
-// promotion lives ONLY in the request's context.Principal; the
+// agentHolderAdmitMiddleware narrowly promotes an untrusted
+// RolePeer request to the agent-proxy surface when THIS host is
+// the current lock holder for the targeted agent. The promotion
+// lives ONLY in the request's context.Principal; the
 // peer_registry.trusted column stays untouched, so the other
 // privileged surfaces (sessions, files, git, upload, info, dirs)
 // remain closed.
 //
-// Why this exists: §3.7 device-switch lands an agent on a peer that
-// has not necessarily been marked trusted on the receiving host.
-// Every post-switch Hub→peer chat / messages / persona / memory
-// edit travels as a RolePeer-signed proxy. The strict policy gate
-// (PeerTrusted required for /api/v1/agents/*) would 403 them all,
-// breaking the device-switch UX. A blanket admit (drop the
-// PeerTrusted requirement) leaks credentials/persona/memory to any
-// paired peer. The lock-holder gate threads the needle: a peer
-// that legitimately owns an agent's runtime (which only the
-// orchestrator can transfer) gets request-scoped admit; everyone
-// else falls through to the policy default-deny.
+// Direction of the check: a post-§3.7 device-switch leaves
+// agent_locks.holder_peer == THIS peer's device_id on the host
+// that adopted the agent. Every post-switch Hub→peer chat /
+// messages / persona / memory edit travels as a RolePeer-signed
+// proxy from the Hub; the SIGNER is the Hub, not the peer that
+// holds the lock, so a signer-equals-holder check would always
+// fail. The "self holds the lock" gate is what threads the
+// needle: we admit any RolePeer-signed write only when the agent
+// in question actually lives on this host, which is the same
+// condition the local runtime checks before accepting frames at
+// the fencing layer.
+//
+// Trust trade-off vs the strict PeerTrusted gate: any PAIRED
+// peer (not just the Hub) can reach the agents/* surface for
+// agents whose runtime currently lives on this host. The lock
+// is the authoritative permission token here — moving an agent
+// to this host implicitly authorises the cluster to talk to it,
+// and an unpaired peer's signature wouldn't pass PeerAuth in the
+// first place. Operators who want stricter scoping can flip the
+// peer's registry.trusted bit to keep using the per-row gate.
 //
 // Chain placement: this middleware MUST run AFTER PeerAuth (so
 // p.PeerID is populated) and BEFORE EnforceMiddleware (so the
 // promoted Principal participates in the policy gate). Owner /
-// untrusted-non-peer principals pass through untouched.
+// already-trusted-peer / non-peer principals pass through
+// untouched.
 func (s *Server) agentHolderAdmitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/v1/agents/") {
@@ -39,9 +49,6 @@ func (s *Server) agentHolderAdmitMiddleware(next http.Handler) http.Handler {
 		}
 		p := auth.FromContext(r.Context())
 		if !p.IsPeer() || p.PeerTrusted {
-			// Owners are admin; already-trusted peers pass via
-			// the normal policy admit. Only the bare RolePeer
-			// case needs the lock-holder lookup.
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -50,7 +57,7 @@ func (s *Server) agentHolderAdmitMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if s.agents == nil || s.agents.Store() == nil {
+		if s.agents == nil || s.agents.Store() == nil || s.peerID == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -59,20 +66,21 @@ func (s *Server) agentHolderAdmitMiddleware(next http.Handler) http.Handler {
 			// No lock row or read error — fall through. The
 			// policy gate will 403 this RolePeer request, which
 			// is the correct default-deny posture for an agent
-			// the signer can't prove it holds.
+			// this host doesn't claim to hold.
 			next.ServeHTTP(w, r)
 			return
 		}
-		if lock.HolderPeer == "" || lock.HolderPeer != p.PeerID {
+		if lock.HolderPeer == "" || lock.HolderPeer != s.peerID.DeviceID {
+			// This host isn't the holder — the agent lives
+			// elsewhere; refuse via the policy gate.
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Holder match: stamp a per-request promotion so the
-		// policy gate admits THIS request only. The registry row
-		// stays untrusted; the next request from the same signer
-		// re-runs the lookup and gets admitted (or not) based on
-		// the live lock state — releasing the lock revokes the
-		// admit on the very next call.
+		// Local host holds the lock for the targeted agent.
+		// Admit the peer-signed proxy for THIS request only; the
+		// registry row stays untrusted. The next request re-runs
+		// the lookup, so a lock release revokes the admit on the
+		// very next call.
 		promoted := p
 		promoted.PeerTrusted = true
 		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), promoted)))

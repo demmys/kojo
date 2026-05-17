@@ -67,18 +67,18 @@ func TestVerifyFailsOnTamperedRawQuery(t *testing.T) {
 	}
 }
 
-// v2 deliberately does NOT cover the request body. This test pins
-// that property so a future refactor that re-introduces body-hash
-// signing has to delete this test (rather than silently re-adding
-// a 16 MiB hidden cap).
+// The signature deliberately does NOT cover the request body. This
+// test pins that property so a future refactor that re-introduces
+// body-hash signing has to delete this test (rather than silently
+// re-adding a hidden 16 MiB cap).
 func TestVerifyIgnoresBody(t *testing.T) {
 	in, pub, priv := freshInput(t)
 	sig := Sign(priv, in)
-	// The canonical payload no longer references the body, so a
+	// The canonical payload doesn't reference the body, so a
 	// signature minted with no body in mind must still validate
 	// no matter what the receiver later sees on r.Body.
 	if err := Verify(pub, sig, in); err != nil {
-		t.Errorf("v2 must ignore body: %v", err)
+		t.Errorf("signature must ignore body: %v", err)
 	}
 }
 
@@ -94,15 +94,12 @@ func TestVerifyFailsOnWrongPublicKey(t *testing.T) {
 func TestVerifyFailsOnCrossDomainSignature(t *testing.T) {
 	// A signature minted by a DIFFERENT domain prefix must not
 	// validate under this verifier — that's the whole point of
-	// AuthDomainPrefix's "kojo-peer-auth-v2\n" line. (Also closes
-	// rolling-upgrade ambiguity: a v1 signature, which hashed the
-	// body into the canonical payload, is just one specific case
-	// of "wrong domain" the same way an entirely fake prefix is.)
+	// AuthDomainPrefix's "kojo-peer-auth-v1\n" line.
 	in, pub, priv := freshInput(t)
 	// Build a fake "v0" payload that omits the domain prefix —
 	// what an older signing impl would have produced. We sign it
 	// directly with raw ed25519 and submit it through Verify which
-	// uses the v2 payload shape.
+	// uses the current payload shape.
 	rawPayload := []byte(in.DeviceID + "\n" + "0\n" + in.Nonce + "\n" + in.Method + "\n" + in.Path + "\n")
 	fakeSig := ed25519.Sign(priv, rawPayload)
 	sigB64 := base64.StdEncoding.EncodeToString(fakeSig)
@@ -250,7 +247,7 @@ func TestCanonicalPayloadIsStable(t *testing.T) {
 		RawQuery: "q=1",
 	}
 	got := string(in.CanonicalPayload())
-	want := "kojo-peer-auth-v2\nabc\nxyz\n42\nn\nGET\n/p\nq=1"
+	want := "kojo-peer-auth-v1\nabc\nxyz\n42\nn\nGET\n/p\nq=1"
 	if got != want {
 		t.Errorf("payload mismatch:\nwant: %q\ngot:  %q", want, got)
 	}

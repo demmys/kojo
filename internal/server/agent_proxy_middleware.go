@@ -171,7 +171,7 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		targetURL += "?" + encoded
 	}
 
-	// v2 peer-auth no longer hashes the body, so we stream the
+	// Peer-auth no longer hashes the body, so we stream the
 	// request straight through instead of buffering it. Downstream
 	// handlers apply their own per-route MaxBytesReader.
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)

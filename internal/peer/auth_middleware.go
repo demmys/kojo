@@ -14,11 +14,11 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-// v2 of the peer-auth wire format dropped body hashing from the
-// signature (see auth.go). The middleware no longer buffers the
-// request body, so there is no AuthMaxBodyBytes constant — each
-// handler enforces its own per-route body cap via http.MaxBytesReader
-// just like a non-peer request would.
+// The peer-auth signature does not cover the request body (see
+// auth.go). The middleware therefore never buffers r.Body, so
+// there is no AuthMaxBodyBytes constant — each handler enforces
+// its own per-route body cap via http.MaxBytesReader just like a
+// non-peer request would.
 
 // AuthMiddleware is the HTTP middleware that resolves an
 // Ed25519-signed peer request to an auth.Principal{Role:RolePeer}.
@@ -43,10 +43,10 @@ import (
 // AuthMiddleware so its principal isn't clobbered. The downstream
 // middlewares respect a pre-existing non-Guest principal.
 //
-// Body handling: v2 dropped body-hash signing, so the middleware
-// passes r.Body through unchanged to the handler. Per-route body
-// limits live on each handler (e.g. http.MaxBytesReader in the
-// upload / blob PUT paths).
+// Body handling: the signature does not cover the body, so the
+// middleware passes r.Body through unchanged to the handler.
+// Per-route body limits live on each handler (e.g.
+// http.MaxBytesReader in the upload / blob PUT paths).
 type AuthMiddleware struct {
 	store  *store.Store
 	nonces *NonceCache
@@ -182,9 +182,10 @@ func (m *AuthMiddleware) Wrap(next http.Handler) http.Handler {
 				"peer_registry public_key shape invalid")
 			return
 		}
-		// Step 5: signature verification. v2 doesn't cover the
-		// body, so r.Body is passed through to the handler
-		// untouched — no buffering, no per-middleware size cap.
+		// Step 5: signature verification. The signature does
+		// not cover the body, so r.Body is passed through to
+		// the handler untouched — no buffering, no
+		// per-middleware size cap.
 		in := SigningInput{
 			DeviceID: dev,
 			Audience: aud,
@@ -281,7 +282,7 @@ func SignRequest(req *http.Request, deviceID string, priv ed25519.PrivateKey, no
 	if nonce == "" {
 		return errors.New("peer.SignRequest: nonce required")
 	}
-	// v2 doesn't cover the body; nothing to read here.
+	// The signature does not cover the body; nothing to read here.
 	ts := time.Now().UnixMilli()
 	in := SigningInput{
 		DeviceID: deviceID,

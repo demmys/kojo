@@ -89,13 +89,12 @@ func itoa(i int) string {
 const peerAgentSyncMaxBody = 128 << 20
 
 // peerAgentSyncMaxWireBody caps the on-the-wire body size,
-// independent of Content-Encoding. v2 of the peer-auth wire
-// format no longer bounds the body at the middleware, so this
-// constant is the only ceiling on what the handler will pull
-// off the socket; ≤ peerAgentSyncMaxBody so uncompressed bodies
-// from the owner path stay bounded too. 32 MiB gives owner /
-// drill room to send a small-to-moderate raw JSON without
-// admitting a gzip-bomb-grade compressed input.
+// independent of Content-Encoding. The peer-auth middleware no
+// longer bounds the body, so this constant is the only ceiling
+// on what the handler will pull off the socket; ≤ peerAgentSyncMaxBody
+// so uncompressed bodies from the owner path stay bounded too.
+// 32 MiB gives owner / drill room to send a small-to-moderate raw
+// JSON without admitting a gzip-bomb-grade compressed input.
 const peerAgentSyncMaxWireBody = 32 << 20
 
 type peerAgentSyncRequest struct {

@@ -70,10 +70,10 @@ func isPeerProxyPath(p string) bool {
 // isRawProxyPath returns true when the request reads bulk body
 // data (raw file, view, download). Kept around so callers that
 // want to distinguish "API ping" from "stream a body" still can,
-// but with the v2 peer-auth refactor every proxied request uses
-// the no-timeout HTTP client — a multi-GiB upload over a slow
-// tailnet can't fit in any sensible fixed budget, and the
-// caller's request context already cancels the dispatch.
+// but every proxied request now uses the no-timeout HTTP client
+// — a multi-GiB upload over a slow tailnet can't fit in any
+// sensible fixed budget, and the caller's request context
+// already cancels the dispatch.
 func isRawProxyPath(p string) bool {
 	switch p {
 	case "/api/v1/files/raw", "/api/v1/files/view":
@@ -122,7 +122,7 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 		target += "?" + rawQuery
 	}
 
-	// v2 peer-auth no longer hashes the body, so there is no
+	// Peer-auth no longer hashes the body, so there is no
 	// signing-budget reason to cap the proxy stream. Forward r.Body
 	// straight through; the local upload / blob handlers downstream
 	// apply their own per-route MaxBytesReader. ContentLength is

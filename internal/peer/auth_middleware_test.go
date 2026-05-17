@@ -244,7 +244,7 @@ func TestAuthMiddleware_RejectsSelfLoopback(t *testing.T) {
 	}
 }
 
-// v2 deliberately does NOT bind the body into the signature. A body
+// The signature deliberately does NOT bind the body. A body
 // swapped after signing must therefore reach the handler unchanged
 // — that's the property we trade against being able to stream
 // multi-GiB uploads.
@@ -273,13 +273,13 @@ func TestAuthMiddleware_BodySwapStillPasses(t *testing.T) {
 	}
 }
 
-// v2 doesn't buffer the body, so there is no per-middleware body
-// cap. Big bodies pass through; the per-route MaxBytesReader on the
-// downstream handler is what enforces a limit. We assert the
-// middleware itself doesn't 413.
+// The middleware doesn't buffer the body, so there is no
+// per-middleware body cap. Big bodies pass through; the per-route
+// MaxBytesReader on the downstream handler is what enforces a
+// limit. We assert the middleware itself doesn't 413.
 func TestAuthMiddleware_NoMiddlewareBodyCap(t *testing.T) {
 	mw, priv, dev, _ := newAuthFixture(t)
-	// 32 MiB — far above the v1 16 MiB cap we just removed.
+	// 32 MiB — far above the old 16 MiB cap we removed.
 	big := make([]byte, 32<<20)
 	r := signedRequest(t, http.MethodPost, "/api/v1/peers/blobs/foo", big, dev, priv)
 	w := httptest.NewRecorder()
@@ -292,7 +292,7 @@ func TestAuthMiddleware_NoMiddlewareBodyCap(t *testing.T) {
 		t.Fatalf("handler not reached: status=%d body=%s", w.Code, w.Body.String())
 	}
 	if w.Code == http.StatusRequestEntityTooLarge {
-		t.Errorf("middleware rejected large body — v2 must not cap it here")
+		t.Errorf("middleware rejected large body — must not cap it here")
 	}
 }
 

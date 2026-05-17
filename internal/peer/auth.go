@@ -43,9 +43,9 @@ import (
 //	X-Kojo-Peer-Sig   : base64 Ed25519 signature over the
 //	                    canonical payload defined by SigningInput.
 //
-// Canonical signing payload (v2 — no body hash):
+// Canonical signing payload:
 //
-//	"kojo-peer-auth-v2\n" ||
+//	"kojo-peer-auth-v1\n" ||
 //	device_id || "\n" ||
 //	audience  || "\n" ||
 //	ts        || "\n" ||
@@ -54,22 +54,26 @@ import (
 //	path      || "\n" ||
 //	raw_query
 //
-// The domain prefix "kojo-peer-auth-v2\n" prevents an Ed25519
-// signature lifted from any other context (or the older v1
-// body-hashing variant) from validating here.
+// The domain prefix "kojo-peer-auth-v1\n" prevents an Ed25519
+// signature lifted from any other context (a future
+// kojo-blob-attest-v1 etc.) from validating here.
 //
-// Body integrity is intentionally NOT covered by the signature. The
-// previous v1 wire format hashed the full body so a man-in-the-middle
-// couldn't substitute a different POST payload — but that protection
-// forced every signed request to buffer its full body for hashing,
-// which capped cross-peer uploads at AuthMaxBodyBytes (16 MiB). kojo
-// rides on Tailscale-only transport with mutually-authenticated TLS
-// at the tsnet layer, so the threat model treats the wire as
+// Body integrity is intentionally NOT covered by the signature.
+// kojo rides on Tailscale-only transport with mutually-authenticated
+// TLS at the tsnet layer, so the threat model treats the wire as
 // confidential and non-malleable. Dropping body hashing lets large
 // uploads stream straight through. Endpoints that genuinely need
 // content-binding (e.g. blob PUT) can opt into the per-handler
 // X-Kojo-Expected-SHA256 header, which gives the same guarantee
 // without bouncing through the auth middleware.
+//
+// This wire format is still pre-release (develop-v1 branch); the
+// signing payload changed shape vs. earlier dev builds — the
+// domain prefix stays "v1" because no released peer has shipped
+// the prior shape, so there is no fleet to be backwards compatible
+// with. The prefix earns a version bump only when a released
+// peer needs to keep validating signatures it minted before the
+// change.
 
 const (
 	// AuthHeaderID is the device_id header.
@@ -90,12 +94,12 @@ const (
 	AuthHeaderAud = "X-Kojo-Peer-Aud"
 
 	// AuthDomainPrefix is the canonical first line of the signing
-	// payload — domain separation across protocol versions /
-	// kojo subsystems. v2 dropped the body-hash field; bumping the
-	// prefix means a v1 signature deliberately won't validate
-	// against a v2 verifier (and vice-versa), so a mixed-version
-	// peer fleet fails loud rather than appearing to authenticate.
-	AuthDomainPrefix = "kojo-peer-auth-v2\n"
+	// payload — domain separation against other kojo subsystems
+	// that might sign with the same Ed25519 identity. develop-v1
+	// is still pre-release; the payload shape evolved (body hash
+	// dropped) without bumping the prefix because no released
+	// peer has ever validated the prior shape.
+	AuthDomainPrefix = "kojo-peer-auth-v1\n"
 
 	// AuthMaxClockSkew bounds both the timestamp window (a request
 	// older or newer than this is refused) and the nonce cache
@@ -144,7 +148,7 @@ var ErrAuthBadSignature = errors.New("peer: signature verification failed")
 // attacker without breaking the signature. We sign the full
 // reconstructed request URI now.
 //
-// Body bytes are NOT part of the signature in v2 — see the package
+// Body bytes are NOT part of the signature — see the package
 // doc-comment in auth.go for the rationale and the per-handler
 // X-Kojo-Expected-SHA256 escape hatch for endpoints that need
 // content binding.

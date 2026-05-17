@@ -371,13 +371,15 @@ func TestScanAndIngestAttachments_RejectsSymlinkStageDir(t *testing.T) {
 	}
 }
 
-// TestScanAndIngestAttachments_ForwarderErrorDropsFromMessage
-// verifies a hub-forward failure DROPS the attachment from the
-// returned slice so the UI does not render a chip pointing at a
-// hub-side URL that will 404. The local blob still lives on the
-// holder peer (operator can recover it manually), but the user-
-// visible message must stay honest about what hub can serve.
-func TestScanAndIngestAttachments_ForwarderErrorDropsFromMessage(t *testing.T) {
+// TestScanAndIngestAttachments_ForwarderErrorKeepsAttachment
+// verifies a hub-forward failure KEEPS the attachment on the
+// returned message. The codex-review-blessed drop-on-failure
+// posture lost user data when a transient hub outage interrupted
+// the push; the bytes still exist on the holder peer and a
+// future device-switch back to here surfaces them. Better to
+// render a chip whose URL 404s temporarily than to silently drop
+// what the agent generated.
+func TestScanAndIngestAttachments_ForwarderErrorKeepsAttachment(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("APPDATA", "")
@@ -401,11 +403,14 @@ func TestScanAndIngestAttachments_ForwarderErrorDropsFromMessage(t *testing.T) {
 	})
 
 	out := m.scanAndIngestAttachments(context.Background(), agentID, "m_fwderr")
-	if len(out) != 0 {
-		t.Fatalf("got %d; want 0 (forward failure must drop the attachment from the message)", len(out))
+	if len(out) != 1 {
+		t.Fatalf("got %d; want 1 (forward failure must NOT silently drop the attachment)", len(out))
+	}
+	if out[0].Name != "y.bin" {
+		t.Errorf("name = %q; want y.bin", out[0].Name)
 	}
 
-	// Local blob should still exist — the holder peer keeps its
+	// Local blob still exists — the holder peer keeps its
 	// authoritative copy regardless of hub reachability.
 	if _, err := bs.Head(blob.ScopeGlobal,
 		"agents/"+agentID+"/attach/m_fwderr/y.bin"); err != nil {

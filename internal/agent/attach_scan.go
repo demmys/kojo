@@ -248,21 +248,26 @@ func (m *Manager) ingestOneAttachment(
 		if openErr != nil {
 			logger.Warn("attach scan: re-open for forward",
 				"path", full, "err", openErr)
-			return MessageAttachment{}, false
-		}
-		fwdCtx, cancel := context.WithTimeout(ctx, forwardTimeoutFor(obj.Size))
-		fwdErr := forwarder(fwdCtx, scope, blobPath, obj.SHA256, fwdFile, obj.Size)
-		cancel()
-		fwdFile.Close()
-		if fwdErr != nil {
-			logger.Warn("attach scan: hub forward failed; dropping attachment",
-				"uri", uri, "err", fwdErr)
-			// Drop from the message so the UI doesn't render a
-			// chip pointing at a hub-side URL that 404s. The
-			// local blob still exists (operator can recover it
-			// manually) but the user-visible reply stays honest:
-			// we surfaced the bytes only if the hub holds them.
-			return MessageAttachment{}, false
+			// Keep the attachment — the local blob exists on
+			// this peer, and a future device-switch back to here
+			// (or a manual blob pull) will surface the bytes.
+			// Dropping silently meant the user-visible reply
+			// lost the file metadata entirely, which is worse
+			// than rendering a chip that 404s until the bytes
+			// sync.
+		} else {
+			fwdCtx, cancel := context.WithTimeout(ctx, forwardTimeoutFor(obj.Size))
+			fwdErr := forwarder(fwdCtx, scope, blobPath, obj.SHA256, fwdFile, obj.Size)
+			cancel()
+			fwdFile.Close()
+			if fwdErr != nil {
+				logger.Warn("attach scan: hub forward failed; keeping attachment for later sync",
+					"uri", uri, "err", fwdErr)
+				// Same rationale as the openErr branch above —
+				// retain the metadata so the user-visible chat
+				// is honest about what the agent produced, even
+				// if the bytes haven't reached hub yet.
+			}
 		}
 	}
 

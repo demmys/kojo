@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bufio"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
 // secretPatterns matches common secret formats for redaction.
@@ -536,52 +537,55 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 	defer f.Close()
 
 	var msgs []*Message
-	br := bufio.NewReader(f)
-
-	for {
-		line, readErr := br.ReadBytes('\n')
-		if len(line) > 0 {
-			var raw struct {
-				Type    string          `json:"type"`
-				Message json.RawMessage `json:"message"`
+	// Use the shared JSONL scanner so a corrupted/oversize line bounds
+	// allocations to MaxJSONLLineBytes instead of OOMing on a malformed
+	// session file. We log ErrLineTooLarge / I/O errors at Warn but keep
+	// whatever messages were successfully parsed up to that point —
+	// returning empty would force the summary generator to fall back to
+	// the kojo transcript, which can mix unrelated context.
+	if err := chathistory.ScanJSONLLines(f, func(line []byte) {
+		var raw struct {
+			Type    string          `json:"type"`
+			Message json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(line, &raw) != nil {
+			return
+		}
+		switch raw.Type {
+		case "user":
+			var msg struct {
+				Content json.RawMessage `json:"content"`
 			}
-			if json.Unmarshal(line, &raw) == nil {
-				switch raw.Type {
-				case "user":
-					var msg struct {
-						Content json.RawMessage `json:"content"`
-					}
-					if json.Unmarshal(raw.Message, &msg) == nil {
-						var text string
-						if json.Unmarshal(msg.Content, &text) == nil && text != "" {
-							msgs = append(msgs, &Message{Role: "user", Content: text})
-						}
-					}
+			if json.Unmarshal(raw.Message, &msg) == nil {
+				var text string
+				if json.Unmarshal(msg.Content, &text) == nil && text != "" {
+					msgs = append(msgs, &Message{Role: "user", Content: text})
+				}
+			}
 
-				case "assistant":
-					var msg struct {
-						Content []struct {
-							Type string `json:"type"`
-							Text string `json:"text"`
-						} `json:"content"`
+		case "assistant":
+			var msg struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			}
+			if json.Unmarshal(raw.Message, &msg) == nil {
+				var text strings.Builder
+				for _, block := range msg.Content {
+					if block.Type == "text" && block.Text != "" {
+						text.WriteString(block.Text)
 					}
-					if json.Unmarshal(raw.Message, &msg) == nil {
-						var text strings.Builder
-						for _, block := range msg.Content {
-							if block.Type == "text" && block.Text != "" {
-								text.WriteString(block.Text)
-							}
-						}
-						if text.Len() > 0 {
-							msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
-						}
-					}
+				}
+				if text.Len() > 0 {
+					msgs = append(msgs, &Message{Role: "assistant", Content: text.String()})
 				}
 			}
 		}
-		if readErr != nil {
-			break
-		}
+	}); err != nil {
+		logger.Warn("autosummary: session scan failed",
+			"agent", agentID, "path", sessionFile, "err", err,
+			"parsedMessages", len(msgs))
 	}
 
 	// Return last N messages

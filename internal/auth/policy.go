@@ -179,11 +179,16 @@ func isSelfScopedRoute(method, sub string) bool {
 		// PreCompact hook fired by claude-code on the agent's own session.
 		return method == http.MethodPost
 	case "/user-context":
-		// Agent edits its own user.md (people-it-works-with notes).
-		// Read is handled separately by /files; this gate covers writes.
+		// Agent reads/edits its own user.md (people-it-works-with notes).
+		// GET returns the in-memory default template when the file is absent
+		// without requiring filesystem access via /files, so this gate covers
+		// both reads and writes.
 		return method == http.MethodGet || method == http.MethodPut
 	case "/checkin-file":
-		// Agent edits its own checkin.md (recurring check-in instructions).
+		// Agent reads/edits its own checkin.md (recurring check-in instructions).
+		// GET returns DefaultCheckinContent when the file is absent so the
+		// settings screen renders the template even before first save; this
+		// gate covers both reads and writes.
 		return method == http.MethodGet || method == http.MethodPut
 	}
 

@@ -177,11 +177,60 @@ export function AgentSettings() {
 
   useEffect(() => {
     if (!id) return;
-    Promise.all([
+    // Cancellation guard for the in-flight Promise.allSettled. When the user
+    // navigates between /agents/{a}/settings → /agents/{b}/settings before
+    // the previous fetch resolves, the older promise must NOT win the race
+    // and stomp on b's form state — that would silently mix a's fields into
+    // a save that targets b.
+    let cancelled = false;
+    // Reset all per-agent state up front so a partial-failure load can't
+    // leave the textareas showing the previous agent's content. If
+    // /user-context fetches for the new agent reject (transient 500, broken
+    // symlink, etc.) and we kept the previous values, the user could edit
+    // and Save that stale content as the new agent's user.md.
+    setAgent(null);
+    setError("");
+    setUserContext("");
+    setSavedUserContext("");
+    setUserContextIsDefault(false);
+    setCronMessage("");
+    setSavedCronMessage("");
+    setCronIsDefault(false);
+    // Promise.allSettled so a 500 from /user-context or /checkin-file (e.g.
+    // unreadable / broken symlink on disk) doesn't blank out the entire
+    // settings screen — the user still needs to see the agent fields, the
+    // Save / Reset / Archive buttons, and a concrete error so they can fix
+    // the bad file or pick another action. The previous Promise.all + catch
+    // redirected to "/" on any failure, which hid the underlying cause and
+    // left the broken file un-fixable from this UI.
+    Promise.allSettled([
       agentApi.get(id),
       agentApi.userContext.get(id),
       agentApi.getCheckinFile(id),
-    ]).then(([a, uc, checkin]) => {
+    ]).then(([agentRes, ucRes, checkinRes]) => {
+      if (cancelled) return;
+      // Agent itself missing or unfetchable. Only treat 404 (caller deleted
+      // it from another tab, or wrong ID) as "go home"; surface every other
+      // failure inline so the user can read the actual server response.
+      //
+      // httpClient throws `${res.status}: ${body}` for any non-2xx (see
+      // lib/httpClient.ts request()), so a real 404 always shows up as a
+      // string starting with "404:". Matching the substring "not found"
+      // instead would also fire on 500 bodies that happen to mention the
+      // phrase (e.g. "configuration file not found in cache") and silently
+      // bounce the user home on transient backend failures.
+      if (agentRes.status === "rejected") {
+        const msg = agentRes.reason instanceof Error
+          ? agentRes.reason.message
+          : String(agentRes.reason);
+        if (msg.startsWith("404:")) {
+          navigate("/");
+        } else {
+          setError(msg);
+        }
+        return;
+      }
+      const a = agentRes.value;
       setAgent(a);
       setName(a.name);
       setPersona(a.persona);
@@ -206,17 +255,35 @@ export function AgentSettings() {
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
-      setUserContext(uc.content);
-      setSavedUserContext(uc.content);
-      setUserContextIsDefault(uc.isDefault);
-      setCronMessage(checkin.content);
-      // When the server reports isDefault=true the textarea is showing the
-      // template, not the persisted file. Mark savedCronMessage with the
-      // same value so cronMessageDirty stays false until the user actually
-      // types — and remember isDefault so handleSave can skip the no-op PUT.
-      setSavedCronMessage(checkin.content);
-      setCronIsDefault(checkin.isDefault);
-    }).catch(() => navigate("/"));
+
+      const loadErrors: string[] = [];
+      if (ucRes.status === "fulfilled") {
+        setUserContext(ucRes.value.content);
+        setSavedUserContext(ucRes.value.content);
+        setUserContextIsDefault(ucRes.value.isDefault);
+      } else {
+        const msg = ucRes.reason instanceof Error ? ucRes.reason.message : String(ucRes.reason);
+        loadErrors.push(`User Context: ${msg}`);
+      }
+      if (checkinRes.status === "fulfilled") {
+        setCronMessage(checkinRes.value.content);
+        // When the server reports isDefault=true the textarea is showing the
+        // template, not the persisted file. Mark savedCronMessage with the
+        // same value so cronMessageDirty stays false until the user actually
+        // types — and remember isDefault so handleSave can skip the no-op PUT.
+        setSavedCronMessage(checkinRes.value.content);
+        setCronIsDefault(checkinRes.value.isDefault);
+      } else {
+        const msg = checkinRes.reason instanceof Error ? checkinRes.reason.message : String(checkinRes.reason);
+        loadErrors.push(`Check-in Message: ${msg}`);
+      }
+      if (loadErrors.length > 0) {
+        setError(loadErrors.join("\n"));
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [id, navigate]);
 
   const needsCustomURL = tool === "custom" || tool === "llama.cpp";
@@ -273,26 +340,32 @@ export function AgentSettings() {
           stylePrompt: ttsStylePrompt.trim() || undefined,
         },
       });
-      // Same conditional-PUT story as checkin.md (see comment below): when
-      // the textarea is still showing the in-memory default template AND
-      // the user hasn't edited it, an unconditional PUT would write the
-      // template to disk — flipping isDefault to false and pinning whatever
-      // text happens to be the default at this moment, so future template
-      // updates would never reach this agent.
-      if (userContextDirty || !userContextIsDefault) {
+      // Only PUT when the textarea actually changed. The previous condition
+      // (`userContextDirty || !userContextIsDefault`) re-wrote user.md on
+      // every save once the agent had a persisted file, which means a
+      // transient /user-context failure (network blip, EISDIR, etc.) would
+      // re-introduce the partial-update bug: agentApi.update has already
+      // succeeded, but the unrelated user-context write rejects and the
+      // whole save() throws — leaving name/persona persisted while the
+      // user thinks the save failed entirely.
+      //
+      // The isDefault skip-guard the earlier condition tried to address
+      // (don't pin the in-memory default by PUTting it back) is still
+      // covered: if the user didn't edit the textarea, dirty is false and
+      // we skip; if they did edit (whether starting from the default or
+      // from a custom file), dirty is true and we PUT, which is correct.
+      if (userContextDirty) {
         const savedUC = await agentApi.userContext.set(id!, userContext);
         setUserContext(savedUC.content);
         setSavedUserContext(savedUC.content);
         setUserContextIsDefault(savedUC.isDefault);
       }
-      // Only persist checkin.md when the user actually changed it. When the
-      // textarea is still showing the server-supplied default template AND
-      // the user hasn't edited it, an unconditional PUT would write the
-      // template to disk — flipping isDefault to false and pinning whatever
-      // text happens to be the default at this moment. Skipping the PUT
-      // keeps the "uses default" state intact so future template updates
-      // continue to apply.
-      if (cronMessageDirty || !cronIsDefault) {
+      // Same logic as above for checkin.md — only PUT when the textarea
+      // changed. Previously a !cronIsDefault clause forced a PUT on every
+      // save once an agent had a persisted checkin.md; a transient
+      // /checkin-file failure would then block saving unrelated fields
+      // even though agentApi.update had already applied them.
+      if (cronMessageDirty) {
         const savedCheckin = await agentApi.putCheckinFile(id!, cronMessage);
         // Sync the textarea to the server-normalized value (WriteCheckinFile
         // trims whitespace) so the UI matches what was actually persisted,
@@ -561,7 +634,24 @@ export function AgentSettings() {
     }
   };
 
-  if (!agent) return null;
+  // Initial fetch failed before agentApi.get resolved. Show the error so
+  // the user can see what went wrong (and a Back link so they can leave)
+  // instead of a blank page.
+  if (!agent) {
+    return error ? (
+      <div className="min-h-full bg-neutral-950 text-neutral-200 p-4 max-w-md mx-auto">
+        <button
+          onClick={() => navigate("/")}
+          className="text-neutral-400 hover:text-neutral-200 text-sm mb-3"
+        >
+          ← Back
+        </button>
+        <div className="p-3 bg-red-950 border border-red-800 rounded-lg text-sm text-red-300 whitespace-pre-wrap">
+          {error}
+        </div>
+      </div>
+    ) : null;
+  }
 
   return (
     <div className="min-h-full bg-neutral-950 text-neutral-200">

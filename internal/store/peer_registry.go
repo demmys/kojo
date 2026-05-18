@@ -31,16 +31,6 @@ type PeerRecord struct {
 	URL      string
 	LastSeen int64 // unix millis, 0 = NULL
 	Status   string
-	// Trusted gates the privileged cross-peer surface: when set,
-	// requests authenticated by this row's outbound Bearer are
-	// admitted on /api/v1/sessions, /api/v1/ws, /api/v1/info,
-	// /api/v1/dirs, /api/v1/files, /api/v1/git, /api/v1/upload.
-	// Without it the bearer can only reach the minimal inter-peer
-	// endpoints (peers/events, peers/blobs, peers/pull,
-	// peers/agent-sync). Operator-controlled at pairing time (the
-	// auto-pairing Approve flow flips it on; --peer-trust toggles
-	// it after the fact).
-	Trusted bool
 }
 
 // PeerStatus values accepted by the schema's CHECK constraint.
@@ -88,13 +78,11 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 		return nil, fmt.Errorf("store.UpsertPeer: invalid status %q", rec.Status)
 	}
 
-	// On conflict only the *mutable* columns update. `trusted` is
-	// operator-controlled and preserved on conflict so a heartbeat
-	// never silently flips trust. Status / last_seen / name / url
-	// are expected to drift over time and overwrite cleanly.
+	// On conflict only the *mutable* columns update. Status /
+	// last_seen / name / url drift over time and overwrite cleanly.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status, trusted)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, last_seen, status)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name      = excluded.name,
   url       = excluded.url,
@@ -104,18 +92,11 @@ ON CONFLICT(device_id) DO UPDATE SET
 	if _, err := s.db.ExecContext(ctx, q,
 		rec.DeviceID, rec.Name, rec.URL,
 		nullableInt64(rec.LastSeen),
-		rec.Status, boolToInt(rec.Trusted),
+		rec.Status,
 	); err != nil {
 		return nil, fmt.Errorf("store.UpsertPeer: %w", err)
 	}
 	return s.GetPeer(ctx, rec.DeviceID)
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // RegisterPeerMetadata is the operator-driven peer registration path:
@@ -150,22 +131,19 @@ func (s *Store) RegisterPeerMetadata(ctx context.Context, rec *PeerRecord) (*Pee
 	// On conflict, treat empty url as "no change" instead of
 	// blanking the existing column. A startup-time register from a
 	// peer that hasn't bound its listener yet would otherwise wipe
-	// the Hub's known URL for that peer and break every subsequent
-	// Hub→peer dial. The same applies to name — the operator-
-	// supplied label on the Hub is more authoritative than the
-	// bare hostname a fresh peer emits. `trusted` is operator-
-	// controlled and preserved on conflict.
+	// the Hub's known URL and break every subsequent Hub→peer dial.
+	// Same for name — the operator-supplied label is more
+	// authoritative than the bare hostname.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status, trusted)
-VALUES (?, ?, ?, NULL, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, last_seen, status)
+VALUES (?, ?, ?, NULL, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name = CASE WHEN excluded.name = '' THEN peer_registry.name ELSE excluded.name END,
   url  = CASE WHEN excluded.url  = '' THEN peer_registry.url  ELSE excluded.url  END
-  -- last_seen, status, trusted intentionally NOT touched on conflict
+  -- last_seen, status intentionally NOT touched on conflict
 `
 	if _, err := s.db.ExecContext(ctx, q,
-		rec.DeviceID, rec.Name, rec.URL,
-		PeerStatusOffline, boolToInt(rec.Trusted),
+		rec.DeviceID, rec.Name, rec.URL, PeerStatusOffline,
 	); err != nil {
 		return nil, fmt.Errorf("store.RegisterPeerMetadata: %w", err)
 	}
@@ -215,38 +193,12 @@ UPDATE peer_registry
 	return nil
 }
 
-// UpdatePeerTrust flips the trusted bit on a paired peer row.
-// Operator-driven only; the cross-peer register-push path
-// preserves the existing trust state (any cluster member with a
-// signing key would otherwise self-promote to trusted). Returns
-// ErrNotFound when no row matches the device_id.
-func (s *Store) UpdatePeerTrust(ctx context.Context, deviceID string, trusted bool) error {
-	if deviceID == "" {
-		return errors.New("store.UpdatePeerTrust: device_id required")
-	}
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE peer_registry SET trusted = ? WHERE device_id = ?`,
-		boolToInt(trusted), deviceID,
-	)
-	if err != nil {
-		return fmt.Errorf("store.UpdatePeerTrust: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("store.UpdatePeerTrust: rows affected: %w", err)
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
 
 // GetPeer returns the row keyed by device_id or ErrNotFound.
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `
 SELECT device_id, name, url,
-       COALESCE(last_seen,0), status, trusted
+       COALESCE(last_seen,0), status
   FROM peer_registry WHERE device_id = ?`
 	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -269,7 +221,7 @@ type ListPeersOptions struct {
 func (s *Store) ListPeers(ctx context.Context, opts ListPeersOptions) ([]*PeerRecord, error) {
 	q := `
 SELECT device_id, name, url,
-       COALESCE(last_seen,0), status, trusted
+       COALESCE(last_seen,0), status
   FROM peer_registry
  WHERE 1=1`
 	args := []any{}
@@ -502,13 +454,11 @@ func (s *Store) DeletePeer(ctx context.Context, deviceID string) error {
 
 func scanPeerRow(r rowScanner) (*PeerRecord, error) {
 	var rec PeerRecord
-	var trustedInt int
 	if err := r.Scan(
 		&rec.DeviceID, &rec.Name, &rec.URL,
-		&rec.LastSeen, &rec.Status, &trustedInt,
+		&rec.LastSeen, &rec.Status,
 	); err != nil {
 		return nil, err
 	}
-	rec.Trusted = trustedInt != 0
 	return &rec, nil
 }

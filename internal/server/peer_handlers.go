@@ -49,13 +49,7 @@ type peerResponse struct {
 	URL      string `json:"url,omitempty"`
 	LastSeen int64  `json:"lastSeen,omitempty"`
 	Status   string `json:"status"`
-	IsSelf       bool   `json:"isSelf"`
-	// Trusted mirrors peer_registry.trusted. When true the peer's
-	// signed requests are admitted on the privileged surface
-	// (sessions, ws, info, dirs, files, git, upload). UI flips
-	// this via PATCH /api/v1/peers/{id} or the register form's
-	// "trust this peer" checkbox.
-	Trusted bool `json:"trusted"`
+	IsSelf   bool   `json:"isSelf"`
 }
 
 type peerListResponse struct {
@@ -72,11 +66,6 @@ type peerRegisterRequest struct {
 	DeviceID string `json:"deviceId"`
 	Name     string `json:"name"`
 	URL      string `json:"url"`
-	// Trusted opts the peer into the privileged cross-peer surface
-	// at registration time. Defaults to false; the UI checkbox
-	// flips it to true and operators who paste an unmodified
-	// pairing spec keep the safe default.
-	Trusted bool `json:"trusted,omitempty"`
 }
 
 // peerRequestCap caps the JSON request size for POST /api/v1/peers.
@@ -120,7 +109,6 @@ func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
 		URL:      rec.URL,
 		LastSeen: rec.LastSeen,
 		Status:   rec.Status,
-		Trusted:  rec.Trusted,
 	}
 	if s.peerID != nil && rec.DeviceID == s.peerID.DeviceID {
 		out.IsSelf = true
@@ -328,26 +316,12 @@ func (s *Server) handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 		DeviceID: req.DeviceID,
 		Name:     req.Name,
 		URL:      req.URL,
-		Trusted:  req.Trusted,
 	}
 	out, err := s.agents.Store().RegisterPeerMetadata(r.Context(), rec)
 	if err != nil {
 		s.logger.Error("peer handler: register failed", "device_id", req.DeviceID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		return
-	}
-	// RegisterPeerMetadata preserves `trusted` on conflict (an
-	// untrusted re-push can't self-promote). Apply the operator's
-	// explicit value so re-registering with a flipped checkbox
-	// updates the trust state in the same round-trip.
-	if out != nil && out.Trusted != req.Trusted {
-		if err := s.agents.Store().UpdatePeerTrust(r.Context(), req.DeviceID, req.Trusted); err != nil {
-			s.logger.Error("peer handler: trust apply failed",
-				"device_id", req.DeviceID, "err", err)
-			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-			return
-		}
-		out.Trusted = req.Trusted
 	}
 	// Cluster convergence is no longer push-replicated: peers learn
 	// each other lazily via the Hub-mediated Bearer pairing flow
@@ -447,58 +421,6 @@ func (s *Server) handlePatchPeerMetadata(w http.ResponseWriter, r *http.Request)
 	// Edit propagation is no longer push-replicated. Other peers see
 	// the new url/name through their next /api/v1/peers GET against
 	// the Hub (docs/peer-simplify-plan.md).
-	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
-}
-
-// peerTrustRequest is the wire shape for PATCH
-// /api/v1/peers/{id}/trust.
-type peerTrustRequest struct {
-	Trusted bool `json:"trusted"`
-}
-
-// handlePatchPeerTrust flips the trusted bit on a paired peer
-// row. Owner-only. Refuses self for symmetry with the CLI
-// (trusting yourself is a no-op — auth never checks the local
-// row's trusted column).
-func (s *Server) handlePatchPeerTrust(w http.ResponseWriter, r *http.Request) {
-	if !s.requireOwnerForPeers(w, r) {
-		return
-	}
-	id := r.PathValue("id")
-	if err := validateDeviceID(id); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		return
-	}
-	if s.peerID != nil && id == s.peerID.DeviceID {
-		writeError(w, http.StatusConflict, "conflict",
-			"cannot flip trust on the local peer; the trust bit only gates inbound requests")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, peerRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
-	var req peerTrustRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
-		return
-	}
-	if err := s.agents.Store().UpdatePeerTrust(r.Context(), id, req.Trusted); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "peer not registered")
-			return
-		}
-		s.logger.Error("peer handler: trust update failed", "device_id", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
-		return
-	}
-	rec, err := s.agents.Store().GetPeer(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "post-update lookup failed")
-		return
-	}
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))
 }
 

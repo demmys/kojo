@@ -10,7 +10,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-func openStoreWithPeer(t *testing.T, deviceID string, trusted bool) *store.Store {
+func openStoreWithPeer(t *testing.T, deviceID string, _ bool) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), store.Options{ConfigDir: dir})
@@ -19,19 +19,12 @@ func openStoreWithPeer(t *testing.T, deviceID string, trusted bool) *store.Store
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	rec := &store.PeerRecord{
-		DeviceID:  deviceID,
-		Name:      "test-peer",
-		URL:       "http://example:8080",
-		
-		Trusted:   trusted,
+		DeviceID: deviceID,
+		Name:     "test-peer",
+		URL:      "http://example:8080",
 	}
 	if _, err := st.RegisterPeerMetadata(context.Background(), rec); err != nil {
 		t.Fatalf("register: %v", err)
-	}
-	if trusted {
-		if err := st.UpdatePeerTrust(context.Background(), deviceID, true); err != nil {
-			t.Fatalf("trust: %v", err)
-		}
 	}
 	return st
 }
@@ -68,9 +61,6 @@ func TestBearerMiddleware_ValidBearerStampsRolePeer(t *testing.T) {
 	}
 	if cap.gotPrincipal.PeerID != "dev-alpha" {
 		t.Fatalf("peer_id = %q", cap.gotPrincipal.PeerID)
-	}
-	if !cap.gotPrincipal.PeerTrusted {
-		t.Fatal("trust bit lost")
 	}
 }
 
@@ -120,22 +110,6 @@ func TestBearerMiddleware_SelfLoopbackRefused(t *testing.T) {
 	}
 }
 
-func TestBearerMiddleware_UntrustedPeerStampsFalse(t *testing.T) {
-	st := openStoreWithPeer(t, "dev-untrusted", false)
-	issued, _ := st.IssuePeerToken(context.Background(), "dev-untrusted", store.PeerTokenRolePeerToHub)
-	mw := NewBearerPeerMiddleware(st, "")
-	cap := &captureHandler{}
-	h := mw.Wrap(cap)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/info", nil)
-	req.Header.Set("Authorization", "Bearer "+issued.Raw)
-	h.ServeHTTP(httptest.NewRecorder(), req)
-	if cap.gotPrincipal.Role != auth.RolePeer {
-		t.Fatal("RolePeer not stamped")
-	}
-	if cap.gotPrincipal.PeerTrusted {
-		t.Fatal("untrusted peer reported trusted")
-	}
-}
 
 func TestExtractBearer(t *testing.T) {
 	cases := []struct {

@@ -207,16 +207,15 @@ func (s *Store) ApprovePeerPending(ctx context.Context, deviceID string) (*PeerR
 		return nil, "", fmt.Errorf("store.ApprovePeerPending: select pending: %w", err)
 	}
 
-	// Upsert into peer_registry. Insert when fresh, update name/url
-	// on conflict. trusted = 1 always (Approve grants the privileged
-	// surface — that's the whole point of the operator action).
+	// Upsert into peer_registry. Insert when fresh, refresh
+	// name/url on conflict. With the trusted column gone, Bearer
+	// existence IS the trust signal.
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO peer_registry (device_id, name, url, last_seen, status, trusted)
-VALUES (?, ?, ?, NULL, ?, 1)
+INSERT INTO peer_registry (device_id, name, url, last_seen, status)
+VALUES (?, ?, ?, NULL, ?)
 ON CONFLICT(device_id) DO UPDATE SET
-  name      = excluded.name,
-  url       = excluded.url,
-  trusted   = 1`,
+  name = excluded.name,
+  url  = excluded.url`,
 		pending.DeviceID, pending.Name, pending.URL,
 		PeerStatusOffline,
 	); err != nil {
@@ -231,7 +230,7 @@ ON CONFLICT(device_id) DO UPDATE SET
 
 	rec, err := scanPeerRow(tx.QueryRowContext(ctx, `
 SELECT device_id, name, url,
-       COALESCE(last_seen,0), status, trusted
+       COALESCE(last_seen,0), status
   FROM peer_registry WHERE device_id = ?`, deviceID))
 	if err != nil {
 		return nil, "", fmt.Errorf("store.ApprovePeerPending: re-read: %w", err)

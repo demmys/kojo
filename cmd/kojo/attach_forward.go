@@ -74,23 +74,17 @@ func wireAttachForwarder(mgr *agent.Manager, st *store.Store, self *peer.Identit
 		// authoritative target — failure to reach them is a
 		// failure, not a reason to try someone else.
 		//
-		// Within each bucket we keep last_seen DESC (the order
-		// ListPeers already returned) so the most-recently-
-		// active row is tried first.
-		var trusted, untrusted []*store.PeerRecord
+		// Every paired peer (= row exists in peer_registry) is a
+		// candidate. The trusted vs. untrusted bucketing the prior
+		// code did is gone — Bearer pairing replaces that gate.
+		// last_seen DESC ordering is preserved by ListPeers so the
+		// most-recently-active row is tried first.
+		var candidates []*store.PeerRecord
 		for _, p := range peers {
 			if p.DeviceID == selfID || p.URL == "" {
 				continue
 			}
-			if p.Trusted {
-				trusted = append(trusted, p)
-			} else {
-				untrusted = append(untrusted, p)
-			}
-		}
-		candidates := trusted
-		if len(candidates) == 0 {
-			candidates = untrusted
+			candidates = append(candidates, p)
 		}
 		if len(candidates) == 0 {
 			return errors.New("attach forward: no candidate hub peers in registry (need at least one paired peer with a URL)")
@@ -124,14 +118,13 @@ func wireAttachForwarder(mgr *agent.Manager, st *store.Store, self *peer.Identit
 				if len(candidates) > 1 {
 					logger.Info("attach forward: hub push succeeded",
 						"hub", hub.DeviceID, "url", hub.URL,
-						"trusted", hub.Trusted,
 						"candidates_total", len(candidates), "candidate_index", i)
 				}
 				return nil
 			}
 			logger.Warn("attach forward: candidate hub failed; trying next",
 				"hub", hub.DeviceID, "url", hub.URL,
-				"trusted", hub.Trusted, "err", err)
+				"err", err)
 			lastErr = fmt.Errorf("%s (%s): %w", hub.DeviceID, hub.URL, err)
 		}
 		return fmt.Errorf("attach forward: all %d candidate(s) failed; last: %w", len(candidates), lastErr)

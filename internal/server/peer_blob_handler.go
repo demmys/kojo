@@ -184,9 +184,9 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 // source side and the Hub is just a streaming proxy.
 func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDeviceID string) {
 	p := auth.FromContext(r.Context())
-	if !(p.IsPeer() && p.PeerTrusted) && !p.IsOwner() {
+	if !p.IsPeer() && !p.IsOwner() {
 		writeError(w, http.StatusForbidden, "forbidden",
-			"blob relay requires trusted peer or owner principal")
+			"blob relay requires peer or owner principal")
 		return
 	}
 	if s.peerID != nil && sourceDeviceID == s.peerID.DeviceID {

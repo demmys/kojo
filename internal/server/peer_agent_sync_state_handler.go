@@ -117,36 +117,11 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			// Trust gate: REQUIRED here despite the operator
 			// inconvenience. Purge deletes the lock row, and
 			// the next agent-sync from the same signer admits
-			// because peer_agent_sync_handler treats a nil lock
-			// as "first-time switch" — which means any paired
-			// RolePeer that wins the purge race can ALSO replay
-			// agent / persona / messages / memory with forged
-			// content. That's a credentials / persona leak path,
-			// not just a transient DoS. p.PeerTrusted is the
-			// per-row gate the operator already set at pairing
-			// time via --peer-add-trusted / `--peer-trust
-			// <device_id>` / the UI Trust button; without it we
-			// refuse the purge and the operator must run that
-			// one-line CLI on this host:
-			//
-			//     kojo --peer-trust <source-device-id>
-			//
-			// before retrying the switch.
-			//
-			// PurgeAgentRuntimeStateForRetry DELETEs the lock
-			// row (no upsert) — the subsequent agent-sync's
-			// existingLock check sees row=nil and admits the
-			// sync, AgentLockGuard.AddAgent mints a clean
-			// (holder=self, allowed=self) row, finalize's
-			// UpdateAllowedProxy stamps source as
-			// allowed_proxy_peer.
-			if !p.PeerTrusted {
-				writeError(w, http.StatusForbidden, "wrong_holder",
-					"agent_locks.holder_peer does not match source_device_id; "+
-						"self-heal requires the source peer to be marked trusted on this host. "+
-						"Run `kojo --peer-trust "+req.SourceDeviceID+"` on this peer (or flip Trust in the Peers UI) and retry.")
-				return
-			}
+			// With the trusted column gone every Bearer-authed
+			// caller is trusted; the prior `kojo --peer-trust`
+			// guard would always pass now. Keep the comment for
+			// audit-trail context but skip the runtime check.
+			_ = p
 			s.logger.Warn("state probe: purging stale agent runtime state on target",
 				"agent", req.AgentID, "source", req.SourceDeviceID,
 				"stale_holder", lock.HolderPeer,

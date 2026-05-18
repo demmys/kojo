@@ -322,14 +322,9 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 	if err != nil {
 		return err
 	}
-	// trusted=true unconditionally — operator opted in by running
-	// `kojo --peer`; the Hub it auto-discovered must be admitted on
-	// the privileged surface for session-proxy / agent-sync to land.
-	if rec == nil || !rec.Trusted {
-		if err := d.store.UpdatePeerTrust(ctx, hub.DeviceID, true); err != nil {
-			return fmt.Errorf("trust apply: %w", err)
-		}
-	}
+	// Trust column retired — Bearer existence is the only trust
+	// signal now.
+	_ = rec
 	return nil
 }
 

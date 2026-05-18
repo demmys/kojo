@@ -206,10 +206,9 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := s.agents.Store()
-	// approved branch: peer_registry row exists AND is trusted.
-	// Untrusted rows are still in the "operator must approve"
-	// state from the peer's point of view — answer pending below.
-	if rec, err := st.GetPeer(r.Context(), id); err == nil && rec.Trusted {
+	// approved branch: peer_registry row exists. (Trust column was
+	// retired; presence in peer_registry implies Approve happened.)
+	if _, err := st.GetPeer(r.Context(), id); err == nil {
 		hub := s.buildHubInfoResponse(r.Context())
 		resp := joinRequestResponse{State: "approved", Hub: hub}
 		// ACK check FIRST. If the peer presents its permanent
@@ -244,19 +243,10 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 // future channel (e.g. signed re-pair) reuses the same logic.
 func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req joinRequestBody) {
 	st := s.agents.Store()
-	existing, err := st.GetPeer(r.Context(), req.DeviceID)
+	_, err := st.GetPeer(r.Context(), req.DeviceID)
 	switch {
 	case err == nil:
-		// Existing registry row. Trust gate: the auto-onboarding flow's contract is
-		// "Approve → trusted=true"; an existing untrusted row
-		// means the peer was paired via `--peer-add` (no
-		// --trusted) or had its trust revoked. Either way,
-		// it must NOT be auto-promoted just because the peer
-		// retransmitted its join-request. Fall through to
-		// pending so the Owner sees it in Settings → Approve.
-		if !existing.Trusted {
-			break
-		}
+		// Existing registry row → already approved by operator.
 		// /join-request is unauthenticated by design (the first-time
 		// peer has no credential yet). Once a row is trusted, the
 		// metadata-update + Bearer-attach paths must require proof
@@ -482,21 +472,18 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 	if err := s.mintAndStashPairingBearers(mintCtx, id, joinSecretHash); err != nil {
 		s.logger.Error("approve: bearer mint failed; rolling back approval",
 			"device_id", id, "err", err)
-		// Best-effort rollback: drop the trust bit so the next
-		// /join-request poll re-enters the pending state and the
-		// operator can re-approve. Leaving the row in
-		// peer_registry with trusted=false is the closest we can
-		// get to "undo" without re-introducing the pending row,
-		// which a cooperating client could re-create on its next
-		// 60s tick anyway.
+		// Best-effort rollback: with the trusted column gone, the
+		// only way to "undo" approve is to drop the peer_registry
+		// row entirely. The peer's next /join-request POST will
+		// land it back in peer_pending and the operator can retry.
 		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rollbackCancel()
-		if rErr := s.agents.Store().UpdatePeerTrust(rollbackCtx, id, false); rErr != nil {
-			s.logger.Error("approve: rollback trust flip failed",
+		if rErr := s.agents.Store().DeletePeer(rollbackCtx, id); rErr != nil {
+			s.logger.Error("approve: rollback peer delete failed",
 				"device_id", id, "err", rErr)
 		}
 		writeError(w, http.StatusInternalServerError, "bearer_mint_failed",
-			"bearer pair mint failed; the peer has been rolled back to untrusted, retry approve")
+			"bearer pair mint failed; peer rolled back, retry approve")
 		return
 	}
 	// No fan-out broadcast — sibling peers learn about this row when

@@ -59,11 +59,8 @@ func main() {
 
 	peerMode := flag.Bool("peer", false, "run as a daemon-only peer: bind plain HTTP to 0.0.0.0:<port> + a loopback agent-auth listener on <port>+1. Exposes the full peer API (session lifecycle, agents, files, git, /api/v1/peers/* inter-peer routes) but skips the Web UI / dev proxy / Hub-side mutation routes / tsnet. Owner Bearer is unavailable; non-Owner access is gated by Ed25519 inter-peer auth (RolePeer) plus the per-row `trusted` bit. The tailnet identity is borrowed from the OS tailscaled (no --hostname). Mutually exclusive with --dev / --local / --no-auth.")
 	peerList := flag.Bool("peer-list", false, "list peer_registry rows and exit (read-only; coexists with running kojo)")
-	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>|<base64-public-key>. The other host prints this spec on startup (`kojo --peer`).")
-	peerAddTrusted := flag.Bool("peer-add-trusted", false, "with --peer-add: mark the peer as trusted (allowed to create sessions, browse files, run git on this host). Without this flag the paired peer is restricted to inter-peer endpoints only.")
+	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>. Metadata-only; Bearer tokens are minted by the auto-pairing /join-request Approve flow.")
 	peerRemove := flag.String("peer-remove", "", "delete a peer_registry row by device_id; refuses to remove self")
-	peerTrust := flag.String("peer-trust", "", "flip a paired peer's trusted bit on (allowed to drive sessions/files/git on this host); pass <device_id>")
-	peerUntrust := flag.String("peer-untrust", "", "flip a paired peer's trusted bit off; pass <device_id>")
 	// Auto-onboarding flags (docs/peer-onboarding-plan.md).
 	hubURL := flag.String("hub", "", "with --peer: override Hub auto-discovery. Accepts host:port or scheme://host:port. Falls back to $KOJO_HUB_URL then MagicDNS default `https://kojo.<tailnet>.ts.net:<KOJO_HUB_PORT or 8080>`.")
 	tailnetOnly := flag.Bool("tailnet-only", false, "with --peer: bind the listener to the Tailscale interface IP only. Refuses to start if Tailscale is not running. Without this flag, peer mode falls back to 0.0.0.0 when Tailscale is unavailable.")
@@ -89,7 +86,7 @@ func main() {
 	// daemon and don't waste cycles on init when the user just wants
 	// to query the registry. Each opens its own short-lived
 	// *store.Store and exits.
-	if *peerList || *peerAdd != "" || *peerRemove != "" || *peerTrust != "" || *peerUntrust != "" {
+	if *peerList || *peerAdd != "" || *peerRemove != "" {
 		if *configDir != "" {
 			configdir.Set(*configDir)
 		}
@@ -98,13 +95,9 @@ func main() {
 		case *peerList:
 			os.Exit(runPeerListCommand(logger, configdir.Path()))
 		case *peerAdd != "":
-			os.Exit(runPeerAddCommand(logger, configdir.Path(), *peerAdd, *peerAddTrusted))
+			os.Exit(runPeerAddCommand(logger, configdir.Path(), *peerAdd))
 		case *peerRemove != "":
 			os.Exit(runPeerRemoveCommand(logger, configdir.Path(), *peerRemove))
-		case *peerTrust != "":
-			os.Exit(runPeerTrustCommand(logger, configdir.Path(), *peerTrust, true))
-		case *peerUntrust != "":
-			os.Exit(runPeerTrustCommand(logger, configdir.Path(), *peerUntrust, false))
 		}
 	}
 

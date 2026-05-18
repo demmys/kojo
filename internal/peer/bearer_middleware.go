@@ -117,9 +117,8 @@ func (m *BearerPeerMiddleware) Wrap(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r.WithContext(
 			auth.WithPrincipal(r.Context(), auth.Principal{
-				Role:        auth.RolePeer,
-				PeerID:      rec.DeviceID,
-				PeerTrusted: rec.Trusted,
+				Role:   auth.RolePeer,
+				PeerID: rec.DeviceID,
 			}),
 		))
 	})

@@ -55,7 +55,7 @@ func runPeerListCommand(logger *slog.Logger, configDir string) int {
 	selfID := readSelfDeviceID(ctx, st)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DEVICE_ID\tNAME\tURL\tSTATUS\tLAST_SEEN\tTRUST\tSELF")
+	fmt.Fprintln(w, "DEVICE_ID\tNAME\tURL\tSTATUS\tLAST_SEEN\tSELF")
 	now := store.NowMillis()
 	for _, p := range peers {
 		idShort := p.DeviceID
@@ -76,12 +76,8 @@ func runPeerListCommand(logger *slog.Logger, configDir string) int {
 		if urlCol == "" {
 			urlCol = "—"
 		}
-		trust := "—"
-		if p.Trusted {
-			trust = "trusted"
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			idShort, p.Name, urlCol, p.Status, lastSeen, trust, self)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			idShort, p.Name, urlCol, p.Status, lastSeen, self)
 	}
 	if err := w.Flush(); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-list: flush: %v\n", err)
@@ -174,7 +170,7 @@ func relativeTime(deltaMillis int64) string {
 // peer's identity, not its current reachability. The Hub flips it
 // to "online" on the first successful inbound heartbeat from that
 // peer.
-func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool) int {
+func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 	st, closeFn, err := openStoreReadOnly(logger, configDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
@@ -189,8 +185,6 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 	}
 	deviceID, name, peerURL := parts[0], parts[1], parts[2]
 
-	// Shape gates shared with the HTTP handler so a typo doesn't
-	// reach UpsertPeer.
 	if err := peer.ValidateDeviceID(deviceID); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
 		return 1
@@ -206,85 +200,21 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// RegisterPeerMetadata (not UpsertPeer) so a re-add against
-	// an already-known peer doesn't clobber the heartbeat's
-	// last_seen / status — UpsertPeer would reset them to
-	// (offline, 0) and the operator-visible `peer-list` would
-	// flip the peer offline until the next heartbeat.
 	if _, err := st.RegisterPeerMetadata(ctx, &store.PeerRecord{
 		DeviceID: deviceID,
 		Name:     name,
 		URL:      peerURL,
-		Trusted:  trusted,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: register: %v\n", err)
 		return 1
 	}
-	// RegisterPeerMetadata's preserve-on-conflict contract leaves
-	// trusted alone on re-add. Apply the flip explicitly so the
-	// CLI argument is authoritative for both insert AND update.
-	if err := st.UpdatePeerTrust(ctx, deviceID, trusted); err != nil {
-		fmt.Fprintf(os.Stderr, "peer-add: set trust: %v\n", err)
-		return 1
-	}
-	trustLabel := ""
-	if trusted {
-		trustLabel = " [trusted]"
-	}
-	fmt.Printf("peer added: %s (%s, %s)%s\n", deviceID, name, peerURL, trustLabel)
-	// docs/peer-simplify-plan.md: --peer-add only writes the
-	// peer_registry row. Without a Bearer pair, inter-peer auth
-	// will reject every call from this row. Tell the operator so
-	// they aren't surprised.
+	fmt.Printf("peer added: %s (%s, %s)\n", deviceID, name, peerURL)
 	fmt.Fprintln(os.Stderr,
-		"\n  WARNING: --peer-add writes metadata only. Bearer tokens are\n"+
-			"  NOT minted by this path; inter-peer requests against this row\n"+
-			"  will fail until you pair via `kojo --peer` against the Hub OR\n"+
-			"  a future --peer-mint-bearer command lands.")
-	return 0
-}
-
-// runPeerTrustCommand flips the trusted bit on an existing
-// peer_registry row. Decoupled from peer-add so the operator can
-// promote / demote a previously-paired peer without re-typing the
-// full spec. Refuses self (same reasoning as peer-remove —
-// flipping the local trust state would be a meaningless self-write
-// because the principal never authenticates against its own
-// trusted column).
-func runPeerTrustCommand(logger *slog.Logger, configDir, deviceID string, trusted bool) int {
-	st, closeFn, err := openStoreReadOnly(logger, configDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
-		return 1
-	}
-	defer closeFn()
-	if deviceID == "" {
-		fmt.Fprintf(os.Stderr, "peer-trust: device_id required\n")
-		return 1
-	}
-	if err := peer.ValidateDeviceID(deviceID); err != nil {
-		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
-		return 1
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if self := readSelfDeviceID(ctx, st); self != "" && self == deviceID {
-		fmt.Fprintf(os.Stderr, "peer-trust: refusing to flip self (%s)\n", deviceID)
-		return 1
-	}
-	if err := st.UpdatePeerTrust(ctx, deviceID, trusted); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			fmt.Fprintf(os.Stderr, "peer-trust: %s not in peer_registry\n", deviceID)
-			return 1
-		}
-		fmt.Fprintf(os.Stderr, "peer-trust: %v\n", err)
-		return 1
-	}
-	state := "trusted"
-	if !trusted {
-		state = "untrusted"
-	}
-	fmt.Printf("peer %s: %s\n", deviceID, state)
+		"\n  WARNING: --peer-add writes peer_registry metadata only.\n"+
+			"  Bearer tokens are minted only by the auto-pairing Approve\n"+
+			"  flow (peer side runs `kojo --peer --hub <hub>`, operator\n"+
+			"  clicks Approve in Settings). Until that's done, inter-peer\n"+
+			"  auth against this row will return 401.")
 	return 0
 }
 

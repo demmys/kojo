@@ -39,17 +39,9 @@ func hubFixture(t *testing.T) (string, *Identity, *store.Store) {
 	if _, err := st.UpsertPeer(context.Background(), &store.PeerRecord{
 		DeviceID: subID.DeviceID,
 		Name:     subID.Name,
-		// public_key is still NOT NULL in the schema; step 10
-		// drops the column once the signing layer is fully out.
-		// Use a placeholder to satisfy the constraint.
-		
-		Status:    store.PeerStatusOnline,
-		Trusted:   true,
+		Status:   store.PeerStatusOnline,
 	}); err != nil {
 		t.Fatalf("UpsertPeer: %v", err)
-	}
-	if err := st.UpdatePeerTrust(context.Background(), subID.DeviceID, true); err != nil {
-		t.Fatalf("UpdatePeerTrust: %v", err)
 	}
 	issued, err := st.IssuePeerToken(context.Background(), subID.DeviceID, store.PeerTokenRolePeerToHub)
 	if err != nil {

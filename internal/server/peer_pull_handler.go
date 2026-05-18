@@ -141,18 +141,10 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Trust gate: a RolePeer signer can dispatch a pull regardless
-	// of whether they are themselves the source — orchestrators
-	// (typically the Hub) drive switches between two other peers,
-	// so the historical "signer == source" check is too strict
-	// once peer↔peer Bearers are gone (the target relays through
-	// the orchestrator's Hub-relay endpoint, see relayPeerBlob).
-	// PeerTrusted is the authorisation bar instead: an untrusted
-	// peer cannot ask us to fetch arbitrary URIs.
-	if p.IsPeer() && !p.PeerTrusted {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer-signed pull requires the signer's peer_registry row to be trusted")
-		return
-	}
+	// Any Bearer-authenticated peer can drive a pull (Bearer
+	// existence implies operator-approved pairing; the prior
+	// "trusted" gate was redundant with that). Orchestrator !=
+	// source is supported via the relay arm below.
 
 	// Resolve the source's dial address from OUR peer_registry
 	// row — never from the request body.

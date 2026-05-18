@@ -172,46 +172,14 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// run inside the handler.
 			return true
 		}
-		// kojo-attach hub-ingest: admitted BEFORE the PeerTrusted
-		// gate. The handler-side guards (regex-locked path under
-		// `agents/<id>/attach/<msg>/<filename>`, mandatory
-		// X-Kojo-Expected-SHA256, existing-row sha256-conflict
-		// check, home_peer cross-overwrite refusal) make this
-		// surface narrow enough that requiring the operator to
-		// also flip `--peer-trust` would just produce silent
-		// "attachment vanished" failures in the common case where
-		// a peer was auto-paired via discovery but never
-		// explicitly trusted on hub. Any RolePeer signer that
-		// completed pairing can push attachments scoped to its
-		// own agent runtime; the body digest is the integrity
-		// gate, not the trust bit.
+		// kojo-attach hub-ingest path.
 		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
 			return true
 		}
-		// Trust gate. Every privileged peer surface — sessions,
-		// ws, info, dirs, files, git, upload, AND the §3.7 agent
-		// proxy paths — requires the per-row peer_registry.trusted
-		// bit to be set on the receiving side (--peer-add --trusted
-		// / `--peer-trust` / UI checkbox). Pairing alone is shape
-		// validation, not authorisation: any paired RolePeer
-		// signer that bypassed this gate could reach credentials /
-		// persona / memory / export and the rest of the agent
-		// admin surface.
-		//
-		// device-switch interplay: a Hub→target post-switch chat
-		// proxy is admitted on the agents/* surface WITHOUT
-		// flipping registry.trusted — agentHolderAdmitMiddleware
-		// (chain step BEFORE this gate) request-scope-promotes the
-		// Principal when agent_locks.holder_peer == self AND
-		// agent_locks.allowed_proxy_peer == signer. The finalize
-		// handler stamps allowed_proxy_peer = source so the Hub's
-		// signed proxy passes the dual check. The promotion is
-		// per-request and per-agent; registry.trusted stays
-		// untouched, so the same signer cannot reach
-		// sessions/files/git through this admit.
-		if !p.PeerTrusted {
-			return false
-		}
+		// Every paired peer (= has a valid Bearer issued via the
+		// operator's Approve flow) is admitted on the privileged
+		// surface. The earlier "trusted" bit that gated this is
+		// gone — Bearer existence IS the operator's trust signal.
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}

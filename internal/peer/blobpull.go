@@ -39,13 +39,22 @@ import (
 
 // PullSource identifies the peer to fetch from.
 type PullSource struct {
-	// DeviceID is the source peer's identity, used as the
-	// SigningInput.Audience and as a sanity check on incoming
-	// blob_refs rows.
+	// DeviceID is the logical source peer's identity. When RelayVia
+	// is nil, used as the AuthorizeOutbound target; otherwise it
+	// rides in the `?relay_from=` query so the relayer (typically
+	// the Hub) knows which third peer to forward to.
 	DeviceID string
-	// Address is the base URL (e.g. "http://hub.tail-net.ts.net:8080")
-	// returned by NormalizeAddress. The blob URI path is appended.
+	// Address is the base URL of whoever this client should dial.
+	// Direct mode: source's URL. Relay mode: relayer's URL (Hub).
 	Address string
+	// RelayVia, when non-nil, makes PullOne dial RelayVia.Address
+	// with `?relay_from=<DeviceID>` appended, and authenticate as
+	// the Bearer paired with RelayVia.DeviceID (Hub↔peer). This is
+	// the Bearer-only-auth replacement for direct peer↔peer pulls
+	// (docs/peer-simplify-plan.md Codex P1-2): each peer carries
+	// only Hub↔peer credentials, so peer-to-peer blob transfers
+	// pass through the Hub as a streaming proxy.
+	RelayVia *PullSource
 }
 
 // PullItem is one entry in a pull batch — the URI to fetch plus
@@ -196,22 +205,38 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 		return res, nil
 	}
 
-	reqURL, err := buildPeerBlobURL(src.Address, item.URI)
+	// Direct mode: dial source, authenticate as source's Bearer.
+	// Relay mode: dial RelayVia (Hub), authenticate as Hub's Bearer,
+	// append `?relay_from=<source_device_id>` so the Hub knows whom
+	// to forward to. The Hub side (peer_blob_handler.go relayPeerBlob)
+	// strips the query and re-issues the upstream GET with its own
+	// Hub→source Bearer.
+	dialBase := src.Address
+	authTarget := src.DeviceID
+	relayFrom := ""
+	if src.RelayVia != nil {
+		if src.RelayVia.Address == "" || src.RelayVia.DeviceID == "" {
+			return res, errors.New("peer.PullClient: RelayVia missing Address or DeviceID")
+		}
+		dialBase = src.RelayVia.Address
+		authTarget = src.RelayVia.DeviceID
+		relayFrom = src.DeviceID
+	}
+	reqURL, err := buildPeerBlobURL(dialBase, item.URI)
 	if err != nil {
 		res.Status = "error"
 		res.Error = "build url: " + err.Error()
 		return res, nil
+	}
+	if relayFrom != "" {
+		reqURL += "?relay_from=" + url.QueryEscape(relayFrom)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return res, fmt.Errorf("peer.PullOne: new request: %w", err)
 	}
-	// Bearer first when paired (step 7 dual-stack); SignRequest is
-	// the fallback for the peer↔peer leg where no Bearer exists yet.
-	// Once a follow-up adds Hub-issued blob capabilities, swap this
-	// for a capability presentation and drop the sign branch.
-	if err := AuthorizeOutbound(ctx, c.store, req, src.DeviceID); err != nil {
+	if err := AuthorizeOutbound(ctx, c.store, req, authTarget); err != nil {
 		return res, fmt.Errorf("peer.PullOne: authorize: %w", err)
 	}
 

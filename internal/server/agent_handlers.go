@@ -1090,14 +1090,17 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, holderDeviceID); err != nil {
 		return false
 	}
-	// Forward auth token so the holder's auth middleware can verify
-	// read access (the original request's token may carry
-	// owner/agent role).
+	// Forward the agent's own token so the holder's auth middleware
+	// can resolve the original principal. The X-Kojo-Token header is
+	// fine to copy — it's a separate channel from peer auth — but
+	// Authorization MUST NOT be overwritten: AuthorizeOutbound just
+	// stamped this Hub's peer→holder Bearer there, and the
+	// downstream BearerPeerMiddleware needs to see THAT to stamp the
+	// RolePeer principal (Codex review P2). The agent's
+	// Authorization, if any, flows on its own X-Kojo-Token-equivalent
+	// or via the agent's signed-token path.
 	if tok := r.Header.Get("X-Kojo-Token"); tok != "" {
 		req.Header.Set("X-Kojo-Token", tok)
-	}
-	if tok := r.Header.Get("Authorization"); tok != "" {
-		req.Header.Set("Authorization", tok)
 	}
 
 	client := peer.NoKeepAliveHTTPClient(10 * time.Second)

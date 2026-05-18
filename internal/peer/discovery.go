@@ -68,11 +68,18 @@ type HubInfo struct {
 //     US. We must NOT keep the raw value — we hash it and stash the
 //     hash via store.StorePeerTokenHash so the local
 //     BearerPeerMiddleware can validate Hub-inbound requests later.
+//
+// JoinSecret is returned on the FIRST POST and must accompany every
+// subsequent POST/GET in Authorization: Bearer so the Hub can bind
+// pending-row / stash mutations to the original requester. It's
+// stashed in kv `peer/discovery_join_secret/<hub_id>` and reused
+// across polls until the permanent peer→Hub Bearer is delivered.
 type JoinResponse struct {
 	State      string   `json:"state"`
 	Hub        *HubInfo `json:"hub,omitempty"`
 	PeerBearer string   `json:"peerBearer,omitempty"`
 	HubBearer  string   `json:"hubBearer,omitempty"`
+	JoinSecret string   `json:"joinSecret,omitempty"`
 }
 
 // DiscoveryConfig parameterises NewDiscovery.
@@ -327,7 +334,9 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 }
 
 // postJoinRequest sends our identity to Hub and returns the parsed
-// response.
+// response. On subsequent calls (after the first POST returned a
+// joinSecret) we re-present the secret in Authorization so the Hub
+// can bind the row mutation to the original requester (Codex P1 fix).
 func (d *Discovery) postJoinRequest(ctx context.Context, hubURL string) (*JoinResponse, error) {
 	body, err := json.Marshal(map[string]string{
 		"deviceId": d.identity.DeviceID,
@@ -345,6 +354,7 @@ func (d *Discovery) postJoinRequest(ctx context.Context, hubURL string) (*JoinRe
 		return nil, fmt.Errorf("build: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	d.attachJoinAuth(ctx, req)
 	resp, err := d.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -361,7 +371,90 @@ func (d *Discovery) postJoinRequest(ctx context.Context, hubURL string) (*JoinRe
 	if err := json.Unmarshal(respBody, &jr); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
+	// First POST returns a fresh joinSecret; stash it so future POSTs
+	// (and the GET poll path) can present it in Authorization. The
+	// secret lives in kv until the permanent peer→Hub Bearer is
+	// delivered on the approved-branch poll.
+	if jr.JoinSecret != "" {
+		_ = d.persistJoinSecret(ctx, jr.JoinSecret)
+	}
 	return &jr, nil
+}
+
+// discoveryJoinSecretNS holds the per-Hub join secret the peer was
+// issued on its first /join-request POST. Single-row namespace —
+// device_id of THIS peer is the implicit key, so we use a literal.
+const discoveryJoinSecretNS = "peer/discovery_join_secret"
+const discoveryJoinSecretKey = "current"
+
+func (d *Discovery) persistJoinSecret(ctx context.Context, secret string) error {
+	if d == nil || d.store == nil {
+		return errors.New("discovery: nil store")
+	}
+	_, err := d.store.PutKV(ctx, &store.KVRecord{
+		Namespace: discoveryJoinSecretNS,
+		Key:       discoveryJoinSecretKey,
+		Value:     secret,
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{})
+	return err
+}
+
+func (d *Discovery) loadJoinSecret(ctx context.Context) string {
+	if d == nil || d.store == nil {
+		return ""
+	}
+	rec, err := d.store.GetKV(ctx, discoveryJoinSecretNS, discoveryJoinSecretKey)
+	if err != nil {
+		return ""
+	}
+	return rec.Value
+}
+
+func (d *Discovery) clearJoinSecret(ctx context.Context) {
+	if d == nil || d.store == nil {
+		return
+	}
+	_ = d.store.DeleteKV(ctx, discoveryJoinSecretNS, discoveryJoinSecretKey, "")
+}
+
+// attachJoinAuth picks the strongest credential we have for the Hub
+// and stamps it as Authorization: Bearer. Preference order:
+//
+//  1. Permanent peer→Hub Bearer (peer/out_bearer/<hub_id>) once
+//     pairing finished and the approve flow delivered Bearers.
+//  2. Per-join secret minted on the first /join-request POST.
+//
+// Empty header when neither exists — the very first POST has no
+// credential and the Hub mints the secret in its response.
+func (d *Discovery) attachJoinAuth(ctx context.Context, req *http.Request) {
+	if req == nil {
+		return
+	}
+	if hubBearer := d.lookupPermanentBearer(ctx); hubBearer != "" {
+		req.Header.Set("Authorization", "Bearer "+hubBearer)
+		return
+	}
+	if secret := d.loadJoinSecret(ctx); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+}
+
+// lookupPermanentBearer returns the peer→Hub Bearer if it exists.
+// We don't know the Hub's device_id on the very first POST, so the
+// caller must tolerate "". Implementation: list every row in
+// OutBearerNS and take the first — there's only ever one Hub per
+// peer in this deploy shape.
+func (d *Discovery) lookupPermanentBearer(ctx context.Context) string {
+	if d == nil || d.store == nil {
+		return ""
+	}
+	rows, err := d.store.ListKV(ctx, OutBearerNS)
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	return rows[0].Value
 }
 
 // SetPeerPublicURL lets main.go update the advertised URL once the
@@ -453,6 +546,10 @@ func (d *Discovery) persistPairingBearers(ctx context.Context, hubDeviceID, peer
 		if _, err := d.store.PutKV(ctx, rec, store.KVPutOptions{}); err != nil {
 			return fmt.Errorf("persist peer→hub bearer: %w", err)
 		}
+		// Permanent Bearer in hand — the per-join secret is no
+		// longer needed (and a stale row would mislead a future
+		// re-pair attempt).
+		d.clearJoinSecret(ctx)
 	}
 	if hubBearer != "" {
 		hash := store.HashPeerToken(hubBearer)

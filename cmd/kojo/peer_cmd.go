@@ -232,6 +232,15 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string, trusted bool
 		trustLabel = " [trusted]"
 	}
 	fmt.Printf("peer added: %s (%s, %s)%s\n", deviceID, name, peerURL, trustLabel)
+	// docs/peer-simplify-plan.md: --peer-add only writes the
+	// peer_registry row. Without a Bearer pair, inter-peer auth
+	// will reject every call from this row. Tell the operator so
+	// they aren't surprised.
+	fmt.Fprintln(os.Stderr,
+		"\n  WARNING: --peer-add writes metadata only. Bearer tokens are\n"+
+			"  NOT minted by this path; inter-peer requests against this row\n"+
+			"  will fail until you pair via `kojo --peer` against the Hub OR\n"+
+			"  a future --peer-mint-bearer command lands.")
 	return 0
 }
 
@@ -318,55 +327,38 @@ func runPeerRemoveCommand(logger *slog.Logger, configDir, deviceID string) int {
 	return 0
 }
 
-// printPairingSpec prints the pairing triple (device_id|name|url|pubkey)
-// to stderr at startup so the operator can paste it into the OTHER
-// host's `kojo --peer-add` flag. Pairing is bidirectional: each
-// host stores the other's row so signed inter-peer requests pass
-// the receiver's PeerAuth middleware.
+// printPairingSpec prints the pairing identity to stderr at startup.
+// With Ed25519 signing retired (docs/peer-simplify-plan.md) the
+// authoritative pairing channel is the auto-pairing flow: peer hosts
+// run `kojo --peer` against this Hub's URL and the Owner approves
+// the pending join request in Settings. That flow mints + delivers
+// the Bearer pair end-to-end with no manual paste.
 //
-// The pipe `|` separator is shell-active in bash/zsh/cmd/PowerShell,
-// so paste-without-quotes turns the spec into two phantom commands —
-// exactly the failure mode the operator hits when they copy the
-// printed line and run it verbatim. Spell out the single-quote form,
-// with paths for every shell we expect operators to use.
+// `--peer-add` survives only as a metadata-only escape hatch (writes
+// peer_registry without Bearer tokens). Until a follow-up adds
+// matching `--peer-mint-bearer` / `--peer-import-bearer` commands,
+// rows added that way cannot authenticate inter-peer requests.
 //
-// role is "Hub" or "peer" — wording in the banner shifts so the
-// operator knows which side they are sitting on and which side to
-// run --peer-add on.
+// role is "hub" or "peer" — wording in the banner shifts so the
+// operator knows which side they are sitting on.
 func printPairingSpec(id *peer.Identity, peerURL, role string) {
 	if id == nil {
 		return
 	}
-	// Pairing spec carries only metadata now — the Ed25519 public key
-	// that used to occupy the fourth field was retired in
-	// docs/peer-simplify-plan.md step 9. Bearer tokens replace it via
-	// the auto-pairing flow.
 	spec := fmt.Sprintf("%s|%s|%s", id.DeviceID, id.Name, peerURL)
-	// Hub-side pairing must combine `--peer-add <spec>` with the
-	// bool flag `--peer-add-trusted` so the peer admits the Hub
-	// on the privileged surface (session create, files, git, ...).
-	// A plain `--peer-add` leaves the row as trusted=0 and every
-	// Hub→peer proxy call would 403. Peer-side pairing on the Hub
-	// uses plain `--peer-add` because the Hub should NOT trust an
-	// arbitrary peer to drive its own session / file surface; the
-	// operator can flip `--peer-trust <device_id>` later if they
-	// decide to.
-	var headline, suffix string
-	switch role {
-	case "hub":
-		headline = "Hub pairing spec — run on every peer host so the peer admits Hub-driven session/file/git proxy:"
-		suffix = " --peer-add-trusted"
-	case "peer":
-		headline = "peer pairing spec — run on the Hub to register this peer (Hub stays default-untrusted; use `kojo --peer-trust <device_id>` to promote):"
-		suffix = ""
-	default:
-		headline = "peer pairing spec — run on the other host:"
-		suffix = ""
+	hubURL := peerURL
+	if role == "peer" {
+		hubURL = "<hub-url>"
 	}
 	fmt.Fprintf(os.Stderr,
-		"  %s\n\n"+
-			"    bash/zsh:    kojo --peer-add '%[3]s'%[2]s\n"+
-			"    cmd.exe:     kojo --peer-add \"%[3]s\"%[2]s\n"+
-			"    PowerShell:  kojo --peer-add '%[3]s'%[2]s\n\n",
-		headline, suffix, spec)
+		"  Pairing — recommended (auto-pairing via Hub Approve):\n\n"+
+			"    On EACH peer host:\n"+
+			"        kojo --peer --hub %s\n"+
+			"    Then on the Hub, Settings → Pending → Approve.\n\n"+
+			"  This host's identity (for diagnostics / manual offline rows):\n"+
+			"        %s\n\n"+
+			"  Manual `--peer-add '<spec>'` writes the registry row only;\n"+
+			"  it does NOT mint Bearer tokens, so the resulting peer cannot\n"+
+			"  authenticate until a future --peer-mint-bearer command lands.\n\n",
+		hubURL, spec)
 }

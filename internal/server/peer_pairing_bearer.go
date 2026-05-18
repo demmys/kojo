@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -42,6 +44,15 @@ const (
 	// decrypt-on-use) is tracked alongside the blob-capability
 	// signing key (plan step 7).
 	pairingHubOutNS = peerPkgOutBearerNS
+	// peerJoinSecretNS holds a per-pending-peer one-time secret
+	// minted on the FIRST /join-request POST. All subsequent
+	// /join-request POSTs and GET polls for that device_id must
+	// present the raw secret in Authorization: Bearer until the
+	// permanent peer→Hub Bearer is delivered on approve. Without
+	// this binding any host that knows a victim's device_id could
+	// race-poll /join-request right after approve and capture the
+	// Hub→peer / peer→Hub credentials (Codex review P1 finding).
+	peerJoinSecretNS = "peer/join_secret"
 )
 
 // stashedPairingBearers is the JSON envelope kv writes from approve and
@@ -176,4 +187,113 @@ func (s *Server) loadHubOutBearer(ctx context.Context, peerDeviceID string) (str
 		return "", errors.New("peer-pairing: store not initialized")
 	}
 	return peer.LoadOutboundBearer(ctx, s.agents.Store(), peerDeviceID)
+}
+
+// mintJoinSecret returns a fresh 256-bit base64 secret. Same shape +
+// entropy as MintPeerTokenRaw; broken out so the join-request flow
+// can stash a raw value in kv (rather than a hash) without dragging
+// in the peer_tokens semantics.
+func mintJoinSecret() (string, error) {
+	return store.MintPeerTokenRaw()
+}
+
+// persistJoinSecret records the raw join_secret keyed by device_id.
+// Subsequent calls overwrite (the legit peer never sees its existing
+// secret evicted — only the FIRST POST writes, and the corresponding
+// peer immediately receives the value in the response).
+func (s *Server) persistJoinSecret(ctx context.Context, deviceID, secret string) error {
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return errors.New("peer-pairing: store not initialized")
+	}
+	_, err := s.agents.Store().PutKV(ctx, &store.KVRecord{
+		Namespace: peerJoinSecretNS,
+		Key:       deviceID,
+		Value:     secret,
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{})
+	return err
+}
+
+// loadJoinSecret returns the raw secret for device_id, or empty when
+// no secret exists (already consumed, or never minted).
+func (s *Server) loadJoinSecret(ctx context.Context, deviceID string) string {
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return ""
+	}
+	rec, err := s.agents.Store().GetKV(ctx, peerJoinSecretNS, deviceID)
+	if err != nil {
+		return ""
+	}
+	return rec.Value
+}
+
+// consumeJoinSecret removes the kv row. Called on successful Bearer
+// delivery so the secret becomes single-use.
+func (s *Server) consumeJoinSecret(ctx context.Context, deviceID string) {
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return
+	}
+	_ = s.agents.Store().DeleteKV(ctx, peerJoinSecretNS, deviceID, "")
+}
+
+// extractBearerFromRequest pulls the raw Bearer out of an HTTP
+// request's Authorization header. Returns "" when missing or shaped
+// differently (e.g. X-Kojo-Token, basic).
+func extractBearerFromRequest(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(h) <= len(prefix) {
+		return ""
+	}
+	if !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// callerHoldsJoinIdentity returns true when the Authorization header
+// presents EITHER the per-join secret OR the permanent peer→Hub
+// Bearer for device_id. The /join-request endpoints use this as their
+// pre-update / pre-bearer-attach gate: legitimate peer always holds
+// one of the two; an attacker who only knows the UUID-shaped
+// device_id holds neither.
+func (s *Server) callerHoldsJoinIdentity(ctx context.Context, deviceID string, r *http.Request) bool {
+	if s == nil || s.agents == nil || s.agents.Store() == nil || deviceID == "" {
+		return false
+	}
+	presented := extractBearerFromRequest(r)
+	if presented == "" {
+		return false
+	}
+	if secret := s.loadJoinSecret(ctx, deviceID); secret != "" && presented == secret {
+		return true
+	}
+	tok, err := s.agents.Store().ResolvePeerToken(ctx, presented)
+	if err == nil && tok.DeviceID == deviceID && tok.Role == store.PeerTokenRolePeerToHub {
+		return true
+	}
+	return false
+}
+
+// callerHoldsPeerBearer returns true ONLY when Authorization carries
+// a valid peer→Hub Bearer for device_id (not the pre-approval join
+// secret). Used by the processJoinRequest approved-branch URL update
+// gate, which must require the permanent credential — accepting the
+// join_secret there would let an attacker who scraped the secret
+// from the first /join-request response retain the ability to
+// overwrite the peer's URL post-approval.
+func (s *Server) callerHoldsPeerBearer(r *http.Request, deviceID string) bool {
+	if s == nil || s.agents == nil || s.agents.Store() == nil || deviceID == "" {
+		return false
+	}
+	presented := extractBearerFromRequest(r)
+	if presented == "" {
+		return false
+	}
+	tok, err := s.agents.Store().ResolvePeerToken(r.Context(), presented)
+	if err != nil {
+		return false
+	}
+	return tok.DeviceID == deviceID && tok.Role == store.PeerTokenRolePeerToHub
 }

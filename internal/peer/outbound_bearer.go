@@ -71,18 +71,22 @@ func AttachOutboundBearer(ctx context.Context, st *store.Store, req *http.Reques
 //
 //  1. Tries the Bearer path via AttachOutboundBearer.
 //  2. On ErrNoOutboundBearer (no Bearer paired for this peer yet),
-//     falls back to SignRequest with the supplied identity material.
+//     OR when the store handle is nil (test fixtures, daemon
+//     bootstrap before kvstore is wired), falls back to SignRequest
+//     with the supplied identity material.
 //  3. Surfaces any other error verbatim — these signal a genuine
-//     misconfiguration (nil store, bad device_id), not the steady-
-//     state "no Bearer minted yet".
+//     kv failure (transient SQLite BUSY, schema drift), not the
+//     steady-state "no Bearer minted yet".
 //
 // Once step 9 removes SignRequest the fallback branch goes away and
-// callers that still reach this function are kept fail-closed.
+// the function fails closed when no Bearer is present.
 func AuthorizeOutbound(ctx context.Context, st *store.Store, req *http.Request, selfIdent *Identity, peerDeviceID, nonce string) error {
-	if err := AttachOutboundBearer(ctx, st, req, peerDeviceID); err == nil {
-		return nil
-	} else if !errors.Is(err, ErrNoOutboundBearer) {
-		return err
+	if st != nil {
+		if err := AttachOutboundBearer(ctx, st, req, peerDeviceID); err == nil {
+			return nil
+		} else if !errors.Is(err, ErrNoOutboundBearer) {
+			return err
+		}
 	}
 	if selfIdent == nil {
 		return errors.New("peer.AuthorizeOutbound: nil identity for signing fallback")

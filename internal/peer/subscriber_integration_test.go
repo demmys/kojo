@@ -112,7 +112,7 @@ func hubFixture(t *testing.T) (string, ed25519.PrivateKey, *Identity, *store.Sto
 func TestSubscriber_ReceivesSnapshotFromHub(t *testing.T) {
 	hubURL, _, subID, _ := hubFixture(t)
 	bus := NewEventBus()
-	sub := NewSubscriber(subID, bus, nil)
+	sub := NewSubscriber(subID, nil, bus, nil)
 	defer sub.Stop()
 
 	sub.SetTargets([]SubscriberTarget{
@@ -131,7 +131,7 @@ func TestSubscriber_ReceivesSnapshotFromHub(t *testing.T) {
 
 func TestSubscriber_StopUnsubscribesAllTargets(t *testing.T) {
 	hubURL, _, subID, _ := hubFixture(t)
-	sub := NewSubscriber(subID, nil, nil)
+	sub := NewSubscriber(subID, nil, nil, nil)
 	sub.SetTargets([]SubscriberTarget{
 		{DeviceID: "hub-device-id", Address: hubURL},
 	})
@@ -145,7 +145,7 @@ func TestSubscriber_StopUnsubscribesAllTargets(t *testing.T) {
 
 func TestSubscriber_IgnoresSelfTarget(t *testing.T) {
 	subID := &Identity{DeviceID: "self-id", Name: "self"}
-	sub := NewSubscriber(subID, nil, nil)
+	sub := NewSubscriber(subID, nil, nil, nil)
 	sub.SetTargets([]SubscriberTarget{
 		{DeviceID: "self-id", Address: "http://does-not-matter"},
 	})
@@ -158,7 +158,7 @@ func TestSubscriber_IgnoresSelfTarget(t *testing.T) {
 
 func TestSubscriber_AddressChangeRestartsGoroutine(t *testing.T) {
 	subID := &Identity{DeviceID: "self-id"}
-	sub := NewSubscriber(subID, nil, nil)
+	sub := NewSubscriber(subID, nil, nil, nil)
 	defer sub.Stop()
 	// First target.
 	sub.SetTargets([]SubscriberTarget{
@@ -191,7 +191,7 @@ func TestSubscriber_AddressChangeRestartsGoroutine(t *testing.T) {
 
 func TestSubscriber_SetTargetsAfterStopIsNoOp(t *testing.T) {
 	subID := &Identity{DeviceID: "self-id"}
-	sub := NewSubscriber(subID, nil, nil)
+	sub := NewSubscriber(subID, nil, nil, nil)
 	sub.Stop()
 	// Must not panic.
 	sub.SetTargets([]SubscriberTarget{
@@ -205,7 +205,7 @@ func TestSubscriber_SetTargetsAfterStopIsNoOp(t *testing.T) {
 }
 
 func TestSubscriber_FrameDecodeMalformedSkipped(t *testing.T) {
-	sub := NewSubscriber(&Identity{DeviceID: "x"}, nil, nil)
+	sub := NewSubscriber(&Identity{DeviceID: "x"}, nil, nil, nil)
 	sub.handleFrame("target-a", []byte("not json"))
 	// No panic, no live update.
 	if _, ok := sub.LiveStatus("anything"); ok {
@@ -214,7 +214,7 @@ func TestSubscriber_FrameDecodeMalformedSkipped(t *testing.T) {
 }
 
 func TestSubscriber_EventFrameUpdatesLive(t *testing.T) {
-	sub := NewSubscriber(&Identity{DeviceID: "x"}, nil, nil)
+	sub := NewSubscriber(&Identity{DeviceID: "x"}, nil, nil, nil)
 	body, _ := json.Marshal(map[string]any{
 		"type": "event",
 		"event": StatusEvent{
@@ -232,7 +232,7 @@ func TestSubscriber_EventFrameUpdatesLive(t *testing.T) {
 }
 
 func TestSubscriber_SetTargetsRemovesStaleLiveEntries(t *testing.T) {
-	sub := NewSubscriber(&Identity{DeviceID: "self"}, nil, nil)
+	sub := NewSubscriber(&Identity{DeviceID: "self"}, nil, nil, nil)
 	// Feed in an event via target-a, then drop target-a — the
 	// live cache for that target must clear so LiveStatus can't
 	// report stale online for a peer we no longer observe.

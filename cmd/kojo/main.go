@@ -617,7 +617,7 @@ func main() {
 			// no targets and the subscriber's goroutine pool is
 			// empty.
 			if peerRegistrar != nil {
-				peerSubscriber = peer.NewSubscriber(peerIdentity, peerEvents, logger)
+				peerSubscriber = peer.NewSubscriber(peerIdentity, st, peerEvents, logger)
 				peerSubscriberTargetsCtx, peerSubscriberTargetsCancel = context.WithCancel(context.Background())
 				go peerSubscriberTargetsLoop(peerSubscriberTargetsCtx, st, peerIdentity, peerSubscriber, logger)
 			}

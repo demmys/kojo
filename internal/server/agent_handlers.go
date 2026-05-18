@@ -1091,7 +1091,7 @@ func (s *Server) proxyPeerGetMessages(w http.ResponseWriter, r *http.Request, ag
 	if err != nil {
 		return false
 	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, holderDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, s.peerID, holderDeviceID, nonce); err != nil {
 		return false
 	}
 	// Forward auth token so the holder's auth middleware can verify
@@ -1219,7 +1219,7 @@ func (s *Server) fetchRemoteLatestMessage(ctx context.Context, agentID, holderDe
 	if err != nil {
 		return "", "", "", false
 	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, holderDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, s.peerID, holderDeviceID, nonce); err != nil {
 		return "", "", "", false
 	}
 

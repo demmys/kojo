@@ -946,8 +946,8 @@ func (s *Server) sendPeerRegisterPush(addr, targetDeviceID string, row *store.Pe
 	if err != nil {
 		return fmt.Errorf("nonce: %w", err)
 	}
-	if err := peer.SignRequest(req, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, targetDeviceID); err != nil {
-		return fmt.Errorf("sign: %w", err)
+	if err := peer.AuthorizeOutbound(ctx, s.agents.Store(), req, s.peerID, targetDeviceID, nonce); err != nil {
+		return fmt.Errorf("authorize: %w", err)
 	}
 	client := peer.NoKeepAliveHTTPClient(peerRegisterPushBroadcastTimeout)
 	resp, err := client.Do(req)

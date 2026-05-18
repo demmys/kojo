@@ -196,7 +196,7 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 		writeError(w, http.StatusInternalServerError, "nonce", err.Error())
 		return
 	}
-	if err := peer.SignRequest(proxyReq, s.peerID.DeviceID, s.peerID.PrivateKey, nonce, holderDeviceID); err != nil {
+	if err := peer.AuthorizeOutbound(proxyReq.Context(), s.agents.Store(), proxyReq, s.peerID, holderDeviceID, nonce); err != nil {
 		writeError(w, http.StatusInternalServerError, "sign", err.Error())
 		return
 	}

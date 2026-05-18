@@ -6,8 +6,19 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
+
+// peerPkgOutBearerNS is the source-of-truth kv namespace for outbound
+// Bearers — both Hub→peer and peer→Hub use the same row shape. The
+// peer package owns the constant so the to-be-migrated SignRequest
+// callers can pull values via a single helper without duplicating the
+// namespace string.
+const peerPkgOutBearerNS = peer.OutBearerNS
+
+// suppress unused-import errors when only the alias above is used.
+var _ = peer.OutBearerNS
 
 // Pairing-time Bearer issuance, the docs/peer-simplify-plan.md step-4 wiring
 // that links handleApprovePeerPending and the /join-request poll handlers
@@ -21,14 +32,16 @@ const (
 	// same device_id can hand them over. machine-scoped — these are this
 	// host's secret to deliver and must never replicate.
 	pairingBearerStashNS = "peer/pairing_bearer_stash"
-	// pairingHubOutNS holds the Hub-side outbound Bearer (raw Token B)
-	// keyed by peer device_id. The Hub presents this value as its
-	// `Authorization: Bearer …` when calling peer endpoints. machine-
-	// scoped, plaintext — TLS is the on-wire boundary; a KEK-wrapped
-	// row would still be reconstructable on every send. Future
-	// hardening (KEK + decrypt-on-use) is tracked alongside the
-	// blob-capability signing key (plan step 7).
-	pairingHubOutNS = "peer/hub_out_bearer"
+	// pairingHubOutNS aliases the unified peer.OutBearerNS so the
+	// pairing handler keeps its single point of contact with the kv
+	// namespace. Hub-side: stores the raw Bearer we present in
+	// `Authorization: Bearer …` when calling each paired peer,
+	// keyed by peer device_id. machine-scoped, plaintext — TLS is
+	// the on-wire boundary; a KEK-wrapped row would still be
+	// reconstructable on every send. Future hardening (KEK +
+	// decrypt-on-use) is tracked alongside the blob-capability
+	// signing key (plan step 7).
+	pairingHubOutNS = peerPkgOutBearerNS
 )
 
 // stashedPairingBearers is the JSON envelope kv writes from approve and
@@ -156,20 +169,11 @@ func (s *Server) attachPairingBearers(ctx context.Context, peerDeviceID string, 
 }
 
 // loadHubOutBearer fetches the Hub's outbound Bearer for a given peer.
-// Future callers (the to-be-migrated SignRequest sites in step 5) will
-// use this to populate `Authorization: Bearer …` on outgoing requests.
-// Exposed here so the peer-pairing logic stays the single owner of the
-// kv namespace; callers don't need to know the namespace string.
+// Thin wrapper over peer.LoadOutboundBearer kept for the server-only
+// callers that already hold an *Server receiver.
 func (s *Server) loadHubOutBearer(ctx context.Context, peerDeviceID string) (string, error) {
 	if s == nil || s.agents == nil || s.agents.Store() == nil {
 		return "", errors.New("peer-pairing: store not initialized")
 	}
-	rec, err := s.agents.Store().GetKV(ctx, pairingHubOutNS, peerDeviceID)
-	if err != nil {
-		return "", err
-	}
-	if rec.Value == "" {
-		return "", store.ErrNotFound
-	}
-	return rec.Value, nil
+	return peer.LoadOutboundBearer(ctx, s.agents.Store(), peerDeviceID)
 }

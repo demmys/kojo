@@ -422,11 +422,17 @@ func readTailnetName(parent context.Context) (string, error) {
 	return suffix, nil
 }
 
-// peerOutBearerNS holds the peer-side outbound Bearer keyed by HUB
-// device_id. Mirrors server-side peer/hub_out_bearer; on this side
-// "out" means "Bearer we present when calling the Hub". Machine-scoped,
-// plaintext (TLS is the wire boundary).
-const peerOutBearerNS = "peer/peer_out_bearer"
+// OutBearerNS is the kv namespace this kojo uses for the raw outbound
+// Bearer keyed by the REMOTE peer's device_id. Hub and --peer modes
+// share the namespace because they share the call shape: "present this
+// Bearer when calling device X". The local kojo's identity is implicit
+// (it's the row owner); the key is the destination.
+//
+// Exported so the to-be-migrated peer→peer (and peer→Hub) callers in
+// internal/server can attach Authorization headers via a single
+// AttachOutboundBearer helper without duplicating the namespace
+// string. Machine-scoped, plaintext — TLS is the on-wire boundary.
+const OutBearerNS = "peer/out_bearer"
 
 // persistPairingBearers consumes the Bearer pair the Hub delivered in
 // the join-request approved response and lands them in this peer's
@@ -454,7 +460,7 @@ func (d *Discovery) persistPairingBearers(ctx context.Context, hubDeviceID, peer
 	}
 	if peerBearer != "" {
 		rec := &store.KVRecord{
-			Namespace: peerOutBearerNS,
+			Namespace: OutBearerNS,
 			Key:       hubDeviceID,
 			Value:     peerBearer,
 			Type:      store.KVTypeString,

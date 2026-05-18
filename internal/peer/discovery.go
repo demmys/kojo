@@ -58,9 +58,21 @@ type HubInfo struct {
 
 // JoinResponse is the response shape of POST/GET
 // /api/v1/peers/join-request.
+//
+// PeerBearer / HubBearer arrive once per approve event
+// (docs/peer-simplify-plan.md step 4):
+//   - PeerBearer is the credential WE present in Authorization when
+//     calling Hub endpoints (peer→Hub). We persist it in the local kv
+//     keyed by Hub device_id.
+//   - HubBearer is the credential the Hub will present when calling
+//     US. We must NOT keep the raw value — we hash it and stash the
+//     hash via store.StorePeerTokenHash so the local
+//     BearerPeerMiddleware can validate Hub-inbound requests later.
 type JoinResponse struct {
-	State string   `json:"state"`
-	Hub   *HubInfo `json:"hub,omitempty"`
+	State      string   `json:"state"`
+	Hub        *HubInfo `json:"hub,omitempty"`
+	PeerBearer string   `json:"peerBearer,omitempty"`
+	HubBearer  string   `json:"hubBearer,omitempty"`
 }
 
 // DiscoveryConfig parameterises NewDiscovery.
@@ -174,6 +186,10 @@ func (d *Discovery) joinLoop(ctx context.Context, hubURL string) {
 			if resp.Hub != nil {
 				if err := d.upsertHubIntoRegistry(ctx, resp.Hub, hubURL); err != nil {
 					d.logger.Warn("peer discovery: refresh Hub row failed",
+						"err", err)
+				}
+				if err := d.persistPairingBearers(ctx, resp.Hub.DeviceID, resp.PeerBearer, resp.HubBearer); err != nil {
+					d.logger.Warn("peer discovery: pairing bearer persist failed",
 						"err", err)
 				}
 			}
@@ -404,4 +420,55 @@ func readTailnetName(parent context.Context) (string, error) {
 		return "", errors.New("tailscale status: empty MagicDNSSuffix")
 	}
 	return suffix, nil
+}
+
+// peerOutBearerNS holds the peer-side outbound Bearer keyed by HUB
+// device_id. Mirrors server-side peer/hub_out_bearer; on this side
+// "out" means "Bearer we present when calling the Hub". Machine-scoped,
+// plaintext (TLS is the wire boundary).
+const peerOutBearerNS = "peer/peer_out_bearer"
+
+// persistPairingBearers consumes the Bearer pair the Hub delivered in
+// the join-request approved response and lands them in this peer's
+// local state:
+//
+//   - peerBearer: raw value we present in Authorization when calling
+//     Hub endpoints. Stored in kv keyed by Hub device_id.
+//   - hubBearer: raw value the Hub will present when calling US. We
+//     hash + insert into peer_tokens via StorePeerTokenHash; the raw
+//     value is dropped from memory after the call returns.
+//
+// Empty arguments are the steady state for any poll that lands AFTER
+// the one-shot delivery — no-op.
+//
+// Errors are returned but treated as Warn-only by the caller; the Hub
+// will not re-deliver the same raw tokens, so a persist failure forces
+// the operator to re-approve. Surface the error so the human can
+// notice.
+func (d *Discovery) persistPairingBearers(ctx context.Context, hubDeviceID, peerBearer, hubBearer string) error {
+	if peerBearer == "" && hubBearer == "" {
+		return nil
+	}
+	if hubDeviceID == "" {
+		return errors.New("hub device_id required to persist bearers")
+	}
+	if peerBearer != "" {
+		rec := &store.KVRecord{
+			Namespace: peerOutBearerNS,
+			Key:       hubDeviceID,
+			Value:     peerBearer,
+			Type:      store.KVTypeString,
+			Scope:     store.KVScopeMachine,
+		}
+		if _, err := d.store.PutKV(ctx, rec, store.KVPutOptions{}); err != nil {
+			return fmt.Errorf("persist peer→hub bearer: %w", err)
+		}
+	}
+	if hubBearer != "" {
+		hash := store.HashPeerToken(hubBearer)
+		if err := d.store.StorePeerTokenHash(ctx, hubDeviceID, store.PeerTokenRoleHubToPeer, hash); err != nil {
+			return fmt.Errorf("stash hub→peer hash: %w", err)
+		}
+	}
+	return nil
 }

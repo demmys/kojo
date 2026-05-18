@@ -65,12 +65,52 @@ func generatePeerTokenRaw() (string, error) {
 	return base64.RawStdEncoding.EncodeToString(buf), nil
 }
 
+// MintPeerTokenRaw mints a raw token without persisting any hash. The
+// Hub uses this when generating the Hub→peer Bearer it will SEND to the
+// peer: the peer stores the hash via StorePeerTokenHash on its side, the
+// Hub keeps the raw locally in its outbound-Bearer kv. Exposed so the
+// approve handler can mint deterministically and ship over the wire in
+// the same transaction it stamps the receiving-side hash.
+func MintPeerTokenRaw() (string, error) {
+	return generatePeerTokenRaw()
+}
+
 // HashPeerToken returns the canonical hash form used both at issue time and
 // at verification time. Exported so the peer-side stash (kv) and any
 // middleware can recompute the same value without re-importing crypto.
 func HashPeerToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return base64.RawStdEncoding.EncodeToString(sum[:])
+}
+
+// StorePeerTokenHash inserts a token hash without minting a fresh raw
+// value. The peer-side discovery path uses this when accepting a Bearer
+// that the Hub generated and shipped over: the peer doesn't know (and
+// must not learn) the raw bytes after delivery; it stashes the hash so
+// the local BearerPeerMiddleware can later validate Hub→peer requests.
+//
+// Idempotent on (token_hash) collision via INSERT OR IGNORE — a retried
+// delivery from a flaky polling client doesn't 500 the receiver.
+func (s *Store) StorePeerTokenHash(ctx context.Context, deviceID, role, hash string) error {
+	if deviceID == "" {
+		return errors.New("store.StorePeerTokenHash: device_id required")
+	}
+	switch role {
+	case PeerTokenRoleHubToPeer, PeerTokenRolePeerToHub:
+	default:
+		return fmt.Errorf("store.StorePeerTokenHash: invalid role %q", role)
+	}
+	if hash == "" {
+		return errors.New("store.StorePeerTokenHash: hash required")
+	}
+	now := time.Now().UnixMilli()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO peer_tokens (token_hash, device_id, role, created_at) VALUES (?, ?, ?, ?)`,
+		hash, deviceID, role, now)
+	if err != nil {
+		return fmt.Errorf("store.StorePeerTokenHash: insert: %w", err)
+	}
+	return nil
 }
 
 // IssuePeerToken mints a fresh Bearer for (deviceID, role), inserts the

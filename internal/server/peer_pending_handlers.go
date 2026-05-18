@@ -104,9 +104,25 @@ type joinRequestBody struct {
 // When state="approved", Hub carries its own pairing spec in `hub`
 // so the peer can populate / refresh its local registry without a
 // second round-trip to /hub-info.
+//
+// PeerBearer / HubBearer are the two halves of the Bearer-over-TLS
+// pair docs/peer-simplify-plan.md introduces. They are delivered
+// EXACTLY ONCE per approve event: the first /join-request poll
+// returning state="approved" after the operator approves carries
+// the raw values; subsequent polls return state="approved" with
+// the bearer fields empty. The peer side MUST persist both on
+// first receipt:
+//   - PeerBearer (the peer→Hub credential) → peer kv outbound
+//   - HubBearer (the Hub→peer credential) → peer_tokens hash row
+//
+// A peer that crashes between receiving and persisting must
+// trigger operator re-approve to mint a fresh pair; the same raw
+// tokens never come back over the wire.
 type joinRequestResponse struct {
-	State string           `json:"state"` // "approved" | "pending"
-	Hub   *hubInfoResponse `json:"hub,omitempty"`
+	State      string           `json:"state"` // "approved" | "pending"
+	Hub        *hubInfoResponse `json:"hub,omitempty"`
+	PeerBearer string           `json:"peerBearer,omitempty"`
+	HubBearer  string           `json:"hubBearer,omitempty"`
 }
 
 // joinRequestBodyCap bounds the join-request body. A few hundred
@@ -188,10 +204,9 @@ func (s *Server) handleJoinRequestPoll(w http.ResponseWriter, r *http.Request) {
 	// state from the peer's point of view — answer pending below.
 	if rec, err := st.GetPeer(r.Context(), id); err == nil && rec.Trusted {
 		hub := s.buildHubInfoResponse(r.Context())
-		writeJSONResponse(w, http.StatusOK, joinRequestResponse{
-			State: "approved",
-			Hub:   hub,
-		})
+		resp := joinRequestResponse{State: "approved", Hub: hub}
+		s.attachPairingBearers(r.Context(), id, &resp)
+		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	}
 	// pending branch: still in peer_pending.
@@ -236,10 +251,9 @@ func (s *Server) processJoinRequest(w http.ResponseWriter, r *http.Request, req 
 		_ = st.UpdatePeerMetadata(r.Context(), req.DeviceID, req.Name, req.URL)
 		_ = st.TouchPeer(r.Context(), req.DeviceID, store.PeerStatusOnline, 0)
 		hub := s.buildHubInfoResponse(r.Context())
-		writeJSONResponse(w, http.StatusOK, joinRequestResponse{
-			State: "approved",
-			Hub:   hub,
-		})
+		resp := joinRequestResponse{State: "approved", Hub: hub}
+		s.attachPairingBearers(r.Context(), req.DeviceID, &resp)
+		writeJSONResponse(w, http.StatusOK, resp)
 		return
 	case errors.Is(err, store.ErrNotFound):
 		// Fall through to pending.
@@ -379,6 +393,17 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal_error",
 			"internal server error")
 		return
+	}
+	// Mint the Bearer pair (docs/peer-simplify-plan.md step 4) and
+	// stash both raw values for the next /join-request poll to
+	// consume. A mint failure must NOT block approval: the legacy
+	// Ed25519 path is still in place during the dual-stack window,
+	// so a peer that never receives Bearers keeps functioning on
+	// signing until the operator re-approves manually. Log + carry
+	// on rather than rolling back the registry promotion.
+	if err := s.mintAndStashPairingBearers(r.Context(), id); err != nil {
+		s.logger.Warn("approve: bearer mint failed; peer will fall back to signing",
+			"device_id", id, "err", err)
 	}
 	s.broadcastPeerRegistration(rec)
 	writeJSONResponse(w, http.StatusOK, s.toPeerResponse(rec))

@@ -632,27 +632,23 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			}
 		} else {
 			// Stream was started — usually by the first tool_use event —
-			// but the assistant never produced any reply text. Without an
-			// overwrite, the user is left staring at a finalized message
-			// whose only content is one or more "_⏳ {tool}_" status
-			// indicators. Replace it with an error fallback so the channel
-			// reflects the actual outcome. The else-if branches below cannot
-			// run because streamTS != "" already matched, so this is the
-			// only place to surface the failure.
-			fallback := "Sorry, something went wrong while processing your request."
-			updateOpts := []slack.MsgOption{
-				slack.MsgOptionText(fallback, false),
-				slack.MsgOptionMarkdownText(fallback),
-			}
-			if threadTS != "" {
-				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
-			}
-			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
-				b.logger.Warn("failed to overwrite empty-response stream", "err", err)
-				// Last resort: post a separate message so the user still
-				// gets feedback even if chat.update fails.
-				b.postMessage(finCtx, channel, threadTS, fallback)
-			}
+			// but the assistant never produced any reply text. Keep the
+			// stream content (e.g. "_⏳ {tool}_" indicators) intact so
+			// the user can see how far the turn got — which tool_use
+			// was emitted is the most useful debugging artifact when
+			// this path triggers. Surface the failure as a new message
+			// (threaded when threadTS is set, top-level otherwise — same
+			// behavior as the non-empty path's fallback below) instead
+			// of overwriting the stream via chat.update, which would
+			// erase the execution trail. The StopStream call above is
+			// best-effort: if it failed the stream may briefly remain
+			// live next to the error, but Slack auto-finalizes it via
+			// TTL; the non-empty path treats StopStream the same way.
+			// The else-if branches below cannot run because streamTS
+			// != "" already matched, so this is the only place to
+			// surface the failure.
+			b.postMessage(finCtx, channel, threadTS,
+				"Sorry, something went wrong while processing your request.")
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no streaming support)

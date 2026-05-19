@@ -1,7 +1,6 @@
 package server
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -74,39 +73,59 @@ func TestAgentRuntimeSnapshot_DisplayETag(t *testing.T) {
 	}
 }
 
-// TestAgentIfMatchPrecheck_StripsCompositeSuffix mirrors the strip
-// logic in agentIfMatchPrecheck: a client that echoed the HTTP ETag
-// header (composite) into If-Match MUST still match the row etag the
-// store knows about. This guards the precondition path against the
-// composite suffix introduced for cache-busting.
-func TestAgentIfMatchPrecheck_StripsCompositeSuffix(t *testing.T) {
-	// Mirror the actual code path: split on the first "." because
-	// the row etag never contains one.
-	strip := func(et string) string {
-		if et == "*" {
-			return et
-		}
-		if i := strings.IndexByte(et, '.'); i >= 0 {
-			return et[:i]
-		}
-		return et
-	}
-
+// TestStripAgentDisplayETagSuffix exercises the production strip
+// helper directly so the precondition path keeps accepting an
+// If-Match that was copied verbatim from a GET's HTTP ETag header.
+// The full grammar displayETag can emit is "<row>", "<row>.p",
+// "<row>.n<base36>", and "<row>.p.n<base36>"; everything else MUST
+// pass through intact so a malformed precondition surfaces as a 412
+// rather than silently relaxing the row check.
+func TestStripAgentDisplayETagSuffix(t *testing.T) {
 	cases := []struct {
-		in, want string
+		name, in, want string
 	}{
-		{"7-aaa", "7-aaa"},
-		{"7-aaa.p", "7-aaa"},
-		{"7-aaa.ntjfizc", "7-aaa"},
-		{"7-aaa.p.ntjfizc", "7-aaa"},
-		{"*", "*"},
-		// Empty / malformed pass through untouched; the caller's
-		// "rec.ETag != candidate" check fails the precondition.
-		{"", ""},
+		{"bare row", "7-aaa", "7-aaa"},
+		{"row + paused", "7-aaa.p", "7-aaa"},
+		{"row + nextCron", "7-aaa.ntjfizc", "7-aaa"},
+		{"row + paused + nextCron", "7-aaa.p.ntjfizc", "7-aaa"},
+		{"wildcard preserved", "*", "*"},
+		{"empty passes through", "", ""},
+		// Defensive: an unknown suffix MUST NOT be stripped — that
+		// would let "7-aaa.garbage" silently match row "7-aaa" and
+		// relax the precondition.
+		{"unknown suffix kept", "7-aaa.x", "7-aaa.x"},
+		{"empty .n discarded as unknown", "7-aaa.n", "7-aaa.n"},
+		{"non-base36 .n kept", "7-aaa.nFOO", "7-aaa.nFOO"},
+		// .p without trailing .n still strips.
+		{"trailing .p only", "1-bbb.p", "1-bbb"},
+		// Out-of-order ".nXX.p" is NOT emitted by displayETag; the
+		// strip degrades gracefully — peels the trailing .p but
+		// rejects the malformed .n suffix ("XX.p" fails the base36
+		// check). The remaining "1-bbb.nabc" will mismatch the row
+		// etag and the precondition will 412, which is the safer
+		// outcome on malformed input.
+		{"out-of-order .n.p partial", "1-bbb.nabc.p", "1-bbb.nabc"},
 	}
 	for _, c := range cases {
-		if got := strip(c.in); got != c.want {
-			t.Errorf("strip(%q) = %q, want %q", c.in, got, c.want)
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripAgentDisplayETagSuffix(c.in); got != c.want {
+				t.Errorf("stripAgentDisplayETagSuffix(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// Round-trip invariant: every value displayETag could plausibly
+	// emit must strip back to the bare row etag.
+	row := "7-abc"
+	t1 := time.Date(2026, 5, 19, 11, 24, 0, 0, time.UTC)
+	for _, composite := range []string{
+		(agentRuntimeSnapshot{rowETag: row}).displayETag(),
+		(agentRuntimeSnapshot{rowETag: row, cronPaused: true}).displayETag(),
+		(agentRuntimeSnapshot{rowETag: row, nextCron: t1}).displayETag(),
+		(agentRuntimeSnapshot{rowETag: row, cronPaused: true, nextCron: t1}).displayETag(),
+	} {
+		if got := stripAgentDisplayETagSuffix(composite); got != row {
+			t.Errorf("round-trip %q stripped to %q, want %q", composite, got, row)
 		}
 	}
 }

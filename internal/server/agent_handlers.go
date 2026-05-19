@@ -111,6 +111,47 @@ func (s *Server) snapshotAgent(r *http.Request, agentID string) agentRuntimeSnap
 	}
 }
 
+// stripAgentDisplayETagSuffix removes the GET-only composite suffixes
+// that displayETag appends ("." + "p" for cron-paused, ".n" + base36
+// for nextCronAt) so an If-Match value that came from copying the
+// HTTP ETag header still matches the bare row etag stored in the v1
+// table. Anything that doesn't fit the displayETag grammar (".p" or
+// ".n[0-9a-z]+", with the two possibly concatenated in that order)
+// is left intact — over-eager stripping would silently relax
+// optimistic concurrency on a malformed etag.
+//
+// "*" is preserved unchanged so the wildcard precondition path is
+// untouched (the caller checks "ifMatch == \"*\"" separately).
+func stripAgentDisplayETagSuffix(et string) string {
+	if et == "*" {
+		return et
+	}
+	// .n<base36> always comes last in the composite (see displayETag).
+	if i := strings.LastIndex(et, ".n"); i >= 0 {
+		rest := et[i+2:]
+		if rest != "" && isBase36Lower(rest) {
+			et = et[:i]
+		}
+	}
+	if strings.HasSuffix(et, ".p") {
+		et = et[:len(et)-2]
+	}
+	return et
+}
+
+// isBase36Lower reports whether s consists entirely of 0-9a-z. Matches
+// strconv.FormatInt(_, 36) output for non-negative inputs, which is
+// what displayETag emits.
+func isBase36Lower(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
 // displayETag is the HTTP ETag header composite. It builds on the
 // row etag and folds in the runtime fields that change WITHOUT
 // bumping the row — cronPausedGlobal (Dashboard toggle, kv-row
@@ -276,14 +317,8 @@ func (s *Server) agentIfMatchPrecheck(w http.ResponseWriter, r *http.Request, ag
 	// Strip the GET-only composite suffixes (".p" for cron-paused,
 	// ".n<base36>" for nextCronAt — see displayETag) so a client
 	// that copied the HTTP ETag header into If-Match still matches
-	// the underlying row. The row etag itself never contains "." in
-	// its on-the-wire format (it's "<version>-<hash>"), so we can
-	// safely treat everything from the first "." onwards as a
-	// composite tail.
-	candidate := ifMatch
-	if i := strings.IndexByte(candidate, '.'); i >= 0 && candidate != "*" {
-		candidate = candidate[:i]
-	}
+	// the underlying row.
+	candidate := stripAgentDisplayETagSuffix(ifMatch)
 	if ifMatch != "*" && rec.ETag != candidate {
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
 			"If-Match: etag mismatch")

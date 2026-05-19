@@ -149,7 +149,8 @@ type Server struct {
 	logger          *slog.Logger
 	mux             *http.ServeMux
 	httpSrv         *http.Server // public (Owner-trusted) listener
-	authSrv         *http.Server // agent-facing auth-required listener (lazy)
+	authSrv         *http.Server // agent-facing auth-required listener (lazy, loopback)
+	authTsnetSrv    *http.Server // peer-mode primary listener (lazy, tsnet+auth+tailnet identity)
 	authMu          sync.Mutex
 	devMode         bool
 	version         string
@@ -229,17 +230,20 @@ type Config struct {
 	// Nil disables the cross-peer push surface.
 	PeerEvents *peer.EventBus
 	// PeerOnly switches the server into the daemon-mode shape used
-	// by `kojo --peer`: only the two inbound peer endpoints
-	// (/api/v1/peers/events, /api/v1/peers/blobs/) are registered,
-	// the SPA / static FS / dev proxy is skipped, and every Hub-
-	// side route (sessions, agents, files, git, push, WebDAV, kv,
-	// oplog flush, peer-registry mutation) returns 404. The
-	// auth middleware chain stays the same — RolePeer requests
-	// signed with Ed25519 still get stamped via peer.AuthMiddleware
-	// and a tailnet-reach Owner promotion is still applied — but
-	// with nothing else mounted, the peer binary cannot accidentally
-	// expose Hub state even if a client crafts an Owner-shaped
-	// request.
+	// by `kojo --peer`. The §3.7 device-switch slice promoted this
+	// from "minimal peer surface" to a full peer: agent runtime,
+	// agent-facing routes, sessions, files, git, WebDAV mount, the
+	// inter-peer surface — all registered — that's how a switch
+	// can land the agent CLI on this host. What stays Hub-only
+	// and 404s on a peer:
+	//   - peer-registry mutation (POST/DELETE/rotate-key on
+	//     /api/v1/peers): pairing is an operator workflow, not
+	//     something an agent or peer drives.
+	//   - static SPA / dev proxy: peer hosts have no Web UI.
+	// The auth middleware chain stays the same — RolePeer requests
+	// arriving over tsnet get stamped by TailnetIdentityMiddleware
+	// (peer_registry hit) via ServeAuthTsnet, and the agent
+	// loopback listener keeps its Bearer-based AuthMiddleware.
 	PeerOnly bool
 
 	// V0LegacyDir, when non-empty, enables the session store's v0
@@ -911,38 +915,67 @@ func (s *Server) ServeTLS(ln net.Listener, certFile, keyFile string) error {
 // non-Owner principals on routes outside the allowlist) → mux.
 //
 // Intended use: bind to 127.0.0.1 only, expose to local PTY processes
-// via $KOJO_API_BASE. The public listener (Serve) bypasses auth and
-// keeps the user UX intact.
+// via $KOJO_API_BASE. For a tsnet listener that ALSO needs to accept
+// inter-peer traffic (peer-mode primary listener), use ServeAuthTsnet
+// instead — it wires TailnetIdentityMiddleware ahead of AuthMiddleware
+// so a paired peer's WhoIs-resolved identity reaches the policy gate
+// as RolePeer / RoleOwner. The public listener (Serve) bypasses auth
+// and keeps the user UX intact.
 func (s *Server) ServeAuth(ln net.Listener, resolver *auth.Resolver) error {
 	srv := s.ensureAuthServer(resolver)
 	s.logger.Info("auth listener started", "addr", ln.Addr().String())
 	return srv.Serve(ln)
 }
 
-func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
-	s.authMu.Lock()
-	defer s.authMu.Unlock()
-	if s.authSrv != nil {
-		return s.authSrv
-	}
-	// Auth listener middleware order: PeerAuth (Ed25519-signed
-	// inter-peer requests stamp RolePeer in ctx) → AuthMiddleware
-	// (sets Principal from Bearer; skips when peer already stamped)
-	// → EnforceMiddleware (route-level allowlist for non-Owner
-	// principals) → RemoteAgentProxy (§3.7: forward requests for
-	// remote agents to the holder peer; proxied requests bypass
-	// local idempotency + fencing since the target runs its own)
-	// → Idempotency (dedup write retries — sandwiched AFTER
-	// Enforce so a leaked key can't replay another principal's
-	// cached 2xx) → AgentFencing (refuse agent-runtime mutations
-	// when agent_locks.holder_peer ≠ this peer; §3.7) → mux.
+// ServeAuthTsnet serves the auth-required listener on a tsnet listener
+// that also receives inter-peer traffic (peer-mode primary listener).
+// Chain order: TailnetIdentityMiddleware → AuthMiddleware →
+// EnforceMiddleware → … → mux. PromoteUnknownTailnetToOwner is false
+// — only registered peers get a non-Guest principal via WhoIs; unknown
+// tailnet callers fall through to AuthMiddleware so an agent on the
+// same tailnet (rare) can still present a Bearer. The legacy
+// Ed25519-signing path is retired; Tailnet identity (peer_registry
+// membership over a tsnet listener) is the sole inter-peer trust
+// signal here. The --unsafe escape hatch stamps RoleOwner via
+// UnsafeAsHub=true for LAN / docker / CI deployments — peer↔peer
+// handlers gate on the source_device_id carried in the request body,
+// so Owner skips the equality gates rather than failing on an empty
+// PeerID.
+func (s *Server) ServeAuthTsnet(ln net.Listener, resolver *auth.Resolver) error {
+	srv := s.ensureAuthTsnetServer(resolver)
+	s.logger.Info("auth+tsnet listener started", "addr", ln.Addr().String())
+	return srv.Serve(ln)
+}
+
+// buildAuthHandler returns the shared middleware chain used by the
+// auth-required listener. Both ServeAuth (loopback) and
+// ServeAuthTsnet (tsnet primary) wrap this same chain — the latter
+// adds TailnetIdentityMiddleware on the outside. Order is documented
+// inline.
+func (s *Server) buildAuthHandler(resolver *auth.Resolver) http.Handler {
+	// Auth listener middleware order (innermost first):
 	//
-	// Idempotency sits OUTSIDE Fencing so a successful retry
-	// doesn't get re-blocked by transient lock state that
-	// drifted between calls. Fencing's 409 responses stamp
-	// X-Kojo-No-Idempotency-Cache so they aren't saved — a
-	// retry after the lock comes back must re-check rather than
-	// replay the stale 409.
+	//   mux
+	//     ← AgentFencingMiddleware  (refuse agent-runtime mutations
+	//       when agent_locks.holder_peer ≠ this peer; §3.7)
+	//     ← idempotencyMiddleware   (dedup write retries — sandwiched
+	//       AFTER Enforce so a leaked key can't replay another
+	//       principal's cached 2xx; OUTSIDE Fencing so a successful
+	//       retry doesn't get re-blocked by transient lock state)
+	//     ← remoteAgentProxyMiddleware (§3.7: forward requests for
+	//       remote agents to the holder peer; proxied requests bypass
+	//       local idempotency + fencing since the target runs its own)
+	//     ← sessionPeerProxyMiddleware
+	//     ← EnforceMiddleware       (route-level allowlist for
+	//       non-Owner principals)
+	//     ← AuthMiddleware          (sets Principal from Bearer;
+	//       skips when an earlier middleware already stamped a
+	//       non-Guest principal — that is how a tsnet-stamped
+	//       RolePeer reaches Enforce without being clobbered)
+	//
+	// Fencing's 409 responses stamp X-Kojo-No-Idempotency-Cache so
+	// they aren't saved — a retry after the lock comes back must
+	// re-check rather than replay the stale 409.
 	handler := http.Handler(s.mux)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 		handler = auth.AgentFencingMiddleware(
@@ -955,20 +988,114 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 	}
 	handler = auth.EnforceMiddleware(handler)
 	handler = auth.AuthMiddleware(resolver)(handler)
-	// The auth listener binds to 127.0.0.1 only. Agents reach it
-	// via their X-Kojo-Token / Bearer; that is the auth boundary
+	return handler
+}
+
+func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.authSrv != nil {
+		return s.authSrv
+	}
+	// The plain auth listener binds to 127.0.0.1 only. Agents reach
+	// it via their X-Kojo-Token / Bearer; that is the auth boundary
 	// here. We deliberately do NOT wire TailnetIdentityMiddleware
 	// on this listener — same-host tailnet WhoIs would resolve
 	// every same-host caller to the local NodeKey and stamp
 	// RolePeer / RoleOwner BEFORE AuthMiddleware ever sees the
 	// Bearer, silently bypassing the agent-token gate.
 	s.authSrv = &http.Server{
-		Handler:           handler,
+		Handler:           s.buildAuthHandler(resolver),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
 	return s.authSrv
+}
+
+func (s *Server) ensureAuthTsnetServer(resolver *auth.Resolver) *http.Server {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.authTsnetSrv != nil {
+		return s.authTsnetSrv
+	}
+	var st *store.Store
+	if s.agents != nil {
+		st = s.agents.Store()
+	}
+	// Tests can supply the store via pendingSyncDB without spinning
+	// up a full agent.Manager; in production this fallback is a
+	// no-op because cfg.Store and agents.Store() are the same
+	// handle. peer_registry hit / async TouchPeer both need it.
+	if st == nil {
+		st = s.pendingSyncDB
+	}
+	handler := s.buildAuthHandler(resolver)
+	// Tailnet identity stamps the principal first so a paired peer
+	// reaches AuthMiddleware already non-Guest (skip path) and
+	// EnforceMiddleware admits the inter-peer surface per
+	// policy.AllowNonOwner's RolePeer block. peer_registry hit →
+	// RolePeer + sync TouchPeer (production trust signal); miss →
+	// Guest, which then falls through to Bearer resolution in
+	// AuthMiddleware. PromoteUnknownTailnetToOwner stays false —
+	// peer-mode never trusts an unpaired tailnet caller.
+	//
+	// SelfNodeKeyFunc is deliberately nil here: this listener is
+	// the inbound side, never the source of its own requests, so
+	// any caller resolving to the local NodeKey is a misconfig and
+	// must not be promoted to Owner ahead of the Bearer gate.
+	//
+	// resolveFn wraps s.resolveNodeKey to additionally short-circuit
+	// the self case: peer_registry holds a self-row with the
+	// local NodeKey (so other peers can discover and dial us), and
+	// the unwrapped resolver would let a request whose WhoIs
+	// resolved to that key sail through GetPeerByNodeKey → RolePeer,
+	// silently bypassing AuthMiddleware. Returning "" demotes the
+	// caller to Guest so the Bearer gate downstream runs — the
+	// expected path for any self-originated request to this
+	// listener is via the loopback agent-API anyway.
+	//
+	// Unsafe mode uses UnsafeAsHub=true (RoleOwner stamp) instead
+	// of RolePeer. The peer↔peer handlers (handlePeerAgentSync,
+	// handlePeerPull, etc.) gate on p.PeerID == source_device_id
+	// from the request body; RolePeer with an empty PeerID would
+	// fail every such check and break the LAN/CI escape hatch.
+	// Stamping Owner skips the equality gates entirely — the
+	// operator's "trust the listener boundary" contract.
+	resolveFn := func(ctx context.Context, addr string) (string, error) {
+		nk, err := s.resolveNodeKey(ctx, addr)
+		if err != nil || nk == "" {
+			return nk, err
+		}
+		if self := s.currentSelfNodeKey(); self != "" && nk == self {
+			// Treat self as "WhoIs succeeded but caller is not a
+			// foreign peer." Empty string + nil err → Guest in
+			// the middleware's branch above.
+			return "", nil
+		}
+		return nk, nil
+	}
+	var selfDeviceID string
+	if s.peerID != nil {
+		selfDeviceID = s.peerID.DeviceID
+	}
+	handler = auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Resolver:                     resolveFn,
+		SelfNodeKeyFunc:              nil,
+		Store:                        st,
+		PromoteUnknownTailnetToOwner: false,
+		Unsafe:                       s.unsafePeer,
+		UnsafeAsHub:                  true,
+		SelfDeviceID:                 selfDeviceID,
+		Logger:                       s.logger,
+	})(handler)
+	s.authTsnetSrv = &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	return s.authTsnetSrv
 }
 
 // pendingSyncKey is the (agent_id, op_id) tuple that keys the
@@ -1292,6 +1419,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.authSrv != nil {
 		if err := s.authSrv.Shutdown(ctx); err != nil {
 			s.logger.Warn("auth listener shutdown error", "err", err)
+		}
+	}
+	if s.authTsnetSrv != nil {
+		if err := s.authTsnetSrv.Shutdown(ctx); err != nil {
+			s.logger.Warn("auth+tsnet listener shutdown error", "err", err)
 		}
 	}
 	if err := s.httpSrv.Shutdown(ctx); err != nil {

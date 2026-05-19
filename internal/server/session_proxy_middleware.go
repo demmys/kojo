@@ -109,10 +109,11 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 	// it as a fallback Owner-token source on GET/HEAD requests so
 	// `<img src>` / `<a href>` style attachment links work. We
 	// MUST NOT forward that token to the peer — the receiver's
-	// PeerAuth stamps RolePeer first so the token is ignored on
-	// the privileged path, but it would still land in the peer's
-	// HTTP access logs (a credential leak across a trust
-	// boundary). Drop it before re-encoding the query.
+	// ServeAuthTsnet stamps RolePeer from Tailnet identity first
+	// so the token would be ignored on the privileged path, but it
+	// would still land in the peer's HTTP access logs (a credential
+	// leak across a trust boundary). Drop it before re-encoding
+	// the query.
 	q := r.URL.Query()
 	q.Del("peer")
 	q.Del("token")

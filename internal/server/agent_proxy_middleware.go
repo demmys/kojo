@@ -123,9 +123,11 @@ func isRawAgentSubpath(sub string) bool {
 }
 
 // proxyToHolderPeer forwards the HTTP request to the peer that
-// holds the agent's runtime lock, signing it with this peer's
-// Ed25519 identity. The target peer's policy layer admits the
-// request as RolePeer; handler-level guards (If-Match, busy
+// holds the agent's runtime lock. Authentication is by Tailnet
+// identity — the forward dials the target peer over tsnet and its
+// ServeAuthTsnet listener stamps RolePeer from the WhoIs-resolved
+// peer_registry row, so no Authorization header is required on
+// the forwarded request. Handler-level guards (If-Match, busy
 // checks, etc.) still run on the target.
 //
 // On proxy failure the caller receives 502; on success the
@@ -160,8 +162,9 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 	// `?token=`: extractBearer admits it as an Owner-token fallback
 	// on GET/HEAD so attachment / image-src URLs work, but it must
 	// NOT cross the trust boundary into the holder peer's access
-	// logs. The Ed25519 signature is the only auth that needs to
-	// survive this hop.
+	// logs. Authentication on the hop itself is by Tailnet identity
+	// (the target's ServeAuthTsnet stamps RolePeer from the
+	// WhoIs-resolved peer_registry row); no header needs to survive.
 	targetURL := addr + r.URL.Path
 	q := r.URL.Query()
 	if q.Get("token") != "" {

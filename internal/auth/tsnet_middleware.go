@@ -47,16 +47,15 @@ type TailnetIdentityConfig struct {
 	// exclusively for the operator's UI — paired peer devices
 	// opening the Hub UI in a browser also arrive here, and there
 	// is no UX-meaningful distinction between "operator on the Hub
-	// host" and "operator on a paired tailnet device." Inter-peer
-	// agent-sync (Ed25519 signed) lands on the SEPARATE auth
-	// listener, which deliberately omits this middleware and
-	// stamps RolePeer via PeerAuth instead, so trusting every
-	// tailnet caller here does NOT widen the RolePeer surface.
+	// host" and "operator on a paired tailnet device."
 	//
 	// The peer-mode daemon leaves this FALSE so it can still
 	// classify a tailnet caller as RolePeer via peer_registry for
-	// the §3.7 device-switch surface; a stray tailnet node that
-	// hasn't been Approved stays Guest.
+	// the §3.7 device-switch surface (Server.ServeAuthTsnet wires
+	// this middleware ahead of AuthMiddleware on the peer's
+	// primary tsnet listener). A stray tailnet node that hasn't
+	// been Approved stays Guest and falls through to the Bearer
+	// gate.
 	PromoteUnknownTailnetToOwner bool
 	// Unsafe collapses the entire WhoIs path. Every caller is
 	// stamped RoleOwner (UnsafeAsHub=true) or RolePeer (false).
@@ -64,6 +63,17 @@ type TailnetIdentityConfig struct {
 	UnsafeAsHub  bool // true on Hub binary (RoleOwner), false on --peer (RolePeer)
 	ResolveDelay time.Duration
 	Logger       *slog.Logger
+	// SelfDeviceID, when non-empty, demotes a peer_registry hit
+	// whose device_id matches this value back to Guest. The
+	// self-row carries the local NodeKey so other peers can dial
+	// us; without this check, a request looped back through tsnet
+	// (e.g. operator hits the peer's tailnet IP from the same
+	// host) would resolve to the self-row and be stamped RolePeer,
+	// silently bypassing the Bearer gate downstream. Empty
+	// disables the check (Hub public listener doesn't need it
+	// since PromoteUnknownTailnetToOwner short-circuits ahead of
+	// the lookup).
+	SelfDeviceID string
 }
 
 // TailnetIdentityMiddleware authenticates inbound HTTP requests
@@ -151,10 +161,10 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 			// requests that land on the Hub's tsnet listener are
 			// likewise trusted as Owner here (operator-controlled
 			// tailnet only); on the peer-mode daemon the same
-			// inter-peer traffic instead lands on the auth
-			// listener (srv.ServeAuth) and is gated by PeerAuth /
-			// AuthMiddleware, so this Owner promotion never
-			// applies on a peer host.
+			// inter-peer traffic lands on ServeAuthTsnet, which
+			// runs THIS middleware with PromoteUnknownTailnetToOwner=
+			// false so peer_registry hit ⇒ RolePeer for the §3.7
+			// surface.
 			//
 			// peer_registry is still touched as a side-effect when
 			// the resolved NodeKey matches a registered peer, so
@@ -209,6 +219,20 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 					cfg.Logger.Warn("tsnet identity: peer_registry lookup failed; caller demoted to Guest",
 						"remote", r.RemoteAddr, "node_key", nodeKey, "err", err)
 				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Self-loop demotion: a request looped back through
+			// tsnet onto our own listener resolves to the self-row
+			// (the peer_registry self-row carries the local
+			// NodeKey so others can dial us). Stamping that as
+			// RolePeer would silently bypass the Bearer gate
+			// downstream. The Resolver-level self check above
+			// catches this when currentSelfNodeKey is already
+			// populated; this DeviceID-level guard closes the
+			// startup race where tsnet has bound but the self
+			// NodeKey capture goroutine hasn't published yet.
+			if cfg.SelfDeviceID != "" && rec.DeviceID == cfg.SelfDeviceID {
 				next.ServeHTTP(w, r)
 				return
 			}

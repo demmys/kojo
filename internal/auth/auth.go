@@ -33,14 +33,16 @@ const (
 	// Stored in ctx so the WebDAV gate can accept the token alongside
 	// the OwnerOnly principal on the public listener.
 	RoleWebDAV
-	// RolePeer authenticates a request signed by a registered remote
-	// peer's Ed25519 identity (docs §3.10 / §3.7). The principal's
-	// PeerID names the device_id from peer_registry; the scope is
-	// strictly peer-to-peer routes (status events feed, blob handoff
-	// fetch) — every other gate returns false. Set by
-	// peer.AuthMiddleware before the OwnerOnly / Auth middleware
-	// chains run, so the peer's identity wins over the default
-	// "Tailscale reach == Owner" promotion.
+	// RolePeer authenticates a request that arrived from a
+	// registered remote peer over tsnet (docs §3.10 / §3.7). The
+	// principal's PeerID names the device_id from peer_registry;
+	// the scope is the inter-peer surface plus proxied
+	// agent/session routes — every other gate returns false. Set
+	// by TailnetIdentityMiddleware on ServeAuthTsnet (peer-mode
+	// primary listener) and on the Hub's public listener via
+	// WhoIs → peer_registry; the legacy Ed25519-signed Bearer
+	// stamping path is retired. --unsafe collapses the WhoIs
+	// check and stamps RolePeer unconditionally for LAN/docker/CI.
 	RolePeer
 	// RoleOwner is the kojo user. It has full access to everything.
 	RoleOwner
@@ -67,15 +69,16 @@ func (p Principal) IsAgent() bool {
 // every other gate: a leaked token can only reach the WebDAV mount.
 func (p Principal) IsWebDAV() bool { return p.Role == RoleWebDAV }
 
-// IsPeer reports whether the principal was authenticated via a
-// peer's Ed25519 signature. RolePeer is scoped to inter-peer
-// endpoints (cross-subscribe status feed, blob handoff fetch)
-// AND to proxied agent requests (§3.7 remoteAgentProxy: Hub
-// forwards browser/agent requests to the holder peer, signing
-// them with its own Ed25519 key). Handler-level guard methods
-// (CanReadFull, CanMutateSelf, CanDeleteOrReset) admit IsPeer
-// because the Hub already ran Enforce before proxying —
-// re-blocking at the handler would 403 every proxied request.
+// IsPeer reports whether the principal was authenticated via
+// Tailnet identity (WhoIs over tsnet → peer_registry hit). RolePeer
+// is scoped to inter-peer endpoints (cross-subscribe status feed,
+// blob handoff fetch, device-switch orchestration) AND to proxied
+// agent requests (§3.7 remoteAgentProxy: Hub forwards browser/
+// agent requests to the holder peer over tsnet). Handler-level
+// guard methods (CanReadFull, CanMutateSelf, CanDeleteOrReset)
+// admit IsPeer because the Hub already ran Enforce before
+// proxying — re-blocking at the handler would 403 every proxied
+// request.
 func (p Principal) IsPeer() bool { return p.Role == RolePeer }
 
 // CanReadFull returns true if the principal can read the full record
@@ -207,10 +210,10 @@ func FromContext(ctx context.Context) Principal {
 // --- middleware ------------------------------------------------------
 
 // OwnerOnlyMiddleware tags every request as the Owner UNLESS an
-// earlier middleware (e.g. peer.AuthMiddleware) already attached a
-// non-Guest principal. The exception keeps the "Tailscale reach ==
-// Owner" UX for the kojo user from clobbering a peer's Ed25519-
-// authenticated identity on the same listener.
+// earlier middleware (e.g. TailnetIdentityMiddleware) already
+// attached a non-Guest principal. The exception keeps the
+// "Tailscale reach == Owner" UX for the kojo user from clobbering
+// a paired peer's Tailnet-identified RolePeer on the same listener.
 //
 // Used on the public (Tailscale) listener that the kojo user
 // accesses from their phone — the user's UX is preserved (no
@@ -232,9 +235,9 @@ func OwnerOnlyMiddleware(h http.Handler) http.Handler {
 // policy — that is the handler's responsibility (or a separate gate).
 //
 // Skips the Bearer resolution when an earlier middleware (e.g.
-// peer.AuthMiddleware) already attached a non-Guest principal so a
-// peer's Ed25519-signed request doesn't get downgraded to Guest by
-// the absence of a Bearer.
+// TailnetIdentityMiddleware) already attached a non-Guest principal
+// so a paired peer's Tailnet-identified RolePeer doesn't get
+// downgraded to Guest by the absence of a Bearer.
 func AuthMiddleware(resolver *Resolver) func(http.Handler) http.Handler {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

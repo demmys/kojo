@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/session"
 )
@@ -67,7 +68,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Peer-routed attach: the UI carries the session's home peer
 	// in `?peer=` so the Hub knows where to forward the WS.
 	// Self / empty falls through to the local handler. Loop
-	// prevention: a RolePeer-signed inbound WS upgrade must NOT
+	// prevention: an inbound WS already stamped RolePeer (i.e.
+	// arrived via Tailnet identity from another peer) MUST NOT
 	// re-proxy.
 	if pid := r.URL.Query().Get("peer"); pid != "" && s.peerID != nil && pid != s.peerID.DeviceID {
 		if !isPeerWS(r) {
@@ -295,21 +297,30 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	return conn.Write(ctx, websocket.MessageText, data)
 }
 
-// isPeerWS sniffs the inbound WS upgrade for a peer-auth signature
-// header so the proxy router doesn't re-proxy a peer-signed
-// request. We can't use auth.FromContext for the principal because
-// AuthMiddleware may not have run on the WS upgrade path on every
-// listener configuration; checking the header directly is the
-// minimal, correct loop guard.
+// isPeerWS reports whether the inbound WS upgrade carries a
+// pre-stamped RolePeer principal, so the proxy router doesn't
+// re-proxy an inter-peer request and create an unbounded chain.
+//
+// The legacy X-Kojo-Peer-Sig header check is retired: signing is
+// gone, and the listener that admits inter-peer WS upgrades
+// (ServeAuthTsnet) runs TailnetIdentityMiddleware ahead of
+// AuthMiddleware so a paired peer always reaches this point with
+// p.IsPeer() == true. Note that --unsafe stamps RoleOwner instead
+// of RolePeer, so an unsafe-mode caller is NOT recognised here —
+// the loop-prevention guarantee is conditional on the operator
+// running paired peers over tsnet; in --unsafe LAN/CI mode the
+// boundary is the listener itself, not this check.
 func isPeerWS(r *http.Request) bool {
-	return r.Header.Get("X-Kojo-Peer-Sig") != ""
+	return auth.FromContext(r.Context()).IsPeer()
 }
 
 // proxySessionWebSocket dials the target peer's
-// `/api/v1/ws?session=<id>` with peer-auth headers and pipes
-// frames between the inbound (UI) and outbound (peer) sockets
-// until either side closes. Mirrors proxyAgentWebSocket — same
-// trust model, same nonce-replay defence.
+// `/api/v1/ws?session=<id>` over tsnet (target's ServeAuthTsnet
+// stamps RolePeer from the WhoIs-resolved peer_registry row, so no
+// Authorization header is required) and pipes frames between the
+// inbound (UI) and outbound (peer) sockets until either side
+// closes. Mirrors proxyAgentWebSocket — same Tailnet identity
+// trust model.
 func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, sessionID, targetDeviceID string) {
 	if s.agents == nil || s.agents.Store() == nil || s.peerID == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",

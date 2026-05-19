@@ -124,11 +124,18 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	}
 
 	// RolePeer is scoped to the inter-peer surface (status push
-	// feed for §3.10, blob handoff for §3.7). Every other API
-	// path falls through to default-deny — a leaked peer signing
-	// key can't reach /api/v1/agents or any other route. Method
-	// gating is explicit so a future mutation handler under the
-	// same prefix doesn't inherit the read allowlist.
+	// feed for §3.10, blob handoff for §3.7, device-switch
+	// orchestration). The principal is stamped by
+	// TailnetIdentityMiddleware when the request arrives over the
+	// peer's tsnet listener and WhoIs resolves to a peer_registry
+	// row — Tailnet identity IS the trust signal. The legacy
+	// Ed25519-signed Bearer envelope path has been retired; no
+	// other RolePeer stamping route exists. Every API path
+	// outside this block falls through to default-deny, so an
+	// unpaired tailnet caller (Guest after WhoIs) can't reach
+	// /api/v1/agents or any other route. Method gating is
+	// explicit so a future mutation handler under the same
+	// prefix doesn't inherit the read allowlist.
 	if p.IsPeer() {
 		if method == http.MethodGet {
 			if path == "/api/v1/peers/events" {
@@ -185,10 +192,13 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
 			return true
 		}
-		// Every paired peer (= has a valid Bearer issued via the
-		// operator's Approve flow) is admitted on the privileged
-		// surface. The earlier "trusted" bit that gated this is
-		// gone — Bearer existence IS the operator's trust signal.
+		// Every paired peer (= has a peer_registry row matched by
+		// WhoIs over tsnet) is admitted on the privileged surface.
+		// The earlier "trusted" bit that gated this is gone —
+		// Tailnet identity (registry membership) IS the operator's
+		// trust signal. --unsafe collapses the WhoIs check and
+		// unconditionally stamps RolePeer on every caller (LAN /
+		// docker / CI escape hatch).
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}

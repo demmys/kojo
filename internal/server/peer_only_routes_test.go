@@ -11,17 +11,18 @@ import (
 	"github.com/loppo-llc/kojo/internal/peer"
 )
 
-// TestPeerOnlyMux confirms that registerPeerOnlyRoutes wires only the
-// inbound peer surface and that every Hub-side route is left
-// unregistered (Go's default mux returns 404 for missing routes, which
-// is the contract we want — a peer binary MUST NOT pretend to serve
-// Owner endpoints).
+// TestPeerOnlyMux confirms the legacy minimal-peer surface still
+// 404s when registerPeerOnlyRoutes runs against an agents==nil
+// Server. Note: the §3.7 device-switch slice promoted --peer to a
+// full peer (sessions / agents / files / git / WebDAV all
+// registered when agents is wired up via the real registerRoutes),
+// so this test is NOT a regression net for the full-peer surface
+// — it's a narrow assertion that registerPeerOnlyRoutes is a no-op
+// without a Store, which still matters because cmd/kojo never
+// builds a peer without one and the helper must stay defensive.
 //
-// We hit the routes anonymously (no peer.AuthMiddleware in front of
-// the bare mux) because the middleware chain belongs to httpSrv and
-// is exercised in heavy_test peer auth coverage. Here we only assert
-// the mux's registration, which is what guarantees the Hub surface
-// stays off in --peer mode.
+// We hit the routes anonymously because the middleware chain
+// belongs to httpSrv; here we only assert the mux's registration.
 func TestPeerOnlyMux(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 

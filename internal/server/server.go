@@ -392,12 +392,20 @@ func New(cfg Config) *Server {
 	//     ← auth.TailnetIdentityMiddleware  (WhoIs → Principal)
 	//
 	// TailnetIdentityMiddleware runs first so the Principal is
-	// stamped before any policy check. It promotes a request whose
-	// WhoIs-resolved NodeKey == selfNodeKey to RoleOwner (preserves
-	// the "Tailscale reach == Owner" UX on the same host) and
-	// resolves a paired peer's NodeKey via peer_registry.node_key.
-	// Unknown tailnet callers stay Guest; non-tsnet listeners (e.g.
-	// --local) admit Guest and rely on downstream auth.
+	// stamped before any policy check. On the Hub
+	// (PromoteUnknownTailnetToOwner=true) every WhoIs-resolved
+	// tailnet caller — same-host self, paired peer, and any other
+	// tailnet node — is stamped RoleOwner; peer_registry is
+	// touched only as an async liveness side-effect, never to
+	// downgrade the Principal. Rationale: the Hub's tailnet is
+	// operator-controlled, paired-peer UI sessions must render
+	// identically to on-host Owner, and inter-peer agent-sync
+	// runs over tsnet here too (also trusted). Non-tsnet listeners
+	// (e.g. --local) admit Guest and rely on downstream auth.
+	//
+	// On a peer (PromoteUnknownTailnetToOwner=false) the legacy
+	// classifier runs: peer_registry hit ⇒ RolePeer for the §3.7
+	// surface, miss ⇒ Guest.
 	//
 	// --unsafe collapses the WhoIs check and stamps RolePeer
 	// (peer-mode) or RoleOwner (Hub) unconditionally — LAN / docker
@@ -416,13 +424,13 @@ func New(cfg Config) *Server {
 		Resolver:        s.resolveNodeKey,
 		SelfNodeKeyFunc: s.currentSelfNodeKey,
 		Store:           st,
-		// On the Hub's public listener we restore the legacy
-		// "Tailscale reach == Owner" UX: a tailnet caller whose
-		// NodeKey doesn't match a paired peer is promoted to
-		// Owner so the operator can hit the UI from any tailnet
-		// device without pairing it. The peer-mode daemon does
-		// NOT promote (PromoteUnknownTailnetToOwner=false) — a
-		// stray tailnet caller on a peer host stays Guest.
+		// Hub public listener: every WhoIs-resolved tailnet
+		// caller is Owner — paired peers, unpaired tailnet
+		// devices, and inter-peer agent-sync all share the same
+		// operator-controlled tailnet trust boundary. The
+		// peer-mode daemon leaves this FALSE so peer_registry
+		// still classifies callers and unapproved nodes stay
+		// Guest.
 		PromoteUnknownTailnetToOwner: !cfg.PeerOnly,
 		Unsafe:                       cfg.Unsafe,
 		UnsafeAsHub:                  !cfg.PeerOnly,

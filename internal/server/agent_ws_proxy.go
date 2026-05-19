@@ -29,8 +29,9 @@ import (
 //   2. If holder == local peer → fall through to the local
 //      handler (existing handleAgentWebSocket behaviour).
 //   3. Otherwise → upgrade the UI's WS on this side, dial the
-//      target peer's /api/v1/agents/{id}/ws with Ed25519-signed
-//      peer-auth headers, and pipe binary frames both ways
+//      target peer's /api/v1/agents/{id}/ws over tsnet (target's
+//      ServeAuthTsnet stamps RolePeer from the WhoIs-resolved
+//      peer_registry row), and pipe binary frames both ways
 //      until either side closes.
 //
 // This keeps the UI bookmark stable: the user always points at
@@ -125,8 +126,10 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 	}
 	targetURL.Path = "/api/v1/agents/" + agentID + "/ws"
 
-	// Build a signed upgrade request. SignRequest stamps the
-	// peer-auth headers we'll hand to the WS dial via HTTPHeader.
+	// Build the upgrade request. Authentication is by Tailnet
+	// identity — the WS dial travels over tsnet and the target's
+	// ServeAuthTsnet stamps RolePeer from the WhoIs-resolved
+	// peer_registry row, so no Authorization header is required.
 	upgrade, err := http.NewRequestWithContext(r.Context(),
 		http.MethodGet, targetURL.String(), nil)
 	if err != nil {
@@ -138,15 +141,14 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 	// has rotated again, target down, etc.) surfaces as a clean
 	// HTTP error before we've upgraded the inbound conn.
 	//
-	// HTTPClient with keep-alives disabled: the upgrade request
-	// carries an Ed25519-signed Authorization header with a
-	// single-use nonce. Go's default transport silently retries
-	// idempotent GETs on stale idle connections, resending the
-	// SAME nonce — the recipient's peer auth middleware rejects
-	// the retry as a replay. Forcing a fresh TCP/TLS handshake
-	// per upgrade is cheap (one extra round-trip) and keeps the
-	// nonce semantics intact. 10 s ceiling on the upgrade leg
-	// matches the subscriber dial budget.
+	// HTTPClient with keep-alives disabled: the legacy
+	// Ed25519-signed Authorization header carried a single-use
+	// nonce that the Go default transport would silently resend on
+	// stale idle connections, replaying the nonce and getting
+	// rejected. The signing path is retired, but keeping a fresh
+	// TCP/TLS handshake per upgrade is cheap (one extra round-trip
+	// matches the subscriber dial budget) and avoids surprises if
+	// future inter-peer auth reintroduces nonce-bearing headers.
 	targetConn, _, err := websocket.Dial(r.Context(), targetURL.String(),
 		&websocket.DialOptions{
 			HTTPHeader: upgrade.Header,

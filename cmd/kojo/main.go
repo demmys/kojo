@@ -58,14 +58,14 @@ func main() {
 	migrateForceRecentMtime := flag.Bool("migrate-force-recent-mtime", false, "with --migrate: bypass the v0 mtime safety window (5min). Use when v0 is confirmed dead but a recent `ls`/backup-extract bumped a file's timestamp; mid-import data races silently corrupt if v0 is actually live")
 	rollbackExternal := flag.Bool("rollback-external-cli", false, "revert --migrate-external-cli changes; required before booting a v0 binary again")
 
-	peerMode := flag.Bool("peer", false, "run as a daemon-only peer: bind plain HTTP to 0.0.0.0:<port> + a loopback agent-auth listener on <port>+1. Exposes the full peer API (session lifecycle, agents, files, git, /api/v1/peers/* inter-peer routes) but skips the Web UI / dev proxy / Hub-side mutation routes / tsnet. Owner Bearer is unavailable; non-Owner access is gated by Ed25519 inter-peer auth (RolePeer) plus the per-row `trusted` bit. The tailnet identity is borrowed from the OS tailscaled (no --hostname). Mutually exclusive with --dev / --local / --no-auth.")
+	peerMode := flag.Bool("peer", false, "run as a daemon peer: bind a Tailscale-interface listener (the OS tailscaled is consulted via LocalAPI WhoIs for identity) on :<port> plus a 127.0.0.1 agent-auth listener on <port>+1. Registers the full peer API (sessions, agents, files, git, /api/v1/peers/*) so a device-switch can land an agent CLI here. Skipped on a peer: peer-registry mutation (POST/DELETE/rotate-key on /api/v1/peers), the Web UI / dev proxy. Owner Bearer is unavailable; inter-peer access is gated by Tailnet identity (peer_registry NodeKey match → RolePeer; --unsafe collapses the check and stamps Owner). Mutually exclusive with --dev / --local / --no-auth.")
 	peerList := flag.Bool("peer-list", false, "list peer_registry rows and exit (read-only; coexists with running kojo)")
 	peerAdd := flag.String("peer-add", "", "register a remote peer in peer_registry; spec = <device_id>|<name>|<url>. Metadata-only; Bearer tokens are minted by the auto-pairing /join-request Approve flow.")
 	peerRemove := flag.String("peer-remove", "", "delete a peer_registry row by device_id; refuses to remove self")
 	// Auto-onboarding flags (docs/peer-onboarding-plan.md).
 	hubURL := flag.String("hub", "", "with --peer: override Hub auto-discovery. Accepts host:port or scheme://host:port. Falls back to $KOJO_HUB_URL then MagicDNS default `https://kojo.<tailnet>.ts.net:<KOJO_HUB_PORT or 8080>`.")
 	tailnetOnly := flag.Bool("tailnet-only", false, "with --peer: bind the listener to the Tailscale interface IP only. Refuses to start if Tailscale is not running. Without this flag, peer mode falls back to 0.0.0.0 when Tailscale is unavailable.")
-	unsafePeer := flag.Bool("unsafe", false, "disable Tailscale identity verification on the inter-peer surface. Every caller is admitted as RolePeer (--peer) or RoleOwner (Hub). Intended for LAN / docker / CI deployments where the operator opts into trusting the listener boundary; do NOT use on a host with an Internet-routable bind.")
+	unsafePeer := flag.Bool("unsafe", false, "disable Tailscale identity verification. Every caller is admitted as RoleOwner (the listener boundary becomes the sole trust gate). Intended for LAN / docker / CI deployments; do NOT use on a host with an Internet-routable bind.")
 	doSnapshot := flag.Bool("snapshot", false, "take a point-in-time snapshot of kojo.db + blobs/global into <configdir>/snapshots/<ts>/ and exit")
 	doRestore := flag.String("restore", "", "restore a snapshot (verified sha256) into <configdir>. The configdir must not be in use by a running kojo. KEK and per-peer credentials are NOT restored — supply them out-of-band before booting.")
 	restoreForce := flag.Bool("restore-force", false, "with --restore: overwrite an existing kojo.db in the target. Required when the target is a previously-used Hub being re-seeded.")
@@ -1256,7 +1256,12 @@ func main() {
 		}
 
 		go func() {
-			if err := srv.ServeAuth(ln, resolver); err != nil && err != http.ErrServerClosed {
+			// peer-mode primary listener: tsnet + auth chain. Tailnet
+			// identity stamps paired peers as RolePeer (peer_registry
+			// hit via WhoIs) so policy.AllowNonOwner admits the
+			// inter-peer surface; agent loopback Bearer / X-Kojo-Token
+			// flows continue to work via AuthMiddleware below it.
+			if err := srv.ServeAuthTsnet(ln, resolver); err != nil && err != http.ErrServerClosed {
 				logger.Error("server error", "err", err)
 				stop()
 			}

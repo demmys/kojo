@@ -1056,10 +1056,12 @@ func (s *Server) abortAfterFailure(ctx context.Context, agentID string, resp *sw
 }
 
 // dispatchPeerPull POSTs the URI list to the target peer's
-// /api/v1/peers/pull endpoint with an Ed25519-signed request and
-// decodes the per-URI result list. Network and decode errors
-// surface to the caller so the orchestrator can roll back via
-// abort.
+// /api/v1/peers/pull endpoint and decodes the per-URI result list.
+// Authentication is by Tailnet identity: the request travels over
+// tsnet and the target's ServeAuthTsnet listener stamps RolePeer
+// from the WhoIs-resolved peer_registry row. Network and decode
+// errors surface to the caller so the orchestrator can roll back
+// via abort.
 func (s *Server) dispatchPeerPull(ctx context.Context, targetAddr, targetDeviceID string, items []peerPullItem) (*peerPullResponse, error) {
 	body, err := json.Marshal(peerPullRequest{
 		SourceDeviceID: s.peerID.DeviceID,
@@ -1351,13 +1353,15 @@ func encodeAgentSyncWire(payload *peerAgentSyncRequest) (body []byte, rawLen int
 	return compressed.Bytes(), len(raw), nil
 }
 
-// dispatchPeerAgentSync POSTs the precomputed gzipped wire body
-// to target's /api/v1/peers/agent-sync with an Ed25519-signed
-// envelope. The body's gzip framing fits inside the peer auth
-// middleware's wire cap (the orchestrator preflighted that);
-// target's handler honours the Content-Encoding header to
-// decompress. Network and decode errors propagate to the
-// caller so the orchestrator can roll back via abort.
+// dispatchPeerAgentSync POSTs the precomputed gzipped wire body to
+// target's /api/v1/peers/agent-sync. Authentication is by Tailnet
+// identity (ServeAuthTsnet → TailnetIdentityMiddleware → RolePeer
+// when WhoIs resolves to a peer_registry row). The body's gzip
+// framing fits inside the listener's MaxHeaderBytes / read cap (the
+// orchestrator preflighted that); target's handler honours the
+// Content-Encoding header to decompress. Network and decode errors
+// propagate to the caller so the orchestrator can roll back via
+// abort.
 func (s *Server) dispatchPeerAgentSync(ctx context.Context, targetAddr, targetDeviceID string, body []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		targetAddr+"/api/v1/peers/agent-sync", bytes.NewReader(body))

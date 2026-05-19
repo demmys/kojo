@@ -273,12 +273,17 @@ func (s *Server) agentIfMatchPrecheck(w http.ResponseWriter, r *http.Request, ag
 			"If-Match: store read failed")
 		return false
 	}
-	// Strip the GET-only ".p" suffix (composite ETag for cron-paused
-	// state, see handleGetAgent) so a client that copied the HTTP
-	// ETag header into If-Match still matches the underlying row.
-	// The row etag itself never contains "." in its on-the-wire
-	// format (it's "<version>-<hash>"), so this trim is unambiguous.
-	candidate := strings.TrimSuffix(ifMatch, ".p")
+	// Strip the GET-only composite suffixes (".p" for cron-paused,
+	// ".n<base36>" for nextCronAt — see displayETag) so a client
+	// that copied the HTTP ETag header into If-Match still matches
+	// the underlying row. The row etag itself never contains "." in
+	// its on-the-wire format (it's "<version>-<hash>"), so we can
+	// safely treat everything from the first "." onwards as a
+	// composite tail.
+	candidate := ifMatch
+	if i := strings.IndexByte(candidate, '.'); i >= 0 && candidate != "*" {
+		candidate = candidate[:i]
+	}
 	if ifMatch != "*" && rec.ETag != candidate {
 		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
 			"If-Match: etag mismatch")
@@ -468,14 +473,17 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		if ra := s.agents.GetRemote(id); ra != nil {
 			p := auth.FromContext(r.Context())
 			if p.CanReadFull(id) {
-				// Remote-held agents have no local cron entry so
-				// snapshotAgent returns a zero nextCron; the global
-				// cronPaused flag is still meaningful and gets
-				// surfaced. No HTTP ETag is set on this branch by
-				// design — see the rowETag="" guard in
-				// displayETag.
+				// Remote-held agents have no local cron entry, and
+				// surfacing a row etag from the local store would
+				// expose an orphaned row's etag that no PATCH on
+				// this hub can satisfy. Construct an explicit
+				// minimal snapshot — only the global cronPaused
+				// flag carries over. The HTTP ETag header stays
+				// unset because rowETag is "" (see displayETag).
 				writeJSONResponse(w, http.StatusOK,
-					s.buildAgentResponse(ra, s.snapshotAgent(r, id)))
+					s.buildAgentResponse(ra, agentRuntimeSnapshot{
+						cronPaused: s.agents.CronPaused(),
+					}))
 			} else {
 				writeJSONResponse(w, http.StatusOK, toDirectoryView(ra))
 			}

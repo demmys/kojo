@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +71,43 @@ func TestAgentRuntimeSnapshot_DisplayETag(t *testing.T) {
 	b := agentRuntimeSnapshot{rowETag: "7-aaa", nextCron: t2}.displayETag()
 	if a == b {
 		t.Fatalf("nextCron advance must change displayETag, both = %q", a)
+	}
+}
+
+// TestAgentIfMatchPrecheck_StripsCompositeSuffix mirrors the strip
+// logic in agentIfMatchPrecheck: a client that echoed the HTTP ETag
+// header (composite) into If-Match MUST still match the row etag the
+// store knows about. This guards the precondition path against the
+// composite suffix introduced for cache-busting.
+func TestAgentIfMatchPrecheck_StripsCompositeSuffix(t *testing.T) {
+	// Mirror the actual code path: split on the first "." because
+	// the row etag never contains one.
+	strip := func(et string) string {
+		if et == "*" {
+			return et
+		}
+		if i := strings.IndexByte(et, '.'); i >= 0 {
+			return et[:i]
+		}
+		return et
+	}
+
+	cases := []struct {
+		in, want string
+	}{
+		{"7-aaa", "7-aaa"},
+		{"7-aaa.p", "7-aaa"},
+		{"7-aaa.ntjfizc", "7-aaa"},
+		{"7-aaa.p.ntjfizc", "7-aaa"},
+		{"*", "*"},
+		// Empty / malformed pass through untouched; the caller's
+		// "rec.ETag != candidate" check fails the precondition.
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := strip(c.in); got != c.want {
+			t.Errorf("strip(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

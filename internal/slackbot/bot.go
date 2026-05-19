@@ -682,7 +682,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				// postMessage are the trail.
 				noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 				b.postMessage(noticeCtx, channel, threadTS,
-					"_⚠️ 応答が長すぎて Slack に投稿しきれませんでした (kojo ログを確認してください)_")
+					"_⚠️ The response was too long to post in full to Slack. Check kojo logs for details._")
 				noticeCancel()
 			}
 		} else {
@@ -724,7 +724,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if !deliveredAll {
 			noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 			b.postMessage(noticeCtx, channel, threadTS,
-				"_⚠️ 応答が長すぎて Slack に投稿しきれませんでした (kojo ログを確認してください)_")
+				"_⚠️ The response was too long to post in full to Slack. Check kojo logs for details._")
 			noticeCancel()
 		}
 	} else if hasError {

@@ -75,9 +75,17 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 // API routes. Unrecognised paths are denied with 403, and recognised
 // paths may further be denied based on Principal/method/target.
 //
-// This wrapper applies on the *agent-facing* (auth-required) listener
-// only. The public listener uses OwnerOnlyMiddleware and never enters
-// this gate.
+// Wired via EnforceMiddleware on BOTH listeners:
+//
+//   - public (tsnet) listener — TailnetIdentityMiddleware stamps
+//     RoleOwner for every tailnet caller (Hub mode), including
+//     callers whose WhoIs is transiently unresolved, or RolePeer /
+//     Guest (peer mode). Owner short-circuits at the top, so this
+//     gate effectively runs only for the §3.7 RolePeer inter-peer
+//     surface and Guest fallthroughs.
+//   - agent-facing (auth-required) loopback listener — AuthMiddleware
+//     resolves Bearer/X-Kojo-Token to Owner/Agent/PrivAgent/WebDAV,
+//     and this gate enforces per-route policy for non-Owner roles.
 //
 // The intent is "default deny". Routes are grouped into three buckets:
 //

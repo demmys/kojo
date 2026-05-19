@@ -393,15 +393,21 @@ func New(cfg Config) *Server {
 	//
 	// TailnetIdentityMiddleware runs first so the Principal is
 	// stamped before any policy check. On the Hub
-	// (PromoteUnknownTailnetToOwner=true) every WhoIs-resolved
-	// tailnet caller — same-host self, paired peer, and any other
-	// tailnet node — is stamped RoleOwner; peer_registry is
-	// touched only as an async liveness side-effect, never to
+	// (PromoteUnknownTailnetToOwner=true) every tailnet caller
+	// that reaches the listener — same-host self, paired peer,
+	// other tailnet node, and even callers whose WhoIs is
+	// transiently unresolved — is stamped RoleOwner; peer_registry
+	// is touched only as an async liveness side-effect, never to
 	// downgrade the Principal. Rationale: the Hub's tailnet is
 	// operator-controlled, paired-peer UI sessions must render
-	// identically to on-host Owner, and inter-peer agent-sync
-	// runs over tsnet here too (also trusted). Non-tsnet listeners
-	// (e.g. --local) admit Guest and rely on downstream auth.
+	// identically to on-host Owner, and inter-peer agent-sync runs
+	// over tsnet here too (also trusted). The one exception is
+	// auth.ErrNodeKeyResolverNotReady — the startup window before
+	// SetNodeKeyResolver wires the WhoIs closure — which stays
+	// Guest so "no resolver by design" cannot turn into
+	// Owner-by-default. --local / --dev branches that contractually
+	// want every loopback caller as Owner (i.e. --no-auth) flip
+	// cfg.Unsafe instead and bypass the resolver path entirely.
 	//
 	// On a peer (PromoteUnknownTailnetToOwner=false) the legacy
 	// classifier runs: peer_registry hit ⇒ RolePeer for the §3.7
@@ -409,7 +415,7 @@ func New(cfg Config) *Server {
 	//
 	// --unsafe collapses the WhoIs check and stamps RolePeer
 	// (peer-mode) or RoleOwner (Hub) unconditionally — LAN / docker
-	// / CI escape hatch.
+	// / CI / --no-auth escape hatch.
 	var st *store.Store
 	if s.agents != nil {
 		st = s.agents.Store()
@@ -1223,14 +1229,18 @@ func (s *Server) SetSelfNodeKey(nk string) {
 }
 
 // resolveNodeKey is the late-bound resolver closure the tsnet
-// identity middleware calls per-request. Returns ("", error) when
-// no resolver is wired so the middleware falls through to Guest.
+// identity middleware calls per-request. Returns
+// ("", auth.ErrNodeKeyResolverNotReady) when no resolver is wired
+// yet (startup race between http listener and SetNodeKeyResolver).
+// The middleware treats that sentinel as "stay Guest, do not apply
+// Hub-mode Owner-fallback" so an unidentified caller in the wiring
+// window never gains Owner-by-default.
 func (s *Server) resolveNodeKey(ctx context.Context, remoteAddr string) (string, error) {
 	s.identityMu.RLock()
 	fn := s.nodeKeyResolver
 	s.identityMu.RUnlock()
 	if fn == nil {
-		return "", nil
+		return "", auth.ErrNodeKeyResolverNotReady
 	}
 	return fn(ctx, remoteAddr)
 }

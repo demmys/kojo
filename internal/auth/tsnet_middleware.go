@@ -10,6 +10,21 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
+// ErrNodeKeyResolverNotReady is returned by a TailnetIdentityConfig.Resolver
+// to signal "the tsnet/tailscaled handle is not wired yet" — distinct
+// from a real WhoIs failure or a genuinely unknown caller. The
+// middleware uses it to refuse Hub-mode Owner-fallback during the
+// brief window between server start and resolver wiring; a real
+// `lc.WhoIs` error (tailscaled blip) or empty `w.Node` (tsnet view
+// stale) still falls back to Owner so the operator's Dashboard
+// keeps working through transient outages.
+//
+// Callers that build the resolver closure should return ("",
+// ErrNodeKeyResolverNotReady) when the underlying handle is nil
+// instead of returning ("", nil) — the latter is reserved for
+// "WhoIs returned no node" and is honored by Hub fallback.
+var ErrNodeKeyResolverNotReady = errors.New("auth: tsnet node key resolver not ready")
+
 // TailnetIdentityConfig configures TailnetIdentityMiddleware.
 //
 // Resolver maps an incoming request's RemoteAddr to the calling
@@ -41,9 +56,16 @@ type TailnetIdentityConfig struct {
 	// "" (no self-Owner promotion).
 	SelfNodeKeyFunc func() string
 	// PromoteUnknownTailnetToOwner, when true, stamps RoleOwner on
-	// every WhoIs-resolved tailnet caller (other than the local
-	// self-NodeKey, which is already Owner). peer_registry is NOT
-	// consulted on the Hub's public listener: that listener is
+	// every tailnet caller that reaches the listener — both
+	// WhoIs-resolved callers and callers whose WhoIs is transiently
+	// unresolved (resolver error, empty Node, tsnet view lag). The
+	// listener boundary itself (tsnet.ListenTLS) is the trust gate,
+	// so a transient WhoIs blip never demotes the operator. The one
+	// exception is ErrNodeKeyResolverNotReady — startup before
+	// SetNodeKeyResolver wires the closure — which stays Guest so
+	// "no resolver by design" cannot turn into Owner-by-default.
+	// peer_registry is NOT consulted on the Hub's public listener:
+	// that listener is
 	// exclusively for the operator's UI — paired peer devices
 	// opening the Hub UI in a browser also arrive here, and there
 	// is no UX-meaningful distinction between "operator on the Hub
@@ -77,11 +99,21 @@ type TailnetIdentityConfig struct {
 //
 //  1. Unsafe → stamp RoleOwner (Hub) or RolePeer (--peer) and call
 //     next. tsnet is not consulted.
-//  2. Resolver(remoteAddr) → NodeKey. If the resolver errors
-//     (typical: caller is on a non-tsnet listener), the request
-//     falls through with Role=Guest so a downstream middleware
-//     (the existing AuthMiddleware on the auth-required listener)
-//     can still resolve an Authorization: Bearer.
+//  2. Resolver(remoteAddr) → NodeKey. If the resolver errors OR
+//     returns an empty NodeKey (tsnet's view of the tailnet hasn't
+//     refreshed for this caller yet — typical for a just-joined
+//     node or one whose key was recently rotated), the request:
+//       - on Hub mode (PromoteUnknownTailnetToOwner=true) → Owner,
+//         UNLESS the error wraps ErrNodeKeyResolverNotReady. The
+//         tsnet listener is only reachable over Tailscale, so the
+//         listener boundary itself is the trust gate; a transient
+//         WhoIs blip must not 403 the operator's UI. The
+//         ErrNodeKeyResolverNotReady exception covers the startup
+//         window where SetNodeKeyResolver has not run yet — an
+//         unidentified caller there has no claim to Owner.
+//       - on Peer mode (false) → falls through as Guest so a
+//         downstream middleware (the AuthMiddleware on the
+//         auth-required listener) can resolve a Bearer instead.
 //  3. NodeKey == SelfNodeKey → RoleOwner.
 //  4. PromoteUnknownTailnetToOwner true (Hub public listener) →
 //     RoleOwner. peer_registry is NOT consulted for the role; it
@@ -124,13 +156,56 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 			nodeKey, err := cfg.Resolver(ctx, r.RemoteAddr)
 			cancel()
 			if err != nil || nodeKey == "" {
-				if cfg.Logger != nil && err != nil && !errors.Is(err, context.Canceled) {
+				notReady := errors.Is(err, ErrNodeKeyResolverNotReady)
+				if cfg.Logger != nil && err != nil &&
+					!errors.Is(err, context.Canceled) && !notReady {
 					// Warn (not Debug): a chronic resolver error
 					// indicates tailscaled is down / unreachable
-					// and every inbound request will fall through
-					// to Guest. The operator needs to see this.
-					cfg.Logger.Warn("tsnet identity: WhoIs resolution failed; caller demoted to Guest",
-						"remote", r.RemoteAddr, "err", err)
+					// and inbound requests fall back to whatever
+					// the Hub-fallback policy dictates. The
+					// operator needs to see this.
+					cfg.Logger.Warn("tsnet identity: WhoIs resolution failed",
+						"remote", r.RemoteAddr, "err", err,
+						"hub_fallback", cfg.PromoteUnknownTailnetToOwner)
+				} else if cfg.Logger != nil && err == nil && nodeKey == "" {
+					// err==nil but WhoIs returned no node — typically
+					// tsnet's view of the tailnet has not refreshed
+					// for this caller yet (just-joined node, recent
+					// rekey, exit-node-routed source, …). Log at Debug
+					// so a transient blip doesn't spam, but the
+					// operator can still surface it with --dev.
+					cfg.Logger.Debug("tsnet identity: WhoIs returned empty node",
+						"remote", r.RemoteAddr,
+						"hub_fallback", cfg.PromoteUnknownTailnetToOwner)
+				} else if cfg.Logger != nil && notReady {
+					// Resolver not wired yet — startup race between
+					// http listener and SetNodeKeyResolver. Stay
+					// Guest regardless of Hub fallback so an
+					// unidentified caller in this window never
+					// gains Owner by default. The condition
+					// resolves the moment cmd/kojo finishes wiring.
+					cfg.Logger.Debug("tsnet identity: resolver not ready",
+						"remote", r.RemoteAddr)
+				}
+				// Hub public listener: the listener itself is only
+				// reachable over Tailscale (tsnet.ListenTLS), so a
+				// caller arriving here has already passed the tailnet
+				// boundary regardless of whether WhoIs could attach a
+				// NodeKey to them. Trust the listener and promote to
+				// Owner so a transient WhoIs blip (just-joined node,
+				// recent rekey, tsnet view lag) doesn't 403 the
+				// operator's Dashboard.
+				//
+				// Two exceptions stay Guest:
+				//   - notReady (resolver closure's underlying handle
+				//     is nil): startup race, refuse Owner-by-default.
+				//   - Peer mode (PromoteUnknownTailnetToOwner=false):
+				//     an unidentified tailnet caller has no claim to
+				//     RolePeer.
+				if cfg.PromoteUnknownTailnetToOwner && !notReady {
+					ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner})
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
 				}
 				next.ServeHTTP(w, r)
 				return

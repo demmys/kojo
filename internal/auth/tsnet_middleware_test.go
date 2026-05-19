@@ -166,6 +166,90 @@ func TestTailnetIdentityMiddleware_ResolverError(t *testing.T) {
 	}
 }
 
+// Hub mode (PromoteUnknownTailnetToOwner=true): a WhoIs that errors —
+// tailscaled blip, transient context timeout, etc. — must NOT 403 the
+// operator's Dashboard. The tsnet listener is only reachable over
+// Tailscale, so a caller arriving here has already passed the tailnet
+// boundary regardless of WhoIs status. Owner-fallback.
+func TestTailnetIdentityMiddleware_HubResolverErrorPromotesOwner(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "", errors.New("tailscaled unreachable")
+		},
+		PromoteUnknownTailnetToOwner: true,
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleOwner {
+		t.Fatalf("role = %v, want RoleOwner (Hub fallback on WhoIs error)", got.Role)
+	}
+}
+
+// Hub mode: WhoIs returns (nil, nil) — tsnet recognises the listener
+// reach but its view of the tailnet has not refreshed for this caller
+// yet (just-joined node, recent rekey, …). This is the case that
+// silently broke desktop-tvt (100.117.138.20) on develop-v1: err==nil
+// so the Warn log never fired, but nodeKey=="" demoted the caller to
+// Guest, and policy.AllowNonOwner 403'd /agents and /groupdms.
+func TestTailnetIdentityMiddleware_HubEmptyNodeKeyPromotesOwner(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "", nil
+		},
+		PromoteUnknownTailnetToOwner: true,
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleOwner {
+		t.Fatalf("role = %v, want RoleOwner (Hub fallback on empty NodeKey)", got.Role)
+	}
+}
+
+// Hub mode: resolver returns the not-ready sentinel — the http
+// listener accepted a connection before SetNodeKeyResolver finished
+// wiring. The middleware must NOT apply the Hub Owner-fallback for
+// this case: an unidentified caller in the startup window has no
+// claim to Owner, and the wiring race resolves on its own. Guest is
+// the correct stamp; the policy layer then 403s privileged surface.
+func TestTailnetIdentityMiddleware_HubResolverNotReadyStaysGuest(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "", auth.ErrNodeKeyResolverNotReady
+		},
+		PromoteUnknownTailnetToOwner: true,
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleGuest {
+		t.Fatalf("role = %v, want RoleGuest (resolver not ready must not Owner-fallback)", got.Role)
+	}
+}
+
+// Peer mode (PromoteUnknownTailnetToOwner=false): WhoIs returning
+// (nil, nil) must NOT promote the caller. Stays Guest so the
+// auth-required listener's AuthMiddleware can resolve a Bearer
+// instead, and a stray tailnet node never silently gains a role.
+func TestTailnetIdentityMiddleware_PeerEmptyNodeKeyStaysGuest(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "", nil
+		},
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleGuest {
+		t.Fatalf("role = %v, want RoleGuest (peer mode keeps strict fallthrough)", got.Role)
+	}
+}
+
 func TestTailnetIdentityMiddleware_UnsafePeer(t *testing.T) {
 	next, got := stamp()
 	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{

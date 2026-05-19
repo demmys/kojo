@@ -890,7 +890,15 @@ func main() {
 		V0LegacyDir:      sessionV0LegacyDir,
 		PeerOnly:         *peerMode,
 		PendingSyncKEK:   pendingSyncKEK,
-		Unsafe:           *unsafePeer,
+		// --no-auth is loopback-only and contractually Owner-trusted
+		// ("--no-auth (--local/--dev only): the loopback listener is
+		// Owner-trusted"). Collapse it onto the same Unsafe path
+		// --unsafe uses so TailnetIdentityMiddleware stamps every
+		// caller as Owner without consulting the tsnet WhoIs resolver
+		// (which is never wired in --local/--dev anyway, so the
+		// sentinel ErrNodeKeyResolverNotReady would otherwise demote
+		// every caller to Guest and 403 the API).
+		Unsafe: *unsafePeer || *noAuth,
 	})
 	if *unsafePeer {
 		logger.Warn("kojo: --unsafe set; tailnet identity disabled. Inter-peer endpoints are open to anyone reachable on the listener.")

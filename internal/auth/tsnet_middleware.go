@@ -41,13 +41,22 @@ type TailnetIdentityConfig struct {
 	// "" (no self-Owner promotion).
 	SelfNodeKeyFunc func() string
 	// PromoteUnknownTailnetToOwner, when true, stamps RoleOwner on
-	// requests whose WhoIs resolved to a NodeKey that does NOT
-	// match peer_registry. This restores the legacy "Tailscale
-	// reach == Owner" UX on the Hub's public listener so the
-	// operator can hit the UI from any tailnet device without
-	// pairing it as a peer. The peer-mode daemon leaves this
-	// FALSE — a stray tailnet node that hasn't been Approved by
-	// the operator should not gain privilege.
+	// every WhoIs-resolved tailnet caller (other than the local
+	// self-NodeKey, which is already Owner). peer_registry is NOT
+	// consulted on the Hub's public listener: that listener is
+	// exclusively for the operator's UI — paired peer devices
+	// opening the Hub UI in a browser also arrive here, and there
+	// is no UX-meaningful distinction between "operator on the Hub
+	// host" and "operator on a paired tailnet device." Inter-peer
+	// agent-sync (Ed25519 signed) lands on the SEPARATE auth
+	// listener, which deliberately omits this middleware and
+	// stamps RolePeer via PeerAuth instead, so trusting every
+	// tailnet caller here does NOT widen the RolePeer surface.
+	//
+	// The peer-mode daemon leaves this FALSE so it can still
+	// classify a tailnet caller as RolePeer via peer_registry for
+	// the §3.7 device-switch surface; a stray tailnet node that
+	// hasn't been Approved stays Guest.
 	PromoteUnknownTailnetToOwner bool
 	// Unsafe collapses the entire WhoIs path. Every caller is
 	// stamped RoleOwner (UnsafeAsHub=true) or RolePeer (false).
@@ -74,9 +83,14 @@ type TailnetIdentityConfig struct {
 //     (the existing AuthMiddleware on the auth-required listener)
 //     can still resolve an Authorization: Bearer.
 //  3. NodeKey == SelfNodeKey → RoleOwner.
-//  4. NodeKey matches peer_registry row → RolePeer.
-//  5. Otherwise → Guest (a tailnet node we have not approved is
-//     not yet trusted; the policy layer 403s the privileged
+//  4. PromoteUnknownTailnetToOwner true (Hub public listener) →
+//     RoleOwner. peer_registry is NOT consulted for the role; it
+//     is touched async as a liveness side-effect when the NodeKey
+//     matches a registered peer.
+//  5. PromoteUnknownTailnetToOwner false (peer-mode public
+//     listener) → consult peer_registry. Hit ⇒ RolePeer + sync
+//     TouchPeer. Miss / DB error ⇒ Guest (unapproved tailnet
+//     callers stay Guest; the policy layer 403s privileged
 //     surface).
 func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) http.Handler {
 	resolveTimeout := cfg.ResolveDelay
@@ -128,6 +142,48 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 					return
 				}
 			}
+			// Hub public listener: every WhoIs-resolved tailnet
+			// caller is trusted as Owner. peer_registry is NOT
+			// consulted for the principal decision — paired peer
+			// devices opening the Hub UI in a browser are the
+			// operator's other devices and must receive the same
+			// view as the on-host Owner. Inter-peer agent-sync
+			// requests that land on the Hub's tsnet listener are
+			// likewise trusted as Owner here (operator-controlled
+			// tailnet only); on the peer-mode daemon the same
+			// inter-peer traffic instead lands on the auth
+			// listener (srv.ServeAuth) and is gated by PeerAuth /
+			// AuthMiddleware, so this Owner promotion never
+			// applies on a peer host.
+			//
+			// peer_registry is still touched as a side-effect when
+			// the resolved NodeKey matches a registered peer, so
+			// the Hub UI's last_seen / status stay fresh. The
+			// touch runs async on a background context — the
+			// request never waits on the store.
+			if cfg.PromoteUnknownTailnetToOwner {
+				if cfg.Store != nil {
+					st := cfg.Store
+					nk := nodeKey
+					logger := cfg.Logger
+					go func() {
+						tctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						defer cancel()
+						rec, err := st.GetPeerByNodeKey(tctx, nk)
+						if err != nil {
+							if logger != nil && !errors.Is(err, store.ErrNotFound) {
+								logger.Warn("tsnet identity: async liveness lookup failed",
+									"node_key", nk, "err", err)
+							}
+							return
+						}
+						_ = st.TouchPeer(tctx, rec.DeviceID, store.PeerStatusOnline, time.Now().UnixMilli())
+					}()
+				}
+				ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner})
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
 			if cfg.Store == nil {
 				// No registry — can't elevate to RolePeer. Stay
 				// Guest. (Shouldn't happen in production; defensive
@@ -140,21 +196,12 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 			rec, err := cfg.Store.GetPeerByNodeKey(lookupCtx, nodeKey)
 			lookupCancel()
 			if err != nil {
-				// Distinguish "no row" from "DB blip". Owner
-				// promotion on a tailnet caller without a
-				// matching peer_registry row is the legacy
-				// "Tailscale reach == Owner" UX (Hub public
-				// listener only). A genuine store error MUST
-				// NOT silently promote — that would let a
-				// flaky DB hand Owner privileges to anyone on
-				// the tailnet. Fall through as Guest in that
-				// case and log Warn so the operator notices.
+				// Reached only when PromoteUnknownTailnetToOwner
+				// is false (peer-mode public listener). No row →
+				// stray tailnet caller, stay Guest. DB blip → log
+				// Warn and also fall through as Guest so a flaky
+				// store can never silently promote.
 				if errors.Is(err, store.ErrNotFound) {
-					if cfg.PromoteUnknownTailnetToOwner {
-						ctx := WithPrincipal(r.Context(), Principal{Role: RoleOwner})
-						next.ServeHTTP(w, r.WithContext(ctx))
-						return
-					}
 					next.ServeHTTP(w, r)
 					return
 				}

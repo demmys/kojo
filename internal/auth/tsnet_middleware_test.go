@@ -93,6 +93,49 @@ func TestTailnetIdentityMiddleware_SelfOwner(t *testing.T) {
 	}
 }
 
+// Hub public listener: every WhoIs-resolved tailnet caller is Owner,
+// peer_registry is NOT consulted. Covers the paired-peer browser case
+// that the develop-v1 regression broke (paired peer was being demoted
+// to RolePeer, then policy.AllowNonOwner gated the bare list
+// endpoints and Dashboard rendered empty).
+func TestTailnetIdentityMiddleware_HubPromotesPairedPeerToOwner(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "nodekey:peerA", nil
+		},
+		PromoteUnknownTailnetToOwner: true,
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleOwner {
+		t.Fatalf("role = %v, want RoleOwner (Hub trusts every tailnet caller, paired-peer included)", got.Role)
+	}
+	if got.PeerID != "" {
+		t.Fatalf("peer_id = %q, want empty (Owner has no PeerID)", got.PeerID)
+	}
+}
+
+// Hub public listener: an unpaired tailnet caller is still Owner —
+// peer_registry lookup is skipped entirely. Preserves the legacy
+// "Tailscale reach == Owner" UX.
+func TestTailnetIdentityMiddleware_HubPromotesUnknownTailnetCallerToOwner(t *testing.T) {
+	st, _ := newTestStore(t, "nodekey:peerA")
+	next, got := stamp()
+	h := auth.TailnetIdentityMiddleware(auth.TailnetIdentityConfig{
+		Store: st,
+		Resolver: func(ctx context.Context, addr string) (string, error) {
+			return "nodekey:stranger", nil
+		},
+		PromoteUnknownTailnetToOwner: true,
+	})(next)
+	h.ServeHTTP(httptest.NewRecorder(), newReq())
+	if got.Role != auth.RoleOwner {
+		t.Fatalf("role = %v, want RoleOwner", got.Role)
+	}
+}
+
 func TestTailnetIdentityMiddleware_UnknownTailnetCallerGuest(t *testing.T) {
 	st, _ := newTestStore(t, "nodekey:peerA")
 	next, got := stamp()

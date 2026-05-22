@@ -213,13 +213,13 @@ const defaultResumeIdleDuration = 5 * time.Minute
 
 // Agent represents a persistent AI persona (friend).
 type Agent struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Persona         string `json:"persona"`           // persona description (markdown)
-	Model           string `json:"model"`             // e.g. "sonnet", "opus"
-	Effort          string `json:"effort,omitempty"`  // claude only: "low", "medium", "high", "xhigh", "max"
-	Tool            string `json:"tool"`              // CLI tool: "claude", "codex", "gemini"
-	WorkDir         string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Persona string `json:"persona"`           // persona description (markdown)
+	Model   string `json:"model"`             // e.g. "sonnet", "opus"
+	Effort  string `json:"effort,omitempty"`  // claude only: "low", "medium", "high", "xhigh", "max"
+	Tool    string `json:"tool"`              // CLI tool: "claude", "codex"
+	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
 	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
 	// expressions never reach this field.
@@ -429,14 +429,14 @@ type DirectoryEntry struct {
 
 // AgentConfig is the request body for creating an agent.
 type AgentConfig struct {
-	Name            string `json:"name"`
-	Persona         string `json:"persona"`
-	Model           string `json:"model"`
-	Effort          string `json:"effort"`
-	Tool            string `json:"tool"`
-	CustomBaseURL   string `json:"customBaseURL"`
-	ThinkingMode    string `json:"thinkingMode"`
-	WorkDir string `json:"workDir"`
+	Name          string `json:"name"`
+	Persona       string `json:"persona"`
+	Model         string `json:"model"`
+	Effort        string `json:"effort"`
+	Tool          string `json:"tool"`
+	CustomBaseURL string `json:"customBaseURL"`
+	ThinkingMode  string `json:"thinkingMode"`
+	WorkDir       string `json:"workDir"`
 	// CronExpr is the 5-field cron expression for periodic check-ins.
 	// nil    = use default ("*/30 * * * *" with per-agent offset).
 	// ""     = scheduling explicitly disabled.
@@ -450,7 +450,7 @@ type AgentConfig struct {
 	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil = use default (0 = 10 min)
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (5 min).
-	ResumeIdleMinutes *int    `json:"resumeIdleMinutes"`
+	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`
 	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
 	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
 	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
@@ -472,12 +472,12 @@ type AgentUpdateConfig struct {
 	Model                 *string `json:"model"`
 	Effort                *string `json:"effort"`
 	Tool                  *string `json:"tool"`
-	WorkDir  *string `json:"workDir"`
-	CronExpr *string `json:"cronExpr"`
+	WorkDir               *string `json:"workDir"`
+	CronExpr              *string `json:"cronExpr"`
 	// LegacyIntervalMinutes mirrors the AgentConfig field — catches old clients
 	// still PATCH-ing intervalMinutes so we can reject with a clear error.
-	LegacyIntervalMinutes *int `json:"intervalMinutes,omitempty"`
-	TimeoutMinutes        *int `json:"timeoutMinutes"`
+	LegacyIntervalMinutes *int    `json:"intervalMinutes,omitempty"`
+	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
 	SilentStart           *string `json:"silentStart"`
 	SilentEnd             *string `json:"silentEnd"`
@@ -605,7 +605,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		SilentStart:        silentStart,
 		SilentEnd:          silentEnd,
 		NotifyDuringSilent: notifyDuringSilent,
-		CronMessage: cronMessage,
+		CronMessage:        cronMessage,
 		// DeviceSwitchEnabled stays nil here when the caller didn't
 		// provide one — IsDeviceSwitchEnabled() returns true for nil
 		// so a fresh agent gets the skill auto-installed without

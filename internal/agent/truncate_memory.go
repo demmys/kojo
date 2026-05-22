@@ -389,7 +389,7 @@ func truncateMessagesFromMsgID(ctx context.Context, agentID, msgID string) (time
 // Best-effort across files — a per-file failure is logged and the walk
 // continues; the first error is returned so the caller can surface it.
 //
-// (gemini-only / codex-only agents simply have nothing to do here.)
+// (codex-only agents simply have nothing to do here.)
 func truncateClaudeSessions(agentDirPath string, since time.Time, logger *slog.Logger) (entriesRemoved, filesRemoved int, err error) {
 	absDir, aerr := filepath.Abs(agentDirPath)
 	if aerr != nil {

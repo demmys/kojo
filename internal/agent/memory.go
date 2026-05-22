@@ -522,8 +522,8 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	// kojo-attach contract. Backends that natively load `.claude/skills/`
 	// (claude / custom) ALSO see the dedicated kojo-attach SKILL.md
 	// installed by SyncAttachSkill; this short block in the system
-	// prompt is for the rest of the backends (codex / gemini /
-	// llama.cpp) so they can also surface attachments without
+	// prompt is for the rest of the backends (codex / llama.cpp)
+	// so they can also surface attachments without
 	// depending on the claude-specific skills mechanism. Costs a
 	// handful of tokens that stay cached as long as the agentDir
 	// path is stable.

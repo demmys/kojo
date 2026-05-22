@@ -392,7 +392,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	//       remove it independently of Slack-side history, so signal (a)
 	//       alone is not safe).
 	//
-	// For backends that don't support resume (codex, gemini, …) the
+	// For backends that don't support resume (codex, …) the
 	// ChatOneShot call falls back to OneShot:true, which carries no prior
 	// context across turns. Those backends must keep receiving injected
 	// history on every turn or they lose the conversation entirely.

@@ -97,7 +97,7 @@ func TestBulkInsertSessions(t *testing.T) {
 	// Mixed: some new, some duplicate.
 	mix := []*SessionRecord{
 		{ID: "s1", AgentID: &agentID, Status: "archived", Cmd: "claude", WorkDir: "/x"},
-		{ID: "s3", AgentID: &agentID, Status: "archived", Cmd: "gemini", WorkDir: "/y"},
+		{ID: "s3", AgentID: &agentID, Status: "archived", Cmd: "codex", WorkDir: "/y"},
 	}
 	n3, err := s.BulkInsertSessions(ctx, mix, SessionInsertOptions{PeerID: "peer-1"})
 	if err != nil {

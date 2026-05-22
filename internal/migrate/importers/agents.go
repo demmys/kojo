@@ -224,6 +224,18 @@ func buildSettings(raw map[string]any, logger *slog.Logger) map[string]any {
 			}
 		}
 	}
+
+	// Legacy tool removal: v0 supported "gemini" as a CLI backend. v1
+	// has no gemini backend (Gemini API is still used for TTS / embedding
+	// / avatar generation, but not as a chat CLI). Remap to "claude" so
+	// the agent stays loadable; the operator can re-select another tool
+	// after migration. The model is also reset because claude backend
+	// would otherwise receive a gemini-* model id and fail on first chat.
+	if tool, _ := settings["tool"].(string); tool == "gemini" {
+		settings["tool"] = "claude"
+		settings["model"] = "sonnet"
+		logger.Warn("migrated agent.tool from 'gemini' to 'claude' (gemini CLI no longer supported); model reset to 'sonnet'")
+	}
 	return settings
 }
 

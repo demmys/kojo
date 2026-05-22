@@ -1,15 +1,13 @@
 // Package externalcli implements docs/multi-device-storage.md §5.5.1's
 // continuity layer for path-hashed external-CLI transcript stores
-// (claude, codex) and the mapping-file store (gemini).
+// (claude, codex).
 //
 // Forward (`--migrate-external-cli`): when v0 → v1 changes the agent
 // working directory from <v0>/agents/<id> to <v1>/agents/<id>, the
 // external CLIs would otherwise lose their prior chat history. We
 // create a symlink (or, on Windows, a junction) at the v1-hash
 // directory pointing at the v0-hash directory so each CLI's internal
-// path-hash lookup still resolves to the same on-disk state. For
-// gemini we append a (v1_abs_dir → existing project_name) row to
-// projects.json so the same chats dir is reachable under both paths.
+// path-hash lookup still resolves to the same on-disk state.
 //
 // Reverse (`--rollback-external-cli`): every forward operation is
 // recorded into a manifest under the v1 dir. Rollback walks the
@@ -32,7 +30,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 // ManifestFileName is the on-disk record of forward operations,
@@ -48,12 +45,6 @@ const (
 	// the new (v1) symlink. Target = the v0 hash directory it points
 	// at. Reverse with os.Remove(Path) (do not touch Target).
 	OpSymlink OpKind = "symlink"
-
-	// OpGeminiProjectAdd: a new map entry was appended to
-	// gemini's projects.json. Path = absolute path of projects.json.
-	// Target = the v1 absolute directory key that we added. Reverse
-	// by reading the file, removing the key, atomic-rewrite.
-	OpGeminiProjectAdd OpKind = "gemini_project_add"
 )
 
 // Op is one reversible forward action recorded for rollback.
@@ -126,9 +117,9 @@ func SaveManifest(v1Dir string, m *Manifest) error {
 // operations to record. Caller (cmd/kojo/migrate.go) converts the
 // migration's agent list into a slice of these.
 type PlanInput struct {
-	AgentID  string
-	V0Dir    string // <v0>/agents/<id>
-	V1Dir    string // <v1>/agents/<id>
+	AgentID string
+	V0Dir   string // <v0>/agents/<id>
+	V1Dir   string // <v1>/agents/<id>
 }
 
 // Hasher is the path-hash function used by claude / codex. The forward
@@ -195,11 +186,6 @@ func ApplyForward(v1Dir string, ops []Op) (*Manifest, []string) {
 				warnings = append(warnings, fmt.Sprintf("symlink %s -> %s: %v", op.Path, op.Target, err))
 				continue
 			}
-		case OpGeminiProjectAdd:
-			if err := addGeminiProject(op.Path, op.Target, op.AgentID); err != nil {
-				warnings = append(warnings, fmt.Sprintf("gemini projects.json: %v", err))
-				continue
-			}
 		default:
 			warnings = append(warnings, fmt.Sprintf("unknown op kind %q (skipped)", op.Kind))
 			continue
@@ -225,19 +211,13 @@ func Rollback(v1Dir string) ([]string, error) {
 		return []string{"externalcli: no manifest at " + v1Dir + " — nothing to roll back"}, nil
 	}
 	var warnings []string
-	// Reverse order: gemini-project-add entries should be undone in the
-	// reverse of their insertion so a hand-edited projects.json
-	// preserves any other appends that happened after migration.
+	// Reverse order so dependent ops unwind cleanly.
 	for i := len(m.Ops) - 1; i >= 0; i-- {
 		op := m.Ops[i]
 		switch op.Kind {
 		case OpSymlink:
 			if err := removeSymlink(op.Path, op.Target); err != nil {
 				warnings = append(warnings, fmt.Sprintf("remove %s: %v", op.Path, err))
-			}
-		case OpGeminiProjectAdd:
-			if err := removeGeminiProject(op.Path, op.Target); err != nil {
-				warnings = append(warnings, fmt.Sprintf("revert %s: %v", op.Path, err))
 			}
 		default:
 			warnings = append(warnings, fmt.Sprintf("unknown op kind %q in manifest (skipped)", op.Kind))
@@ -278,98 +258,6 @@ func removeSymlink(link, expectedTarget string) error {
 		return fmt.Errorf("link %s points at %s, not %s; refusing to remove", link, got, expectedTarget)
 	}
 	return os.Remove(link)
-}
-
-// geminiProjects is the on-disk shape of ~/.gemini/projects.json. We
-// keep the full Projects map so a re-marshal preserves keys we don't
-// care about.
-type geminiProjects struct {
-	Projects map[string]string `json:"projects"`
-	// Other fields are passed through via the raw map below.
-}
-
-// addGeminiProject reads/writes projects.json. `key` is the v1 abs dir
-// to add; `agentID` is informational. The mapping value is taken from
-// the existing v0 key for the same agent: we look for a key whose
-// suffix matches "/agents/<id>" and copy its value. Without that
-// fallback we cannot know what projectName gemini gave the v0 dir.
-func addGeminiProject(path, v1Key, agentID string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("projects.json missing")
-		}
-		return err
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return fmt.Errorf("projects.json parse: %w", err)
-	}
-	projsRaw, ok := doc["projects"].(map[string]any)
-	if !ok {
-		// older / different format — refuse, leave the file intact.
-		return errors.New("projects.json: 'projects' field absent or wrong type")
-	}
-	if _, exists := projsRaw[v1Key]; exists {
-		return nil // already present (idempotent)
-	}
-	suffix := "/agents/" + agentID
-	var v0Value string
-	for k, v := range projsRaw {
-		if strings.HasSuffix(k, suffix) {
-			if s, ok := v.(string); ok && s != "" {
-				v0Value = s
-				break
-			}
-		}
-	}
-	if v0Value == "" {
-		return errors.New("no v0 entry to mirror")
-	}
-	projsRaw[v1Key] = v0Value
-	doc["projects"] = projsRaw
-
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func removeGeminiProject(path, v1Key string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return err
-	}
-	projsRaw, ok := doc["projects"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	if _, exists := projsRaw[v1Key]; !exists {
-		return nil
-	}
-	delete(projsRaw, v1Key)
-	doc["projects"] = projsRaw
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 func isExistingDir(p string) bool {

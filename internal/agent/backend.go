@@ -64,7 +64,7 @@ type ChatOptions struct {
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (codex, gemini, llama.cpp, custom) cannot isolate a
+// ignore SessionKey (codex, llama.cpp, custom) cannot isolate a
 // per-thread session from the agent's main session, so the manager drops
 // SessionKey for them and degrades to OneShot=true — keeping the chat
 // ephemeral rather than silently mixing thread contexts.
@@ -90,7 +90,7 @@ type ChatBackend interface {
 	// The channel is closed when the response is complete.
 	Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error)
 
-	// Name returns the tool identifier (e.g. "claude", "codex", "gemini").
+	// Name returns the tool identifier (e.g. "claude", "codex").
 	Name() string
 
 	// Available returns true if the CLI tool is installed and accessible.

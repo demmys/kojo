@@ -87,7 +87,7 @@ func TestIsRateLimitMessage(t *testing.T) {
 		{"has tool uses", &Message{Content: "hit your limit", ToolUses: []ToolUse{{Name: "test"}}}, false},
 		{"claude rate limit", &Message{Content: "You've hit your limit for the day."}, true},
 		{"generic rate limit", &Message{Content: "Rate limit exceeded. Please wait."}, true},
-		{"gemini exhausted", &Message{Content: "Resource exhausted, try again later"}, true},
+		{"resource exhausted", &Message{Content: "Resource exhausted, try again later"}, true},
 		{"openai quota", &Message{Content: "You exceeded your current quota"}, true},
 		{"usage limit", &Message{Content: "Usage limit exceeded for this month"}, true},
 		{"normal message", &Message{Content: "Here is the code you requested."}, false},

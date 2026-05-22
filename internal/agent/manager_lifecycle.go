@@ -119,13 +119,9 @@ func (m *Manager) ResetData(id string) error {
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
-	if err := os.RemoveAll(filepath.Join(dir, ".gemini")); err != nil {
-		m.logger.Warn("reset: failed to remove .gemini dir", "agent", id, "err", err)
-	}
 
 	// Clear global CLI session stores
 	clearClaudeSession(id)
-	clearGeminiSession(id)
 
 	// Recreate empty memory directory and MEMORY.md (required for agent to function).
 	// Capture the error rather than returning so we always release
@@ -1561,8 +1557,6 @@ func (m *Manager) ResetSession(agentID string) error {
 	switch tool {
 	case "claude":
 		clearClaudeSession(agentID)
-	case "gemini":
-		clearGeminiSession(agentID)
 	case "custom":
 		clearClaudeSession(agentID)
 	}

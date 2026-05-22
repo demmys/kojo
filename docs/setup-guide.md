@@ -33,7 +33,7 @@
 |------|------|
 | `--migrate` | v0 dir から v1 dir に import して exit。idempotent (途中 kill された場合の resume OK) |
 | `--migrate-restart` | 部分 import 済みの v1 dir を破棄して v0 から再 import |
-| `--migrate-external-cli=true/false` | claude / codex / gemini の transcript link 移行。default `true`。modifier flag なので primary mode と併用 |
+| `--migrate-external-cli=true/false` | claude / codex の transcript link 移行。default `true`。modifier flag なので primary mode と併用 |
 | `--migrate-backup PATH` | `--migrate` 前に v0 dir を read-only zip として PATH に保存。modifier flag |
 | `--migrate-force-recent-mtime` | v0 dir の直近 5 分以内の mtime check を bypass。**v0 が確実に停止している** ことを確認してから使う。modifier flag |
 | `--fresh` | v0 を無視して v1 を新規セットアップ |

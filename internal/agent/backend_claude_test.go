@@ -173,12 +173,6 @@ func TestBackendSupportsSessionKey(t *testing.T) {
 			t.Errorf("codex should not support session key")
 		}
 	})
-	t.Run("gemini does not", func(t *testing.T) {
-		b := &GeminiBackend{}
-		if backendSupportsSessionKey(b) {
-			t.Errorf("gemini should not support session key")
-		}
-	})
 	t.Run("llama does not", func(t *testing.T) {
 		b := &LlamaCppBackend{}
 		if backendSupportsSessionKey(b) {

@@ -284,7 +284,6 @@ func TestImportersRoundTrip(t *testing.T) {
 		// CLI workspace dotdirs.
 		"kojo://local/agents/ag_1/.claude/settings.local.json",
 		"kojo://local/agents/ag_1/.codex/session.json",
-		"kojo://local/agents/ag_1/.gemini/settings.json",
 	}
 	for _, u := range suppressed {
 		if _, err := st.GetBlobRef(ctx, u); !errors.Is(err, store.ErrNotFound) {
@@ -1458,7 +1457,7 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 			"status": "running", "createdAt": "2026-04-01T10:00:00+09:00"},
 		{"id": "sess_done", "tool": "codex", "workDir": "/tmp/y",
 			"status": "stopped", "exitCode": exit0, "createdAt": "2026-04-02T10:00:00+09:00"},
-		{"id": "", "tool": "gemini", "workDir": "/tmp/z", "status": "stopped"},
+		{"id": "", "tool": "custom", "workDir": "/tmp/z", "status": "stopped"},
 	}
 	sessionsJSON, err := json.Marshal(sessions)
 	if err != nil {
@@ -1613,8 +1612,6 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	mustWrite(filepath.Join(a1, ".claude", "settings.local.json"), []byte("{}"))
 	mustMkdir(filepath.Join(a1, ".codex"))
 	mustWrite(filepath.Join(a1, ".codex", "session.json"), []byte("{}"))
-	mustMkdir(filepath.Join(a1, ".gemini"))
-	mustWrite(filepath.Join(a1, ".gemini", "settings.json"), []byte("{}"))
 
 	// chat_history layout — exercises the external_chat_cursors importer:
 	//   - _channel.jsonl:                      excluded channel rollup (NOT a cursor source)

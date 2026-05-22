@@ -38,7 +38,7 @@ describe("needsCustomURLFor", () => {
     expect(needsCustomURLFor(tool)).toBe(true);
   });
 
-  it.each(["claude", "codex", "gemini", ""])("returns false for %s", (tool) => {
+  it.each(["claude", "codex", ""])("returns false for %s", (tool) => {
     expect(needsCustomURLFor(tool)).toBe(false);
   });
 });
@@ -68,8 +68,8 @@ describe("buildAgentSavePayload", () => {
   });
 
   it("omits effort for tools that don't support an effort selector", () => {
-    // gemini doesn't surface effort in toolModels
-    const out = buildAgentSavePayload(baseState({ tool: "gemini" }));
+    // codex doesn't surface effort in toolModels
+    const out = buildAgentSavePayload(baseState({ tool: "codex" }));
     expect(out.effort).toBeUndefined();
   });
 
@@ -114,9 +114,6 @@ describe("buildAgentSavePayload", () => {
     ).toEqual(["/etc"]);
     expect(
       buildAgentSavePayload(baseState({ tool: "codex" })).allowProtectedPaths,
-    ).toBeUndefined();
-    expect(
-      buildAgentSavePayload(baseState({ tool: "gemini" })).allowProtectedPaths,
     ).toBeUndefined();
     expect(
       buildAgentSavePayload(baseState({ tool: "llama.cpp" })).allowProtectedPaths,

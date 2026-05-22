@@ -14,8 +14,7 @@
 │  │                                        │                  │
 │  ├─ Session Manager                       │                  │
 │  │  ├─ Session 1: claude (PTY)            │                  │
-│  │  ├─ Session 2: codex  (PTY)            │                  │
-│  │  └─ Session N: gemini (PTY)            │                  │
+│  │  └─ Session N: codex  (PTY)            │                  │
 │  │                                                            │
 │  ├─ Notification Manager                                     │
 │  │  └─ Web Push (VAPID)                                      │
@@ -60,7 +59,7 @@ Go 標準ライブラリ (`net/http`) + coder/websocket。
 type Session struct {
     mu        sync.Mutex // 状態変更の排他制御
     ID        string
-    Tool      string    // "claude" | "codex" | "gemini"
+    Tool      string    // "claude" | "codex"
     WorkDir   string    // 作業ディレクトリ
     PTY       *os.File  // PTY master fd
     Cmd       *exec.Cmd // 子プロセス
@@ -83,7 +82,7 @@ kojo server
     │
     ├── PTY master ◄──── read ──── goroutine ──── broadcast to WebSocket clients
     │       │
-    │       └── PTY slave ──── claude / codex / gemini (child process)
+    │       └── PTY slave ──── claude / codex (child process)
     │
     └── WebSocket input ──── write ──── PTY master
 ```
@@ -103,7 +102,6 @@ Web Push (RFC 8030 + VAPID) で通知を送信。
 PTY 出力から特定パターンをマッチング:
 - Claude Code: `Do you want to` / `Allow` / `Deny` 等のパターン
 - Codex: 同様のパターン
-- Gemini: 同様のパターン
 
 これはヒューリスティクスであり、完全ではない。Phase 2 で改善可能。
 
@@ -255,7 +253,7 @@ dev:
 - **ネットワーク**: Tailscale WireGuard で暗号化。公開ネットワークには露出しない
 - **認証**: Tailscale のデバイス認証に委譲。追加認証なし
 - **ファイルアクセス**: ファイルブラウザはディレクトリ一覧のみ。パストラバーサル防止
-- **プロセス実行**: 起動可能な CLI は許可リスト制（claude, codex, gemini）
+- **プロセス実行**: 起動可能な CLI は許可リスト制（claude, codex）
 
 ### Graceful Shutdown
 

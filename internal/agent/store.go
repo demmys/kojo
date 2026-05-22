@@ -985,17 +985,12 @@ func (st *agentStore) SaveCronPaused(paused bool) error {
 //
 //   - the FTS index dir (index/)
 //   - the persona.md / MEMORY.md / memory/*.md disk mirrors that
-//     the CLI subprocess (claude / gemini / codex) reads at chat
-//     time
+//     the CLI subprocess (claude / codex) reads at chat time
 //   - persona_summary.md (regeneratable cache)
-//   - the per-agent CLI workspace (.claude/, .gemini/, and .codex/
-//     if the codex CLI happens to create one — codex's primary
-//     session store is global at ~/.codex/sessions/, see
+//   - the per-agent CLI workspace (.claude/ and .codex/ if the
+//     codex CLI happens to create one — codex's primary session
+//     store is global at ~/.codex/sessions/, see
 //     docs/multi-device-storage.md §5.5.1.3)
-//   - GEMINI.md (project-instruction file written by
-//     internal/agent/backend_gemini.go's prepareGeminiDir to
-//     override Gemini CLI's built-in system prompt; recreated on
-//     every Chat invocation, never authoritative state)
 //   - chat_history/ (external-platform — Slack etc. — local cache;
 //     cursor lives in DB, see internal/chathistory/store.go)
 //   - any legacy file left mid-migration that the runtime now

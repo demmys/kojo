@@ -23,9 +23,6 @@ import (
 //   - lists agents from the v1 DB (the migration just populated it),
 //   - computes per-agent v0 / v1 working directories,
 //   - builds claude project-symlink ops via externalcli.PlanSymlinks,
-//   - builds gemini projects.json mirror ops by inspecting the existing
-//     map for any v0 entry the user already has (only those agents get
-//     a v1 alias — we never invent project names),
 //   - calls externalcli.ApplyForward, which records each successful op
 //     into external_cli_migration.json so --rollback-external-cli can
 //     undo them later.
@@ -71,23 +68,6 @@ func applyExternalCLIForward(ctx context.Context, v0Path, v1Path string, logger 
 		},
 	}
 	ops := externalcli.PlanSymlinks(specs, plans)
-
-	// gemini — read ~/.gemini/projects.json (if any), append a v1-keyed
-	// entry mirroring each v0 entry we recognize. Skip silently if the
-	// file does not exist; gemini may simply not be installed.
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		geminiProjects := filepath.Join(home, ".gemini", "projects.json")
-		if _, err := os.Stat(geminiProjects); err == nil {
-			for _, p := range plans {
-				ops = append(ops, externalcli.Op{
-					Kind:    externalcli.OpGeminiProjectAdd,
-					Path:    geminiProjects,
-					Target:  p.V1Dir,
-					AgentID: p.AgentID,
-				})
-			}
-		}
-	}
 
 	if len(ops) == 0 {
 		logger.Info("external-cli forward: no operations planned")

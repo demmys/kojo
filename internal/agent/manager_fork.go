@@ -31,7 +31,7 @@ type ForkOptions struct {
 //
 // External integrations are intentionally NOT copied: SlackBot and
 // credentials all require per-agent tokens that cannot be safely shared.
-// CLI local state (.claude/, .gemini/) is also skipped so the fork starts a
+// CLI local state (.claude/) is also skipped so the fork starts a
 // fresh session. WorkDir is cleared so the fork does not share external output
 // storage with the source.
 //

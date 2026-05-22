@@ -78,7 +78,7 @@ const (
 	startupModeMigrateRestart
 	// startupModeFresh starts a clean v1 install, refusing if v1 is non-empty.
 	startupModeFresh
-	// startupModeRollbackExternal undoes the claude/codex/gemini CLI
+	// startupModeRollbackExternal undoes the claude/codex CLI
 	// symlinks the migrator installed. Independent of v1 dir state.
 	startupModeRollbackExternal
 	// startupModeInvalid means multiple primary flags were set; the caller
@@ -153,7 +153,7 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 	st := probeDirs()
 
 	// rollback-external-cli is independent of v1 dir state; it only touches
-	// claude / codex symlinks and gemini projects.json. Run it first if set.
+	// claude / codex symlinks. Run it first if set.
 	if mode == startupModeRollbackExternal {
 		if err := runRollbackExternalCLI(st, logger); err != nil {
 			logger.Error("rollback-external-cli failed", "err", err)
@@ -404,7 +404,7 @@ func runMigrate(ctx context.Context, st dirState, flags migrationFlags, logger *
 	// is the natural fallback. The manifest is written under the v1 dir
 	// so `kojo --rollback-external-cli` can undo every operation later.
 	// Intentionally placed AFTER the err-return above: if migration
-	// failed we must not touch ~/.claude or ~/.gemini, since the v1
+	// failed we must not touch ~/.claude, since the v1
 	// store may not exist or may be inconsistent.
 	if flags.migrateExternalCLI {
 		for _, w := range applyExternalCLIForward(ctx, st.v0Path, st.v1Path, logger) {

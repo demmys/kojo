@@ -41,7 +41,7 @@ func (sessionsImporter) Domain() string { return "sessions" }
 //   - Attachments: ephemeral upload tracking; the actual files are
 //     elsewhere on disk.
 //   - TmuxSessionName: v0-specific UX state with no v1 column.
-//   - ToolSessionID/ParentID: claude/codex/gemini CLI internal ids.
+//   - ToolSessionID/ParentID: claude/codex CLI internal ids.
 //     v1 sessions table has no column for them and the external CLI
 //     migration (5.5.1) handles tool-side state separately.
 //   - YoloMode/Internal: per-row policy flags; v1 surfaces them via

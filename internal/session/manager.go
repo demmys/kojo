@@ -57,7 +57,6 @@ const (
 var userTools = map[string]bool{
 	"claude": true,
 	"codex":  true,
-	"gemini": true,
 	"custom": true,
 }
 
@@ -714,22 +713,6 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 			return []string{"resume", toolSessionID}
 		}
 		return []string{"resume", "--last"}
-
-	case "gemini":
-		args := make([]string, 0, len(origArgs)+2)
-		skipNext := false
-		for _, a := range origArgs {
-			if skipNext {
-				skipNext = false
-				continue
-			}
-			if a == "--resume" || a == "-r" {
-				skipNext = true
-				continue
-			}
-			args = append(args, a)
-		}
-		return append(args, "--resume", "latest")
 
 	default:
 		// Internal tools (tmux/shell) use platform-specific restart args

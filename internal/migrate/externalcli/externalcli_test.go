@@ -1,7 +1,6 @@
 package externalcli
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,60 +216,6 @@ func TestRollbackSkipsLinkPointingElsewhere(t *testing.T) {
 	}
 }
 
-func TestGeminiProjectAddAndRollback(t *testing.T) {
-	root := t.TempDir()
-	v1Root := filepath.Join(root, "v1")
-	if err := os.MkdirAll(v1Root, 0o700); err != nil {
-		t.Fatalf("mkdir v1: %v", err)
-	}
-	projectsPath := filepath.Join(root, "gemini", "projects.json")
-	if err := os.MkdirAll(filepath.Dir(projectsPath), 0o700); err != nil {
-		t.Fatalf("mkdir gemini: %v", err)
-	}
-	// Seed: v0 entry exists.
-	v0Key := "/old/agents/ag_1"
-	v1Key := "/new/agents/ag_1"
-	doc := map[string]any{
-		"projects": map[string]any{v0Key: "kojo-ag_1"},
-	}
-	data, _ := json.Marshal(doc)
-	if err := os.WriteFile(projectsPath, data, 0o600); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	op := Op{Kind: OpGeminiProjectAdd, Path: projectsPath, Target: v1Key, AgentID: "ag_1"}
-
-	m, w := ApplyForward(v1Root, []Op{op})
-	if len(w) != 0 {
-		t.Errorf("warnings: %v", w)
-	}
-	if len(m.Ops) != 1 {
-		t.Fatalf("manifest ops: %d", len(m.Ops))
-	}
-	// Re-read projects.json to confirm v1 entry exists with same value.
-	raw, _ := os.ReadFile(projectsPath)
-	var got map[string]any
-	json.Unmarshal(raw, &got)
-	projs := got["projects"].(map[string]any)
-	if projs[v1Key] != "kojo-ag_1" {
-		t.Errorf("projects.json[v1Key] = %v, want kojo-ag_1", projs[v1Key])
-	}
-
-	if w, err := Rollback(v1Root); err != nil {
-		t.Fatalf("Rollback: %v", err)
-	} else if len(w) != 0 {
-		t.Errorf("rollback warnings: %v", w)
-	}
-	raw, _ = os.ReadFile(projectsPath)
-	json.Unmarshal(raw, &got)
-	projs = got["projects"].(map[string]any)
-	if _, ok := projs[v1Key]; ok {
-		t.Errorf("v1Key still in projects.json after rollback: %v", projs)
-	}
-	if _, ok := projs[v0Key]; !ok {
-		t.Error("v0 entry destroyed by rollback")
-	}
-}
-
 func TestRollbackOnAbsentManifestIsNoop(t *testing.T) {
 	v1Root := t.TempDir()
 	w, err := Rollback(v1Root)
@@ -279,5 +224,28 @@ func TestRollbackOnAbsentManifestIsNoop(t *testing.T) {
 	}
 	if len(w) != 1 {
 		t.Errorf("expected 1 warning ('no manifest'), got %v", w)
+	}
+}
+
+// TestRollbackTolerLegacyGeminiOp confirms a pre-existing manifest from
+// a v1 install that ran the now-removed Gemini projects.json forward
+// pass still rolls back cleanly: the unknown op kind is logged as a
+// warning rather than aborting the whole rollback.
+func TestRollbackToleratesLegacyGeminiOp(t *testing.T) {
+	v1Root := t.TempDir()
+	manifestPath := filepath.Join(v1Root, ManifestFileName)
+	legacy := []byte(`{"version":1,"ops":[{"kind":"gemini_project_add","path":"/tmp/projects.json","target":"/tmp/v1","agent_id":"ag_legacy"}]}`)
+	if err := os.WriteFile(manifestPath, legacy, 0o600); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+	w, err := Rollback(v1Root)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if len(w) != 1 {
+		t.Fatalf("expected 1 warning for unknown legacy op, got %d: %v", len(w), w)
+	}
+	if !strings.Contains(w[0], "gemini_project_add") {
+		t.Errorf("warning should mention the unknown op kind, got %q", w[0])
 	}
 }

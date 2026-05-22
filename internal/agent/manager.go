@@ -325,7 +325,6 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		backends: map[string]ChatBackend{
 			"claude":    NewClaudeBackend(logger),
 			"codex":     NewCodexBackend(logger),
-			"gemini":    NewGeminiBackend(logger),
 			"custom":    NewCustomBackend(logger),
 			"llama.cpp": NewLlamaCppBackend(logger),
 		},
@@ -1621,7 +1620,6 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// MCP servers are injected per-backend:
 	// - Claude: --mcp-config CLI arg (in backend_claude.go)
 	// - Codex: -c flag override (in backend_codex.go)
-	// - Gemini: .gemini/settings.json mcpServers (in backend_gemini.go)
 
 	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
 
@@ -1867,7 +1865,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// invariant across turns within the same session. Doing this at the
 	// manager level (rather than inside each backend) keeps the wire
 	// behaviour identical for every backend including the ones that don't
-	// read ChatOptions.SystemPromptExtra directly (gemini, llama.cpp).
+	// read ChatOptions.SystemPromptExtra directly (llama.cpp).
 	if opts.SystemPromptExtra != "" {
 		if prep.sysPrompt != "" {
 			prep.sysPrompt += "\n\n"

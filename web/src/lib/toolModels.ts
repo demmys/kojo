@@ -20,16 +20,6 @@ export const toolModels: Record<string, ToolModelConfig> = {
       "gpt-5.2",
     ],
   },
-  gemini: {
-    default: "gemini-3-pro-preview",
-    models: [
-      "gemini-3-pro-preview",
-      "gemini-3-flash-preview",
-      "gemini-2.5-pro",
-      "gemini-2.5-flash",
-      "gemini-2.5-flash-lite",
-    ],
-  },
   custom: {
     default: "",
     models: [],

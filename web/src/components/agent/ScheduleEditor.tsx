@@ -461,8 +461,14 @@ export function ScheduleEditor({
         </div>
       )}
 
-      {/* Next check-in / manual check-in trigger */}
-      {(enabled || onCheckin) && (
+      {/* Next check-in / manual check-in trigger.
+          Both pieces are only meaningful for a persisted agent: nextCronAt
+          is server-computed against the saved schedule, and onCheckin fires
+          a run against the saved record. AgentCreate passes neither, so
+          gating on `onCheckin` (which AgentSettings always provides) keeps
+          the whole block hidden in create mode — even though `enabled` is
+          true there via the default cron preset. */}
+      {onCheckin && (
         <div className="rounded-md border border-neutral-800 bg-neutral-900/50 p-3 space-y-2">
           {enabled && (() => {
             const next = scheduleDirty ? null : formatNextCron(nextCronAt, now);
@@ -490,16 +496,16 @@ export function ScheduleEditor({
             );
           })()}
 
-          {onCheckin && (
-            <button
-              type="button"
-              onClick={onCheckin}
-              disabled={checkingIn}
-              className="w-full px-3 py-1.5 rounded text-xs bg-amber-900/40 hover:bg-amber-900/60 border border-amber-800/60 text-amber-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {checkingIn ? "Checking in…" : "Check in now"}
-            </button>
-          )}
+          {/* Outer guard above already requires onCheckin, so render
+              unconditionally here. */}
+          <button
+            type="button"
+            onClick={onCheckin}
+            disabled={checkingIn}
+            className="w-full px-3 py-1.5 rounded text-xs bg-amber-900/40 hover:bg-amber-900/60 border border-amber-800/60 text-amber-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {checkingIn ? "Checking in…" : "Check in now"}
+          </button>
         </div>
       )}
 

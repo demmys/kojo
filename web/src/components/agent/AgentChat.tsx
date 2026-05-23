@@ -103,6 +103,129 @@ export function AgentChat() {
     }).catch(console.error);
   }, [id, navigate]);
 
+  // §3.7 device-switch: when the agent's runtime lives on a remote
+  // peer that is currently offline, the WS proxy + GET /messages
+  // proxy both 502, the transcript shown is whatever stale snapshot
+  // Hub has locally, and Send would just queue into the void. We
+  // poll the agent record every 5 s to refresh holderPeerStatus
+  // without tearing the chat down — when the holder flips back to
+  // online we refetch /messages so the most-recent transcript from
+  // the holder lands. Stops when the agent has no holder (local)
+  // or the page unmounts.
+  const holderOffline = !!agent?.holderPeer && agent.holderPeerStatus !== "online";
+  // Key the seen status by holderPeer so a holder rotation (peerA →
+  // peerB) doesn't silently reuse peerA's last-seen status as the
+  // "prev" for peerB. Holder change with both endpoints already
+  // "online" also triggers a refetch — the new holder may have
+  // accumulated messages while peerA owned the lock.
+  const lastHolderRef = useRef<{ peer: string; status?: string } | null>(null);
+  // Monotonic refetch generation: every refetch increments the seq
+  // and only the latest one's response is allowed to commit. Guards
+  // against a slow response from holderA arriving after holderB has
+  // already supplied a fresh transcript — without this the stale
+  // response would re-order or replace the newer view.
+  const refetchSeqRef = useRef(0);
+  useEffect(() => {
+    if (!id) {
+      // Agent route gone — invalidate any in-flight refetch so a
+      // late response can't commit to whatever loads next.
+      refetchSeqRef.current++;
+      return;
+    }
+    if (!agent?.holderPeer) {
+      // Agent went back to local. Drop the seen state so a future
+      // re-transition to a remote holder starts fresh, and bump
+      // the seq so an in-flight refetch from the previous remote
+      // holder can't land on the now-local transcript.
+      refetchSeqRef.current++;
+      lastHolderRef.current = null;
+      return;
+    }
+    const prev = lastHolderRef.current;
+    const currStatus = agent.holderPeerStatus;
+    const currPeer = agent.holderPeer;
+    lastHolderRef.current = { peer: currPeer, status: currStatus };
+
+    // Refetch trigger:
+    //   (a) holder rotation — peer changed, regardless of status,
+    //   (b) status flip away-from-online → online on the SAME holder.
+    // Case (a) catches new-holder-with-already-online-status; case
+    // (b) catches recovery from a transient offline window.
+    const holderChanged = !!prev && prev.peer !== currPeer;
+    const cameOnline = !!prev && prev.peer === currPeer && prev.status !== "online" && currStatus === "online";
+    if (!holderChanged && !cameOnline) return;
+
+    // Preserve scroll position over the refetch — the user may be
+    // mid-read on older content and a jump-to-bottom would be
+    // disruptive. Mirrors loadOlderMessages's restore protocol.
+    const container = scrollContainerRef.current;
+    suppressAutoScrollRef.current = true;
+    scrollRestoreRef.current = {
+      prevScrollHeight: container?.scrollHeight ?? 0,
+      prevScrollTop: container?.scrollTop ?? 0,
+    };
+    const seq = ++refetchSeqRef.current;
+    agentApi.messages(id, PAGE_SIZE).then((r) => {
+      // Generation guard: if a newer refetch has fired (e.g. holder
+      // rotated again, or another flip-online landed) we drop this
+      // response — applying it would either reorder the transcript
+      // (older response containing only top-N rows) or overwrite a
+      // fresher view with a stale snapshot.
+      if (seq !== refetchSeqRef.current) return;
+      setMessages((existing) => {
+        // Merge: prefer the server's view for the most recent
+        // PAGE_SIZE rows, but keep
+        //   1. older rows the user already paged in (any non-
+        //      synthetic id absent from the fresh page), and
+        //   2. local-only synthetic rows (pending_/error_/aborted_)
+        //      so an in-flight optimistic message survives.
+        // Mirrors the merge in the background-done branch.
+        const newIds = new Set(r.messages.map((m) => m.id));
+        const olderKept = existing.filter((m) => !newIds.has(m.id) && !/^(pending|error|aborted)_/.test(m.id));
+        const localSynthetic = existing.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id));
+        return [...olderKept, ...r.messages, ...localSynthetic];
+      });
+      // Don't shrink hasMore — older pages may already be loaded.
+      // Only widen it if the server now reports more.
+      if (r.hasMore) setHasMore(true);
+    }).catch(() => {
+      // Refetch failed — release the scroll-restore tokens so a
+      // subsequent normal update isn't suppressed forever. Skip
+      // when a newer refetch has superseded this one (it owns the
+      // restore tokens now).
+      if (seq !== refetchSeqRef.current) return;
+      suppressAutoScrollRef.current = false;
+      scrollRestoreRef.current = null;
+    });
+    // Cleanup: when the effect re-runs (holder/status/id changed)
+    // or the component unmounts, bump the seq so this iteration's
+    // pending response can't commit out of order, and release the
+    // scroll-restore tokens — the stale response will early-return
+    // before clearing them itself, and leaving them set would let an
+    // unrelated next message update consume an out-of-date scroll
+    // anchor.
+    return () => {
+      refetchSeqRef.current++;
+      suppressAutoScrollRef.current = false;
+      scrollRestoreRef.current = null;
+    };
+  }, [id, agent?.holderPeer, agent?.holderPeerStatus]);
+
+  // Polling refresh for the agent record so holderPeerStatus tracks
+  // peer_registry without a page reload. Cheap (one row read) so 5 s
+  // matches the dashboard's cadence.
+  useEffect(() => {
+    if (!id || !agent?.holderPeer) return;
+    const t = setInterval(() => {
+      agentApi.get(id).then(setAgent).catch(() => {
+        // Transient — leave the previous record in place. We don't
+        // want a flaky poll to clear holderPeerStatus and flip the
+        // UI back to "online" when nothing changed.
+      });
+    }, 5000);
+    return () => clearInterval(t);
+  }, [id, agent?.holderPeer]);
+
   const scrollToBottom = useCallback(() => {
     if (suppressAutoScrollRef.current) return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -341,6 +464,10 @@ export function AgentChat() {
   const handleSend = () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
+    // Holder peer offline → the WS frame would dead-end at the Hub
+    // proxy and the user's message would be lost. Refuse rather than
+    // silently swallow.
+    if (holderOffline) return;
     abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
@@ -405,7 +532,13 @@ export function AgentChat() {
         <div className="flex-1 min-w-0">
           <div className="font-medium text-sm truncate">{agent.name}</div>
           <div className="text-xs text-neutral-500">
-            {connected ? (streaming ? "typing..." : "online") : "connecting..."}
+            {holderOffline
+              ? `host offline @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}`
+              : connected
+                ? streaming
+                  ? "typing..."
+                  : "online"
+                : "connecting..."}
           </div>
         </div>
         {ttsAgentEnabled && (
@@ -532,6 +665,7 @@ export function AgentChat() {
           const editable =
             agent.tool === "llama.cpp" &&
             !streaming &&
+            !holderOffline &&
             !msg.id.startsWith("pending_") &&
             !msg.id.startsWith("error_") &&
             !msg.id.startsWith("aborted_");
@@ -546,7 +680,11 @@ export function AgentChat() {
               avatarHash={agent.avatarHash}
               ttsEnabled={ttsAgentEnabled}
               ttsPlayState={tts.state[msg.id]}
-              onTTSPlay={ttsAgentEnabled ? tts.play : undefined}
+              // TTS synthesize is an agent sub-route that the remote-
+              // agent proxy forwards to the holder peer. Disable
+              // play while the holder is offline — otherwise the
+              // request just 502s through the proxy.
+              onTTSPlay={ttsAgentEnabled && !holderOffline ? tts.play : undefined}
               onEdit={
                 editable
                   ? async (msgId, content) => {
@@ -701,6 +839,21 @@ export function AgentChat() {
 
       {/* Input */}
       <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
+        {/* Holder offline banner — replaces the live indicator while the
+            §3.7 device-switch target is unreachable. The transcript shown
+            above this banner is whatever Hub has locally; latest messages
+            from the holder will land once it reconnects (see status-flip
+            refetch in the holderPeerStatus effect). */}
+        {holderOffline && (
+          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-amber-950/60 border border-amber-900/60 rounded-lg text-xs text-amber-200">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-3.5 h-3.5 shrink-0">
+              <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+            </svg>
+            <span className="flex-1">
+              ホスト端末 <span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span> がオフライン。復帰まで送信不可。
+            </span>
+          </div>
+        )}
         {/* Upload error */}
         {uploadError && (
           <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
@@ -760,9 +913,9 @@ export function AgentChat() {
           />
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={uploading || streaming}
+            disabled={uploading || streaming || holderOffline}
             className="p-2 text-neutral-500 hover:text-neutral-300 disabled:opacity-40 shrink-0"
-            title="Attach files"
+            title={holderOffline ? "Holder peer offline" : "Attach files"}
           >
             {uploading ? (
               <svg className="w-5 h-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -798,8 +951,9 @@ export function AgentChat() {
           ) : (
             <button
               onClick={handleSend}
-              disabled={(!input.trim() && pendingFiles.length === 0) || !connected}
+              disabled={(!input.trim() && pendingFiles.length === 0) || !connected || holderOffline}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-medium disabled:opacity-40 shrink-0"
+              title={holderOffline ? `Holder peer is offline — send disabled until @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
             >
               Send
             </button>

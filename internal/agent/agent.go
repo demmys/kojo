@@ -375,6 +375,12 @@ type Agent struct {
 	// against decommission, or a freshly switched-to peer that
 	// hasn't broadcast its registration yet).
 	HolderPeerName string `json:"holderPeerName,omitempty"`
+	// HolderPeerStatus mirrors peer_registry.status for HolderPeer at
+	// list/read time so the UI can grey out chat (and surface an
+	// "offline" banner) without a second round-trip to /api/v1/peers.
+	// One of "online" / "offline" / "degraded". Empty when HolderPeer
+	// is empty or the registry has no row for the holder.
+	HolderPeerStatus string `json:"holderPeerStatus,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM

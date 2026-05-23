@@ -131,6 +131,11 @@ export interface AgentInfo {
   // from peer_registry. Falls back to holderPeer (deviceID) when the
   // registry lookup miss races a decommission.
   holderPeerName?: string;
+  // holderPeerStatus mirrors peer_registry.status for holderPeer. Used
+  // by AgentChat to disable send + show an "offline" banner when the
+  // §3.7 device-switch target has gone offline. Empty when holderPeer
+  // is empty.
+  holderPeerStatus?: "online" | "offline" | "degraded";
 }
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.

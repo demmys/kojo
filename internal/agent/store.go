@@ -112,6 +112,19 @@ var reservedAgentKeys = map[string]bool{
 	// feature is gone; strip the key so a Save migrates the row off the
 	// stale field on the next write.
 	"notifySources": true,
+	// holderPeer / holderPeerName / holderPeerStatus are runtime-only
+	// fields populated by Manager.GetRemote / Manager.ListRemote from
+	// agent_locks + peer_registry. They MUST NOT leak into
+	// settings_json — that would let a stale snapshot of "who held the
+	// lock at write time" outlive the lock itself and resurface on the
+	// next Load, contradicting the live agent_locks view. The current
+	// write path never Saves remote agents (the in-memory map only
+	// holds local ones), but stripping defensively here closes the
+	// door on a future code path inadvertently routing a GetRemote
+	// result through agentToSettings.
+	"holderPeer":       true,
+	"holderPeerName":   true,
+	"holderPeerStatus": true,
 }
 
 // loadStripKeys lists the keys settingsToAgent() must filter out before
@@ -131,6 +144,13 @@ var loadStripKeys = map[string]bool{
 	"createdAt":   true,
 	"updatedAt":   true,
 	"lastMessage": true,
+	// holder* fields are runtime-only; strip on Load too in case an
+	// older binary wrote them into settings_json before the Save-side
+	// guard above existed. Without this a stale "holderPeer=oldPeer"
+	// row could surface for a freshly-local agent.
+	"holderPeer":       true,
+	"holderPeerName":   true,
+	"holderPeerStatus": true,
 }
 
 // agentStore persists agent metadata to the v1 SQLite store.

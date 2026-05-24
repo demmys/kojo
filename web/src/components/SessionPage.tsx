@@ -82,11 +82,19 @@ export function SessionPage() {
   // could pin scrollback at 0 and drop history before the new metadata loads.
   const sessionMatches = session?.id === id;
   const isClaude = sessionMatches && session?.tool === "claude";
+  const isGrok = sessionMatches && session?.tool === "grok";
+  // grok-builder binds its own scroll shortcuts (Ctrl+K up, Ctrl+J down) and
+  // ignores xterm's internal scrollback. Forward wheel/swipe to those keys so
+  // the user can drive the TUI's scroll without a keyboard.
+  const scrollAsKeys = isGrok
+    ? { up: "\x0b", down: "\x0a", send: (key: string) => sendInputRef.current(key) }
+    : undefined;
   const { termRef: xtermRef, autoScrollRef, safeFit, immediateFit } = useTerminal({
     containerRef: termContainerRef,
     onInput: useCallback((data: string) => sendInputRef.current(wrapInputRef.current(data)), []),
     onResize: useCallback((cols: number, rows: number) => sendResizeRef.current(cols, rows), []),
     scrollback: sessionMatches ? (isClaude ? 1000 : 0) : undefined,
+    scrollAsKeys,
     deps: [id],
   });
 

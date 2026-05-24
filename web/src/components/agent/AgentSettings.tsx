@@ -78,6 +78,10 @@ export function AgentSettings() {
     messagesRemoved: number;
     claudeSessionEntriesRemoved: number;
     claudeSessionFilesRemoved: number;
+    // Optional so older servers (pre-grok-truncate rollout) that omit the
+    // fields render as "0" via `?? 0` below instead of "undefined".
+    grokSessionsRemoved?: number;
+    grokSessionFilesRemoved?: number;
     diaryFilesRemoved: number;
     diaryEntriesRemoved: number;
   } | null>(null);
@@ -591,7 +595,7 @@ export function AgentSettings() {
     }
     if (
       !confirm(
-        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
+        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), the entire grok --resume session (events.jsonl has no per-record timestamp so partial cuts are not safe — the next turn opens a fresh session), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
       )
     ) {
       return;
@@ -1424,7 +1428,7 @@ export function AgentSettings() {
               {truncating ? "Truncating..." : "Truncate Memory From This Time"}
             </button>
             <p className="text-xs text-neutral-600 mt-1">
-              Drop transcript records, Claude --resume session entries, and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
+              Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale — see below), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.
             </p>
             {truncateResult && (
               <div className="mt-2 text-xs text-neutral-400 bg-neutral-900/60 border border-neutral-800 rounded-lg p-2 space-y-0.5">
@@ -1432,6 +1436,7 @@ export function AgentSettings() {
                 <div>
                   Transcript: {truncateResult.messagesRemoved} ·
                   {" "}Claude session: {truncateResult.claudeSessionEntriesRemoved} entries / {truncateResult.claudeSessionFilesRemoved} files ·
+                  {" "}Grok session: {truncateResult.grokSessionsRemoved ?? 0} sessions / {truncateResult.grokSessionFilesRemoved ?? 0} files ·
                   {" "}Diary: {truncateResult.diaryEntriesRemoved} entries / {truncateResult.diaryFilesRemoved} files
                 </div>
               </div>

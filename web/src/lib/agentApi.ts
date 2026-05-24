@@ -269,6 +269,16 @@ export interface TruncateMemoryResult {
   messagesRemoved: number;
   claudeSessionEntriesRemoved: number;
   claudeSessionFilesRemoved: number;
+  // Grok session subtrees dropped wholesale ($GROK_HOME/sessions/<encoded(agentDir)>/<uuid>/).
+  // Grok's events.jsonl has no kojo-compatible per-record timestamp so any
+  // truncate that lands inside a session drops the whole session — the next
+  // non-OneShot turn opens a fresh one.
+  //
+  // Optional because the fields were added after v0.19 — an older server
+  // peer (mid-rollout) returns the response without them, and the UI
+  // should render "0" instead of "undefined".
+  grokSessionsRemoved?: number;
+  grokSessionFilesRemoved?: number;
   diaryFilesRemoved: number;
   diaryEntriesRemoved: number;
 }

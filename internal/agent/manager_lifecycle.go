@@ -44,6 +44,19 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to truncate transcript", "agent", id, "err", err)
 	}
 
+	// Clear the global CLI session stores BEFORE acquiring
+	// memorySyncMu. clearGrokSession now takes lockGrokSessionTransfer
+	// internally, and the peer-agent-sync handler holds
+	// lockGrokSessionTransfer THEN takes memorySyncMu (via
+	// agent.LockAgentMemorySync at peer_agent_sync_handler.go:519).
+	// Acquiring memorySyncMu first here would invert that order and
+	// deadlock against a concurrent device-switch arrival. Neither
+	// clear touches memory/* nor MEMORY.md, so moving it outside the
+	// memorySyncMu region is safe for the half-reset-visibility
+	// invariant the lock protects.
+	clearClaudeSession(id)
+	clearGrokSession(id)
+
 	// Hold the per-agent memory-sync lock around the entire on-
 	// disk wipe + recreate + post-reset sync so concurrent CRUD /
 	// sync helpers can't observe a half-reset tree (memory/ wiped
@@ -120,9 +133,9 @@ func (m *Manager) ResetData(id string) error {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
 
-	// Clear global CLI session stores
-	clearClaudeSession(id)
-	clearGrokSession(id)
+	// (Global CLI session stores cleared above, BEFORE lockMemorySync,
+	// to avoid the lock-order inversion against the peer-agent-sync
+	// handler. See the comment at the top of this function for detail.)
 
 	// Recreate empty memory directory and MEMORY.md (required for agent to function).
 	// Capture the error rather than returning so we always release
@@ -1562,7 +1575,22 @@ func (m *Manager) ResetSession(agentID string) error {
 	case "custom":
 		clearClaudeSession(agentID)
 	case "grok":
-		clearGrokSession(agentID)
+		// Use the counted variant so permission / IO failures
+		// surface in the log instead of being silently swallowed.
+		// The handler still returns nil on partial failure
+		// (matching the claude path and ResetData's stance), but
+		// operators get a Warn entry pointing at the cause when
+		// the next chat resumes against a leftover session.
+		files, sessions, cerr := clearGrokSessionCounted(agentID)
+		if cerr != nil {
+			m.logger.Warn("CLI session reset: grok clear partial failure",
+				"agent", agentID, "err", cerr,
+				"filesRemoved", files, "sessionsRemoved", sessions)
+		} else {
+			m.logger.Debug("CLI session reset: grok cleared",
+				"agent", agentID,
+				"filesRemoved", files, "sessionsRemoved", sessions)
+		}
 	}
 	// Codex uses ephemeral sessions — no persistent state to clear
 

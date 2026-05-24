@@ -41,6 +41,21 @@ type TruncateMemoryResult struct {
 	// would have been left empty).
 	ClaudeSessionFilesRemoved int `json:"claudeSessionFilesRemoved"`
 
+	// GrokSessionsRemoved counts UUID-named grok session subdirectories
+	// dropped from $GROK_HOME/sessions/<encoded(agentDir)>/. Grok's
+	// events.jsonl / chat_history.jsonl have no kojo-compatible per-record
+	// timestamp scheme, so any truncate that lands inside a session
+	// drops the entire session rather than risk replaying a torn turn
+	// log on the next `grok --resume <id>`. The session_id pointer file
+	// (<agentDir>/.grok/session_id) is removed alongside so the next
+	// non-OneShot turn opens a fresh session.
+	GrokSessionsRemoved int `json:"grokSessionsRemoved"`
+
+	// GrokSessionFilesRemoved counts every regular file deleted from
+	// the dropped grok session subtrees (events.jsonl, chat_history.jsonl,
+	// summary.json, system_prompt.txt, terminal/*.log, …).
+	GrokSessionFilesRemoved int `json:"grokSessionFilesRemoved"`
+
 	// DiaryFilesRemoved counts memory/YYYY-MM-DD.md files we deleted
 	// outright because their date is strictly after the threshold's date
 	// (in JST — diary timestamps are JST-local). Also counts memory_entries
@@ -211,6 +226,24 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.ClaudeSessionEntriesRemoved = entriesRm
 	res.ClaudeSessionFilesRemoved = filesRm
 
+	// 2b. Grok session subtree. Grok's events.jsonl / chat_history.jsonl
+	//     records do not carry the RFC3339 `timestamp` field we trim
+	//     claude JSONL on, so a per-record cut would either be
+	//     unreliable (timestamp guessed from a non-canonical field)
+	//     or destructively wrong (resume after a torn turn breaks the
+	//     UI replay). Drop the session wholesale and let the next
+	//     non-OneShot turn open a fresh one with the post-truncate
+	//     transcript still injected via the system prompt. Best-effort
+	//     across files; called unconditionally because a non-grok agent
+	//     simply has no $GROK_HOME/sessions/<encoded(agentDir)>/ entry
+	//     and the helper no-ops.
+	grokFilesRm, grokSessRm, gerr := clearGrokSessionCounted(agentID)
+	if gerr != nil {
+		m.logger.Warn("truncate: grok session partial failure", "agent", agentID, "err", gerr)
+	}
+	res.GrokSessionFilesRemoved = grokFilesRm
+	res.GrokSessionsRemoved = grokSessRm
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race
@@ -326,6 +359,8 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		"messages", res.MessagesRemoved,
 		"claudeEntries", res.ClaudeSessionEntriesRemoved,
 		"claudeFiles", res.ClaudeSessionFilesRemoved,
+		"grokSessions", res.GrokSessionsRemoved,
+		"grokFiles", res.GrokSessionFilesRemoved,
 		"diaryEntries", res.DiaryEntriesRemoved,
 		"diaryFiles", res.DiaryFilesRemoved,
 	)

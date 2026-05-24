@@ -561,11 +561,99 @@ func hasGrokSession(cwd string) bool {
 // working directory AND clears the persisted resume-ID file. Used by
 // ResetData / ResetSession to give the next turn a clean slate.
 func clearGrokSession(agentID string) {
+	_, _, _ = clearGrokSessionCounted(agentID)
+}
+
+// clearGrokSessionCounted is the same as clearGrokSession but reports
+// what it removed. Used by truncate_memory.go so the TruncateMemory
+// result can surface "how much grok state we dropped".
+//
+// sessionsRemoved counts UUID-named subdirectories under
+// $GROK_HOME/sessions/<encoded(agentDir)>/ — including OneShot sessions
+// that might still be lingering. filesRemoved counts every regular
+// file under those subdirectories (events.jsonl, chat_history.jsonl,
+// summary.json, system_prompt.txt, terminal/*.log, …).
+//
+// Per-subtree counters are committed only AFTER the subtree's
+// RemoveAll succeeds, so a permission failure on one session does not
+// inflate the "removed" totals for state that is still on disk.
+//
+// Concurrency: takes lockGrokSessionTransfer(agentID) across the whole
+// clear so a §3.7 device-switch StageGrokSession / ReadGrokSessionFiles
+// running on the same agent cannot race the rename-into-place / read
+// against our RemoveAll. Lock order is (caller's reset guard) →
+// lockGrokSessionTransfer; both ResetData and TruncateMemory hold the
+// reset guard before reaching us.
+//
+// Errors removing individual files are tolerated and logged into the
+// returned err (best-effort, matching ResetData's stance). A missing
+// session directory or pointer file is NOT an error — both no-op.
+func clearGrokSessionCounted(agentID string) (filesRemoved, sessionsRemoved int, err error) {
+	release := lockGrokSessionTransfer(agentID)
+	defer release()
+
 	dir := agentDir(agentID)
 	if sessionsDir := grokSessionDir(dir); sessionsDir != "" {
-		_ = os.RemoveAll(sessionsDir)
+		entries, derr := os.ReadDir(sessionsDir)
+		switch {
+		case derr == nil:
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				// Only count grok-shaped session IDs so a stray
+				// non-UUID directory (corruption, accidental
+				// mkdir) doesn't inflate the counter. The
+				// removal below still wipes the whole tree —
+				// counting is best-effort metadata, not a gate.
+				if !isGrokSessionID(e.Name()) {
+					continue
+				}
+				sub := filepath.Join(sessionsDir, e.Name())
+				// Pre-count this subtree's files but do NOT
+				// commit the counters until RemoveAll succeeds
+				// for the same subtree. Otherwise a permission
+				// failure on one session would inflate the
+				// "removed" totals for state still on disk.
+				subFiles := 0
+				_ = filepath.Walk(sub, func(_ string, info os.FileInfo, werr error) error {
+					if werr != nil || info == nil {
+						return nil
+					}
+					if !info.IsDir() {
+						subFiles++
+					}
+					return nil
+				})
+				if rerr := os.RemoveAll(sub); rerr != nil && !os.IsNotExist(rerr) {
+					if err == nil {
+						err = rerr
+					}
+					continue
+				}
+				sessionsRemoved++
+				filesRemoved += subFiles
+			}
+			// Sweep any non-UUID detritus + the now-empty
+			// sessionsDir itself so the cwd's per-cwd grok root
+			// disappears entirely. Errors here are non-fatal.
+			if rerr := os.RemoveAll(sessionsDir); rerr != nil && !os.IsNotExist(rerr) {
+				if err == nil {
+					err = rerr
+				}
+			}
+		case os.IsNotExist(derr):
+			// nothing to remove — fine.
+		default:
+			err = derr
+		}
 	}
-	_ = os.Remove(grokSessionIDFile(dir))
+	if rerr := os.Remove(grokSessionIDFile(dir)); rerr != nil && !os.IsNotExist(rerr) {
+		if err == nil {
+			err = rerr
+		}
+	}
+	return filesRemoved, sessionsRemoved, err
 }
 
 // classifyGrokProcessError picks the most informative error string

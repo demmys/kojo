@@ -341,3 +341,77 @@ func randomSuffix() string {
 	// test, not break it.
 	return filepath.Base(os.TempDir()) + "-x"
 }
+
+// TestClearGrokSessionCounted_ReportsCounts plants a primary + OneShot
+// session, then asserts clearGrokSessionCounted removes both subtrees
+// and the resume pointer file, reporting the correct counts.
+func TestClearGrokSessionCounted_ReportsCounts(t *testing.T) {
+	withGrokHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	const agentID = "ag_grok_clear_counted"
+	const primaryID = "019e588f-419b-7202-9cff-1647e57116d5"
+	const oneShotID = "019e58a0-2222-7202-9cff-1647e57116d5"
+	plantGrokSession(t, agentID, primaryID)
+
+	// Plant a OneShot directory alongside (no pointer file written
+	// for OneShot — clearGrokSessionCounted should still wipe it).
+	dir := agentDir(agentID)
+	oneShotRoot := filepath.Join(grokSessionDir(dir), oneShotID)
+	if err := os.MkdirAll(oneShotRoot, 0o755); err != nil {
+		t.Fatalf("mkdir oneshot: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(oneShotRoot, "events.jsonl"), []byte(`{"type":"end"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write oneshot events: %v", err)
+	}
+
+	files, sessions, err := clearGrokSessionCounted(agentID)
+	if err != nil {
+		t.Fatalf("clearGrokSessionCounted: %v", err)
+	}
+	// Primary session has 5 files (events / chat_history / summary /
+	// system_prompt / terminal/call-abc-1.log); OneShot has 1.
+	const wantFiles = 5 + 1
+	if files != wantFiles {
+		t.Errorf("filesRemoved = %d, want %d", files, wantFiles)
+	}
+	if sessions != 2 {
+		t.Errorf("sessionsRemoved = %d, want 2", sessions)
+	}
+
+	// Pointer file gone.
+	if _, err := os.Stat(grokSessionIDFile(dir)); !os.IsNotExist(err) {
+		t.Errorf("session_id pointer still present: err=%v", err)
+	}
+	// Session subtree gone.
+	if _, err := os.Stat(grokSessionDir(dir)); !os.IsNotExist(err) {
+		t.Errorf("session subtree still present: err=%v", err)
+	}
+}
+
+// TestClearGrokSessionCounted_NoState covers the non-grok agent /
+// fresh agent path: no .grok/session_id, no $GROK_HOME/sessions
+// entry. Helper must no-op cleanly and report zeroes.
+func TestClearGrokSessionCounted_NoState(t *testing.T) {
+	withGrokHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	const agentID = "ag_grok_no_state"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	files, sessions, err := clearGrokSessionCounted(agentID)
+	if err != nil {
+		t.Fatalf("clearGrokSessionCounted on fresh agent: %v", err)
+	}
+	if files != 0 || sessions != 0 {
+		t.Errorf("counts on fresh agent: files=%d sessions=%d, want 0/0", files, sessions)
+	}
+}

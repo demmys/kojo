@@ -274,24 +274,29 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 			return
 		}
 
-		// processError is set from any of three signals, in order of
-		// preference: stderr buffer, the streamed {"type":"error"}
-		// payload, or cmd.Wait's error string. A grok stream can emit
-		// `{"type":"error","message":"..."}` and STILL exit 0 (the
-		// CLI considers "we surfaced the error to the caller" as a
-		// non-fatal outcome), so we must inspect streamError even
-		// when Wait() returns nil — otherwise the user sees an empty
-		// assistant message and never learns the turn failed.
+		// processError is set from at most three signals, in order of
+		// preference:
+		//   1. the streamed {"type":"error"} payload (most semantic)
+		//   2. cmd.Wait's error — augmented with stderr if available
+		//   3. nothing — clean exit, no stream error → success
+		//
+		// We deliberately do NOT promote stderr by itself to a fatal
+		// error: grok routes routine operational logs to stderr,
+		// including non-fatal `tool_error: tool_output_error` records
+		// for things like `read_file` on a missing file (the agent
+		// handles those gracefully and the turn still succeeds with
+		// exit 0). Treating any stderr byte as fatal made every such
+		// turn surface a bogus error attached to a perfectly good
+		// reply.
+		//
+		// A grok stream can emit `{"type":"error","message":"..."}`
+		// and STILL exit 0 (the CLI considers "we surfaced the error
+		// to the caller" as a non-fatal outcome), so we must inspect
+		// streamError even when Wait() returns nil — otherwise the
+		// user sees an empty assistant message and never learns the
+		// turn failed.
 		waitErr := cmd.Wait()
-		var processError string
-		switch {
-		case strings.TrimSpace(stderrBuf.String()) != "":
-			processError = strings.TrimSpace(stderrBuf.String())
-		case result.streamError != "":
-			processError = result.streamError
-		case waitErr != nil:
-			processError = waitErr.Error()
-		}
+		processError := classifyGrokProcessError(waitErr, stderrBuf.String(), result.streamError)
 		if waitErr != nil {
 			b.logger.Warn("grok process exited with error",
 				"agent", agent.ID, "err", waitErr, "stderr", stderrBuf.String(), "streamError", result.streamError)
@@ -561,6 +566,30 @@ func clearGrokSession(agentID string) {
 		_ = os.RemoveAll(sessionsDir)
 	}
 	_ = os.Remove(grokSessionIDFile(dir))
+}
+
+// classifyGrokProcessError picks the most informative error string
+// for a finished grok process, or "" when the turn succeeded. See the
+// long-form rationale at the Chat callsite for why stderr is NOT
+// promoted on its own.
+//
+// When the process actually failed (waitErr != nil) we keep BOTH the
+// wait-error string (carries exit code / signal, e.g. "signal: killed"
+// for a SIGTERM after WaitDelay) AND the trimmed stderr (carries the
+// human-readable diagnostic). Returning just stderr would let routine
+// log lines mask the cause of death; returning just waitErr would
+// drop the diagnostic the operator actually needs.
+func classifyGrokProcessError(waitErr error, stderr, streamError string) string {
+	if streamError != "" {
+		return streamError
+	}
+	if waitErr == nil {
+		return ""
+	}
+	if s := strings.TrimSpace(stderr); s != "" {
+		return waitErr.Error() + ": " + s
+	}
+	return waitErr.Error()
 }
 
 // isStaleSessionError reports whether a grok stderr / exit message

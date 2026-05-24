@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -245,6 +246,60 @@ func TestIsStaleSessionError(t *testing.T) {
 		if got := isStaleSessionError(tc.in); got != tc.want {
 			t.Errorf("isStaleSessionError(%q) = %v, want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestClassifyGrokProcessError(t *testing.T) {
+	exitErr := errors.New("exit status 1")
+	// Real-world sample: grok logs non-fatal tool failures (e.g.
+	// read_file on a missing path) to stderr while the process still
+	// exits 0. The classifier MUST ignore stderr in that case so the
+	// user's reply isn't decorated with a bogus error.
+	toolErrLog := "2026-05-23T22:48:54.687587Z ERROR tool_error: tool_output_error session_id=019e5706 tool_name=\"read_file\" error_message=\"Error: /a/b does not exist.\""
+
+	cases := []struct {
+		name        string
+		waitErr     error
+		stderr      string
+		streamError string
+		want        string
+	}{
+		{
+			name: "clean exit no stderr",
+			want: "",
+		},
+		{
+			name:   "clean exit with stderr-only tool log is NOT fatal",
+			stderr: toolErrLog,
+			want:   "",
+		},
+		{
+			name:        "stream error wins over everything",
+			waitErr:     exitErr,
+			stderr:      "ignored",
+			streamError: "Session does not exist",
+			want:        "Session does not exist",
+		},
+		{
+			name:    "non-zero exit augments wait error with stderr",
+			waitErr: exitErr,
+			stderr:  "  fatal: oom\n",
+			want:    "exit status 1: fatal: oom",
+		},
+		{
+			name:    "non-zero exit falls back to wait error when stderr empty",
+			waitErr: exitErr,
+			want:    "exit status 1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyGrokProcessError(tc.waitErr, tc.stderr, tc.streamError)
+			if got != tc.want {
+				t.Errorf("classifyGrokProcessError(%v, %q, %q) = %q, want %q",
+					tc.waitErr, tc.stderr, tc.streamError, got, tc.want)
+			}
+		})
 	}
 }
 

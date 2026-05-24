@@ -1250,6 +1250,61 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
+	// grok session: independent surface. Gate by source's Tool so
+	// a claude/custom agent whose agentDir happens to contain a
+	// stale `.grok/session_id` (e.g. from a previous era when the
+	// operator briefly switched to grok and back) does NOT
+	// accidentally ship grok state target would then resume from.
+	// The wire's tombstone branch on the receiver does the same
+	// gate, so source + target stay in lockstep.
+	//
+	// CAVEAT (torn-turn read): when the agent triggered the switch
+	// via the kojo-switch-device skill, this read happens WHILE
+	// the agent's grok turn is still in flight (the LLM is parked
+	// on the curl POST that delivered us here). The JSONL
+	// surfaces (events.jsonl, chat_history.jsonl, updates.jsonl)
+	// tolerate torn writes — a partial trailing line is dropped
+	// on parse — and grok writes summary.json / system_prompt.txt
+	// atomically (rename-into-place), so a mid-turn read either
+	// sees the previous turn's bytes or the new turn's bytes,
+	// never a partial. If a required core file is somehow absent
+	// (a half-deleted session left behind by a crashed `grok
+	// sessions delete --partial`, etc.), ReadGrokSessionFiles
+	// returns an error and buildAgentSyncRequest fails — the
+	// orchestrator reports this as a switch failure with the
+	// error attached, and the operator can retry. The in-flight
+	// message itself is captured separately via
+	// SnapshotAccumulatedMessageRecord (the same path claude
+	// uses), so target's UI transcript stays complete even when
+	// the file-level session lags a turn. A post-arrival re-sync
+	// to replace the lagged session with the final source-side
+	// version is NOT implemented in v1; if the resumed
+	// conversation drifts the operator can ResetSession on target
+	// and start fresh.
+	if agentRecordTool(rec) == "grok" {
+		grokTransfer, grokSkipped, gerr := agent.ReadGrokSessionFiles(agentID)
+		if gerr != nil {
+			return nil, fmt.Errorf("read grok session: %w", gerr)
+		}
+		if len(grokSkipped) > 0 {
+			s.logger.Warn("agent-sync: skipped oversized grok session files",
+				"agent", agentID, "files", grokSkipped)
+		}
+		if grokTransfer != nil && len(grokTransfer.Files) > 0 {
+			gw := &grokSessionWire{
+				SessionID: grokTransfer.SessionID,
+				Files:     make([]grokSessionFileWire, 0, len(grokTransfer.Files)),
+			}
+			for _, f := range grokTransfer.Files {
+				gw.Files = append(gw.Files, grokSessionFileWire{
+					RelPath:    f.RelPath,
+					ContentB64: base64.StdEncoding.EncodeToString(f.Content),
+				})
+			}
+			req.GrokSession = gw
+		}
+	}
+
 	// Raw agent token (best-effort — post-restart peers only
 	// have the kv hash, so the callback may return false; that's
 	// acceptable in v1, the target will require a re-issue

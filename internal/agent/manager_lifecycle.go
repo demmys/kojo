@@ -546,11 +546,12 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 	// arrived agent can initiate another switch from this peer.
 	// Without this the skill file only exists at prepareChat time,
 	// so a fresh arrival that hasn't chatted yet would not expose
-	// the /kojo-switch-device slash command. claude/custom only —
-	// other backends never create a .claude/ tree.
-	if a.Tool == "claude" || a.Tool == "custom" {
-		SyncDeviceSwitchSkill(agentID, a.IsDeviceSwitchEnabled(), m.logger)
-	}
+	// the kojo-switch-device skill. SyncDeviceSwitchSkillForTool
+	// dispatches based on Tool: claude/custom install the
+	// Claude-Code-flavored body, grok installs its own body
+	// (no `!`exec`` substitution, `grok --resume` wording),
+	// codex/llama.cpp are no-op.
+	SyncDeviceSwitchSkillForTool(agentID, a.Tool, a.IsDeviceSwitchEnabled(), m.logger)
 }
 
 // arrivalNotified deduplicates NotifyDeviceSwitchArrival across

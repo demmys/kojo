@@ -303,6 +303,147 @@ func (e errShortRead) Error() string {
 	return fmt.Sprintf("short read: got=%d want=%d", e.got, e.want)
 }
 
+// TestSyncDeviceSwitchSkillForTool_GrokOverwritesClaudeBody covers
+// the tool-change rewrite path: an agent created as claude (or
+// custom) installs the Claude-Code-flavored SKILL.md, then the
+// operator PATCHes Tool to grok. grok reads .claude/skills/, so
+// the dispatcher MUST overwrite the on-disk body with the grok
+// flavor (no `!`exec`` substitution, `grok --resume` wording) on
+// the next sync — otherwise grok would execute Claude-Code-only
+// constructs literally and the switch would derail.
+func TestSyncDeviceSwitchSkillForTool_GrokOverwritesClaudeBody(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	withPeerCount(t, 2)
+
+	const agentID = "ag_devswitch_tool_rewrite"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// Simulate the prior claude install.
+	SyncDeviceSwitchSkill(agentID, true, logger)
+	got, err := os.ReadFile(skillPath(agentID))
+	if err != nil {
+		t.Fatalf("pre-condition: claude install failed: %v", err)
+	}
+	// Sanity: the claude body uses the inline-exec sigil.
+	if !strings.Contains(string(got), "!`curl ") {
+		t.Fatalf("pre-condition: claude body did not contain expected `!`curl` marker; got:\n%s", got)
+	}
+
+	// Sync as grok. The body must change to the grok variant.
+	SyncDeviceSwitchSkillForTool(agentID, "grok", true, logger)
+	got, err = os.ReadFile(skillPath(agentID))
+	if err != nil {
+		t.Fatalf("post-grok SKILL.md missing: %v", err)
+	}
+	if strings.Contains(string(got), "!`curl ") {
+		t.Errorf("post-grok body still contains Claude-Code-only `!`curl` substitution; got:\n%s", got)
+	}
+	if !strings.Contains(string(got), "grok --resume") {
+		t.Errorf("post-grok body missing `grok --resume` wording; got:\n%s", got)
+	}
+}
+
+// TestSyncDeviceSwitchSkillForTool_GrokRemovesWhenDisabled confirms
+// the grok branch obeys the enabled flag the same way the claude
+// branch does: with enabled=false the on-disk SKILL.md goes away,
+// the surrounding .claude/ tree is left intact.
+func TestSyncDeviceSwitchSkillForTool_GrokRemovesWhenDisabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	withPeerCount(t, 2)
+
+	const agentID = "ag_devswitch_grok_off"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	// Install grok body.
+	SyncDeviceSwitchSkillForTool(agentID, "grok", true, logger)
+	if _, err := os.Stat(skillPath(agentID)); err != nil {
+		t.Fatalf("pre-condition: grok install failed: %v", err)
+	}
+
+	// Flip the toggle.
+	SyncDeviceSwitchSkillForTool(agentID, "grok", false, logger)
+	if _, err := os.Stat(skillPath(agentID)); !os.IsNotExist(err) {
+		t.Fatalf("grok SKILL.md not removed when enabled=false: err=%v", err)
+	}
+}
+
+// TestSyncDeviceSwitchSkillForTool_ClaudeInstalls confirms the
+// claude branch behaves identically to a direct SyncDeviceSwitchSkill
+// call. Mainly a guard against future refactors accidentally routing
+// claude through the cleanup branch.
+func TestSyncDeviceSwitchSkillForTool_ClaudeInstalls(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	withPeerCount(t, 1)
+
+	const agentID = "ag_devswitch_for_tool_claude"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	SyncDeviceSwitchSkillForTool(agentID, "claude", true, logger)
+
+	if _, err := os.Stat(skillPath(agentID)); err != nil {
+		t.Fatalf("SKILL.md not written via ForTool dispatch: %v", err)
+	}
+}
+
+// TestSyncDeviceSwitchSkillForTool_CodexIsNoop confirms codex (no
+// skill loader) does NOT receive any cleanup attempt — calling
+// RemoveAll on a `.claude/` tree that should not exist for codex
+// would be a code smell, and importantly we want to preserve any
+// pre-existing claude-installed file on disk so that a future
+// Tool=claude flip restores it intact (the operator may flip back
+// without realising they lost the install).
+func TestSyncDeviceSwitchSkillForTool_CodexIsNoop(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", home+"/.config")
+
+	withPeerCount(t, 1)
+
+	const agentID = "ag_devswitch_for_tool_codex"
+	if err := os.MkdirAll(agentDir(agentID), 0o755); err != nil {
+		t.Fatalf("mkdir agentDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	// Plant a pre-existing SKILL.md as if claude had previously
+	// installed it.
+	SyncDeviceSwitchSkill(agentID, true, logger)
+	if _, err := os.Stat(skillPath(agentID)); err != nil {
+		t.Fatalf("pre-condition: claude-style install failed: %v", err)
+	}
+
+	// codex sync must leave the file alone (no-op branch).
+	SyncDeviceSwitchSkillForTool(agentID, "codex", true, logger)
+
+	if _, err := os.Stat(skillPath(agentID)); err != nil {
+		t.Fatalf("codex sync unexpectedly removed pre-existing SKILL.md: %v", err)
+	}
+}
+
 // TestIsDeviceSwitchEnabled_DefaultsToTrue locks in the documented
 // default: a nil pointer means "use the default" which is true so
 // agents predating the field still get the skill.

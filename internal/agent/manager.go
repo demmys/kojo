@@ -1290,6 +1290,19 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
+	// Snapshot the tool BEFORE applying cfg so a tool change
+	// (claude↔grok, claude→custom, etc.) can fire the device-
+	// switch sync further down even when the operator didn't touch
+	// the toggle. Each backend gets a different SKILL.md body —
+	// claude/custom use `!`curl`` inline substitution that grok
+	// renders literally, and grok mentions `grok --resume` instead
+	// of `claude --continue`. Without this snapshot the on-disk
+	// body would stay frozen on the previous backend's flavour
+	// and the next switch attempt would either execute a non-
+	// substituted curl string (grok seeing a claude body) or
+	// produce wrong wording in the UI.
+	oldTool := a.Tool
+
 	oldPersona := a.Persona
 	oldOverride := a.PublicProfileOverride
 	if cfg.Persona != nil {
@@ -1433,12 +1446,20 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 
 	m.save()
 
-	// §3.7 device-switch skill: if the toggle was touched, re-sync
-	// the SKILL.md on disk now so a flip-off cleans up promptly
-	// without waiting for the next prepareChat. claude/custom only
-	// — other backends never had a .claude/ tree to begin with.
-	if cfg.DeviceSwitchEnabled != nil && (cp.Tool == "claude" || cp.Tool == "custom") {
-		SyncDeviceSwitchSkill(id, cp.IsDeviceSwitchEnabled(), m.logger)
+	// §3.7 device-switch skill: re-sync the SKILL.md on disk now if
+	// either the toggle was touched OR the tool changed (claude↔grok
+	// etc). The tool-change fork is critical because each supported
+	// backend ships a DIFFERENT SKILL.md body — claude/custom use
+	// the Claude-Code-flavored body with `!`curl`` inline shell
+	// substitution; grok uses a backend-neutral body with regular
+	// fenced bash blocks and `grok --resume` wording. Skipping the
+	// re-sync on a pure tool change would leave grok staring at a
+	// Claude-Code body it can't execute, or claude staring at the
+	// grok body with the wrong CLI invocation surfaced to the user.
+	// SyncDeviceSwitchSkillForTool dispatches to the right writer.
+	toolChanged := cfg.Tool != nil && *cfg.Tool != oldTool
+	if cfg.DeviceSwitchEnabled != nil || toolChanged {
+		SyncDeviceSwitchSkillForTool(id, cp.Tool, cp.IsDeviceSwitchEnabled(), m.logger)
 	}
 
 	return cp, nil
@@ -1615,23 +1636,32 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		apiBase = m.groupdms.APIBase()
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
+	// Claude-Code-specific hooks (PreToolUse / PreCompact) — only
+	// claude / custom understand the settings.local.json schema.
 	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
 		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
-		// §3.7 device-switch skill. Toggle defaults to true via
-		// IsDeviceSwitchEnabled; SyncDeviceSwitchSkill internally
-		// gates installation on LookupPeerCount() > 0 so a single-
-		// node install never sees the skill. Removes any stale
-		// SKILL.md when the toggle is off or the last peer was
-		// dropped.
-		SyncDeviceSwitchSkill(agentID, agentCopy.IsDeviceSwitchEnabled(), m.logger)
-		// kojo-attach skill: agent writes files into
-		// <agentDir>/.kojo/attach/ during the turn and kojo
-		// surfaces them as MessageAttachment chips on the
-		// assistant reply. Gated on blob store presence
-		// because without a blob.Store there is no canonical
-		// place to store the bytes and the user UI cannot
-		// fetch them. No operator toggle yet — the feature is
-		// always-on when the store is wired.
+	}
+	// §3.7 device-switch skill. SyncDeviceSwitchSkillForTool
+	// dispatches based on Tool. Every supported tool (claude,
+	// custom, grok) goes through normal install/remove driven by
+	// the toggle, with the right body for that backend; codex and
+	// llama.cpp are no-op (no skill loader). Toggle defaults to
+	// true via IsDeviceSwitchEnabled; the underlying writer
+	// internally gates installation on LookupPeerCount() > 0 so a
+	// single-node install never sees the skill regardless of the
+	// toggle, and removes any stale SKILL.md when the toggle is
+	// off or the last peer was dropped.
+	SyncDeviceSwitchSkillForTool(agentID, agentCopy.Tool, agentCopy.IsDeviceSwitchEnabled(), m.logger)
+	// kojo-attach skill: agent writes files into
+	// <agentDir>/.kojo/attach/ during the turn and kojo surfaces
+	// them as MessageAttachment chips on the assistant reply. Gated
+	// on backendLoadsClaudeSkills (claude/custom/grok) because the
+	// SKILL.md only reaches an LLM whose backend reads
+	// `.claude/skills/`; and on blob store presence because without
+	// a blob.Store there is no canonical place to store the bytes
+	// and the user UI cannot fetch them. No operator toggle yet —
+	// the feature is always-on when both gates pass.
+	if backendLoadsClaudeSkills(agentCopy.Tool) {
 		SyncAttachSkill(agentID, m.blobStore != nil, m.logger)
 	}
 

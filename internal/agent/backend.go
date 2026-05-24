@@ -84,6 +84,69 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 	}
 }
 
+// backendLoadsClaudeSkills reports whether the given Agent.Tool value
+// belongs to a backend that loads `.claude/skills/<name>/SKILL.md`
+// at session start. claude / custom obviously do. grok also does:
+// its skill loader treats `.claude/skills/` as a Claude-Code-
+// compatibility source (verified empirically via `grok inspect` from
+// an agentDir that has the kojo-* skills installed — they list as
+// `project` scope alongside the user-scoped `~/.grok/skills/` ones).
+// codex / llama.cpp do not have a skill loader, so any `.claude/`
+// tree in their agentDir is inert. We intentionally do NOT clean it
+// up on those tools (see SyncDeviceSwitchSkillForTool's no-op
+// branch): preserving a pre-existing install lets a Tool=claude
+// flip-back restore the original behaviour without re-running
+// install logic.
+//
+// Used to gate SyncAttachSkill installation: writing the SKILL.md
+// into an agentDir whose backend never reads it just leaves dead
+// bytes on disk.
+//
+// NOTE: kojo-switch-device has a STRICTER gate — see
+// backendSupportsDeviceSwitch. Loading the skill is necessary but
+// not sufficient; the handoff orchestrator must also know how to
+// migrate the backend's session state to the target peer.
+func backendLoadsClaudeSkills(tool string) bool {
+	switch tool {
+	case "claude", "custom", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
+// backendSupportsDeviceSwitch reports whether the device-switch
+// handoff can carry the backend's session state to the target peer.
+//
+//   - claude / custom: switch_device_handler.go transfers the
+//     ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl session files
+//     via ClaudeSessions on the peer-sync wire; backend_claude.go
+//     on target resumes with `claude --continue`.
+//
+//   - grok: same orchestrator transfers `<agentDir>/.grok/session_id`
+//     and every regular file under
+//     $GROK_HOME/sessions/<encoded(absAgentDir)>/<uuid>/ via
+//     GrokSession on the peer-sync wire (see
+//     grok_session_transfer.go); backend_grok.go on target picks up
+//     the resume pointer at the next chat and issues
+//     `grok --resume <uuid>`.
+//
+// codex / llama.cpp have no session transfer wired up; they stay
+// off.
+//
+// Gating the SKILL.md install (instead of, say, a runtime 4xx) keeps
+// the failure mode obvious for unsupported tools: the skill simply
+// doesn't appear in the backend's skill listing, so the agent never
+// offers a switch it cannot fulfil.
+func backendSupportsDeviceSwitch(tool string) bool {
+	switch tool {
+	case "claude", "custom", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
 // ChatBackend abstracts a CLI tool for agent chat.
 type ChatBackend interface {
 	// Chat sends a message and returns a channel of streaming events.

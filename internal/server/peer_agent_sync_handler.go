@@ -121,6 +121,18 @@ type peerAgentSyncRequest struct {
 	// only. Empty / absent for non-claude agents.
 	ClaudeSessions []claudeSessionWire `json:"claude_sessions,omitempty"`
 
+	// GrokSession carries the grok agent's primary session state:
+	// the resume pointer (`.grok/session_id`) plus every file
+	// under $GROK_HOME/sessions/<encoded(absAgentDir)>/<uuid>/.
+	// Target replays both so `grok --resume <uuid>` on the next
+	// chat picks up the conversation under target's own AgentDir-
+	// derived encoded path. Empty / absent for non-grok agents,
+	// for grok agents that have never started a session, and for
+	// grok agents whose stored session_id no longer resolves to a
+	// directory (treated as "no state to migrate" — a fresh
+	// session starts on target).
+	GrokSession *grokSessionWire `json:"grok_session,omitempty"`
+
 	// SinceMessageSeq, when > 0, signals INCREMENTAL message
 	// sync: the orchestrator consulted target's /agent-sync/state
 	// endpoint, learned target already has messages up to this
@@ -161,11 +173,50 @@ type peerAgentSyncRequest struct {
 	// is the only mode for this surface.
 }
 
+// agentRecordTool extracts the agent's backend CLI name from an
+// AgentRecord. Tool is stored inside the dynamic Settings map
+// (`{"tool":"grok"}`); this helper centralises the cast so the
+// grok-session-tombstone branch doesn't repeat the lookup pattern
+// inline. Returns "" when Settings is nil or the value isn't a
+// string — both fall through to the non-tombstone path, which is
+// the safer default for an unrecognised record shape.
+func agentRecordTool(rec *store.AgentRecord) string {
+	if rec == nil || rec.Settings == nil {
+		return ""
+	}
+	v, _ := rec.Settings["tool"].(string)
+	return v
+}
+
 // claudeSessionWire is the JSON shape of one transferred JSONL
 // file. SessionID is the filename without the .jsonl suffix
 // (claude's per-conversation UUID).
 type claudeSessionWire struct {
 	SessionID  string `json:"session_id"`
+	ContentB64 string `json:"content_b64"`
+}
+
+// grokSessionWire is the JSON shape of a transferred grok session.
+// SessionID identifies the conversation (UUIDv7); Files carry every
+// regular file under source's
+// $GROK_HOME/sessions/<encoded(absAgentDir)>/<SessionID>/ subtree.
+// Each entry's RelPath is the slash-separated path RELATIVE to that
+// subtree (e.g. "events.jsonl", "terminal/call-…-1.log"). Target
+// replays the subtree under its OWN encoded-agentDir path so the
+// next `grok --resume <SessionID>` (issued by backend_grok.go) finds
+// the conversation.
+type grokSessionWire struct {
+	SessionID string                `json:"session_id"`
+	Files     []grokSessionFileWire `json:"files,omitempty"`
+}
+
+// grokSessionFileWire is one file inside grokSessionWire.Files.
+// ContentB64 is base64 so the JSON envelope stays text-only — grok
+// session files include both JSONL text and small JSON blobs today,
+// but base64-everywhere insulates us from a future grok release
+// adding binary outputs (e.g. captured images) to the subtree.
+type grokSessionFileWire struct {
+	RelPath    string `json:"rel_path"`
 	ContentB64 string `json:"content_b64"`
 }
 
@@ -338,6 +389,28 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// grok session: optional. Decode here so a malformed base64
+	// surfaces as 400 before any DB / disk state is touched.
+	var decodedGrok *agent.GrokSessionTransfer
+	if req.GrokSession != nil && len(req.GrokSession.Files) > 0 {
+		decodedGrok = &agent.GrokSessionTransfer{
+			SessionID: req.GrokSession.SessionID,
+			Files:     make([]agent.GrokSessionFile, 0, len(req.GrokSession.Files)),
+		}
+		for i, gf := range req.GrokSession.Files {
+			body, derr := base64.StdEncoding.DecodeString(gf.ContentB64)
+			if derr != nil {
+				writeError(w, http.StatusBadRequest, "bad_request",
+					"grok_session.files["+itoa(i)+"]: invalid base64: "+derr.Error())
+				return
+			}
+			decodedGrok.Files = append(decodedGrok.Files, agent.GrokSessionFile{
+				RelPath: gf.RelPath,
+				Content: body,
+			})
+		}
+	}
+
 	// Materialise the portable default workDir on disk so a
 	// subsequent Settings save (validateUpdateConfigPure absolute
 	// path check + the post-existence stat in Update) doesn't 400
@@ -374,6 +447,39 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// grok session: stage in the same two-phase fashion as claude.
+	// On stage failure we roll back the already-staged claude
+	// files so target is not left with a partial cross-backend
+	// switch. On DB failure later we roll back BOTH; on success
+	// we commit BOTH.
+	//
+	// Tombstone branch: when the inbound payload says the agent IS
+	// a grok agent but carries NO GrokSession (source has no
+	// session yet OR cleared it via ResetSession), we don't just
+	// skip — we proactively purge any pre-existing grok state on
+	// target. Without this, target's stale `.grok/session_id`
+	// (inherited from a previous time target hosted the agent)
+	// would still drive `--resume` on the next chat, presenting
+	// the user with a local-history conversation that bears no
+	// relation to source's current state.
+	var grokCommit, grokRollback func()
+	var gserr error
+	if req.Agent != nil && agentRecordTool(req.Agent) == "grok" && decodedGrok == nil {
+		grokCommit, grokRollback, gserr = agent.StageGrokSessionCleanup(req.Agent.ID)
+	} else {
+		grokCommit, grokRollback, gserr = agent.StageGrokSession(req.Agent.ID, decodedGrok)
+	}
+	if gserr != nil {
+		if sessionRollback != nil {
+			sessionRollback()
+		}
+		s.logger.Error("peer agent-sync: grok session stage failed",
+			"agent", req.Agent.ID, "err", gserr)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"grok session stage: "+gserr.Error())
+		return
+	}
+
 	// Incremental message sync: SinceMessageSeq > 0 means source
 	// has consulted /agent-sync/state, confirmed source's
 	// transcript is append-only (no tombstones, no edits), and
@@ -394,6 +500,9 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	if req.SinceMemoryEntrySeq > 0 {
 		if sessionRollback != nil {
 			sessionRollback()
+		}
+		if grokRollback != nil {
+			grokRollback()
 		}
 		writeError(w, http.StatusBadRequest, "unsupported",
 			"since_memory_entry_seq is not a valid delta cursor; use since_memory_entry_updated_at")
@@ -429,6 +538,9 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		if sessionRollback != nil {
 			sessionRollback()
 		}
+		if grokRollback != nil {
+			grokRollback()
+		}
 		s.logger.Error("peer agent-sync: store apply failed; rolled back session files",
 			"agent", req.Agent.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -437,6 +549,9 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 	}
 	if sessionCommit != nil {
 		sessionCommit()
+	}
+	if grokCommit != nil {
+		grokCommit()
 	}
 
 	// Reconcile target's MEMORY.md + memory/* tree against the

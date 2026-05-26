@@ -2,7 +2,13 @@ package slackbot
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
@@ -204,5 +210,267 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 
 	if bot.shouldAutoReply("C1", "ts1", "hello") {
 		t.Fatal("should not auto-reply with empty agentDataDir")
+	}
+}
+
+// --- postMessage tests ---
+
+// TestBotPostMessageSendsMarkdownTextOnly verifies that postMessage emits
+// only the markdown_text form field. Pairing it with text triggers Slack's
+// markdown_text_conflict error and the call silently fails — observed in
+// production (2026-05-19) and the cause of stream finalize truncation in
+// multi-chunk replies. Regression guard: if a future change re-adds
+// MsgOptionText to postMessage, this test must fail.
+func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
+	type captured struct {
+		text         string
+		markdownText string
+		called       int
+	}
+	var got captured
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			_ = r.ParseForm()
+			got.text = r.FormValue("text")
+			got.markdownText = r.FormValue("markdown_text")
+			got.called++
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+	}
+
+	if !bot.postMessage(context.Background(), "C1", "", "hello world") {
+		t.Fatal("postMessage should succeed against a mock returning ok")
+	}
+	if got.called != 1 {
+		t.Fatalf("chat.postMessage called %d times, want 1", got.called)
+	}
+	if got.markdownText != "hello world" {
+		t.Errorf("markdown_text = %q, want %q", got.markdownText, "hello world")
+	}
+	if got.text != "" {
+		t.Errorf("text must be empty to avoid markdown_text_conflict, got %q", got.text)
+	}
+}
+
+// TestFinalizeUpdateOptsSendsMarkdownTextOnly verifies that the stream-finalize
+// chat.update call wires markdown_text alone, with no text field. Pairing
+// MsgOptionText with MsgOptionMarkdownText was the root cause of the
+// "{accumulated stream buffer} + {final body}" double-render bug (see the
+// IMPORTANT comment in sendToAgent). Mirrors TestBotPostMessageSendsMarkdownTextOnly
+// but covers the chat.update path — the postMessage test alone does not
+// guard against re-adding MsgOptionText to the finalize update slice.
+func TestFinalizeUpdateOptsSendsMarkdownTextOnly(t *testing.T) {
+	type captured struct {
+		text         string
+		markdownText string
+		threadTS     string
+		called       int
+	}
+	var got captured
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.update":
+			_ = r.ParseForm()
+			got.text = r.FormValue("text")
+			got.markdownText = r.FormValue("markdown_text")
+			got.threadTS = r.FormValue("thread_ts")
+			got.called++
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+
+	opts := finalizeUpdateOpts("hello body", "thread.999")
+	if _, _, _, err := api.UpdateMessageContext(context.Background(), "C1", "stream.111", opts...); err != nil {
+		t.Fatalf("UpdateMessageContext failed: %v", err)
+	}
+
+	if got.called != 1 {
+		t.Fatalf("chat.update called %d times, want 1", got.called)
+	}
+	if got.markdownText != "hello body" {
+		t.Errorf("markdown_text = %q, want %q", got.markdownText, "hello body")
+	}
+	if got.text != "" {
+		t.Errorf("text must be empty to avoid double-render with the streamed buffer, got %q", got.text)
+	}
+	if got.threadTS != "thread.999" {
+		t.Errorf("thread_ts = %q, want %q", got.threadTS, "thread.999")
+	}
+}
+
+// TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty guards the conditional MsgOptionTS
+// append — passing an empty threadTS would otherwise leak `ts=` to the wire and
+// chat.update would reject it.
+func TestFinalizeUpdateOptsOmitsThreadTSWhenEmpty(t *testing.T) {
+	var sawTS string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chat.update" {
+			_ = r.ParseForm()
+			// chat.update encodes the stream ts as the "ts" field; what we care
+			// about here is the *thread_ts* field, which finalizeUpdateOpts
+			// adds via MsgOptionTS only when threadTS != "". An empty input
+			// must not surface thread_ts on the wire.
+			sawTS = r.FormValue("thread_ts")
+		}
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	opts := finalizeUpdateOpts("body", "")
+	if _, _, _, err := api.UpdateMessageContext(context.Background(), "C1", "stream.222", opts...); err != nil {
+		t.Fatalf("UpdateMessageContext failed: %v", err)
+	}
+	if sawTS != "" {
+		t.Errorf("thread_ts must be empty when input threadTS is empty, got %q", sawTS)
+	}
+}
+
+// TestDeliveryFailureNoticeDoesNotAttributeCause guards against regressing
+// the notice wording back to a cause-specific phrasing like "too long".
+// The notice is posted from any deliveredAll=false path in sendToAgent
+// (stream-finalize and batch-fallback), and those failures may come from
+// chunkPostTimeout expiry, transient Slack API errors, or context cancel
+// — not just oversized replies. The text must stay cause-neutral so users
+// aren't misled into thinking they hit a length limit when they didn't.
+func TestDeliveryFailureNoticeDoesNotAttributeCause(t *testing.T) {
+	forbidden := []string{"too long", "too large", "exceeded", "limit"}
+	lower := strings.ToLower(deliveryFailureNotice)
+	for _, sub := range forbidden {
+		if strings.Contains(lower, sub) {
+			t.Errorf("deliveryFailureNotice = %q must not imply specific cause %q", deliveryFailureNotice, sub)
+		}
+	}
+	if !strings.Contains(deliveryFailureNotice, "could not be delivered") {
+		t.Errorf("deliveryFailureNotice = %q should describe a generic delivery failure", deliveryFailureNotice)
+	}
+}
+
+// TestPostMessageRateLimitNoExtraSleepOnFinalAttempt guards against the
+// rate-limit retry loop sleeping after the last permitted attempt fails.
+// Before the fix, an attempt == maxRateLimitRetry that hit a 429 still
+// spent attempt+1 seconds in time.After before exiting the loop, eating
+// chunkPostTimeout budget for no subsequent retry. After the fix the loop
+// must:
+//   - perform exactly maxRateLimitRetry+1 PostMessage calls
+//   - sleep at most maxRateLimitRetry times (one per gap between attempts)
+//   - return false promptly when the final attempt is also rate-limited
+func TestPostMessageRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sleeps atomic.Int32
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+		// Use a synchronous "instant fire" sleeper so the test does not
+		// depend on real wall-clock waits while still counting how many
+		// times the loop tried to sleep.
+		rateLimitSleep: func(d time.Duration) <-chan time.Time {
+			sleeps.Add(1)
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+
+	if bot.postMessage(context.Background(), "C1", "", "hello") {
+		t.Fatal("postMessage should return false when all attempts are rate limited")
+	}
+
+	if got := calls.Load(); got != int32(maxRateLimitRetry+1) {
+		t.Errorf("PostMessage call count = %d, want %d (maxRateLimitRetry+1)", got, maxRateLimitRetry+1)
+	}
+	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
+		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
+	}
+}
+
+// TestAppendStreamRateLimitNoExtraSleepOnFinalAttempt mirrors the
+// postMessage guard for appendStream's identical retry loop. Both sites
+// must stop sleeping once attempt == maxRateLimitRetry — a stray sleep
+// there delays the entire stream-finalize path with no follow-up
+// AppendStream call to justify the wait.
+func TestAppendStreamRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slack streaming sends chat.appendStream — return 429 on any
+		// path that isn't an irrelevant info call so the test stays
+		// resilient to URL routing changes in slack-go.
+		if strings.Contains(r.URL.Path, "appendStream") {
+			calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sleeps atomic.Int32
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+		rateLimitSleep: func(d time.Duration) <-chan time.Time {
+			sleeps.Add(1)
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+
+	bot.appendStream(context.Background(), "C1", "stream-ts", "delta")
+
+	if got := calls.Load(); got != int32(maxRateLimitRetry+1) {
+		t.Errorf("AppendStream call count = %d, want %d (maxRateLimitRetry+1)", got, maxRateLimitRetry+1)
+	}
+	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
+		t.Errorf("rateLimitSleep invocations = %d, want %d (one per inter-attempt gap; no sleep after final attempt)", got, maxRateLimitRetry)
 	}
 }

@@ -61,6 +61,12 @@ type Bot struct {
 
 	// sem limits the number of concurrent sendToAgent goroutines.
 	sem chan struct{}
+
+	// rateLimitSleep, when non-nil, replaces time.After in postMessage /
+	// appendStream's rate-limit backoff wait. Tests use this to count
+	// sleeps and run the retry loop without real wall-clock delays. nil
+	// in production.
+	rateLimitSleep func(time.Duration) <-chan time.Time
 }
 
 const (
@@ -77,6 +83,32 @@ const (
 
 	// typingStatus is the assistant status text shown while processing a message.
 	typingStatus = "Thinking…"
+
+	// finalizeShortTimeout caps the single-call finalize ops
+	// (StopStream, chat.update, clearAssistantStatus) that share finCtx.
+	// chunks[1:] posting and the delivery-failure notice each get their
+	// own context — they can spend longer than this on rate-limit retries.
+	finalizeShortTimeout = 5 * time.Second
+
+	// chunkPostTimeoutBase/PerChunk/Max bound the timeout budget used when
+	// posting chunks[1:] (and any postMessage fallback for chunks[0]).
+	// postMessage's rate-limit retry alone can spend 1+2+3=6 s on a single
+	// 429, so a finalize block that fires 5 chunks could need 30 s+ before
+	// any one of them gives up. We give a per-chunk allowance covering that
+	// worst case + HTTP RTT, capped at chunkPostTimeoutMax so a runaway
+	// reply (hundreds of chunks) does not hold the goroutine for minutes.
+	chunkPostTimeoutBase     = 10 * time.Second
+	chunkPostTimeoutPerChunk = 7 * time.Second
+	chunkPostTimeoutMax      = 90 * time.Second
+
+	// deliveryFailureNotice is the user-visible message posted when one or
+	// more chunks of a multi-chunk reply could not be delivered. The text
+	// stays cause-neutral on purpose — the failure can come from rate
+	// limiting, transient Slack API errors, context cancellation, or
+	// chunkPostTimeout expiry, and attributing it to "too long" would
+	// mislead users who hit a non-length failure. Centralized so the
+	// stream-finalize and batch-fallback paths cannot drift apart.
+	deliveryFailureNotice = "_⚠️ The full response could not be delivered to Slack. Check kojo logs for details._"
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -99,10 +131,10 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 		botToken:     botToken,
 		ctx:          ctx,
 		cancel:       cancel,
-		done:        make(chan struct{}),
-		threadLocks: make(map[string]*threadLock),
-		userCache:   make(map[string]string),
-		sem:         make(chan struct{}, maxConcurrentChats),
+		done:         make(chan struct{}),
+		threadLocks:  make(map[string]*threadLock),
+		userCache:    make(map[string]string),
+		sem:          make(chan struct{}, maxConcurrentChats),
 	}
 }
 
@@ -559,8 +591,11 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 
 	// Use a separate context for finalization so cleanup API calls
 	// (StopStream, UpdateMessage, etc.) complete even if the Bot's context
-	// was cancelled (e.g. during shutdown or reconfiguration).
-	finCtx, finCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// was cancelled (e.g. during shutdown or reconfiguration). finCtx
+	// covers the short, single-call ops only — chunk posting via
+	// postMessage gets its own larger context per call site (see
+	// chunkPostTimeout) so rate-limit backoff doesn't truncate the reply.
+	finCtx, finCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	defer finCancel()
 
 	// Flush any remaining text delta before finalizing.
@@ -578,36 +613,84 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		// Replace stream content with the full response via chat.update.
 		// This guarantees complete text even if AppendStream calls were
 		// lost to rate limiting, stream timeout, or transient errors.
+		// Use MsgOptionMarkdownText (markdown_text param) so Slack uses
+		// the same full-Markdown renderer as chat.appendStream; the
+		// legacy mrkdwn renderer (text param) does not support tables,
+		// headings, etc.
 		//
-		// We send markdown_text (full-Markdown renderer matching
-		// chat.appendStream — supports tables, headings, etc.) AND the
-		// legacy text param. Clients that ignore markdown_text — push
-		// notifications, link unfurls, search-result previews — surface
-		// text instead, so without the fallback those surfaces would
-		// show "no preview" for every bot reply. Slack uses markdown_text
-		// for in-channel rendering when both are set.
+		// IMPORTANT: send markdown_text ALONE — do NOT pair it with
+		// MsgOptionText. Slack's chat.update docs only state that
+		// markdown_text may be sent without text (it does not document
+		// the streamed-buffer interaction directly), but empirically
+		// pairing both leaves Slack rendering as "{accumulated stream
+		// markdown_text} + {final body}" — i.e. the chat.update text
+		// field is overwritten while the streamed markdown_text buffer
+		// stays intact. Sending markdown_text alone empirically yields
+		// the desired replacement (this matched the working behavior
+		// observed up to 2026-05-17, before MsgOptionText was added).
+		// Push notification previews lose their body text as a side
+		// effect; handled outside the stream-finalize path.
 		if response.Len() > 0 {
 			text := response.String()
 			chunks := SplitMessage(text, slackMaxMsgLen)
-			updateOpts := []slack.MsgOption{
-				slack.MsgOptionText(chunks[0], false),
-				slack.MsgOptionMarkdownText(chunks[0]),
+			updateOpts := finalizeUpdateOpts(chunks[0], threadTS)
+
+			deliveredAll := true
+			_, _, _, updateErr := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...)
+			if updateErr != nil {
+				b.logger.Warn("failed to update stream message with final text", "err", updateErr)
 			}
-			if threadTS != "" {
-				updateOpts = append(updateOpts, slack.MsgOptionTS(threadTS))
-			}
-			if _, _, _, err := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...); err != nil {
-				b.logger.Warn("failed to update stream message with final text", "err", err)
-				// Fallback: post the first chunk as a fresh message so
-				// the final reply still reaches the user. Without this,
-				// a chat.update failure leaves the channel with whatever
+
+			// chunks[1:] (and any postMessage fallback for chunks[0]) need
+			// their own context — finCtx only has finalizeShortTimeout
+			// covering StopStream + chat.update + clearAssistantStatus, and
+			// postMessage's rate-limit retry alone can consume 1+2+3s.
+			// chunkPostTimeout scales with chunk count and caps at
+			// chunkPostTimeoutMax so huge replies don't hold the goroutine
+			// open for several minutes.
+			//
+			// Allocate AFTER UpdateMessageContext returns so a slow
+			// chat.update round-trip doesn't eat into the chunk-posting
+			// budget. (chat.update itself uses finCtx and has its own
+			// short timeout.)
+			chunkCtx, chunkCancel := context.WithTimeout(context.Background(), chunkPostTimeout(len(chunks)))
+			defer chunkCancel()
+
+			if updateErr != nil {
+				// Fallback: post the first chunk as a fresh message so the
+				// final reply still reaches the user. Without this, a
+				// chat.update failure leaves the channel with whatever
 				// partial AppendStream output happened to land, possibly
 				// truncated.
-				b.postMessage(finCtx, channel, threadTS, chunks[0])
+				//
+				// If even chunks[0] fails, do NOT post the remaining
+				// chunks — emitting chunks[1:] without their lead would
+				// just confuse the user. Skip straight to the delivery
+				// failure notice.
+				if !b.postMessage(chunkCtx, channel, threadTS, chunks[0]) {
+					deliveredAll = false
+				}
 			}
-			// Remaining chunks: post as follow-up messages.
-			for _, chunk := range chunks[1:] {
-				b.postMessage(finCtx, channel, threadTS, chunk)
+			// Remaining chunks: post as follow-up messages, but only if
+			// chunks[0] reached the user. Stop on the first failure —
+			// once chunkCtx is cancelled or Slack is hard rate-limiting
+			// us, subsequent posts will fail the same way.
+			if deliveredAll {
+				for _, chunk := range chunks[1:] {
+					if !b.postMessage(chunkCtx, channel, threadTS, chunk) {
+						deliveredAll = false
+						break
+					}
+				}
+			}
+			if !deliveredAll {
+				// Surface the delivery failure to the user with a fresh
+				// context — chunkCtx may already be expired at this point.
+				// Best effort; if this also fails the log entries from
+				// postMessage are the trail.
+				noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
+				noticeCancel()
 			}
 		} else {
 			// Stream was started — usually by the first tool_use event —
@@ -624,10 +707,24 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no
-		// streaming support).
+		// streaming support). Same chunkCtx pattern as the streaming
+		// path: finCtx is too short to cover postMessage's full
+		// rate-limit retry chain when there are multiple chunks.
 		chunks := SplitMessage(response.String(), slackMaxMsgLen)
+		chunkCtx, chunkCancel := context.WithTimeout(context.Background(), chunkPostTimeout(len(chunks)))
+		defer chunkCancel()
+
+		deliveredAll := true
 		for _, chunk := range chunks {
-			b.postMessage(finCtx, channel, threadTS, chunk)
+			if !b.postMessage(chunkCtx, channel, threadTS, chunk) {
+				deliveredAll = false
+				break
+			}
+		}
+		if !deliveredAll {
+			noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+			b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
+			noticeCancel()
 		}
 	} else if hasError || streamFailed {
 		// Either an explicit agent error, or StartStream failed and the
@@ -637,8 +734,11 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	}
 
 	// Clear typing indicator (auto-clears on message post, but explicit
-	// clear as safety net).
-	b.clearAssistantStatus(finCtx, channel, threadTS)
+	// clear as safety net). Uses a fresh context — finCtx may already be
+	// expired after a long chunk-posting + delivery-failure-notice path.
+	clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+	b.clearAssistantStatus(clearCtx, channel, threadTS)
+	clearCancel()
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
@@ -800,12 +900,32 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
+			// No retries left — return without sleeping. Sleeping
+			// past the final attempt has no follow-up call to wait
+			// for and just delays the rest of the stream finalize
+			// path. Mirrors the same guard in postMessage so both
+			// retry sites stay in lockstep.
+			//
+			// Log on exhaustion so a sustained 429 storm leaves a
+			// trail — without this, stream deltas stop appearing in
+			// the channel with no log entry to correlate against
+			// (non-rate-limit errors hit the Debug log below).
+			if attempt == maxRateLimitRetry {
+				b.logger.Warn("failed to append slack stream after rate limit retries",
+					"channel", channel, "streamTS", streamTS,
+					"retryAfter", rlErr.RetryAfter, "err", err)
+				return
+			}
 			delay := rlErr.RetryAfter
 			if delay == 0 {
 				delay = time.Duration(attempt+1) * time.Second
 			}
+			sleep := b.rateLimitSleep
+			if sleep == nil {
+				sleep = time.After
+			}
 			select {
-			case <-time.After(delay):
+			case <-sleep(delay):
 				continue
 			case <-ctx.Done():
 				return
@@ -814,6 +934,32 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 		b.logger.Debug("append stream failed", "err", err)
 		return
 	}
+}
+
+// finalizeUpdateOpts returns the slack.MsgOption slice used by the
+// stream-finalize chat.update call. Centralized so the wire shape
+// (markdown_text alone, no MsgOptionText) is asserted from tests
+// without invoking the full sendToAgent path. See the IMPORTANT
+// comment in sendToAgent for why MsgOptionText must not be paired
+// with MsgOptionMarkdownText on this code path.
+func finalizeUpdateOpts(text, threadTS string) []slack.MsgOption {
+	opts := []slack.MsgOption{
+		slack.MsgOptionMarkdownText(text),
+	}
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	return opts
+}
+
+// chunkPostTimeout returns the timeout budget for posting nChunks
+// messages via postMessage, capped at chunkPostTimeoutMax.
+func chunkPostTimeout(nChunks int) time.Duration {
+	d := chunkPostTimeoutBase + chunkPostTimeoutPerChunk*time.Duration(nChunks)
+	if d > chunkPostTimeoutMax {
+		d = chunkPostTimeoutMax
+	}
+	return d
 }
 
 // clearAssistantStatus clears the assistant typing indicator (best-effort).
@@ -825,15 +971,37 @@ func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string
 	})
 }
 
-func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
-	// Send both markdown_text and the legacy text param. Slack renders
-	// markdown_text in-channel (full Markdown: tables, headings, etc.)
-	// while surfaces that ignore markdown_text — push notifications,
-	// link unfurls, search previews — fall back to text. Without the
-	// fallback those surfaces would show empty previews for every bot
-	// reply. Symmetric with the streaming chat.update path above.
+// postMessage sends a message to Slack with rate-limit retry. Returns
+// true if Slack accepted the post, false if the call ultimately failed
+// (rate-limit retries exhausted, context cancelled, or any non-rate-limit
+// error). Failure reasons are logged at Warn. Callers in the finalize
+// block use the return value to detect chunk-level delivery failures and
+// surface a user-visible notice; callers that only need best-effort
+// delivery may ignore it.
+func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) bool {
+	// Send markdown_text alone. Pairing MsgOptionText with
+	// MsgOptionMarkdownText was empirically observed (2026-05-19
+	// production logs) to make Slack return markdown_text_conflict, so
+	// every chat.postMessage call silently fails. This broke the
+	// finalize block: stream chunks[1:] (multi-chunk replies) and the
+	// delivery-failure notice fallback were both dropped, leaving the
+	// channel with only chunks[0] visible. The streaming-update path
+	// also goes markdown_text-alone for an unrelated reason (Slack
+	// double-renders when both fields are set on chat.update); make
+	// chat.postMessage symmetric.
+	//
+	// Trade-off: push notification previews, link unfurls and other
+	// surfaces that ignore markdown_text now show whatever fallback
+	// Slack auto-generates from the blocks (typically incomplete for
+	// tables/code blocks). That is strictly better than the previous
+	// behavior, where the message itself never reached Slack at all.
+	//
+	// markdown_text is sent raw — Slack parses Markdown directly and
+	// resolves mention tokens the LLM intentionally emits (<!channel>,
+	// <@U…>, …) the same way as the chat.update path. Mention misuse
+	// is controlled by the agent's system prompt, not by escaping at
+	// this layer.
 	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
 		slack.MsgOptionMarkdownText(text),
 	}
 	if threadTS != "" {
@@ -843,26 +1011,49 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) {
 	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
 		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
 		if err == nil {
-			return
+			return true
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
+			// No retries left — return immediately. Sleeping here
+			// would burn 1+ s of chunkPostTimeout for no subsequent
+			// attempt, exceeding the documented 1+2+3 s backoff
+			// chain and risking a cascade where later chunks lose
+			// their budget too.
+			if attempt == maxRateLimitRetry {
+				// Include err and RetryAfter so production logs
+				// can distinguish a Slack hard 429 from a slow
+				// recovery — without these the Warn is opaque.
+				b.logger.Warn("failed to post slack message after rate limit retries",
+					"channel", channel, "threadTS", threadTS,
+					"retryAfter", rlErr.RetryAfter, "err", err)
+				return false
+			}
 			wait := rlErr.RetryAfter
 			if wait <= 0 {
 				wait = time.Duration(attempt+1) * time.Second
 			}
 			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+			sleep := b.rateLimitSleep
+			if sleep == nil {
+				sleep = time.After
+			}
 			select {
 			case <-ctx.Done():
-				return
-			case <-time.After(wait):
+				b.logger.Warn("slack post cancelled while waiting on rate limit",
+					"channel", channel, "threadTS", threadTS, "err", ctx.Err())
+				return false
+			case <-sleep(wait):
 				continue
 			}
 		}
-		b.logger.Warn("failed to post slack message", "channel", channel, "err", err)
-		return
+		b.logger.Warn("failed to post slack message",
+			"channel", channel, "threadTS", threadTS, "err", err)
+		return false
 	}
-	b.logger.Warn("failed to post slack message after rate limit retries", "channel", channel)
+	// Unreachable: the rate-limited branch above returns on the final
+	// attempt rather than falling through. Kept to satisfy the compiler.
+	return false
 }
 
 // threadLock is a reference-counted mutex for serializing per-thread processing.

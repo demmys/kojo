@@ -93,9 +93,16 @@ const peerAgentSyncMaxBody = 128 << 20
 // longer bounds the body, so this constant is the only ceiling
 // on what the handler will pull off the socket; ≤ peerAgentSyncMaxBody
 // so uncompressed bodies from the owner path stay bounded too.
-// 32 MiB gives owner / drill room to send a small-to-moderate raw
-// JSON without admitting a gzip-bomb-grade compressed input.
-const peerAgentSyncMaxWireBody = 32 << 20
+//
+// Pinned to peerAgentSyncMaxBody. A smaller wire cap is an
+// artificial bottleneck — gzip-bomb defense already lives in the
+// LimitReader around the gzip reader (caps decompressed size), so
+// admitting up to 128 MiB on the wire doesn't widen the memory
+// attack surface. Long-lived agents accumulate claude / grok
+// session JSONLs that base64-bloat poorly (high-entropy tool_use
+// payloads compress at ~1.0×), and the 32 MiB cap was rejecting
+// those during kojo-switch-device with "agent_too_large".
+const peerAgentSyncMaxWireBody = peerAgentSyncMaxBody
 
 type peerAgentSyncRequest struct {
 	SourceDeviceID string `json:"source_device_id"`
@@ -261,20 +268,24 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, peerAgentSyncMaxWireBody))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"read body: "+err.Error())
-		return
-	}
-	// Honor Content-Encoding: gzip. The peer auth middleware
-	// already verified the signature over the COMPRESSED bytes
-	// (whatever bytes arrived on r.Body); decompressing here is
-	// a pure transport-level translation. Bound the decompressed
-	// size by peerAgentSyncMaxBody so a gzip bomb can't blow up
-	// memory. Case-insensitive comparison per RFC 7230.
-	if enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc == "gzip" {
-		gz, gerr := gzip.NewReader(bytes.NewReader(body))
+	// Wire cap and decompressed cap are now equal (both
+	// peerAgentSyncMaxBody). To keep peak memory bounded by ONE
+	// cap (not wire + decoded simultaneously), gzip-encoded bodies
+	// are streamed: the MaxBytesReader bounds the compressed
+	// stream and gzip.NewReader decompresses on the fly. The
+	// fully-buffered `body` only holds the JSON we need to decode.
+	// Case-insensitive Content-Encoding per RFC 7230.
+	limited := http.MaxBytesReader(w, r.Body, peerAgentSyncMaxWireBody)
+	var body []byte
+	enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
+	switch enc {
+	case "gzip":
+		// The peer auth middleware already verified the signature
+		// over the COMPRESSED bytes (whatever bytes arrived on
+		// r.Body); decompressing here is a pure transport-level
+		// translation. The LimitReader around gz caps the
+		// decompressed size so a gzip bomb can't blow up memory.
+		gz, gerr := gzip.NewReader(limited)
 		if gerr != nil {
 			writeError(w, http.StatusBadRequest, "bad_request",
 				"gzip reader: "+gerr.Error())
@@ -295,7 +306,17 @@ func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		body = decoded
-	} else if enc != "" {
+	case "":
+		// Identity-encoded: read straight from the bounded
+		// reader.
+		raw, rerr := io.ReadAll(limited)
+		if rerr != nil {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"read body: "+rerr.Error())
+			return
+		}
+		body = raw
+	default:
 		// Any other Content-Encoding is a misconfiguration; we
 		// don't want to silently treat it as identity-encoded.
 		writeError(w, http.StatusUnsupportedMediaType, "bad_request",

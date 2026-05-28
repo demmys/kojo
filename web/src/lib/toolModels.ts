@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "opus", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "opus", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-5.5",
@@ -49,7 +49,15 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-opus-4-7", "grok-build"]);
+const xhighModels = new Set(["opus", "claude-opus-4-8", "claude-opus-4-7", "grok-build"]);
+
+/**
+ * Models whose default effort is xhigh (rather than high).
+ * Per https://code.claude.com/docs/en/model-config, Opus 4.8 supports xhigh but
+ * defaults to high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated
+ * as Opus 4.8, so it defaults to high. grok-build keeps xhigh default.
+ */
+const defaultXhighModels = new Set(["claude-opus-4-7", "grok-build"]);
 
 export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok";
@@ -63,5 +71,5 @@ export function effortLevelsForModel(model: string): readonly EffortLevel[] {
 
 /** Return the default effort level label for a given model. */
 export function defaultEffortForModel(model: string): string {
-  return xhighModels.has(model) ? "xhigh" : "high";
+  return defaultXhighModels.has(model) ? "xhigh" : "high";
 }

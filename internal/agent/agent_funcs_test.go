@@ -151,7 +151,7 @@ func TestValidEffort(t *testing.T) {
 
 func TestValidModelEffort(t *testing.T) {
 	// xhigh is valid for opus models
-	for _, m := range []string{"opus", "claude-opus-4-7"} {
+	for _, m := range []string{"opus", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}

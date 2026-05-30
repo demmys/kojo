@@ -596,3 +596,100 @@ func TestTrimDiaryStringEntries(t *testing.T) {
 		}
 	}
 }
+
+// TestTruncateClaudeSessionFileDeletesNoConversation verifies that a
+// session file is deleted when truncation removes all conversation
+// entries (user + assistant turns) but leaves non-conversation metadata
+// lines. Without this, --resume would be used against a session that
+// has no turns, causing Claude CLI to error with "No conversation".
+func TestTruncateClaudeSessionFileDeletesNoConversation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess.jsonl")
+
+	// init entry (no timestamp) survives the timestamp gate,
+	// conversation entries are after "since" and will be dropped.
+	lines := []string{
+		claudeLine(t, map[string]any{
+			"type": "system",
+			"message": map[string]any{
+				"role":    "system",
+				"content": "init prompt",
+			},
+		}),
+		claudeLine(t, map[string]any{
+			"type":      "user",
+			"timestamp": "2026-05-09T05:00:00.000Z",
+			"message":   map[string]any{"role": "user", "content": "hello"},
+		}),
+		claudeLine(t, map[string]any{
+			"type":      "assistant",
+			"timestamp": "2026-05-09T05:00:30.000Z",
+			"message":   map[string]any{"content": []map[string]any{{"type": "text", "text": "hi"}}},
+		}),
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	since := mustParseRFC3339(t, "2026-05-09T04:00:00Z")
+	removed, deleted, err := truncateClaudeSessionFile(path, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
+		t.Error("file should be deleted when no conversation entries remain")
+	}
+	if removed != 2 {
+		t.Errorf("removed=%d, want 2", removed)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still exists after deletion: err=%v", err)
+	}
+}
+
+// TestTruncateClaudeSessionFileDeletesSummaryWithConversation verifies
+// that when truncation drops conversation entries, surviving summary
+// entries (from auto-compact) are also removed — they contain a digest
+// of the erased history. The resulting empty session file is deleted.
+func TestTruncateClaudeSessionFileDeletesSummaryWithConversation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sess.jsonl")
+
+	lines := []string{
+		claudeLine(t, map[string]any{
+			"type": "summary",
+			"message": map[string]any{
+				"content": "summary of previous conversation",
+			},
+		}),
+		claudeLine(t, map[string]any{
+			"type":      "user",
+			"timestamp": "2026-05-09T05:00:00.000Z",
+			"message":   map[string]any{"role": "user", "content": "hello"},
+		}),
+		claudeLine(t, map[string]any{
+			"type":      "assistant",
+			"timestamp": "2026-05-09T05:00:30.000Z",
+			"message":   map[string]any{"content": []map[string]any{{"type": "text", "text": "hi"}}},
+		}),
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	since := mustParseRFC3339(t, "2026-05-09T04:00:00Z")
+	removed, deleted, err := truncateClaudeSessionFile(path, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted {
+		t.Error("file should be deleted — summary must be erased along with conversation turns")
+	}
+	// 2 conversation entries dropped by timestamp + 1 summary stripped
+	if removed != 3 {
+		t.Errorf("removed=%d, want 3", removed)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still exists after deletion: err=%v", err)
+	}
+}

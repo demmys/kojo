@@ -490,13 +490,20 @@ type claudeSessionEntry struct {
 	toolResultIDs []string // tool_use_id refs contained in a synthetic user message
 }
 
+// classifyResult holds the outcome of classifyClaudeSessionLines.
+type classifyResult struct {
+	keep                    []claudeSessionEntry
+	timestampDropped        int
+	conversationTurnDropped bool // true when at least one user(real) or assistant entry was dropped
+}
+
 // classifyClaudeSessionLines walks rawLines once, dropping entries whose
 // timestamp is at-or-after `since` and tagging the survivors with the
 // type / tool-block-id metadata pruneOrphanTailEntries needs. Lines
 // that are blank or fail JSON parsing are preserved verbatim (only the
 // raw field is set); they never participate in the timestamp gate.
-func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) (keep []claudeSessionEntry, timestampDropped int) {
-	keep = make([]claudeSessionEntry, 0, len(rawLines))
+func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) classifyResult {
+	res := classifyResult{keep: make([]claudeSessionEntry, 0, len(rawLines))}
 	for _, raw := range rawLines {
 		stripped := raw
 		if len(stripped) > 0 && stripped[len(stripped)-1] == '\n' {
@@ -506,7 +513,7 @@ func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) (keep []clau
 			}
 		}
 		if len(stripped) == 0 {
-			keep = append(keep, claudeSessionEntry{raw: raw})
+			res.keep = append(res.keep, claudeSessionEntry{raw: raw})
 			continue
 		}
 		var entry struct {
@@ -515,12 +522,15 @@ func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) (keep []clau
 			Message   json.RawMessage `json:"message"`
 		}
 		if json.Unmarshal(stripped, &entry) != nil {
-			keep = append(keep, claudeSessionEntry{raw: raw})
+			res.keep = append(res.keep, claudeSessionEntry{raw: raw})
 			continue
 		}
 		if entry.Timestamp != "" {
 			if t, perr := time.Parse(time.RFC3339Nano, entry.Timestamp); perr == nil && !t.Before(since) {
-				timestampDropped++
+				res.timestampDropped++
+				if entry.Type == "assistant" || (entry.Type == "user" && isRealUserEntry(entry.Message)) {
+					res.conversationTurnDropped = true
+				}
 				continue
 			}
 		}
@@ -534,9 +544,9 @@ func classifyClaudeSessionLines(rawLines [][]byte, since time.Time) (keep []clau
 		case "assistant":
 			k.toolUseIDs = collectToolUseIDs(entry.Message)
 		}
-		keep = append(keep, k)
+		res.keep = append(res.keep, k)
 	}
-	return keep, timestampDropped
+	return res
 }
 
 // pruneOrphanTailEntries removes trailing synthetic-user (tool_result)
@@ -583,6 +593,23 @@ func pruneOrphanTailEntries(keep []claudeSessionEntry) (after []claudeSessionEnt
 	return keep, dropped
 }
 
+// pruneSummaryEntries removes all entries with typ == "summary". Summary
+// entries contain a condensed digest of the full conversation history; when
+// truncation has dropped conversation turns, the surviving summaries would
+// still reference the erased content. Because a summary cannot be partially
+// redacted, all of them are removed.
+func pruneSummaryEntries(keep []claudeSessionEntry) (after []claudeSessionEntry, dropped int) {
+	out := make([]claudeSessionEntry, 0, len(keep))
+	for _, k := range keep {
+		if k.typ == "summary" {
+			dropped++
+			continue
+		}
+		out = append(out, k)
+	}
+	return out, dropped
+}
+
 func truncateClaudeSessionFile(path string, since time.Time) (removed int, deleted bool, err error) {
 	src, oerr := os.Open(path)
 	if oerr != nil {
@@ -610,11 +637,28 @@ func truncateClaudeSessionFile(path string, since time.Time) (removed int, delet
 	}
 	src.Close()
 
-	keep, timestampDropped := classifyClaudeSessionLines(rawLines, since)
-	removed = timestampDropped
+	cl := classifyClaudeSessionLines(rawLines, since)
+	keep := cl.keep
+	removed = cl.timestampDropped
 
-	if timestampDropped > 0 {
+	if cl.timestampDropped > 0 {
 		var orphanDropped int
+
+		// Summary entries (from Claude's auto-compact) contain a digest
+		// of the conversation history that includes the turns we just
+		// dropped. Keeping them would leak the memories the truncate is
+		// supposed to erase. Strip all surviving summaries — they can't
+		// be surgically edited to remove only post-since content.
+		// Only strip when an actual conversation turn was dropped; pure
+		// metadata drops (e.g. system entries) don't taint summaries.
+		if cl.conversationTurnDropped {
+			keep, orphanDropped = pruneSummaryEntries(keep)
+			removed += orphanDropped
+		}
+
+		// Prune orphaned tail entries AFTER summary removal — dropping a
+		// trailing summary may expose orphaned tool_result/tool_use pairs
+		// that were previously hidden behind it.
 		keep, orphanDropped = pruneOrphanTailEntries(keep)
 		removed += orphanDropped
 	}
@@ -639,7 +683,23 @@ func truncateClaudeSessionFile(path string, since time.Time) (removed int, delet
 			break
 		}
 	}
-	if allBlank {
+
+	// Even when non-blank entries survive, a session with no conversation
+	// turns (no real user or assistant entries) is not resumable — Claude
+	// CLI will emit "No conversation" when --resume is used against it.
+	// Delete such files so sessionFileUsable returns false and the next
+	// chat starts a fresh session with --session-id instead.
+	hasConversation := false
+	if !allBlank {
+		for _, k := range keep {
+			if k.typ == "assistant" || (k.typ == "user" && k.real) {
+				hasConversation = true
+				break
+			}
+		}
+	}
+
+	if allBlank || !hasConversation {
 		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
 			return removed, false, rerr
 		}

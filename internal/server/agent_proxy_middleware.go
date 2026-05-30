@@ -57,12 +57,12 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 
 		// --- Routes that don't need proxying ---
 
-		// Avatar GET: blob is content-addressed & immutable; local
-		// copy is identical to target's.
-		if r.Method == http.MethodGet && sub == "/avatar" {
-			next.ServeHTTP(w, r)
-			return
-		}
+		// NOTE: avatar GET (`/avatar`) is intentionally NOT exempted.
+		// The avatar blob is path-addressed (`agents/<id>/avatar.<ext>`)
+		// and MUTABLE — not content-addressed — so a non-holder's local
+		// copy can be missing (never replicated) or stale (changed on
+		// the holder after a past device-switch). Proxy it to the holder
+		// like every other agent read so the UI shows the live avatar.
 
 		// Bare GET /agents/{id}: handler already has GetRemote fallback.
 		if sub == "" && r.Method == http.MethodGet {

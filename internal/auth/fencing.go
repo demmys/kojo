@@ -40,8 +40,8 @@ type AgentFencingStore interface {
 //     mutate state out from under the real holder. The fence is
 //     the load-bearing safeguard here because EnforceMiddleware
 //     admits /api/v1/agents/* for trusted RolePeer.
-//   - RoleOwner / RoleWebDAV / RoleGuest pass through (owner is
-//     admin; webdav / guest don't write to agent state).
+//   - RoleOwner / RoleGuest pass through (owner is admin; guest
+//     doesn't write to agent state).
 //   - Read methods (GET / HEAD / OPTIONS) pass through. Lock
 //     holders rotate via complete; readers should still observe
 //     transient state without 409s.
@@ -202,10 +202,7 @@ func agentIDForFencing(path, callerAgentID string) (string, bool) {
 
 // shouldFenceRequest decides whether the request's method
 // warrants fencing. Mutating verbs are fenced; safe verbs and
-// WebSocket upgrades are not. WebDAV's COPY / MOVE / PROPFIND
-// / etc. are intentionally NOT fenced here because the WebDAV
-// mount surface has its own token-based auth and lives outside
-// the per-agent {id} path shape.
+// WebSocket upgrades are not.
 func shouldFenceRequest(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:

@@ -62,6 +62,26 @@ var peerBlobIngestPath = regexp.MustCompile(
 	`^agents/([A-Za-z0-9_.\-]{1,64})/attach/([A-Za-z0-9_.\-]{1,64})/([^/\x00]{1,200})$`,
 )
 
+// peerBlobAgentReadPath gates cross-peer READ-THROUGH (GET
+// ?live_read=1) down to any global blob under an agent's tree:
+//
+//	scope = global
+//	path  = agents/<agentID>/...   (avatar, attach, future agent files)
+//
+// Broader than peerBlobIngestPath on purpose: ingest (PUT) stays
+// locked to the kojo-attach contract, but a non-holder peer must be
+// able to READ any of the agent's global blobs (avatars, attachments)
+// live from the holder — that is the multi-device "proxy, don't
+// replicate" read path. Safety still holds via three independent
+// gates the read handler enforces alongside this match: scope MUST be
+// `global` (excludes machine/local secrets), blob_refs.home_peer MUST
+// equal the serving peer (no relay-theft of other peers' blobs), and
+// blob.Store.Open resolves strictly within the scope dir (no `..`
+// traversal). Only the captured agentID is used, to locate the holder.
+var peerBlobAgentReadPath = regexp.MustCompile(
+	`^agents/([A-Za-z0-9_.\-]{1,64})/`,
+)
+
 func (s *Server) handlePeerBlobIngest(w http.ResponseWriter, r *http.Request) {
 	if s.blob == nil {
 		writeError(w, http.StatusServiceUnavailable, "unavailable",

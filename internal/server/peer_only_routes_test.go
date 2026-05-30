@@ -14,7 +14,7 @@ import (
 // TestPeerOnlyMux confirms the legacy minimal-peer surface still
 // 404s when registerPeerOnlyRoutes runs against an agents==nil
 // Server. Note: the §3.7 device-switch slice promoted --peer to a
-// full peer (sessions / agents / files / git / WebDAV all
+// full peer (sessions / agents / files / git all
 // registered when agents is wired up via the real registerRoutes),
 // so this test is NOT a regression net for the full-peer surface
 // — it's a narrow assertion that registerPeerOnlyRoutes is a no-op
@@ -50,9 +50,9 @@ func TestPeerOnlyMux(t *testing.T) {
 	// suppresses everything Hub-shaped. We can't easily wire a full
 	// agent.Manager in a light-weight test, so we re-use the helper
 	// that builds a mux for a peer-shaped Server and assert no
-	// session / agent / file / WebDAV / kv / push / oplog / static
-	// route is present. They all return 404 because the mux is
-	// empty for that surface.
+	// session / agent / file / kv / push / oplog / static route is
+	// present. They all return 404 because the mux is empty for that
+	// surface.
 	hubShapedPaths := []string{
 		"/api/v1/info",
 		"/api/v1/sessions",
@@ -60,7 +60,6 @@ func TestPeerOnlyMux(t *testing.T) {
 		"/api/v1/files",
 		"/api/v1/git/status",
 		"/api/v1/kv/foo",
-		"/api/v1/webdav/",
 		"/api/v1/oplog/flush",
 		"/api/v1/push/vapid",
 		"/api/v1/changes",

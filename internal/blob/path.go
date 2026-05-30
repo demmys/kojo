@@ -13,10 +13,10 @@ import (
 // surface to HTTP map this to 400.
 var ErrInvalidPath = errors.New("blob: invalid path")
 
-// reservedNames is the OS-junk allowlist documented in §4.3 ("予約
-// ファイル名"). Compared case-insensitively so `THUMBS.DB` / `thumbs.db`
-// / `Thumbs.db` all reject — without that the native API would let
-// callers stage payloads that the WebDAV layer auto-discards.
+// reservedNames is the OS-junk allowlist ("予約ファイル名"). Compared
+// case-insensitively so `THUMBS.DB` / `thumbs.db` / `Thumbs.db` all
+// reject — these are OS-generated turds (Finder/Explorer metadata) that
+// should never be stored as agent blobs.
 var reservedNames = map[string]bool{
 	".ds_store":   true,
 	"thumbs.db":   true,
@@ -79,17 +79,15 @@ var windowsReservedBases = func() map[string]bool {
 //     is TEXT and would store the truncated form)
 //   - leaf must not be a reserved name / prefix / suffix
 //   - every intermediate dir must obey the reserved-name rule too,
-//     because List() returns them and the WebDAV mount would expose them
+//     because List() returns them to clients
 func validatePath(p string) (string, error) {
 	if p == "" {
 		return "", ErrInvalidPath
 	}
-	// docs §4.3 mandates NFC. Rather than silently rewriting the
-	// caller's input (two distinct-looking strings would round-trip
-	// to the same blob, which surprises log readers), refuse non-NFC
-	// up front. macOS Finder write paths go through the WebDAV
-	// adapter (slice 4) which normalizes there; native API callers
-	// already control the bytes they send.
+	// Mandate NFC. Rather than silently rewriting the caller's input
+	// (two distinct-looking strings would round-trip to the same blob,
+	// which surprises log readers), refuse non-NFC up front. Native API
+	// callers already control the bytes they send.
 	if !norm.NFC.IsNormalString(p) {
 		return "", ErrInvalidPath
 	}
@@ -128,8 +126,8 @@ func validateSegment(seg string) error {
 	}
 	// Win32 silently strips trailing dot/space and refuses
 	// `<>:"|?*` outright; a path that lands fine on POSIX but breaks
-	// when a Windows peer pulls the blob over webdav is a sync hazard
-	// we can avoid by refusing on write.
+	// when a Windows peer materializes the blob on disk is a sync
+	// hazard we can avoid by refusing on write.
 	if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
 		return ErrInvalidPath
 	}

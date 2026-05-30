@@ -84,7 +84,7 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //     gate effectively runs only for the §3.7 RolePeer inter-peer
 //     surface and Guest fallthroughs.
 //   - agent-facing (auth-required) loopback listener — AuthMiddleware
-//     resolves Bearer/X-Kojo-Token to Owner/Agent/PrivAgent/WebDAV,
+//     resolves Bearer/X-Kojo-Token to Owner/Agent/PrivAgent,
 //     and this gate enforces per-route policy for non-Owner roles.
 //
 // The intent is "default deny". Routes are grouped into three buckets:
@@ -106,29 +106,6 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 func AllowNonOwner(p Principal, method, path string) bool {
 	if p.IsOwner() {
 		return true
-	}
-
-	// WebDAV mount surface: the handler-side `webdavGate` is the
-	// canonical authorization point here because the credential a
-	// WebDAV client presents is HTTP Basic — AuthMiddleware can't
-	// resolve it to a Principal (only Bearer / X-Kojo-Token go
-	// through there), so we'd 403 a perfectly valid Basic-auth
-	// mount request before it ever reached the gate.
-	//
-	// Letting any principal through to the mux means the gate has
-	// to enforce both "no creds → 401 with Basic challenge" and
-	// "bad creds → 401" itself, which it does. The blast radius is
-	// bounded: only /api/v1/webdav/* opts out of policy-layer
-	// enforcement.
-	if strings.HasPrefix(path, "/api/v1/webdav/") || path == "/api/v1/webdav" {
-		return true
-	}
-
-	// RoleWebDAV is otherwise a dead-end — the token's only valid
-	// destination is the webdav mount above. Any other API path
-	// falls through to default-deny.
-	if p.IsWebDAV() {
-		return false
 	}
 
 	// RolePeer is scoped to the inter-peer surface (status push

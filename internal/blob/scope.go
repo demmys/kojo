@@ -12,16 +12,34 @@ import (
 	"path/filepath"
 )
 
-// Scope partitions blobs by replication policy. The three values map
-// 1-1 to the on-disk subtrees of the kojo config dir:
+// Scope partitions blobs by placement / sharing policy. The three
+// values map 1-1 to the on-disk subtrees of the kojo config dir:
 //
-//	<root>/global/   — replicated across peers (avatars, books, outbox, MEMORY.md)
+//	<root>/global/   — shareable across peers; the holder serves reads
+//	                   on demand (live_read read-through), not replicated
 //	<root>/local/    — peer-local only (FTS index, transient temp)
 //	<root>/machine/  — never leaves the host (credentials, machine secrets)
 //
-// `cas` (content-addressed storage, see blob_refs CHECK) is reserved for
-// a future slice and not exposed yet — accepting it here would let
-// callers create paths the rest of the stack does not understand.
+// MISTAKE: `cas` (content-addressed storage). It was added to the
+// blob_refs CHECK in migrations/0001_initial.sql on the speculation
+// that large files (models / datasets) would one day be partially
+// replicated by content hash. That feature was never built and is not
+// planned — the multi-device design settled on "the holder serves
+// reads on demand" (proxy / live_read), so nothing is content-addressed
+// and nothing is partially replicated. Admitting a value for a
+// non-existent code path was the error: it implied a capability the
+// stack does not have.
+//
+// It is intentionally NOT a member of this enum and Valid() rejects it,
+// so every write path (BuildURI → Valid) refuses scope='cas'. No row
+// with scope='cas' can ever be created; the CHECK literal is therefore
+// dead and unreachable.
+//
+// It is left in the CHECK rather than removed because removing it buys
+// nothing and costs real risk: SQLite cannot ALTER a CHECK, so dropping
+// the literal needs a full blob_refs table-rebuild migration (create a
+// twin table, copy every row, drop, rename, recreate indexes) on a core
+// table — pure churn for a value already proven unreachable in code.
 type Scope string
 
 const (

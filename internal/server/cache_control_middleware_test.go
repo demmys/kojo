@@ -32,20 +32,6 @@ func TestAPINoStoreDefaultMiddleware(t *testing.T) {
 			fallthroughHit: true,
 		},
 		{
-			name:           "skips WebDAV exact",
-			path:           "/api/v1/webdav",
-			handlerSets:    "",
-			wantSet:        false,
-			fallthroughHit: true,
-		},
-		{
-			name:           "skips WebDAV subtree",
-			path:           "/api/v1/webdav/share/file.txt",
-			handlerSets:    "",
-			wantSet:        false,
-			fallthroughHit: true,
-		},
-		{
 			name:           "does not touch non-API surface",
 			path:           "/assets/index.js",
 			handlerSets:    "",

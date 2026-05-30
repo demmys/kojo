@@ -335,6 +335,14 @@ CREATE INDEX idx_kv_scope ON kv(scope);
 
 CREATE TABLE blob_refs (
   uri               TEXT PRIMARY KEY,         -- kojo://<scope>/<path>
+  -- MISTAKE: 'cas' should never have been listed here. It was added on
+  -- speculation about content-addressed partial replication that was
+  -- never built and is not planned. It is inert/unreachable:
+  -- blob.Scope.Valid() rejects 'cas', so no write path can persist a
+  -- scope='cas' row. Removing it from the CHECK would require a full
+  -- blob_refs table-rebuild migration (SQLite cannot ALTER a CHECK) for
+  -- zero behavioural change, so it is left documented rather than
+  -- migrated out. See internal/blob/scope.go.
   scope             TEXT NOT NULL CHECK (scope IN ('global','local','machine','cas')),
   home_peer         TEXT NOT NULL,
   size              INTEGER NOT NULL,

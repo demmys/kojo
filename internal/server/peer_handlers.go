@@ -179,8 +179,8 @@ func validatePeerURL(rawURL string) error {
 //
 // Auth: Owner and Agent principals are admitted. The response shape
 // carries no identity-sensitive fields, so both roles see the same
-// view. Other non-Owner principals (Guest, Peer, WebDAV) fall
-// through the policy gate and never reach the handler.
+// view. Other non-Owner principals (Guest, Peer) fall through the
+// policy gate and never reach the handler.
 func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
 	if !p.IsOwner() && !p.IsAgent() {

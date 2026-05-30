@@ -388,27 +388,6 @@ func main() {
 	})
 	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged)
 
-	// Short-lived WebDAV token store (docs §3.4 / §5.6). Wired only
-	// when kv is available — pre-cutover installs that haven't
-	// migrated the auth row layout yet can't back the kv rows that
-	// the verifier reads. The resolver gains the store via
-	// SetWebDAVStore so it can recognise tokens presented on the
-	// auth listener; the server gains it via Config so the WebDAV
-	// mount gate + the management endpoints come online together.
-	var webdavTokens *auth.WebDAVTokenStore
-	if authKV != nil {
-		webdavCtx, webdavCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		webdavTokens, err = auth.NewWebDAVTokenStore(webdavCtx, authKV)
-		webdavCancel()
-		if err != nil {
-			logger.Warn("webdav token store: init failed; short-lived tokens disabled",
-				"err", err)
-			webdavTokens = nil
-		} else {
-			resolver.SetWebDAVStore(webdavTokens)
-		}
-	}
-
 	// Phase G: peer identity. Load (or generate on first run) this
 	// binary's stable {device_id, Ed25519 keypair, name} from kv. The
 	// device_id replaces the os.Hostname() placeholder previously
@@ -534,6 +513,18 @@ func main() {
 	// 既定 true: 非 --peer や peerIdentity nil の経路では prune 自体を
 	// 走らせないが、StartSchedulers は走らせたいため。
 	peerPruneOK := true
+	// Fail-closed for a --peer node that couldn't establish its
+	// identity: without peerIdentity the ownership prune below cannot
+	// run, so m.agents may still hold agents owned by OTHER peers.
+	// Running schedulers OR the file watcher over them would double-fire
+	// cron and flush those peers' stale leftover files into the DB,
+	// rolling back the real holder. Hub / single-node (non --peer) keeps
+	// the default true — it legitimately owns every loaded agent even
+	// when peerIdentity is nil.
+	if *peerMode && peerIdentity == nil {
+		peerPruneOK = false
+		logger.Warn("--peer without peer identity; skipping schedulers + file watcher to avoid cross-peer double-fire / stale flush. fix identity and restart.")
+	}
 	if peerIdentity != nil && agentMgr != nil {
 		if st := agentMgr.Store(); st != nil {
 			peerEvents = peer.NewEventBus()
@@ -871,6 +862,23 @@ func main() {
 		agentMgr.StartSchedulers()
 	}
 
+	// Reflect agent-CLI disk writes (MEMORY.md, memory/, persona.md,
+	// workspace files) into the DB promptly via a filesystem watcher,
+	// instead of waiting for the next prepareChat's lazy sync. Stops on
+	// agentMgr.Close(). Best-effort: a watcher init failure degrades to
+	// the lazy sync, never to data loss.
+	//
+	// MUST start AFTER the ownership prune above (EvictNonLocalAgents /
+	// PruneToOwnedAgentsForPeer) and only when peerPruneOK: the watcher
+	// flushes disk→DB for agents holdsLocally reports as held, so if a
+	// released/orphan row were still in m.agents the watcher would push
+	// that peer's stale leftover files into the DB and roll back the
+	// real holder. Gating on peerPruneOK (same as StartSchedulers)
+	// guarantees m.agents holds only agents this peer legitimately owns.
+	if agentMgr != nil && peerPruneOK {
+		agentMgr.StartFileWatcher()
+	}
+
 	// kojo-attach hub forwarder. In --peer mode the daemon may
 	// host an agent runtime (post device-switch) that generates
 	// attachments locally; the bytes must also reach hub so the
@@ -932,7 +940,6 @@ func main() {
 		// default — operators flip it once their UI / agent CLI have
 		// caught up and stopped sending bare PUT/PATCH/DELETEs.
 		RequireIfMatch:   os.Getenv("KOJO_REQUIRE_IF_MATCH") == "1",
-		WebDAVTokenStore: webdavTokens,
 		V0LegacyDir:      sessionV0LegacyDir,
 		PeerOnly:         *peerMode,
 		PendingSyncKEK:   pendingSyncKEK,
@@ -1195,11 +1202,6 @@ func main() {
 	// sweep goroutine exits when ctx (the shutdown signal context)
 	// is cancelled so it lifecycles with the rest of the binary.
 	srv.StartIdempotencySweep(ctx)
-
-	// Sweep expired short-lived WebDAV tokens (§3.4 / §5.6). No-op
-	// when the store is nil (kv unavailable). Goroutine lifecycle is
-	// tied to ctx so it exits with the rest of the binary.
-	srv.StartWebDAVTokenSweep(ctx)
 
 	if *peerMode {
 		// Peer mode: plain HTTP listen on the Tailscale interface

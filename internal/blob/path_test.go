@@ -60,7 +60,7 @@ func TestValidatePath(t *testing.T) {
 		{name: "COM1.log", in: "com1.log", wantErr: ErrInvalidPath},
 		{name: "LPT9.bin", in: "lpt9.bin", wantErr: ErrInvalidPath},
 		// Intermediate directory must obey the same rules — a "con/"
-		// path would surface to WebDAV listings as a hostile dir name.
+		// path would surface in List() output as a hostile dir name.
 		{name: "reserved intermediate dir", in: "con/file.txt", wantErr: ErrInvalidPath},
 
 		// Unicode

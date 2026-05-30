@@ -219,6 +219,38 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 		s.blobList(w, r, scope)
 		return
 	}
+	// The holder's live_read endpoint streams the full body only — it
+	// does NOT honour ?thumb (returns octet-stream, not a JPEG) or a
+	// Range header (always 200, full body). Route those two request
+	// shapes around read-through so we never break the thumbnail
+	// contract or media seeking. Remote-owned thumbnails / ranged
+	// reads degrade to the local-copy path (or 404) until the
+	// peer-fetch endpoint learns thumb + Range — tracked as a known
+	// follow-up, NOT silently full-bodied.
+	wantsThumb := r.URL.Query().Get("thumb") != ""
+	hasRange := r.Header.Get("Range") != ""
+	readThroughEligible := !wantsThumb && !hasRange
+
+	// Multi-device freshness: for an agent-scoped global blob this peer
+	// does NOT own (blob_refs.home_peer != self), any local body is a
+	// stale cache left over from a past device-switch — the avatar /
+	// attachment is path-addressed and mutable, so the holder's current
+	// bytes may differ. Read through to the holder instead of serving
+	// stale local bytes. tryAgentBlobPeerReadThrough returns false only
+	// when NO holder candidate was reachable, in which case we fall
+	// through to the local copy (best-effort beats a hard failure); a
+	// reachable holder's response — including a terminal 4xx/410 — is
+	// authoritative and returned as-is.
+	if readThroughEligible && scope == blob.ScopeGlobal && s.peerID != nil &&
+		s.agents != nil && s.agents.Store() != nil &&
+		peerBlobAgentReadPath.MatchString(path) {
+		if ref, gerr := s.agents.Store().GetBlobRef(r.Context(), blob.BuildURI(scope, path)); gerr == nil &&
+			ref.HomePeer != "" && ref.HomePeer != s.peerID.DeviceID {
+			if s.tryAgentBlobPeerReadThrough(w, r, scope, path) {
+				return
+			}
+		}
+	}
 	// ?thumb=<size>: serve a cached JPEG thumbnail instead of the
 	// full blob. Only applies to image formats the thumbnail package
 	// can decode; non-images fall through to the full-body path.
@@ -250,14 +282,14 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 
 	f, obj, err := s.blob.Open(scope, path)
 	if err != nil {
-		// kojo-attach hub-fallback: when peer holds the agent and
-		// the forwarder push to hub failed (or hasn't run yet), the
-		// hub has no local body to serve. Try fetching from the
-		// holder peer's /peers/blobs/{uri}?live_read=1 endpoint
-		// before surfacing 404. Returns true when the fallback
+		// Multi-device read-through: when the agent runs on another
+		// (holder) peer, an agent-scoped global blob (avatar,
+		// attachment, ...) has no local body here. Try fetching from
+		// the holder peer's /peers/blobs/{uri}?live_read=1 endpoint
+		// before surfacing 404. Returns true when the read-through
 		// wrote the response.
-		if errors.Is(err, blob.ErrNotFound) &&
-			s.tryAttachBlobPeerFallback(w, r, scope, path) {
+		if errors.Is(err, blob.ErrNotFound) && readThroughEligible &&
+			s.tryAgentBlobPeerReadThrough(w, r, scope, path) {
 			return
 		}
 		s.writeBlobErr(w, err)
@@ -278,17 +310,20 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, obj.Path, time.UnixMilli(obj.ModTime), f)
 }
 
-// tryAttachBlobPeerFallback covers the kojo-attach miss-on-hub case.
-// When the agent runs on a peer and the per-turn forwarder push to
-// hub failed (or hasn't completed yet — hub offline, transient TLS
-// reject, etc.) the blob bytes only live on the peer's disk.
-// Hub's regular handleBlobGet then 404s and the Web UI renders a
-// 0×0 broken image with no visible chip.
+// tryAgentBlobPeerReadThrough covers the multi-device read-through
+// case: an agent-scoped global blob (avatar, attachment, or any other
+// file under the agent's tree) is missing on THIS peer because the
+// agent runs — and the bytes live — on another (holder) peer. This is
+// the steady-state "proxy, don't replicate" read path; without it a
+// non-holder peer's Web UI renders a 0×0 broken image for the
+// holder's avatars/attachments.
 //
-// The fallback path is scope-limited to the attach URI pattern
-// (`scope=global, path=agents/<id>/attach/<msgID>/<file>`) so it
-// can never serve arbitrary blobs that just happen to be missing
-// locally. We probe holder candidates in priority order:
+// Originally attach-only (kojo-attach miss-on-hub); widened to every
+// agents/<id>/ global blob so avatars and other agent files are
+// viewable cross-device, not just attachments. Scope-limited to
+// `global` + the agents/<id>/ prefix so it can never relay an
+// arbitrary missing blob. We probe holder candidates in priority
+// order:
 //
 //  1. agent_locks.holder_peer for the agent extracted from the URI
 //     — authoritative even when hub has no blob_refs row.
@@ -302,7 +337,7 @@ func (s *Server) handleBlobGet(w http.ResponseWriter, r *http.Request) {
 // the response was written (success OR a deliberate non-2xx
 // passthrough); false when the caller should fall through to the
 // original 404 path.
-func (s *Server) tryAttachBlobPeerFallback(
+func (s *Server) tryAgentBlobPeerReadThrough(
 	w http.ResponseWriter, r *http.Request,
 	scope blob.Scope, blobPath string,
 ) bool {
@@ -312,7 +347,7 @@ func (s *Server) tryAttachBlobPeerFallback(
 	if scope != blob.ScopeGlobal {
 		return false
 	}
-	matches := peerBlobIngestPath.FindStringSubmatch(blobPath)
+	matches := peerBlobAgentReadPath.FindStringSubmatch(blobPath)
 	if matches == nil {
 		return false
 	}

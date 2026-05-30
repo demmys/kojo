@@ -23,19 +23,10 @@ import (
 // from getting frozen into a stranger's cache.
 //
 // Limited to /api/v1/*: the static SPA bundle has its own immutable
-// hash-named asset policy in registerStaticFiles. /api/v1/webdav is
-// skipped — golang.org/x/net/webdav.Handler does not set
-// Cache-Control on its own, so seeding no-store there would force
-// the WebDAV client to refetch every byte on every PROPFIND/GET
-// (Finder, davfs2, etc. follow whatever directive the server
-// returns), wrecking the share's UX. The webdav surface is mounted
-// behind webdavGate and is logged in / scoped enough that its
-// default cache behaviour is acceptable.
+// hash-named asset policy in registerStaticFiles.
 func apiNoStoreDefaultMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/v1/") &&
-			!strings.HasPrefix(r.URL.Path, "/api/v1/webdav/") &&
-			r.URL.Path != "/api/v1/webdav" {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)

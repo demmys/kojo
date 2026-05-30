@@ -77,7 +77,6 @@ type Server struct {
 	// last_seen-only). Wired via Config.PeerPresence.
 	peerPresence   *peer.Presence
 	requireIfMatch bool // 428 on missing If-Match (docs §3.5 transition)
-	webdavTokens   *auth.WebDAVTokenStore
 	// onAgentSynced is fired by handlePeerAgentSync after the
 	// store rows commit. ONLY the minimum side effects that are
 	// safe even if the orchestrator later aborts the switch
@@ -161,7 +160,6 @@ type Server struct {
 	devMode         bool
 	version         string
 	idempSweepOnce  sync.Once // guards StartIdempotencySweep
-	webdavSweepOnce sync.Once // guards StartWebDAVTokenSweep
 	// nodeKeyResolver maps an HTTP request's RemoteAddr to the
 	// calling node's Tailscale NodeKey. cmd/kojo wires this from
 	// tsnet.LocalClient.WhoIs AFTER server.New returns — tsnet
@@ -253,8 +251,8 @@ type Config struct {
 	// PeerOnly switches the server into the daemon-mode shape used
 	// by `kojo --peer`. The §3.7 device-switch slice promoted this
 	// from "minimal peer surface" to a full peer: agent runtime,
-	// agent-facing routes, sessions, files, git, WebDAV mount, the
-	// inter-peer surface — all registered — that's how a switch
+	// agent-facing routes, sessions, files, git, the inter-peer
+	// surface — all registered — that's how a switch
 	// can land the agent CLI on this host. What stays Hub-only
 	// and 404s on a peer:
 	//   - peer-registry mutation (POST/PATCH/DELETE on
@@ -293,14 +291,6 @@ type Config struct {
 	// refuses to start when --unsafe is OFF but no NodeKeyResolver
 	// is available (i.e. the operator forgot to opt in).
 	Unsafe bool
-	// WebDAVTokenStore wires the short-lived WebDAV token surface
-	// (docs §3.4 / §5.6). When non-nil the server registers the
-	// /api/v1/auth/webdav-tokens issue/list/revoke handlers, exposes
-	// StartWebDAVTokenSweep for the boot loop to call, and lets the
-	// WebDAV mount gate accept tokens alongside the Owner principal.
-	// Nil disables every WebDAV-token surface — tests / builds with
-	// no kv handle leave it unset.
-	WebDAVTokenStore *auth.WebDAVTokenStore
 }
 
 func New(cfg Config) *Server {
@@ -345,7 +335,6 @@ func New(cfg Config) *Server {
 		peerEvents:      cfg.PeerEvents,
 		peerPresence:    cfg.PeerPresence,
 		requireIfMatch:  cfg.RequireIfMatch,
-		webdavTokens:    cfg.WebDAVTokenStore,
 		pendingSyncKEK:  cfg.PendingSyncKEK,
 		pendingSyncDB:   cfg.Store,
 		logger:          logger,
@@ -542,23 +531,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("DELETE /api/v1/kv/{namespace}/{key...}", s.handleDeleteKV)
 	}
 
-	// WebDAV aux mount (#21). Owner-only — the share holds ad-hoc
-	// files the user wants the agent to see (drag-and-drop
-	// attachments). Reserved-filename auto-discard, NFC, and
-	// case-collision detection live in internal/webdav.
-	if h, err := s.buildWebDAVHandler(); err != nil {
-		s.logger.Warn("webdav mount disabled", "err", err)
-	} else if h != nil {
-		// Register on the entire WebDAV verb surface — net/http's
-		// ServeMux routes by exact pattern match per method, but
-		// WebDAV uses non-standard verbs (PROPFIND, PROPPATCH,
-		// MKCOL, COPY, MOVE, LOCK, UNLOCK) that ServeMux won't
-		// route by method. Use an empty-method registration via
-		// the catch-all path so all verbs reach the handler.
-		mux.Handle("/api/v1/webdav/", s.webdavGate(h))
-		mux.Handle("/api/v1/webdav", s.webdavGate(h))
-	}
-
 	// Op-log replay endpoint (§3.13.1). Owner-only. Wired only when
 	// the agent store is available — the fencing gate + every
 	// dispatch path need it. The endpoint is idempotent at the
@@ -567,17 +539,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// duplicates rows.
 	if s.agents != nil && s.agents.Store() != nil {
 		mux.HandleFunc("POST /api/v1/oplog/flush", s.handleOplogFlush)
-	}
-
-	// WebDAV short-lived token API (§3.4 / §5.6). Owner-only. Wired
-	// only when a WebDAVTokenStore is supplied — leaving it nil
-	// disables both the gate-side fallback and the management
-	// endpoints so a deploy without kv can't half-enable the
-	// feature.
-	if s.webdavTokens != nil {
-		mux.HandleFunc("GET /api/v1/auth/webdav-tokens", s.handleListWebDAVTokens)
-		mux.HandleFunc("POST /api/v1/auth/webdav-tokens", s.handleIssueWebDAVToken)
-		mux.HandleFunc("DELETE /api/v1/auth/webdav-tokens/{id}", s.handleRevokeWebDAVToken)
 	}
 
 	mux.HandleFunc("GET /api/v1/push/vapid", s.handleVAPIDKey)

@@ -149,18 +149,16 @@ func TestAgentFencing_ReturnsServiceUnavailableOnStoreError(t *testing.T) {
 }
 
 func TestAgentFencing_PassesNonAgentPrincipals(t *testing.T) {
-	// Owner / WebDAV / Guest must pass without the middleware
-	// consulting the lock at all. RolePeer is intentionally NOT
-	// in this list: a Hub→peer proxy write needs to be refused
-	// when the holder has moved (covered by
-	// TestAgentFencing_FencesPeerWrongHolder). fakeLockStore
-	// with failErr ensures a hypothetical GetAgentLock call would
-	// error, proving the middleware short-circuited before
+	// Owner / Guest must pass without the middleware consulting the
+	// lock at all. RolePeer is intentionally NOT in this list: a
+	// Hub→peer proxy write needs to be refused when the holder has
+	// moved (covered by TestAgentFencing_FencesPeerWrongHolder).
+	// fakeLockStore with failErr ensures a hypothetical GetAgentLock
+	// call would error, proving the middleware short-circuited before
 	// reaching it.
 	st := &fakeLockStore{failErr: errors.New("should not be called")}
 	for _, p := range []Principal{
 		{Role: RoleOwner},
-		{Role: RoleWebDAV},
 		{Role: RoleGuest},
 	} {
 		h := newFencingHandler(t, st, "peer-self", p)

@@ -428,6 +428,19 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				"disk→DB memory flush failed; switch aborted to avoid shipping stale state: "+err.Error())
 			return
 		}
+		// persona.md rides its own personaSyncMu, NOT the memorySyncMu
+		// path above, so SyncAgentMemoryFromDisk does not flush it.
+		// Manager.syncPersona would, but it bails once SetSwitching is
+		// set (Step -1). Flush it directly here so a persona edit made
+		// during the closing turn isn't dropped from the sync payload.
+		// Same hard-fail contract as the memory flush.
+		if err := agent.SyncAgentPersonaFromDisk(ctx, s.agents.Store(), agentID, s.logger); err != nil {
+			s.logger.Error("switch-device: pre-sync persona disk→DB flush failed; refusing switch to avoid shipping stale persona state",
+				"agent", agentID, "err", err)
+			writeError(w, http.StatusInternalServerError, "persona_flush_failed",
+				"disk→DB persona flush failed; switch aborted to avoid shipping stale state: "+err.Error())
+			return
+		}
 	}
 
 	// Step 0a: probe target's existing state for this agent so

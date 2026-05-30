@@ -52,6 +52,10 @@ type Manager struct {
 	creds    *CredentialStore
 	cron     *cronScheduler
 	logger   *slog.Logger
+	// fileWatcher reflects agent-CLI disk writes (MEMORY.md, memory/,
+	// persona.md, workspace files) into the DB promptly. nil until
+	// StartFileWatcher runs; guarded by mu.
+	fileWatcher *fileWatcher
 
 	// groupdms is set after construction to avoid circular dependency.
 	groupdms *GroupDMManager
@@ -460,7 +464,51 @@ func (m *Manager) Close() error {
 	if m == nil {
 		return nil
 	}
+	m.mu.Lock()
+	fw := m.fileWatcher
+	m.fileWatcher = nil
+	m.mu.Unlock()
+	if fw != nil {
+		_ = fw.Close()
+	}
 	return m.store.Close()
+}
+
+// StartFileWatcher launches the agent-file → DB reflection watcher.
+// Idempotent and best-effort: a watcher init failure is logged and the
+// daemon falls back to the lazy prepareChat sync. Call once after agents
+// are loaded (the watcher walks existing agent dirs at start; new ones
+// are picked up via CREATE events).
+func (m *Manager) StartFileWatcher() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	already := m.fileWatcher != nil
+	m.mu.Unlock()
+	if already {
+		return
+	}
+	fw, err := newFileWatcher(m)
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Warn("file-watch: disabled", "err", err)
+		}
+		return
+	}
+	m.mu.Lock()
+	m.fileWatcher = fw
+	m.mu.Unlock()
+	go fw.run()
+}
+
+// holdsLocally reports whether this peer currently holds the agent's
+// runtime (an in-memory row exists). Side-effect-free, unlike Get.
+func (m *Manager) holdsLocally(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.agents[id]
+	return ok
 }
 
 // Store returns the underlying *store.Store so subsystems built on the

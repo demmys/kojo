@@ -26,13 +26,6 @@ const (
 	// RolePrivAgent extends RoleAgent with the ability to delete/reset
 	// other agents (but not fork or read their full data).
 	RolePrivAgent
-	// RoleWebDAV is a scoped principal issued for the short-lived WebDAV
-	// mount token (docs §3.4 / §5.6). It has zero rights on the normal
-	// /api/v1/* API surface — every IsOwner / IsAgent gate returns false.
-	// The WebDAV handler is the only consumer; see Server.webdavGate.
-	// Stored in ctx so the WebDAV gate can accept the token alongside
-	// the OwnerOnly principal on the public listener.
-	RoleWebDAV
 	// RolePeer authenticates a request that arrived from a
 	// registered remote peer over tsnet (docs §3.10 / §3.7). The
 	// principal's PeerID names the device_id from peer_registry;
@@ -63,11 +56,6 @@ func (p Principal) IsOwner() bool { return p.Role == RoleOwner }
 func (p Principal) IsAgent() bool {
 	return p.Role == RoleAgent || p.Role == RolePrivAgent
 }
-
-// IsWebDAV reports whether the principal was authenticated via a
-// short-lived WebDAV token. RoleWebDAV is intentionally a dead-end for
-// every other gate: a leaked token can only reach the WebDAV mount.
-func (p Principal) IsWebDAV() bool { return p.Role == RoleWebDAV }
 
 // IsPeer reports whether the principal was authenticated via
 // Tailnet identity (WhoIs over tsnet → peer_registry hit). RolePeer
@@ -131,33 +119,16 @@ func (p Principal) CanSetPrivileged() bool {
 // Resolver maps a Bearer token to a Principal.
 type Resolver struct {
 	tokens       *TokenStore
-	webdav       *WebDAVTokenStore
 	isPrivileged func(agentID string) bool
 }
 
 // NewResolver builds a Resolver from a TokenStore and a privilege
-// predicate (agent.Manager.IsPrivileged). The WebDAVTokenStore is
-// optional; pass nil when the WebDAV slice is not wired (tests / builds
-// without kv).
+// predicate (agent.Manager.IsPrivileged).
 func NewResolver(tokens *TokenStore, isPrivileged func(string) bool) *Resolver {
 	if isPrivileged == nil {
 		isPrivileged = func(string) bool { return false }
 	}
 	return &Resolver{tokens: tokens, isPrivileged: isPrivileged}
-}
-
-// SetWebDAVStore attaches the short-lived WebDAV token store. Safe to
-// call once at boot; callers that don't issue WebDAV tokens leave it
-// unset. Calling twice with different stores is a misuse and panics
-// (the first store would silently lose verifier coverage).
-func (r *Resolver) SetWebDAVStore(s *WebDAVTokenStore) {
-	if r == nil {
-		return
-	}
-	if r.webdav != nil && r.webdav != s {
-		panic("auth.Resolver: WebDAVTokenStore already set")
-	}
-	r.webdav = s
 }
 
 // Resolve maps a Bearer token to a Principal. Empty/unknown tokens
@@ -176,15 +147,6 @@ func (r *Resolver) Resolve(token string) Principal {
 			return Principal{Role: RolePrivAgent, AgentID: id}
 		}
 		return Principal{Role: RoleAgent, AgentID: id}
-	}
-	// WebDAV short-lived token last: its surface is intentionally
-	// minimal (the gate around /api/v1/webdav/ is the only consumer),
-	// so verifying it after owner/agent keeps the hot path for normal
-	// API traffic unchanged.
-	if r.webdav != nil {
-		if r.webdav.Verify(token) {
-			return Principal{Role: RoleWebDAV}
-		}
 	}
 	return Principal{Role: RoleGuest}
 }

@@ -119,29 +119,28 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 			"blob_refs read: "+err.Error())
 		return
 	}
-	// `?live_read=1` is the kojo-attach hub-fallback path: hub asks
-	// the holder peer for an attach blob whose forwarder push never
-	// landed on hub (network blip, hub offline at push time, etc.).
-	// Bypasses handoff_pending because attach reads are NOT part of
-	// the §3.7 switch state machine — they happen during normal
-	// operation, when no handoff is in flight.
+	// `?live_read=1` is the multi-device read-through path: a
+	// non-holder peer (or hub on its behalf) asks the holder for an
+	// agent-scoped global blob — avatar, attachment, or any other
+	// file under the agent's tree — during normal operation.
+	// Bypasses handoff_pending because read-through is NOT part of
+	// the §3.7 switch state machine; it is the steady-state "proxy,
+	// don't replicate" read path. Originally attach-only; widened to
+	// every agents/<id>/ global blob so avatars and other agent
+	// files are viewable cross-device, not just attachments.
 	//
-	// Strictly scope-limited:
-	//   - scope MUST be `global` (the only scope the kojo-attach
-	//     contract publishes into; mirrors peerBlobIngestHandler)
-	//   - path MUST match peerBlobIngestPath
-	//     (agents/<id>/attach/<msgID>/<file>)
-	//
-	// Together these guarantee live_read can only ever surface a
-	// row this peer published via the kojo-attach skill — never an
-	// avatar / book / arbitrary other blob_refs row in the same
-	// agent's tree. The downstream `wrong_home` check (the row's
-	// home_peer must equal this peer's DeviceID) means a paired
-	// peer cannot relay-read OTHER peers' attach blobs through us
-	// either.
+	// Scope-limited and theft-proof:
+	//   - scope MUST be `global` (excludes machine/local secrets)
+	//   - path MUST match peerBlobAgentReadPath (agents/<id>/...)
+	//   - the `wrong_home` check below requires the row's home_peer
+	//     to equal this peer's DeviceID, so a paired peer cannot
+	//     relay-read OTHER peers' blobs through us.
+	//   - blob.Store.Open (further down) resolves strictly within the
+	//     scope dir, so a `..` smuggled past the regex still can't
+	//     escape the agent blob root.
 	liveRead := r.URL.Query().Get("live_read") == "1" &&
 		scope == blob.ScopeGlobal &&
-		peerBlobIngestPath.MatchString(blobPath)
+		peerBlobAgentReadPath.MatchString(blobPath)
 	if peerBlobReadHandoffPendingOnly && !ref.HandoffPending && !liveRead {
 		writeError(w, http.StatusConflict, "not_in_handoff",
 			"blob_refs row is not marked handoff_pending; refusing peer fetch")

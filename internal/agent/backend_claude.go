@@ -128,10 +128,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// and emit a partial done event so the transcript is persisted.
 		if result.cancelled {
 			cmd.Wait()
-			content := result.fullText
-			if content == "" {
-				content = result.lastAssistantText
-			}
+			content := mergeStreamTexts(result)
 			emitCancelDone(ctx, ch, content, result.thinking, result.toolUses, result.usage)
 			return
 		}
@@ -150,14 +147,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			}
 		}
 
-		// Determine final text with fallback chain
-		finalText := result.fullText
-
-		// Fallback: text extracted from assistant event content blocks
-		if finalText == "" && result.lastAssistantText != "" {
-			finalText = result.lastAssistantText
-			b.logger.Info("used assistant event text as fallback", "agent", agent.ID, "len", len(finalText))
-		}
+		// Determine final text. mergeStreamTexts prepends text from
+		// earlier assistant turns (lastAssistantText) that was captured
+		// via "assistant" events but never appeared in content_block_delta
+		// text_deltas (fullText). This happens when Claude CLI internally
+		// retries a malformed tool call: the first turn's text lands in
+		// lastAssistantText, and the retry's error message lands in
+		// fullText. Without merging, the original text is silently lost.
+		finalText := mergeStreamTexts(result)
 
 		// Last resort: recover from Claude session JSONL when the stream
 		// produced no usable text. Only used as fallback, never overrides
@@ -300,6 +297,29 @@ type streamParseResult struct {
 	toolUses          []ToolUse
 	usage             *Usage
 	cancelled         bool // true if send returned false (context cancelled)
+}
+
+// mergeStreamTexts combines lastAssistantText and fullText from a stream parse
+// result. When Claude CLI retries a malformed tool call, the first assistant
+// turn's text is captured only in lastAssistantText (via "assistant" events),
+// while the retry's output (often just an error message) goes into fullText
+// (via content_block_delta text_deltas). Without merging, an abort or normal
+// finish would persist only the retry text, silently discarding the original
+// content the user saw streaming.
+func mergeStreamTexts(r *streamParseResult) string {
+	if r.fullText == "" {
+		return r.lastAssistantText
+	}
+	if r.lastAssistantText == "" || r.lastAssistantText == r.fullText {
+		return r.fullText
+	}
+	// lastAssistantText contains text from an earlier assistant turn that
+	// didn't make it into fullText (content_block_delta). Prepend it so
+	// the persisted message reflects everything the user saw.
+	if strings.Contains(r.fullText, r.lastAssistantText) {
+		return r.fullText
+	}
+	return r.lastAssistantText + "\n\n" + r.fullText
 }
 
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents

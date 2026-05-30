@@ -1037,3 +1037,61 @@ func TestPrepareClaudeSettings_BashCaptureHook(t *testing.T) {
 		}
 	})
 }
+
+func TestMergeStreamTexts(t *testing.T) {
+	tests := []struct {
+		name              string
+		fullText          string
+		lastAssistantText string
+		want              string
+	}{
+		{
+			name:              "both empty",
+			fullText:          "",
+			lastAssistantText: "",
+			want:              "",
+		},
+		{
+			name:              "only fullText",
+			fullText:          "hello world",
+			lastAssistantText: "",
+			want:              "hello world",
+		},
+		{
+			name:              "only lastAssistantText",
+			fullText:          "",
+			lastAssistantText: "hello world",
+			want:              "hello world",
+		},
+		{
+			name:              "identical",
+			fullText:          "hello world",
+			lastAssistantText: "hello world",
+			want:              "hello world",
+		},
+		{
+			name:              "fullText contains lastAssistantText",
+			fullText:          "hello world and more",
+			lastAssistantText: "hello world",
+			want:              "hello world and more",
+		},
+		{
+			name:              "disjoint — tool call retry scenario",
+			fullText:          "The model's tool call could not be parsed (retry also failed).",
+			lastAssistantText: "Here is the original response text.",
+			want:              "Here is the original response text.\n\nThe model's tool call could not be parsed (retry also failed).",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &streamParseResult{
+				fullText:          tt.fullText,
+				lastAssistantText: tt.lastAssistantText,
+			}
+			got := mergeStreamTexts(r)
+			if got != tt.want {
+				t.Errorf("mergeStreamTexts() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

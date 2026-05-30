@@ -513,6 +513,27 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("    - When something is genuinely worth keeping (deliverables, long-lived references, structured datasets), create a NAMED subdirectory under %s describing the purpose and put the file there. Examples: %s/reports/, %s/screenshots/2026-04/, %s/data/clients/foo/. Use `mkdir -p` to create the directory on demand.\n", fileDir, fileDir, fileDir, fileDir))
 	sb.WriteString(fmt.Sprintf("    - DO NOT drop newly generated artifacts directly at %s. For new outputs, always pick either temp/ or a purpose-named subdirectory.\n", fileDir))
 	sb.WriteString("    - When unsure whether something is keep-worthy, default to temp/. Promoting a file out of temp/ later is cheap; cleaning up a polluted root is not.\n")
+	// Expose the Claude session JSONL path so the agent can introspect its
+	// own conversation history (e.g. diagnose tool-call parse failures,
+	// review what it said earlier). The path is deterministic — derived from
+	// agentDir via claudeEncodePath + agentIDToUUID — but non-obvious, so
+	// handing it to the agent saves a fruitless `find` expedition.
+	//
+	// This always points at the MAIN session (agent-ID-derived UUID). Chats
+	// routed through a SessionKey (Slack threads) or OneShot mode use a
+	// different JSONL, but those sessions are ephemeral and self-diagnostic
+	// is not expected there. Keeping the path stable across turns is also
+	// important for prompt-cache hit rate — varying it per SessionKey would
+	// invalidate the cached prefix on every Slack message.
+	if a.Tool == "claude" || a.Tool == "custom" {
+		absDir, err := filepath.Abs(dir)
+		if err == nil {
+			sessionID := expectedClaudeSessionID(a.ID, "", false)
+			sessionPath := filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl")
+			sb.WriteString(fmt.Sprintf("- Your main conversation session log is at: %s\n", sessionPath))
+			sb.WriteString("  - This is the Claude CLI's raw JSONL transcript. You can Read or grep it to review your own prior messages, tool calls, and errors.\n")
+		}
+	}
 	sb.WriteString(fmt.Sprintf("- %s contains notes about who you are. You can edit it as you grow and change.\n", personaPath))
 	userPath := filepath.Join(dir, "user.md")
 	sb.WriteString(fmt.Sprintf("- %s contains information about the people you work with. Update it as you learn about them.\n", userPath))

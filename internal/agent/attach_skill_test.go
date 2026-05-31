@@ -36,6 +36,9 @@ func TestSyncAttachSkill_Install(t *testing.T) {
 	if !strings.Contains(str, ".kojo/attach") {
 		t.Errorf("SKILL.md missing staging dir reference")
 	}
+	if !strings.Contains(str, "--clean-max-age-days") {
+		t.Errorf("SKILL.md missing attachment retention note")
+	}
 }
 
 // TestSyncAttachSkill_Disable removes a prior install and leaves

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
@@ -21,9 +22,10 @@ type blobGCEntry struct {
 }
 
 type blobCleanPlan struct {
-	OrphanFiles []string
-	GCRefs      []blobGCEntry
-	EmptyDirs   []string
+	OrphanFiles        []string
+	GCRefs             []blobGCEntry
+	ExpiredAttachments []blobGCEntry
+	EmptyDirs          []string
 }
 
 func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDays int) (*blobCleanPlan, error) {
@@ -41,7 +43,7 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 	}
 
 	p := &blobCleanPlan{}
-	plannedGC := make(map[string]bool)
+	plannedRefs := make(map[string]bool)
 	for _, scope := range []blob.Scope{blob.ScopeGlobal, blob.ScopeLocal, blob.ScopeMachine} {
 		scopeRoot := filepath.Join(root, string(scope))
 		if _, err := os.Stat(scopeRoot); errors.Is(err, os.ErrNotExist) {
@@ -77,7 +79,12 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 			if ref, ok := refByURI[uri]; ok {
 				if ref.MarkedForGCAt > 0 && ref.MarkedForGCAt <= cutoff {
 					p.GCRefs = append(p.GCRefs, blobGCEntry{URI: uri, Path: path})
-					plannedGC[uri] = true
+					plannedRefs[uri] = true
+					return nil
+				}
+				if isExpiredAttachmentBlobRef(ref, cutoff) {
+					p.ExpiredAttachments = append(p.ExpiredAttachments, blobGCEntry{URI: uri, Path: path})
+					plannedRefs[uri] = true
 					return nil
 				}
 				counts[parent]++
@@ -98,7 +105,21 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 		}
 	}
 	for _, ref := range refs {
-		if ref.MarkedForGCAt == 0 || ref.MarkedForGCAt > cutoff || plannedGC[ref.URI] {
+		if plannedRefs[ref.URI] {
+			continue
+		}
+		if ref.MarkedForGCAt == 0 || ref.MarkedForGCAt > cutoff {
+			if !isExpiredAttachmentBlobRef(ref, cutoff) {
+				continue
+			}
+			scope, rel, err := blob.ParseURI(ref.URI)
+			if err != nil {
+				return nil, fmt.Errorf("parse expired attachment blob URI %s: %w", ref.URI, err)
+			}
+			p.ExpiredAttachments = append(p.ExpiredAttachments, blobGCEntry{
+				URI:  ref.URI,
+				Path: filepath.Join(root, string(scope), filepath.FromSlash(rel)),
+			})
 			continue
 		}
 		scope, rel, err := blob.ParseURI(ref.URI)
@@ -112,6 +133,7 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 	}
 	sort.Strings(p.OrphanFiles)
 	sort.Slice(p.GCRefs, func(i, j int) bool { return p.GCRefs[i].URI < p.GCRefs[j].URI })
+	sort.Slice(p.ExpiredAttachments, func(i, j int) bool { return p.ExpiredAttachments[i].URI < p.ExpiredAttachments[j].URI })
 	sort.Strings(p.EmptyDirs)
 	return p, nil
 }
@@ -121,17 +143,20 @@ func printBlobCleanPlan(p *blobCleanPlan, apply bool) {
 	if apply {
 		mode = "removing"
 	}
-	if p == nil || (len(p.OrphanFiles) == 0 && len(p.GCRefs) == 0 && len(p.EmptyDirs) == 0) {
+	if p == nil || (len(p.OrphanFiles) == 0 && len(p.GCRefs) == 0 && len(p.ExpiredAttachments) == 0 && len(p.EmptyDirs) == 0) {
 		fmt.Fprintln(os.Stderr, "kojo: clean blobs: nothing to remove")
 		return
 	}
-	fmt.Fprintf(os.Stderr, "kojo: clean blobs: %s %d orphan file(s), %d GC ref(s), %d empty dir(s)\n",
-		mode, len(p.OrphanFiles), len(p.GCRefs), len(p.EmptyDirs))
+	fmt.Fprintf(os.Stderr, "kojo: clean blobs: %s %d orphan file(s), %d GC ref(s), %d expired attachment(s), %d empty dir(s)\n",
+		mode, len(p.OrphanFiles), len(p.GCRefs), len(p.ExpiredAttachments), len(p.EmptyDirs))
 	for _, path := range p.OrphanFiles {
 		fmt.Fprintf(os.Stderr, "  orphan file: %s\n", path)
 	}
 	for _, ref := range p.GCRefs {
 		fmt.Fprintf(os.Stderr, "  gc ref: %s (%s)\n", ref.URI, ref.Path)
+	}
+	for _, ref := range p.ExpiredAttachments {
+		fmt.Fprintf(os.Stderr, "  expired attachment: %s (%s)\n", ref.URI, ref.Path)
 	}
 	for _, dir := range p.EmptyDirs {
 		fmt.Fprintf(os.Stderr, "  empty dir: %s\n", dir)
@@ -157,6 +182,15 @@ func applyBlobCleanPlan(ctx context.Context, p *blobCleanPlan, st *store.Store) 
 			errs = append(errs, fmt.Errorf("delete blob ref %s: %w", ref.URI, err))
 		}
 	}
+	for _, ref := range p.ExpiredAttachments {
+		if err := os.Remove(ref.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove expired attachment %s: %w", ref.Path, err))
+			continue
+		}
+		if err := st.DeleteBlobRef(ctx, ref.URI); err != nil {
+			errs = append(errs, fmt.Errorf("delete expired attachment ref %s: %w", ref.URI, err))
+		}
+	}
 	sort.Slice(p.EmptyDirs, func(i, j int) bool { return len(p.EmptyDirs[i]) > len(p.EmptyDirs[j]) })
 	for _, dir := range p.EmptyDirs {
 		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -164,6 +198,19 @@ func applyBlobCleanPlan(ctx context.Context, p *blobCleanPlan, st *store.Store) 
 		}
 	}
 	return errs
+}
+
+func isExpiredAttachmentBlobRef(ref *store.BlobRefRecord, cutoff int64) bool {
+	if ref == nil || ref.CreatedAt == 0 || ref.CreatedAt > cutoff {
+		return false
+	}
+	scope, rel, err := blob.ParseURI(ref.URI)
+	if err != nil || scope != blob.ScopeGlobal {
+		return false
+	}
+	parts := strings.Split(rel, "/")
+	return len(parts) == 5 && parts[0] == "agents" && parts[2] == "attach" &&
+		parts[1] != "" && parts[3] != "" && parts[4] != ""
 }
 
 type deletedAgentEntry struct {

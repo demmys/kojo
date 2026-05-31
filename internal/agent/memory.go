@@ -558,6 +558,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString(fmt.Sprintf("- `mkdir -p %s` before the first write of a turn (the daemon empties the directory between turns).\n", attachStage))
 	sb.WriteString("- Plain filenames only. Subdirectories under the staging dir are ignored. Dotfiles are rejected.\n")
 	sb.WriteString("- Per-file cap is 10 GiB. Empty files are skipped.\n")
+	sb.WriteString("- Attachment bodies are delivery artifacts, not long-term storage; Kojo blob cleanup may remove them after --clean-max-age-days (default: 7 days), while chat metadata can remain.\n")
 	sb.WriteString("- You do NOT need to repeat the path or post a curl command in your reply — the UI surfaces the attachment automatically.\n")
 
 	// Memory paths.

@@ -104,6 +104,9 @@ description: Send a file (image, audio, video, PDF, archive, anything) to the us
 - The directory is emptied after every turn. Do not stash files
   there hoping to reference them in a later turn — copy them
   somewhere else if you need them.
+- Attachment bodies are delivery artifacts, not long-term storage.
+  Kojo blob cleanup may remove them after ` + "`--clean-max-age-days`" + `
+  (default: 7 days), while the chat message metadata can remain.
 - You do not need to mention the attachment in your reply.
   The UI renders previewable thumbnails (images / video) or a
   download chip (everything else) on the assistant bubble. A

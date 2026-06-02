@@ -28,7 +28,7 @@ func newHydrateBlobFixture(t *testing.T) (*store.Store, *blob.Store) {
 	return st, bs
 }
 
-func TestHydrateAgentDirFromBlobsSkipsAttachArtifacts(t *testing.T) {
+func TestHydrateAgentDirFromBlobsSkipsGenericBlobArtifacts(t *testing.T) {
 	st, bs := newHydrateBlobFixture(t)
 	ctx := context.Background()
 	agentID := "ag_hydrate_attach"
@@ -46,12 +46,8 @@ func TestHydrateAgentDirFromBlobsSkipsAttachArtifacts(t *testing.T) {
 	}
 
 	bookPath := filepath.Join(agentDir(agentID), "books", "readme.md")
-	got, err := os.ReadFile(bookPath)
-	if err != nil {
-		t.Fatalf("book was not hydrated: %v", err)
-	}
-	if string(got) != "book" {
-		t.Fatalf("book body = %q, want book", string(got))
+	if _, err := os.Stat(bookPath); !os.IsNotExist(err) {
+		t.Fatalf("generic blob artifact was hydrated at %s; err=%v", bookPath, err)
 	}
 	attachPath := filepath.Join(agentDir(agentID), "attach", "m_1", "chart.png")
 	if _, err := os.Stat(attachPath); !os.IsNotExist(err) {

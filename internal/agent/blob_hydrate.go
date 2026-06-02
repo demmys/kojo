@@ -18,36 +18,22 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-// hydrateAgentDirFromBlobs materializes blob_refs entries for one
-// agent into agentDir(id). Used at Manager.Load so the v1 CLI process
-// (cmd.Dir = agentDir) can `ls books/`, `cat outputs/result.bvh`,
-// etc. just like it could on v0 — even though the canonical store is
-// now the per-scope blob tree under <configdir>/{global,local}/.
+// hydrateAgentDirFromBlobs used to materialize per-agent blob_refs
+// entries into agentDir(id). That was too broad: historical delivery
+// artifacts and arbitrary working-directory files could reappear in the
+// agent CWD just because a stale blob_refs row existed. v1 now keeps the
+// only portable file surfaces on their dedicated paths:
 //
-// Skip rules (mirrors and complements internal/migrate/importers/
-// blobs.go's catchall):
-//   - kojo://machine/agents/<id>/ — credentials.{json,key}; the
-//     runtime never reads them from agentDir (credential.go owns
-//     the canonical encrypted store) and writing them to disk would
-//     leak machine-bound secrets to the agent CWD where the CLI
-//     could accidentally pick them up.
-//   - agents/<id>/avatar.<ext> — Web UI surfaces avatars via
-//     /api/v1/agents/<id>/avatar which Get's the blob direct; the
-//     CLI never reads avatar from CWD.
-//   - agents/<id>/attach/... — chat attachments are delivery
-//     artifacts rendered from message metadata + the blob API. The
-//     CLI staging contract is .kojo/attach/, not a restored attach/
-//     tree in CWD.
-//   - agents/<id>/index/memory.db — RAG index; the runtime
-//     regenerates per-peer on first use, materializing v0's snapshot
-//     would freeze a stale layout.
+//   - MEMORY.md + memory/ are hydrated from typed DB tables by
+//     SyncAgentMemoryFromDisk / ReconcileMemoryEntriesDiskFromDBHeld.
+//   - avatar.<ext> is read through the avatar/blob API and is not a
+//     CWD file.
+//   - chat attachments are delivery artifacts in blob store and message
+//     metadata; the agent-facing staging dir is .kojo/attach/.
 //
-// Already-on-disk leaves whose sha256 matches the blob_refs row are
-// skipped to avoid pointless rewrites on every agent load.
-//
-// Best-effort per row: a single failed copy logs and continues so
-// one missing-on-disk blob (orphan ref) doesn't block the hydrate of
-// the rest.
+// The function remains as a load-time cleanup hook for old deployments:
+// it removes the legacy CWD attach/ tree created by the prior broad
+// hydrate path, but it no longer copies blob_refs rows into the CWD.
 func hydrateAgentDirFromBlobs(ctx context.Context, st *store.Store, bs *blob.Store, agentID string, logger *slog.Logger) error {
 	if st == nil || bs == nil || agentID == "" {
 		return nil
@@ -160,23 +146,11 @@ func decodeURISegments(encoded string) (string, error) {
 }
 
 // skipBlobHydrate reports whether a (scope, agents/<id>/<rel>) blob
-// should be skipped on the hydrate path. Mirrors the importer's
-// isExplicitlyPublishedLeaf for the Web-UI-only / runtime-rebuilt
-// leaves so the CLI dir isn't polluted with files no one reads from
-// there.
+// should be skipped on the hydrate path. The answer is deliberately
+// yes for every blob_refs row: CWD hydration is now handled by the
+// typed memory/workspace reconcilers, not by the generic blob store.
 func skipBlobHydrate(rel string) bool {
-	if rel == "index/memory.db" {
-		return true
-	}
-	if rel == "attach" || strings.HasPrefix(rel, "attach/") {
-		return true
-	}
-	for _, ext := range []string{"png", "svg", "jpg", "jpeg", "webp"} {
-		if rel == "avatar."+ext {
-			return true
-		}
-	}
-	return false
+	return true
 }
 
 func cleanupHydratedAttachDir(dir, agentID string, logger *slog.Logger) {

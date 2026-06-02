@@ -234,18 +234,13 @@ func (m *Manager) SetBlobStore(bs *blob.Store) {
 // for subsystem composition.
 func (m *Manager) BlobStore() *blob.Store { return m.blobStore }
 
-// HydrateAgentBlobsAtLoad copies every loaded agent's blob_refs
-// entries (global + local scope, excluding avatar / index /
-// credentials) into agentDir(id) so the v1 CLI process — which
-// runs with cmd.Dir = agentDir — can `ls books/`, `cat
-// outputs/result.bvh`, etc. just like it could on v0. Without this
-// step, post-migration agent CWDs would appear empty to the CLI
-// even though the blob store has the files (under
-// <configdir>/{global,local}/agents/<id>/ rather than
-// agents/<id>/).
+// HydrateAgentBlobsAtLoad is retained as a load-time cleanup hook for
+// old deployments that previously materialized blob_refs into agentDir.
+// It no longer copies generic blob_refs rows into the agent CWD:
+// MEMORY.md + memory/ are DB-canonical and reconciled by the memory
+// sync path, while avatar.* and chat attachments are served through the
+// blob/message APIs rather than as CWD files.
 //
-// Idempotent: existing leaves whose sha256 matches the blob_refs
-// row are skipped, so re-runs at every Load are O(stat) per ref.
 // Best-effort across agents: one agent's failure logs and the rest
 // proceed.
 //
@@ -422,10 +417,10 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 
 // StartSchedulers boots the cron loop and schedules every non-archived
 // agent's interval. Split out of NewManager (Phase G follow-up to codex
-// review) so cmd/kojo can interpose Phase D's HydrateAgentBlobsAtLoad
-// between agent load and scheduler start — without the gap, a cron tick
-// that fires before hydrate finishes would spawn the CLI process in an
-// empty CWD (books/, outputs/, etc. not yet on disk).
+// review) so cmd/kojo can interpose load-time cleanup between agent load
+// and scheduler start. The generic blob hydrate path no longer populates
+// agent CWDs; memory/workspace files are reconciled by their typed DB
+// sync paths instead.
 //
 // Idempotent: a sync.Once guard pins the boot to a single execution
 // regardless of how many callers race here. Shutdown short-circuits when

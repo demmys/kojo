@@ -213,29 +213,16 @@ func TestImportersRoundTrip(t *testing.T) {
 		t.Errorf("members = %d, want 2", len(groups[0].Members))
 	}
 
-	// blobs — every leaf written by writeV0Fixtures must have a
-	// blob_refs row addressed under the right scope, with size and
-	// sha256 matching the on-disk body. The home_peer column reflects
-	// opts.HomePeer (deterministic across hosts).
+	// blobs — only portable avatar leaves are published to blob_refs.
+	// Memory/persona/transcript ride typed DB tables; arbitrary files
+	// under the agent working directory remain local working-directory
+	// state and must not become multi-device blobs. The home_peer
+	// column reflects opts.HomePeer (deterministic across hosts).
 	type blobCase struct {
 		uri, scope, body string
 	}
 	cases := []blobCase{
 		{"kojo://global/agents/ag_1/avatar.png", "global", "\x89PNG"},
-		{"kojo://global/agents/ag_1/books/intro.md", "global", "intro book\n"},
-		{"kojo://global/agents/ag_1/books/ch01.md", "global", "chapter one\n"},
-		{"kojo://global/agents/ag_1/outbox/draft.txt", "global", "draft body\n"},
-		{"kojo://local/agents/ag_1/temp/scratch.json", "local", `{"k":"v"}`},
-		{"kojo://local/agents/ag_1/index/memory.db", "local", "SQLITE-FAKE-BLOB"},
-		{"kojo://machine/agents/ag_1/credentials.json", "machine", `{"token":"x"}`},
-		{"kojo://machine/agents/ag_1/credentials.key", "machine", "ENVELOPE-KEY"},
-		// Phase C catchall walk: top-level scratch + outputs/ +
-		// arbitrary subdirs land at scope=local.
-		{"kojo://local/agents/ag_1/game-design-doc.md", "local", "scratch design doc\n"},
-		{"kojo://local/agents/ag_1/outputs/result.bvh", "local", "BVH-FAKE\n"},
-		{"kojo://local/agents/ag_1/outputs/timing.json", "local", `{"t":1}`},
-		{"kojo://local/agents/ag_1/projects/kojo-v1/notes.md", "local", "project notes\n"},
-		{"kojo://local/agents/ag_1/research/x-cookies/session.json", "local", `{"sid":"abc"}`},
 	}
 	for _, c := range cases {
 		ref, err := st.GetBlobRef(ctx, c.uri)
@@ -258,9 +245,8 @@ func TestImportersRoundTrip(t *testing.T) {
 	}
 
 	// Suppression assertions: each URI MUST NOT have a blob_refs row.
-	// These cover the skipBlobDir / skipBlobFile / canonicalDBLeaves
-	// branches independently. ErrNotFound is the contract; any other
-	// outcome indicates a regression in the suppression rules.
+	// ErrNotFound is the contract; any other outcome indicates the
+	// migration importer widened the file-sync surface again.
 	suppressed := []string{
 		// canonicalDBLeaves — DB-canonical, no blob duplicate.
 		"kojo://global/agents/ag_1/persona.md",
@@ -274,6 +260,19 @@ func TestImportersRoundTrip(t *testing.T) {
 		"kojo://local/agents/ag_1/memory/2026-04-01.md",
 		"kojo://local/agents/ag_1/memory/projects/kojo.md",
 		"kojo://local/agents/ag_1/memory/people/akari.md",
+		// Non-memory working-directory files are not multi-device blobs.
+		"kojo://global/agents/ag_1/books/intro.md",
+		"kojo://global/agents/ag_1/books/ch01.md",
+		"kojo://global/agents/ag_1/outbox/draft.txt",
+		"kojo://local/agents/ag_1/temp/scratch.json",
+		"kojo://local/agents/ag_1/index/memory.db",
+		"kojo://machine/agents/ag_1/credentials.json",
+		"kojo://machine/agents/ag_1/credentials.key",
+		"kojo://local/agents/ag_1/game-design-doc.md",
+		"kojo://local/agents/ag_1/outputs/result.bvh",
+		"kojo://local/agents/ag_1/outputs/timing.json",
+		"kojo://local/agents/ag_1/projects/kojo-v1/notes.md",
+		"kojo://local/agents/ag_1/research/x-cookies/session.json",
 		// chat_history body skipped (re-fetched from platform).
 		"kojo://local/agents/ag_1/chat_history/slack/C123/_channel.jsonl",
 		// blobBackupRe / dotfile / .lock skips.
@@ -1568,10 +1567,9 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	}
 	mustWrite(filepath.Join(a1, "tasks.json"), tasksBuf)
 
-	// ag_1 blob artefacts (avatar/books/outbox/temp/index/credentials).
-	// Coverage targets each scope/walk arm of blobsImporter so the
-	// round-trip exercises the global / local / machine paths and the
-	// directory walks for books/outbox/temp/index.
+	// ag_1 file artefacts. Only avatar.* should become a blob_ref;
+	// the rest are fixture coverage proving the importer does not
+	// publish non-memory working-directory state as multi-device blobs.
 	mustWrite(filepath.Join(a1, "avatar.png"), []byte{0x89, 'P', 'N', 'G'})
 	mustMkdir(filepath.Join(a1, "books"))
 	mustWrite(filepath.Join(a1, "books", "intro.md"), []byte("intro book\n"))
@@ -1585,13 +1583,9 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	mustWrite(filepath.Join(a1, "credentials.json"), []byte(`{"token":"x"}`))
 	mustWrite(filepath.Join(a1, "credentials.key"), []byte("ENVELOPE-KEY"))
 
-	// Catchall coverage: regression for Phase C importer scope
-	// expansion. v0 agents accumulate top-level scratch files,
-	// outputs/, arbitrary subdirs (projects/research/etc.) — none of
-	// which were enumerated in the original mapping. Every regular
-	// file added here lands in the blob store at scope=local
-	// addressed under agents/<id>/<rel>; suppressed files (skip
-	// branches) MUST NOT generate a blob_refs row.
+	// Non-memory working-directory files. These used to be caught by a
+	// broad blob importer; they are now explicitly suppressed so they
+	// cannot inflate blob_refs or handoff payloads.
 	mustWrite(filepath.Join(a1, "game-design-doc.md"), []byte("scratch design doc\n"))
 	mustMkdir(filepath.Join(a1, "outputs"))
 	mustWrite(filepath.Join(a1, "outputs", "result.bvh"), []byte("BVH-FAKE\n"))

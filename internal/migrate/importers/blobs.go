@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 
 	"github.com/loppo-llc/kojo/internal/blob"
 	"github.com/loppo-llc/kojo/internal/migrate"
@@ -19,24 +17,20 @@ import (
 // errSkipInvalidPath signals that publishBlob refused to publish the
 // leaf because v1's blob layer rejected the logical path (NFC,
 // reserved chars, etc.). The Run loop catches this so a single
-// pathological leaf — say a `?` somebody dropped under books/ on
-// macOS — doesn't take down the whole migration.
+// pathological leaf or agent-id-derived path doesn't take down the
+// whole migration.
 var errSkipInvalidPath = errors.New("blobs: v1 path validation refused leaf")
 
-// blobsImporter migrates per-agent binary artefacts into the v1 native
-// blob store. Domain key: "blobs". Runs after agents so blob_refs rows
-// can FK against the agents table indirectly via URI convention (the
-// schema does not enforce that FK because cas / handoff / orphan
-// repair all expect blob_refs to outlive a deleted agent).
+// blobsImporter migrates the per-agent file artefacts that are allowed
+// to live in the v1 native blob store. Domain key: "blobs". Runs after
+// agents so blob_refs rows can FK against the agents table indirectly
+// via URI convention (the schema does not enforce that FK because cas /
+// handoff / orphan repair all expect blob_refs to outlive a deleted
+// agent).
 //
-// Mapping (docs §2.4 / §5.5 step 7):
+// Mapping:
 //
 //	v0 agents/<id>/avatar.{png,svg,jpg,jpeg,webp} → kojo://global/agents/<id>/avatar.<ext>
-//	v0 agents/<id>/books/**             → kojo://global/agents/<id>/books/**
-//	v0 agents/<id>/outbox/**            → kojo://global/agents/<id>/outbox/**
-//	v0 agents/<id>/temp/**              → kojo://local/agents/<id>/temp/**
-//	v0 agents/<id>/index/memory.db      → kojo://local/agents/<id>/index/memory.db
-//	v0 agents/<id>/credentials.{json,key} → kojo://machine/agents/<id>/credentials.<ext>
 //
 // Hidden CLI workspace dirs (.claude/, .codex/) are NOT blob_refs
 // rows. The original plan was a separate dotfiles importer in a
@@ -54,15 +48,12 @@ var errSkipInvalidPath = errors.New("blobs: v1 path validation refused leaf")
 // a stray <v1>/agents/<id>/.claude/ or similar from a pre-cutover
 // dev install treat it as harmless cruft.
 //
-// credentials.{json,key} blob_refs rows ARE written by this
-// importer for archival, but they are NOT consulted at runtime:
-// internal/agent/credential.go owns the canonical encrypted store
-// at <configdir>/credentials.db (with its host-bound encryption
-// key at <configdir>/credentials.key), and its migrateLegacy
-// helper reads from <v1>/agents/<id>/credentials.json (which v1
-// never writes — only a pre-cutover dev install would have one).
-// The blob_refs rows survive purely so an operator can recover the
-// pre-migration v0 secret material if credentials.db is lost.
+// credentials.{json,key} are NOT blob_refs rows. Runtime credentials
+// are owned by internal/agent/credential.go's canonical encrypted store
+// at <configdir>/credentials.db (with its host-bound encryption key at
+// <configdir>/credentials.key). Importing per-agent credential leaves
+// as blobs would create machine-bound secret artefacts that device
+// switch must never replicate.
 //
 // .cron_last is also NOT a blob_refs row, but for a different reason:
 // after Phase 2c-2 slice 12 the cron throttle moved to the kv table
@@ -296,9 +287,9 @@ func knownAgentIDs(ctx context.Context, st *store.Store) (map[string]struct{}, e
 	return ids, nil
 }
 
-// collectBlobMappings walks v0/agents/<id>/ for every leaf the design
-// doc maps onto a blob URI. The list is stable (sorted by relPath) so
-// re-runs under identical v0 state produce identical migration_status
+// collectBlobMappings walks v0/agents/<id>/ for every leaf allowed to
+// become a blob URI. The list is stable (sorted by relPath) so re-runs
+// under identical v0 state produce identical migration_status
 // imported_count and identical mapping order in logs.
 //
 // Only agent ids declared in agents.json are included — orphan dirs
@@ -365,321 +356,13 @@ func collectBlobMappings(ctx context.Context, st *store.Store, v0Dir string) ([]
 			}
 		}
 
-		// `index/memory.db` is the single RAG-index file the design
-		// doc enumerates (§2.4). The rest of `index/` (transient
-		// shards, lock files, fts cache) is local-peer-only state
-		// that v1 will rebuild on first use — copying it would
-		// preserve broken layouts across v0/v1 schema bumps. We
-		// publish it here as a known leaf and then suppress the
-		// rest of `index/` in the catchall walk below.
-		if mapping, ok, err := blobLeaf(v0Dir,
-			filepath.Join(agentRoot, "index", "memory.db"),
-			blob.ScopeLocal,
-			"agents/"+agentID+"/index/memory.db"); err != nil {
-			return nil, err
-		} else if ok {
-			out = append(out, mapping)
-		}
-
-		// Credentials live at fixed leaf names — never recurse into
-		// agentRoot itself looking for them. A directory walk would
-		// also pick up the per-agent CLI dotfile dirs (.claude/,
-		// .codex/), which the catchall walk below skips via
-		// skipBlobDir for the same reason: they are kojo-managed
-		// scratch regenerated by claude backend on first Chat, or
-		// CLI-owned scratch outside kojo's write path for codex.
-		for _, leaf := range []string{"credentials.json", "credentials.key"} {
-			full := filepath.Join(agentRoot, leaf)
-			if mapping, ok, err := blobLeaf(v0Dir, full,
-				blob.ScopeMachine,
-				"agents/"+agentID+"/"+leaf); err != nil {
-				return nil, err
-			} else if ok {
-				out = append(out, mapping)
-			}
-		}
-
-		// Catchall walk: every other leaf under agentRoot. Captures
-		// books/, outbox/, temp/ (formerly hand-mapped), outputs/,
-		// and the long tail of agent-created scratch (game design
-		// docs, screenshots, sqlite journals, project subdirs,
-		// arbitrary subdirs like research/, reports/, data/, work/,
-		// etc.) without an enumerated whitelist — preserving v0
-		// agent state that the design doc didn't enumerate but
-		// users actually accumulated.
-		//
-		// Skip rules (see skipBlobDir / skipBlobFile):
-		//   - dotfiles / dotdirs (.claude, .codex, .DS_Store)
-		//   - DB-canonical leaves already mirrored to a typed table
-		//     (persona.md, MEMORY.md, memory/, tasks.json,
-		//     messages.jsonl, autosummary_marker)
-		//   - regenerable cache (persona_summary.md)
-		//   - backup leaves (*.bak, *.bak1..N) — operator-owned
-		//     scratch, no v1 surface consumes them
-		//   - lock files (*.lock)
-		//   - leaves already published by the explicit blocks above
-		//     (avatar.<ext>, index/memory.db, credentials.{json,key})
-		//
-		// Scope assignment (see classifyBlobScope):
-		//   - books/, outbox/ → global (replicated)
-		//   - everything else → local (machine-specific scratch;
-		//     too noisy to sync, often re-generated, sometimes
-		//     huge)
-		ms, err := walkAgentBlobMappings(v0Dir, agentRoot, agentID)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, ms...)
+		// Everything else under agentRoot is intentionally left out
+		// of blob_refs. MEMORY.md and memory/ ride typed DB tables;
+		// index/ is rebuilt per peer; credentials are in
+		// credentials.db; arbitrary agent-created files are local
+		// working-directory state, not multi-device blob payload.
 	}
 	return out, nil
-}
-
-// walkAgentBlobMappings produces blob mappings for every regular file
-// under agentRoot that isn't suppressed by skipBlobDir / skipBlobFile.
-// Mirrors walkBlobSubtree but operates on the agent root with an
-// agents/<id>/<rel> URI prefix and per-rel scope classification.
-//
-// Symlinks (both leaf and intermediate) are skipped: walkDirV0
-// surfaces them as walkErr and we drop the entry rather than aborting
-// the whole importer.
-func walkAgentBlobMappings(v0Dir, agentRoot, agentID string) ([]blobMapping, error) {
-	if _, err := os.Lstat(agentRoot); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("lstat %s: %w", agentRoot, err)
-	}
-	var out []blobMapping
-	walkErr := walkDirV0(v0Dir, agentRoot, func(p string, d os.DirEntry, werr error) error {
-		if werr != nil {
-			return nil
-		}
-		if d == nil {
-			return nil
-		}
-		rel, err := filepath.Rel(agentRoot, p)
-		if err != nil {
-			return nil
-		}
-		if rel == "." {
-			return nil
-		}
-		// Apply directory skip BEFORE descending. Two match modes:
-		//   - basename match: dotdirs (.claude/, .codex/)
-		//     are unwanted at ANY depth — a stray .claude/ inside
-		//     outputs/ shouldn't end up in the blob store either.
-		//   - top-level rel match: memory/ and chat_history/ are
-		//     only DB-canonical when they sit at agentRoot/. A
-		//     nested dir literally named "memory" inside outputs/
-		//     is an operator's scratch and should be walked normally.
-		if d.IsDir() {
-			if skipBlobDir(d.Name()) {
-				return filepath.SkipDir
-			}
-			if isTopLevelDBCanonicalDir(rel) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		if skipBlobFile(rel, d.Name()) {
-			return nil
-		}
-		// Suppress leaves already published by the explicit
-		// avatar / index / credentials blocks above. Re-emitting
-		// them here would surface as a duplicate mapping for the
-		// same blob URI; the second Put would either ETag-mismatch
-		// or be a redundant write.
-		if isExplicitlyPublishedLeaf(rel) {
-			return nil
-		}
-		scope := classifyBlobScope(rel)
-		logical := "agents/" + agentID + "/" + filepath.ToSlash(rel)
-		v0Rel, err := filepath.Rel(v0Dir, p)
-		if err != nil {
-			return nil
-		}
-		out = append(out, blobMapping{
-			relPath: filepath.ToSlash(v0Rel),
-			absPath: p,
-			scope:   scope,
-			path:    logical,
-		})
-		return nil
-	})
-	if walkErr != nil {
-		return nil, fmt.Errorf("walk %s: %w", agentRoot, walkErr)
-	}
-	return out, nil
-}
-
-// skipBlobDir reports whether a directory at or under agentRoot should
-// be excluded from the catchall walk. The match is on the directory's
-// own basename, not its full rel path — `.claude/` at any depth is
-// skipped (a stray dotfile dir under outputs/ shouldn't end up in the
-// blob store any more than the top-level one).
-//
-//   - .claude / .codex : CLI workspace dirs, regenerated by backends
-//     or owned by the CLI process; copying the v0 tree just creates
-//     stale layouts that the runtime would regenerate anyway.
-//
-// Note: memory/ and chat_history/ are also suppressed but only when
-// they sit at agentRoot/ — see isTopLevelDBCanonicalDir. A literal
-// "memory" subdir nested under outputs/ is operator scratch, not a
-// DB-canonical store.
-func skipBlobDir(name string) bool {
-	switch name {
-	case ".claude", ".codex":
-		return true
-	}
-	return false
-}
-
-// isTopLevelDBCanonicalDir reports whether rel addresses one of the
-// agentRoot-level subdirs whose body is DB-canonical (memory/) or
-// re-fetched from a remote platform (chat_history/). Nested dirs that
-// happen to share the name are operator scratch and DO get walked.
-func isTopLevelDBCanonicalDir(rel string) bool {
-	switch filepath.ToSlash(rel) {
-	case "memory", "chat_history":
-		return true
-	}
-	return false
-}
-
-// canonicalDBLeaves enumerates v0 agent-dir leaves whose state moves
-// to a typed DB table during migration; copying them as blobs would
-// duplicate canonical state. Each entry is the rel-path under
-// agentRoot (forward-slash separated even on Windows — the importer
-// normalizes via filepath.ToSlash).
-var canonicalDBLeaves = map[string]struct{}{
-	"persona.md":         {},
-	"MEMORY.md":          {},
-	"tasks.json":         {},
-	"messages.jsonl":     {},
-	"autosummary_marker": {},
-	"persona_summary.md": {}, // regenerable LLM cache
-}
-
-// blobBackupRe matches operator-owned backup leaves (*.bak,
-// *.bak1..N, *.bak.<anything>). v0 left these around manual-edit
-// snapshots; the user explicitly excluded them from migration scope.
-var blobBackupRe = regexp.MustCompile(`\.bak\d*(\..+)?$`)
-
-// blobOSJunkNames enumerates OS-generated metadata files that the v1
-// blob layer rejects via internal/blob/path.go's reservedNames /
-// reservedPrefixes lists. Filtering them at the importer side
-// suppresses ErrInvalidPath warning spam during migration without
-// changing the v1 layer's defensive posture (a hand-crafted call
-// with one of these names still gets refused).
-//
-// Compared case-insensitively to match the blob layer's behavior.
-var blobOSJunkNames = map[string]bool{
-	"thumbs.db":   true,
-	"desktop.ini": true,
-}
-
-// skipBlobFile reports whether a file leaf should be suppressed by the
-// catchall walk. rel is the agentRoot-relative path with native
-// separators; name is rel's filepath.Base (passed as a hint to avoid
-// recomputing).
-func skipBlobFile(rel, name string) bool {
-	// Dotfiles at any depth — covers .DS_Store, .gitignore, agent
-	// runtime markers like .cron_last, etc. (.claude/ etc. dirs are
-	// already skipped via skipBlobDir before we descend.)
-	if strings.HasPrefix(name, ".") {
-		return true
-	}
-	relSlash := filepath.ToSlash(rel)
-	if _, ok := canonicalDBLeaves[relSlash]; ok {
-		return true
-	}
-	if strings.HasSuffix(name, ".lock") {
-		return true
-	}
-	if blobBackupRe.MatchString(name) {
-		return true
-	}
-	// OS junk: Thumbs.db / desktop.ini / etc. The blob layer rejects
-	// these via reservedNames in internal/blob/path.go (see §4.3 of
-	// the design doc), so without this filter every such file
-	// surfaces as a warn-skip in the migration log. Match
-	// case-insensitively to mirror the blob layer's compare.
-	lower := strings.ToLower(name)
-	if blobOSJunkNames[lower] {
-		return true
-	}
-	// AppleDouble companions (._foo) created by macOS network
-	// shares; Office lock files (~$foo). Both rejected by the blob
-	// layer's reservedPrefixes; same suppression rationale as
-	// blobOSJunkNames.
-	if strings.HasPrefix(name, "._") || strings.HasPrefix(name, "~$") {
-		return true
-	}
-	return false
-}
-
-// isExplicitlyPublishedLeaf reports whether rel is a leaf the
-// explicit avatar / index / credentials blocks already emitted as a
-// mapping. Returning true here suppresses the duplicate from the
-// catchall walk.
-//
-// Avatar extensions mirror the probe list above. credentials.{json,key}
-// at top level. index/memory.db is the only file we publish under
-// the otherwise-skipped index/ subtree — index/* sidecars (memory.db-
-// wal, memory.db-shm, FTS shards, lock files) are SQLite/RAG-internal
-// regenerable state that v1 rebuilds on first use; copying them as
-// blobs would freeze a stale layout across schema bumps and cost
-// blob storage on every peer for state that is purely local.
-func isExplicitlyPublishedLeaf(rel string) bool {
-	relSlash := filepath.ToSlash(rel)
-	switch relSlash {
-	case "credentials.json", "credentials.key", "index/memory.db":
-		return true
-	}
-	// Suppress the rest of the top-level index/ subtree. Match by
-	// prefix so memory.db-wal / memory.db-shm / locks / future FTS
-	// shard files all collapse to "skip" without an enumerated list
-	// that the next SQLite version would invalidate.
-	if strings.HasPrefix(relSlash, "index/") {
-		return true
-	}
-	for _, ext := range []string{"png", "svg", "jpg", "jpeg", "webp"} {
-		if relSlash == "avatar."+ext {
-			return true
-		}
-	}
-	return false
-}
-
-// classifyBlobScope assigns a blob.Scope based on the rel path's top-
-// level segment. Top-level scratch files (rel has no slash) and
-// arbitrary subdirs default to ScopeLocal — they're typically machine-
-// specific work outputs, screenshots, sqlite journals, etc., and
-// replicating them across peers wastes bandwidth without value.
-//
-// Globally-replicated subdirs are an explicit allow-list:
-//   - books/  : user-curated reference material (PDFs, EPUBs)
-//   - outbox/ : pending outbound payloads (messages waiting to send)
-//
-// Note: temp/ is intentionally local — historically the v0 design
-// treated it as transient scratch, and the v1 docs §5.5 mapping
-// confirms `temp/** → kojo://local/...`.
-func classifyBlobScope(rel string) blob.Scope {
-	relSlash := filepath.ToSlash(rel)
-	parts := strings.SplitN(relSlash, "/", 2)
-	if len(parts) > 0 {
-		switch parts[0] {
-		case "books", "outbox":
-			return blob.ScopeGlobal
-		}
-	}
-	return blob.ScopeLocal
 }
 
 // blobLeaf builds a blobMapping for a single leaf, returning ok=false
@@ -713,58 +396,4 @@ func blobLeaf(v0Dir, leaf string, scope blob.Scope, logical string) (blobMapping
 		scope:   scope,
 		path:    logical,
 	}, true, nil
-}
-
-// walkBlobSubtree enumerates every regular file under root and produces
-// a blobMapping for each, addressed under uriPrefix. Symlinks (both leaf
-// and intermediate) are skipped — walkDirV0 surfaces them as walkErr,
-// and we drop those entries rather than aborting the whole importer.
-func walkBlobSubtree(v0Dir, root string, scope blob.Scope, uriPrefix string) ([]blobMapping, error) {
-	var out []blobMapping
-	if _, err := os.Lstat(root); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return out, nil
-		}
-		return nil, fmt.Errorf("lstat %s: %w", root, err)
-	}
-	walkErr := walkDirV0(v0Dir, root, func(p string, d os.DirEntry, werr error) error {
-		if werr != nil {
-			// Symlink / not-regular hits land here; skip and continue.
-			return nil
-		}
-		if d == nil || d.IsDir() {
-			return nil
-		}
-		if d.Type()&os.ModeSymlink != 0 {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return nil
-		}
-		// uriPrefix already ends in "/"; just append the subtree's rel
-		// path with forward slashes.
-		logical := uriPrefix + filepath.ToSlash(rel)
-		// Rebuild relPath as v0-rooted for the checksum row. filepath.
-		// Rel against v0Dir is the canonical form domainChecksum
-		// expects.
-		v0Rel, err := filepath.Rel(v0Dir, p)
-		if err != nil {
-			return nil
-		}
-		out = append(out, blobMapping{
-			relPath: filepath.ToSlash(v0Rel),
-			absPath: p,
-			scope:   scope,
-			path:    logical,
-		})
-		return nil
-	})
-	if walkErr != nil {
-		return nil, fmt.Errorf("walk %s: %w", root, walkErr)
-	}
-	return out, nil
 }

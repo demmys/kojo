@@ -128,9 +128,10 @@ type switchDeviceResponse struct {
 	// sees only "outcome=aborted" and has no diagnostic to report
 	// to the user. Best-effort prose, not a stable code.
 	Reason string `json:"reason,omitempty"`
-	// PullSkipped is true when the agent has no blob_refs rows —
-	// the pull step is a no-op and we proceed straight to complete
-	// (which still transfers the agent_lock).
+	// PullSkipped is true when the agent has no portable blob_refs
+	// rows (currently avatar.*) — the pull step is a no-op and we
+	// proceed straight to complete (which still transfers the
+	// agent_lock).
 	PullSkipped bool `json:"pull_skipped,omitempty"`
 	// AgentSynced reports whether the §3.7 agent-sync step
 	// landed the agent row + transcript + persona + memory +
@@ -265,10 +266,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 
 	// Sanity-check the source. Two pre-conditions:
 	//
-	//   (a) Every blob_refs row for the agent must currently
-	//       live on the local peer. Orchestrating from a peer
-	//       that isn't the home_peer would have the target dial
-	//       us for blobs we don't have.
+	//   (a) Every portable blob_refs row for the agent must
+	//       currently live on the local peer. Orchestrating from a
+	//       peer that isn't the home_peer would have the target dial
+	//       us for blobs we don't have. Historical attach/ blobs are
+	//       not part of the switch payload and intentionally do not
+	//       gate the handoff.
 	//
 	//   (b) The agent_lock (if it exists) must be held by the
 	//       local peer. Without this check, an agent with zero
@@ -276,10 +279,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//       lock currently sits on a third peer. The lock-first
 	//       complete reorder relies on the orchestrator owning
 	//       the lock to begin with.
-	prefix := "kojo://global/agents/" + agentID + "/"
-	refs, err := s.agents.Store().ListBlobRefs(ctx, store.ListBlobRefsOptions{
-		URIPrefix: prefix,
-	})
+	refs, err := s.listHandoffBlobRefs(ctx, agentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"blob_refs list: "+err.Error())
@@ -664,9 +664,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		items = append(items, peerPullItem{URI: b.URI, ExpectedSHA256: ref.SHA256})
 	}
 
-	// Step 2: pull. Skip the network round-trip when the agent
-	// owns no blobs (a freshly forked agent with no memory yet,
-	// etc.); the lock transfer in `complete` is still meaningful.
+	// Step 2: pull. Skip the network round-trip when the agent owns
+	// no portable blobs (for example, no custom avatar); the lock
+	// transfer in `complete` is still meaningful.
 	if len(items) == 0 {
 		resp.PullSkipped = true
 	} else {

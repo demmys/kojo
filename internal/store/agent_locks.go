@@ -117,11 +117,11 @@ func nextFencingToken(ctx context.Context, tx *sql.Tx, agentID string) (int64, e
 //     refresh lease_expires_at and KEEP the existing fencing_token —
 //     the holder's prior writes stay valid.
 //   - If a row exists held by another peer:
-//     - lease still alive → return ErrLockHeld with the current row
-//       so the caller can show "busy on peer X" without a second
-//       SELECT.
-//     - lease expired → reassign to `peer` and INCREMENT the counter
-//       so any in-flight write from the old holder gets rejected.
+//   - lease still alive → return ErrLockHeld with the current row
+//     so the caller can show "busy on peer X" without a second
+//     SELECT.
+//   - lease expired → reassign to `peer` and INCREMENT the counter
+//     so any in-flight write from the old holder gets rejected.
 //
 // All branches run inside one BEGIN IMMEDIATE tx to serialize
 // concurrent acquisitions; the writer-lock-up-front recipe is the
@@ -249,8 +249,8 @@ UPDATE agent_locks
 			HolderPeer:       peer,
 			FencingToken:     token,
 			AllowedProxyPeer: peer,
-			LeaseExpiresAt: now + leaseDuration,
-			AcquiredAt:     now,
+			LeaseExpiresAt:   now + leaseDuration,
+			AcquiredAt:       now,
 		}, nil
 	}
 }
@@ -485,6 +485,49 @@ type CompleteHandoffResult struct {
 	LeftoverURIs []string
 }
 
+type handoffBlobSelector struct {
+	where string
+	args  []any
+}
+
+func handoffPrefixSelector(blobURIPrefix string) handoffBlobSelector {
+	selector := handoffBlobSelector{
+		where: `uri >= ?`,
+		args:  []any{blobURIPrefix},
+	}
+	if upper, ok := nextPrefix(blobURIPrefix); ok {
+		selector.where += ` AND uri < ?`
+		selector.args = append(selector.args, upper)
+	}
+	return selector
+}
+
+func handoffURISelector(blobURIs []string) handoffBlobSelector {
+	seen := make(map[string]struct{}, len(blobURIs))
+	args := make([]any, 0, len(blobURIs))
+	for _, uri := range blobURIs {
+		if uri == "" {
+			continue
+		}
+		if _, ok := seen[uri]; ok {
+			continue
+		}
+		seen[uri] = struct{}{}
+		args = append(args, uri)
+	}
+	if len(args) == 0 {
+		return handoffBlobSelector{}
+	}
+	placeholders := "?"
+	for i := 1; i < len(args); i++ {
+		placeholders += ",?"
+	}
+	return handoffBlobSelector{
+		where: `uri IN (` + placeholders + `)`,
+		args:  args,
+	}
+}
+
 // CompleteHandoff atomically transfers the agent_lock from its
 // current holder to targetPeer AND switches every blob_refs row in
 // the agent's prefix (kojo://global/agents/<id>/) to home_peer=
@@ -518,8 +561,29 @@ func (s *Store) CompleteHandoff(ctx context.Context, agentID, targetPeer, blobUR
 	if leaseDurationMs <= 0 {
 		return nil, errors.New("store.CompleteHandoff: lease duration must be > 0")
 	}
-	upper, hasUpper := nextPrefix(blobURIPrefix)
+	return s.completeHandoffSelected(ctx, agentID, targetPeer, leaseDurationMs, handoffPrefixSelector(blobURIPrefix))
+}
 
+// CompleteHandoffSelectedBlobs atomically transfers the agent_lock and
+// switches only the supplied blob_refs URIs. It is used by the
+// device-switch orchestrator for the small set of portable binary
+// state that must follow the agent (currently avatar blobs) while
+// leaving historical delivery artifacts such as attach/ on their
+// original home peer.
+func (s *Store) CompleteHandoffSelectedBlobs(ctx context.Context, agentID, targetPeer string, blobURIs []string, leaseDurationMs int64) (*CompleteHandoffResult, error) {
+	if agentID == "" {
+		return nil, errors.New("store.CompleteHandoffSelectedBlobs: agent_id required")
+	}
+	if targetPeer == "" {
+		return nil, errors.New("store.CompleteHandoffSelectedBlobs: target peer required")
+	}
+	if leaseDurationMs <= 0 {
+		return nil, errors.New("store.CompleteHandoffSelectedBlobs: lease duration must be > 0")
+	}
+	return s.completeHandoffSelected(ctx, agentID, targetPeer, leaseDurationMs, handoffURISelector(blobURIs))
+}
+
+func (s *Store) completeHandoffSelected(ctx context.Context, agentID, targetPeer string, leaseDurationMs int64, selector handoffBlobSelector) (*CompleteHandoffResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("store.CompleteHandoff: begin: %w", err)
@@ -576,33 +640,31 @@ func (s *Store) CompleteHandoff(ctx context.Context, agentID, targetPeer, blobUR
 	}
 
 	// --- Step 2: switch blob_refs rows still handoff_pending --
-	switchQ := `
+	if selector.where != "" {
+		switchQ := `
 UPDATE blob_refs
    SET home_peer = ?, handoff_pending = 0, updated_at = ?
- WHERE uri >= ? AND handoff_pending = 1`
-	switchArgs := []any{targetPeer, now, blobURIPrefix}
-	if hasUpper {
-		switchQ += ` AND uri < ?`
-		switchArgs = append(switchArgs, upper)
-	}
-	switchQ += ` RETURNING uri`
-	rows, err := tx.QueryContext(ctx, switchQ, switchArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("store.CompleteHandoff: switch blobs: %w", err)
-	}
-	for rows.Next() {
-		var uri string
-		if err := rows.Scan(&uri); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("store.CompleteHandoff: scan switched uri: %w", err)
+ WHERE handoff_pending = 1 AND ` + selector.where + `
+RETURNING uri`
+		switchArgs := append([]any{targetPeer, now}, selector.args...)
+		rows, err := tx.QueryContext(ctx, switchQ, switchArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("store.CompleteHandoff: switch blobs: %w", err)
 		}
-		result.SwitchedURIs = append(result.SwitchedURIs, uri)
+		for rows.Next() {
+			var uri string
+			if err := rows.Scan(&uri); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("store.CompleteHandoff: scan switched uri: %w", err)
+			}
+			result.SwitchedURIs = append(result.SwitchedURIs, uri)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("store.CompleteHandoff: switched rows: %w", err)
+		}
+		rows.Close()
 	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, fmt.Errorf("store.CompleteHandoff: switched rows: %w", err)
-	}
-	rows.Close()
 
 	// --- Step 3: classify untouched rows for the report ------
 	//
@@ -611,48 +673,45 @@ UPDATE blob_refs
 	// source-with-handoff_pending=0 (leftover from a partial state).
 	// The orchestrator surfaces leftovers so the operator knows
 	// complete didn't fully converge.
-	classifyQ := `
+	if selector.where != "" {
+		classifyQ := `
 SELECT uri, home_peer, handoff_pending
   FROM blob_refs
- WHERE uri >= ? AND handoff_pending = 0`
-	classifyArgs := []any{blobURIPrefix}
-	if hasUpper {
-		classifyQ += ` AND uri < ?`
-		classifyArgs = append(classifyArgs, upper)
-	}
-	rows2, err := tx.QueryContext(ctx, classifyQ, classifyArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("store.CompleteHandoff: classify: %w", err)
-	}
-	switched := make(map[string]struct{}, len(result.SwitchedURIs))
-	for _, u := range result.SwitchedURIs {
-		switched[u] = struct{}{}
-	}
-	for rows2.Next() {
-		var uri, home string
-		var pending int
-		if err := rows2.Scan(&uri, &home, &pending); err != nil {
+ WHERE handoff_pending = 0 AND ` + selector.where
+		rows2, err := tx.QueryContext(ctx, classifyQ, selector.args...)
+		if err != nil {
+			return nil, fmt.Errorf("store.CompleteHandoff: classify: %w", err)
+		}
+		switched := make(map[string]struct{}, len(result.SwitchedURIs))
+		for _, u := range result.SwitchedURIs {
+			switched[u] = struct{}{}
+		}
+		for rows2.Next() {
+			var uri, home string
+			var pending int
+			if err := rows2.Scan(&uri, &home, &pending); err != nil {
+				_ = rows2.Close()
+				return nil, fmt.Errorf("store.CompleteHandoff: scan classify row: %w", err)
+			}
+			if _, ok := switched[uri]; ok {
+				// We just flipped this one to home=target,
+				// pending=0; it'll re-appear in the classify pass
+				// because handoff_pending=0 matches. Skip it from
+				// the "already" / "leftover" buckets.
+				continue
+			}
+			if home == targetPeer {
+				result.AlreadyAtTargetURIs = append(result.AlreadyAtTargetURIs, uri)
+			} else {
+				result.LeftoverURIs = append(result.LeftoverURIs, uri)
+			}
+		}
+		if err := rows2.Err(); err != nil {
 			_ = rows2.Close()
-			return nil, fmt.Errorf("store.CompleteHandoff: scan classify row: %w", err)
+			return nil, fmt.Errorf("store.CompleteHandoff: classify rows: %w", err)
 		}
-		if _, ok := switched[uri]; ok {
-			// We just flipped this one to home=target,
-			// pending=0; it'll re-appear in the classify pass
-			// because handoff_pending=0 matches. Skip it from
-			// the "already" / "leftover" buckets.
-			continue
-		}
-		if home == targetPeer {
-			result.AlreadyAtTargetURIs = append(result.AlreadyAtTargetURIs, uri)
-		} else {
-			result.LeftoverURIs = append(result.LeftoverURIs, uri)
-		}
+		rows2.Close()
 	}
-	if err := rows2.Err(); err != nil {
-		_ = rows2.Close()
-		return nil, fmt.Errorf("store.CompleteHandoff: classify rows: %w", err)
-	}
-	rows2.Close()
 
 	// --- Step 4: commit everything atomically -----------------
 	if result.Lock == nil &&

@@ -233,6 +233,80 @@ func TestCompleteHandoff_Idempotent(t *testing.T) {
 	}
 }
 
+func TestCompleteHandoffSelectedBlobs_LeavesUnselectedAttachUntouched(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.InsertAgent(ctx, &AgentRecord{ID: "ag_x", Name: "x"}, AgentInsertOptions{}); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	lock1, err := s.AcquireAgentLock(ctx, "ag_x", "peer-src", NowMillis(), 60_000)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	prefix := "kojo://global/agents/ag_x/"
+	avatarURI := prefix + "avatar.png"
+	attachURI := prefix + "attach/m_1/chart.png"
+	seedHandoffBlob(t, s, avatarURI, "peer-src", "aaa")
+	seedHandoffBlob(t, s, attachURI, "peer-src", "bbb")
+	_ = s.SetBlobRefHandoffPending(ctx, avatarURI, true)
+
+	out, err := s.CompleteHandoffSelectedBlobs(ctx, "ag_x", "peer-tgt", []string{avatarURI}, 60_000)
+	if err != nil {
+		t.Fatalf("CompleteHandoffSelectedBlobs: %v", err)
+	}
+	if !out.LockTransferred {
+		t.Errorf("LockTransferred = false, want true")
+	}
+	if out.Lock.HolderPeer != "peer-tgt" {
+		t.Errorf("lock holder = %q, want peer-tgt", out.Lock.HolderPeer)
+	}
+	if out.Lock.FencingToken <= lock1.FencingToken {
+		t.Errorf("token did not advance: %d -> %d", lock1.FencingToken, out.Lock.FencingToken)
+	}
+	if len(out.SwitchedURIs) != 1 || out.SwitchedURIs[0] != avatarURI {
+		t.Errorf("SwitchedURIs = %v, want [%s]", out.SwitchedURIs, avatarURI)
+	}
+	if len(out.LeftoverURIs) != 0 {
+		t.Errorf("LeftoverURIs = %v, want empty", out.LeftoverURIs)
+	}
+	avatar, _ := s.GetBlobRef(ctx, avatarURI)
+	if avatar.HomePeer != "peer-tgt" || avatar.HandoffPending {
+		t.Errorf("avatar state = home %q pending %v, want peer-tgt false",
+			avatar.HomePeer, avatar.HandoffPending)
+	}
+	attach, _ := s.GetBlobRef(ctx, attachURI)
+	if attach.HomePeer != "peer-src" || attach.HandoffPending {
+		t.Errorf("attach state changed = home %q pending %v, want peer-src false",
+			attach.HomePeer, attach.HandoffPending)
+	}
+}
+
+func TestCompleteHandoffSelectedBlobs_NoBlobStillTransfersLock(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.InsertAgent(ctx, &AgentRecord{ID: "ag_x", Name: "x"}, AgentInsertOptions{}); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	if _, err := s.AcquireAgentLock(ctx, "ag_x", "peer-src", NowMillis(), 60_000); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	out, err := s.CompleteHandoffSelectedBlobs(ctx, "ag_x", "peer-tgt", nil, 60_000)
+	if err != nil {
+		t.Fatalf("CompleteHandoffSelectedBlobs: %v", err)
+	}
+	if !out.LockTransferred {
+		t.Errorf("LockTransferred = false, want true")
+	}
+	if out.Lock.HolderPeer != "peer-tgt" {
+		t.Errorf("lock holder = %q, want peer-tgt", out.Lock.HolderPeer)
+	}
+	if len(out.SwitchedURIs) != 0 || len(out.AlreadyAtTargetURIs) != 0 || len(out.LeftoverURIs) != 0 {
+		t.Errorf("blob result non-empty: switched=%v already=%v leftover=%v",
+			out.SwitchedURIs, out.AlreadyAtTargetURIs, out.LeftoverURIs)
+	}
+}
+
 // TestCompleteHandoff_RejectsRacedLockMovement pins the
 // optimistic-concurrency invariant: a concurrent TransferAgentLock
 // that lands between our scan and our UPDATE must trigger

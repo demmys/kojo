@@ -17,19 +17,20 @@ import (
 // docs/multi-device-storage.md §3.7 — device switch state machine
 // orchestration. The owner drives the three transitions:
 //
-//   begin    → blob_refs.handoff_pending = true for every blob
-//              owned by the agent. Both source and target peers
-//              refuse new agent-runtime writes against these
-//              rows (409) for the duration.
+//   begin    → blob_refs.handoff_pending = true for the portable
+//              binary blobs that must follow the agent (currently
+//              avatar.*). Both source and target peers refuse new
+//              agent-runtime writes against these rows (409) for
+//              the duration.
 //   complete → blob_refs.home_peer = target AND
-//              handoff_pending = false for every blob.
+//              handoff_pending = false for those portable blobs.
 //              agent_locks.holder_peer = target AND
 //              fencing_token bumped so the source peer's
 //              delayed writes can't slip through. Caller MUST
-//              have ensured the target peer pulled every blob
+//              have ensured the target peer pulled every listed blob
 //              (between begin and complete) — the Hub does not
 //              verify the pull happened.
-//   abort    → blob_refs.handoff_pending = false on every blob,
+//   abort    → blob_refs.handoff_pending = false on the portable blobs,
 //              no home_peer / lock changes. Used by the operator
 //              when the target peer's pull failed or timed out.
 //
@@ -63,15 +64,16 @@ type handoffResponse struct {
 	LockTransferred bool   `json:"lock_transferred,omitempty"`
 }
 
-// handleAgentHandoffBegin marks every blob for the agent as
-// handoff_pending and returns the per-blob list so the operator
+// handleAgentHandoffBegin marks every portable blob for the agent
+// as handoff_pending and returns the per-blob list so the operator
 // can drive the target-side pull.
 func (s *Server) handleAgentHandoffBegin(w http.ResponseWriter, r *http.Request) {
 	s.handleAgentHandoffOp(w, r, "begin")
 }
 
-// handleAgentHandoffComplete switches home_peer + transfers the
-// lock. Caller MUST have pulled every blob on the target peer
+// handleAgentHandoffComplete switches portable blob home_peer +
+// transfers the lock. Caller MUST have pulled every listed blob
+// on the target peer
 // first; the Hub doesn't verify.
 func (s *Server) handleAgentHandoffComplete(w http.ResponseWriter, r *http.Request) {
 	s.handleAgentHandoffOp(w, r, "complete")
@@ -105,6 +107,38 @@ func (e *handoffOpError) Error() string {
 
 func newHandoffOpError(status int, code, msg string) *handoffOpError {
 	return &handoffOpError{Status: status, Code: code, Message: msg}
+}
+
+func isHandoffBlobURI(agentID, uri string) bool {
+	prefix := "kojo://global/agents/" + agentID + "/"
+	tail := strings.TrimPrefix(uri, prefix)
+	if tail == uri {
+		return false
+	}
+	switch strings.ToLower(tail) {
+	case "avatar.png", "avatar.jpg", "avatar.jpeg", "avatar.webp", "avatar.svg":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) listHandoffBlobRefs(ctx context.Context, agentID string) ([]*store.BlobRefRecord, error) {
+	prefix := "kojo://global/agents/" + agentID + "/"
+	refs, err := s.agents.Store().ListBlobRefs(ctx, store.ListBlobRefsOptions{
+		Scope:     "global",
+		URIPrefix: prefix,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*store.BlobRefRecord, 0, len(refs))
+	for _, ref := range refs {
+		if isHandoffBlobURI(agentID, ref.URI) {
+			out = append(out, ref)
+		}
+	}
+	return out, nil
 }
 
 func (s *Server) handleAgentHandoffOp(w http.ResponseWriter, r *http.Request, op string) {
@@ -173,11 +207,10 @@ func (s *Server) handleAgentHandoffOp(w http.ResponseWriter, r *http.Request, op
 // = target) then 6 (lock transfer); the begin path stays a
 // separate INSERT-per-row loop (intentionally per-row so a
 // partial-failure surfaces per-URI), but the complete path uses
-// store.CompleteHandoff which folds the lock transfer + every
-// blob_refs flip into ONE transaction — a crash mid-call rolls
-// back to the pre-call state instead of leaving a half-migrated
-// agent (the previous TransferAgentLock + per-row SwitchBlobRefHome
-// loop split this across multiple statements).
+// store.CompleteHandoffSelectedBlobs which folds the lock transfer
+// + every selected blob_refs flip into ONE transaction — a crash
+// mid-call rolls back to the pre-call state instead of leaving a
+// half-migrated agent.
 func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID string) (*handoffResponse, error) {
 	if s.agents == nil || s.agents.Store() == nil {
 		return nil, newHandoffOpError(http.StatusServiceUnavailable,
@@ -219,12 +252,11 @@ func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID str
 		}
 	}
 
-	// Find every blob the agent owns. The §2.3 layout puts
-	// agent-scoped global blobs under `agents/<id>/*`.
-	prefix := "kojo://global/agents/" + agentID + "/"
-	refs, err := s.agents.Store().ListBlobRefs(ctx, store.ListBlobRefsOptions{
-		URIPrefix: prefix,
-	})
+	// Find the portable binary blobs that must move with the
+	// agent. Memory/persona/transcript ride the agent-sync DB
+	// payload; historical attach/ blobs are delivery artifacts and
+	// intentionally stay on their original home peer.
+	refs, err := s.listHandoffBlobRefs(ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("blob_refs list: %w", err)
 	}
@@ -238,9 +270,12 @@ func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID str
 		// and any leftover rows whose state didn't converge.
 		// The whole thing is one DB transaction — a crash
 		// rolls back cleanly.
-		out, cerr := s.agents.Store().CompleteHandoff(ctx,
-			agentID, targetPeerID, prefix,
-			5*60*1000, // 5 min lease
+		blobURIs := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			blobURIs = append(blobURIs, ref.URI)
+		}
+		out, cerr := s.agents.Store().CompleteHandoffSelectedBlobs(ctx,
+			agentID, targetPeerID, blobURIs, 5*60*1000, // 5 min lease
 		)
 		if cerr != nil {
 			if errors.Is(cerr, store.ErrNotFound) {

@@ -34,6 +34,10 @@ import (
 //   - agents/<id>/avatar.<ext> — Web UI surfaces avatars via
 //     /api/v1/agents/<id>/avatar which Get's the blob direct; the
 //     CLI never reads avatar from CWD.
+//   - agents/<id>/attach/... — chat attachments are delivery
+//     artifacts rendered from message metadata + the blob API. The
+//     CLI staging contract is .kojo/attach/, not a restored attach/
+//     tree in CWD.
 //   - agents/<id>/index/memory.db — RAG index; the runtime
 //     regenerates per-peer on first use, materializing v0's snapshot
 //     would freeze a stale layout.
@@ -52,6 +56,7 @@ func hydrateAgentDirFromBlobs(ctx context.Context, st *store.Store, bs *blob.Sto
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("hydrate blobs: ensure agent dir: %w", err)
 	}
+	cleanupHydratedAttachDir(dir, agentID, logger)
 
 	scopes := []struct {
 		scope     blob.Scope
@@ -163,12 +168,44 @@ func skipBlobHydrate(rel string) bool {
 	if rel == "index/memory.db" {
 		return true
 	}
+	if rel == "attach" || strings.HasPrefix(rel, "attach/") {
+		return true
+	}
 	for _, ext := range []string{"png", "svg", "jpg", "jpeg", "webp"} {
 		if rel == "avatar."+ext {
 			return true
 		}
 	}
 	return false
+}
+
+func cleanupHydratedAttachDir(dir, agentID string, logger *slog.Logger) {
+	p := filepath.Join(dir, "attach")
+	st, err := os.Lstat(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		if logger != nil {
+			logger.Warn("hydrate blobs: inspect legacy attach dir failed",
+				"agent", agentID, "path", p, "err", err)
+		}
+		return
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(p); err != nil && logger != nil {
+			logger.Warn("hydrate blobs: remove legacy attach symlink failed",
+				"agent", agentID, "path", p, "err", err)
+		}
+		return
+	}
+	if !st.IsDir() {
+		return
+	}
+	if err := os.RemoveAll(p); err != nil && logger != nil {
+		logger.Warn("hydrate blobs: remove legacy attach dir failed",
+			"agent", agentID, "path", p, "err", err)
+	}
 }
 
 // diskMatchesSHA returns true iff a regular file at path exists and
@@ -276,4 +313,3 @@ func hydrateAgentBlobsAtLoad(st *store.Store, bs *blob.Store, agentID string, lo
 		}
 	}
 }
-

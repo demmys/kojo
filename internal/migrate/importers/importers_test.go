@@ -273,6 +273,7 @@ func TestImportersRoundTrip(t *testing.T) {
 		"kojo://local/agents/ag_1/outputs/timing.json",
 		"kojo://local/agents/ag_1/projects/kojo-v1/notes.md",
 		"kojo://local/agents/ag_1/research/x-cookies/session.json",
+		"kojo://global/agents/ag_1/attach/m_old/old.png",
 		// chat_history body skipped (re-fetched from platform).
 		"kojo://local/agents/ag_1/chat_history/slack/C123/_channel.jsonl",
 		// blobBackupRe / dotfile / .lock skips.
@@ -288,6 +289,49 @@ func TestImportersRoundTrip(t *testing.T) {
 		if _, err := st.GetBlobRef(ctx, u); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("blob_refs[%s] should be suppressed; got err=%v", u, err)
 		}
+	}
+
+	// Agent working-directory files are still physically copied into
+	// v1; they are just not registered as blob_refs and therefore are
+	// not part of peer handoff blob payloads.
+	copied := map[string][]byte{
+		"avatar.png":                      {0x89, 'P', 'N', 'G'},
+		"books/intro.md":                  []byte("intro book\n"),
+		"outbox/draft.txt":                []byte("draft body\n"),
+		"temp/scratch.json":               []byte(`{"k":"v"}`),
+		"index/memory.db":                 []byte("SQLITE-FAKE-BLOB"),
+		"credentials.json":                []byte(`{"token":"x"}`),
+		"game-design-doc.md":              []byte("scratch design doc\n"),
+		"outputs/result.bvh":              []byte("BVH-FAKE\n"),
+		"projects/kojo-v1/notes.md":       []byte("project notes\n"),
+		"research/x-cookies/session.json": []byte(`{"sid":"abc"}`),
+		".claude/settings.local.json":     []byte("{}"),
+		".codex/session.json":             []byte("{}"),
+		"memory/projects/kojo.md":         []byte("project kojo\n"),
+	}
+	for rel, want := range copied {
+		got, err := os.ReadFile(filepath.Join(v1, "agents", "ag_1", filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("copied cwd file %s: %v", rel, err)
+			continue
+		}
+		if string(got) != string(want) {
+			t.Errorf("copied cwd file %s = %q, want %q", rel, got, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(v1, "agents", "ag_1", "attach")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("legacy attach/ should not be copied; stat err=%v", err)
+	}
+	v1Intro := filepath.Join(v1, "agents", "ag_1", "books", "intro.md")
+	if err := os.WriteFile(v1Intro, []byte("mutated in v1\n"), 0o644); err != nil {
+		t.Fatalf("mutate copied cwd file: %v", err)
+	}
+	v0Intro, err := os.ReadFile(filepath.Join(v0, "agents", "ag_1", "books", "intro.md"))
+	if err != nil {
+		t.Fatalf("read original cwd file after v1 mutation: %v", err)
+	}
+	if string(v0Intro) != "intro book\n" {
+		t.Errorf("v0 cwd file changed after v1 mutation; copy must not be a hardlink, got %q", v0Intro)
 	}
 
 	// sessions — every v0 row lands as 'archived' regardless of its
@@ -1604,6 +1648,8 @@ func writeV0Fixtures(t *testing.T, v0 string) {
 	mustWrite(filepath.Join(a1, ".claude", "settings.local.json"), []byte("{}"))
 	mustMkdir(filepath.Join(a1, ".codex"))
 	mustWrite(filepath.Join(a1, ".codex", "session.json"), []byte("{}"))
+	mustMkdir(filepath.Join(a1, "attach", "m_old"))
+	mustWrite(filepath.Join(a1, "attach", "m_old", "old.png"), []byte("legacy attach body"))
 
 	// chat_history layout — exercises the external_chat_cursors importer:
 	//   - _channel.jsonl:                      excluded channel rollup (NOT a cursor source)

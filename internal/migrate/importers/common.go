@@ -410,13 +410,16 @@ func addLeafIfRegular(v0Dir, path string, paths []string) ([]string, error) {
 //
 // Includes:
 //   - agents/agents.json (if present)
-//   - agents/<id>/persona.md
-//   - agents/<id>/MEMORY.md
-//   - agents/<id>/memory/**/*.md
+//   - every regular file under agents/<id>/
 //
-// Excludes the agents importer's *uninvolved* siblings:
-//   - agents/<id>/messages.jsonl  (messages domain)
-//   - agents/groupdms/**          (groupdms domain)
+// Excludes:
+//   - agents/groupdms/**, which belongs to the groupdms domain
+//   - agents/<id>/attach/**, the legacy chat delivery-artifact cache
+//
+// Some files under agents/<id>/ also feed typed importers
+// (messages.jsonl, tasks.json, MEMORY.md, memory/**/*.md), but the
+// agents importer now physically copies the whole working directory
+// into v1, so its checksum must cover those bytes too.
 //
 // Walks via readDirV0 / walkDirV0 — both refuse symlinked directories
 // and assert resolved paths stay under V0Dir. A directory-component
@@ -463,26 +466,7 @@ func collectAgentsSourcePaths(v0Dir string) ([]string, error) {
 			continue
 		}
 		agentRoot := filepath.Join(base, e.Name())
-
-		for _, leaf := range []string{"persona.md", "MEMORY.md"} {
-			leafPath := filepath.Join(agentRoot, leaf)
-			updated, err := addLeafIfRegular(v0Dir, leafPath, paths)
-			if err != nil {
-				return nil, err
-			}
-			paths = updated
-		}
-
-		memRoot := filepath.Join(agentRoot, "memory")
-		// readDirV0 / walkDirV0 reject symlinked directories, so a
-		// `memory/` linked outside V0Dir is a hard error rather than a
-		// silent walk through someone else's filesystem. ErrNotExist
-		// is the common case (no memory dir for this agent) and is
-		// folded into a no-op below.
-		if _, err := os.Lstat(memRoot); err != nil {
-			continue
-		}
-		walkErr := walkDirV0(v0Dir, memRoot, func(p string, d os.DirEntry, werr error) error {
+		walkErr := walkDirV0(v0Dir, agentRoot, func(p string, d os.DirEntry, werr error) error {
 			if werr != nil {
 				// Symlink-dir rejection from walkDirV0 surfaces here;
 				// skip the offending entry rather than abort the whole
@@ -492,12 +476,18 @@ func collectAgentsSourcePaths(v0Dir string) ([]string, error) {
 				return nil
 			}
 			if d == nil || d.IsDir() {
+				if d != nil && d.IsDir() {
+					relToAgent, err := filepath.Rel(agentRoot, p)
+					if err == nil && relToAgent == "attach" {
+						return filepath.SkipDir
+					}
+				}
 				return nil
 			}
 			if d.Type()&os.ModeSymlink != 0 {
 				return nil
 			}
-			if !strings.HasSuffix(d.Name(), ".md") {
+			if d.Type() != 0 && !d.Type().IsRegular() {
 				return nil
 			}
 			rel, err := filepath.Rel(v0Dir, p)
@@ -508,7 +498,7 @@ func collectAgentsSourcePaths(v0Dir string) ([]string, error) {
 			return nil
 		})
 		if walkErr != nil {
-			return nil, fmt.Errorf("walk memory %s: %w", memRoot, walkErr)
+			return nil, fmt.Errorf("walk agent %s: %w", agentRoot, walkErr)
 		}
 	}
 	return paths, nil

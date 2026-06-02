@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -19,8 +21,9 @@ import (
 )
 
 // agentsImporter migrates v0's agents.json plus per-agent persona.md,
-// MEMORY.md, and memory/**/*.md files into the v1 store. Domain key:
-// "agents". Runs first because everything else FK's against agents.
+// MEMORY.md, and memory/**/*.md files into the v1 store, and copies
+// each live agent's working directory into the v1 filesystem. Domain
+// key: "agents". Runs first because everything else FK's against agents.
 type agentsImporter struct{}
 
 func (agentsImporter) Domain() string { return "agents" }
@@ -113,7 +116,7 @@ func (agentsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Opt
 			logger.Warn("skipping agent: missing id or name", "id", id)
 			continue
 		}
-		if err := importOneAgent(ctx, st, opts.V0Dir, agentJSON, logger); err != nil {
+		if err := importOneAgent(ctx, st, opts.V0Dir, opts.V1Dir, agentJSON, logger); err != nil {
 			return fmt.Errorf("agent %s: %w", id, err)
 		}
 		count++
@@ -122,10 +125,11 @@ func (agentsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Opt
 	return markImported(ctx, st, "agents", count, checksum)
 }
 
-// importOneAgent inserts the agent row, then per-agent persona.md,
-// MEMORY.md, and memory/* entries. Each step is independently idempotent
-// so a crash mid-loop converges on the same final state on retry.
-func importOneAgent(ctx context.Context, st *store.Store, v0Dir string, raw map[string]any, logger *slog.Logger) error {
+// importOneAgent inserts the agent row, copies the v0 agent working
+// directory into v1, then imports per-agent persona.md, MEMORY.md, and
+// memory/* DB entries. Each step is independently idempotent so a crash
+// mid-loop converges on the same final state on retry.
+func importOneAgent(ctx context.Context, st *store.Store, v0Dir, v1Dir string, raw map[string]any, logger *slog.Logger) error {
 	id, _ := raw["id"].(string)
 	name, _ := raw["name"].(string)
 	createdAt, _ := raw["createdAt"].(string)
@@ -160,6 +164,10 @@ func importOneAgent(ctx context.Context, st *store.Store, v0Dir string, raw map[
 		}
 	}
 
+	if err := copyAgentWorkingDir(v0Dir, v1Dir, id, logger); err != nil {
+		return fmt.Errorf("copy working dir: %w", err)
+	}
+
 	// persona.md
 	if err := importAgentPersona(ctx, st, v0Dir, id, raw); err != nil {
 		return fmt.Errorf("persona: %w", err)
@@ -171,6 +179,163 @@ func importOneAgent(ctx context.Context, st *store.Store, v0Dir string, raw map[
 	// memory/**/*.md
 	if err := importMemoryEntries(ctx, st, v0Dir, id, updatedAt, logger); err != nil {
 		return fmt.Errorf("memory entries: %w", err)
+	}
+	return nil
+}
+
+// v1AgentDir resolves <v1>/agents/<agentID>, the native working
+// directory layout v1 uses after cutover.
+func v1AgentDir(v1Dir, agentID string) string {
+	return filepath.Join(v1Dir, "agents", agentID)
+}
+
+// copyAgentWorkingDir preserves v0's per-agent working-directory files
+// without publishing them as blob_refs. The top-level attach/ tree is
+// excluded because it is a historical delivery-artifact cache; the
+// agent-facing staging path is .kojo/attach/. This is deliberately a
+// normal copy rather than a hardlink: after migration, v1 may edit these
+// files, and mutating the v0 source inode would break rollback/audit
+// semantics.
+func copyAgentWorkingDir(v0Dir, v1Dir, agentID string, logger *slog.Logger) error {
+	srcRoot := agentDir(v0Dir, agentID)
+	dstRoot := v1AgentDir(v1Dir, agentID)
+	if err := os.MkdirAll(dstRoot, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dstRoot, err)
+	}
+
+	if _, err := readDirV0(v0Dir, srcRoot); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	return walkDirV0(v0Dir, srcRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if logger != nil {
+				logger.Warn("skipping unsafe agent cwd entry", "path", path, "error", walkErr)
+			}
+			return nil
+		}
+		if d == nil {
+			return nil
+		}
+
+		rel, err := filepath.Rel(srcRoot, path)
+		if err != nil {
+			return fmt.Errorf("rel %s: %w", path, err)
+		}
+		if rel == "." {
+			return nil
+		}
+		if rel == "attach" || strings.HasPrefix(rel, "attach"+string(filepath.Separator)) {
+			if d.IsDir() {
+				if logger != nil {
+					logger.Warn("skipping legacy agent attach directory during cwd copy", "path", path)
+				}
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		dst := filepath.Join(dstRoot, rel)
+
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		if d.IsDir() {
+			if err := ensureCopiedDir(dst, info.Mode().Perm()); err != nil {
+				return err
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			if logger != nil {
+				logger.Warn("skipping non-regular agent cwd entry", "path", path)
+			}
+			return nil
+		}
+		if err := copyV0RegularFile(v0Dir, path, dst, info); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func ensureCopiedDir(path string, mode fs.FileMode) error {
+	if mode == 0 {
+		mode = 0o755
+	}
+	if st, err := os.Lstat(path); err == nil {
+		if st.IsDir() {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove non-directory %s: %w", path, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("lstat %s: %w", path, err)
+	}
+	if err := os.MkdirAll(path, mode); err != nil {
+		return fmt.Errorf("mkdir %s: %w", path, err)
+	}
+	return nil
+}
+
+func copyV0RegularFile(v0Dir, src, dst string, info fs.FileInfo) error {
+	in, err := openV0(v0Dir, src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+
+	mode := info.Mode().Perm()
+	if mode == 0 {
+		mode = 0o644
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".migrate-copy-*")
+	if err != nil {
+		return fmt.Errorf("create temp near %s: %w", dst, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp %s: %w", tmpName, err)
+	}
+
+	if st, err := os.Lstat(dst); err == nil {
+		if st.IsDir() {
+			return fmt.Errorf("copy target %s is a directory", dst)
+		}
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("remove existing %s: %w", dst, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("lstat %s: %w", dst, err)
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpName, dst, err)
+	}
+	cleanup = false
+	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
+		return fmt.Errorf("chtimes %s: %w", dst, err)
 	}
 	return nil
 }

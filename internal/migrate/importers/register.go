@@ -86,9 +86,10 @@ func importerOrder() []migrate.Importer {
 		// emitted, in case a future v0 build starts populating the dir
 		// and the importer needs to start producing real rows.
 		compactionsImporter{},
-		// blobsImporter publishes per-agent binary artefacts (avatar /
-		// books / outbox / temp / index / credentials) into the v1
-		// native blob store. Runs after the agent-row importers because
+		// blobsImporter publishes only portable avatar artefacts into
+		// the v1 native blob store. Other per-agent working-directory
+		// files are copied by agentsImporter and deliberately do not
+		// become blob_refs. Runs after the agent-row importers because
 		// blob_refs URIs are namespaced by agent id; an orphan blob
 		// pointing at a non-existent agent is harmless (FK is not
 		// enforced — see schema rationale in 2.4 / 4.2) but the

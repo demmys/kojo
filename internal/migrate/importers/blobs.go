@@ -33,27 +33,23 @@ var errSkipInvalidPath = errors.New("blobs: v1 path validation refused leaf")
 //	v0 agents/<id>/avatar.{png,svg,jpg,jpeg,webp} → kojo://global/agents/<id>/avatar.<ext>
 //
 // Hidden CLI workspace dirs (.claude/, .codex/) are NOT blob_refs
-// rows. The original plan was a separate dotfiles importer in a
-// follow-up slice, but that was abandoned: these dirs are local
-// CLI scratch that is either kojo-managed and regenerated on first
-// Chat (backend_claude.go writes .claude/settings.local.json) or
-// CLI-owned and outside kojo's write path (backend_codex.go only
-// sets cmd.Dir — any .codex/ that appears under agentDir is
-// whatever the codex binary chose to drop, and is recreated by
-// codex itself if absent). The only continuity that matters across
-// the v0→v1 path-hash boundary is the global CLI transcript stores
-// at ~/.claude/projects/<hash> and ~/.codex/sessions/<hash>, which
-// are handled separately by `--migrate-external-cli`
-// (internal/migrate/externalcli) via symlink. v1 binaries that find
-// a stray <v1>/agents/<id>/.claude/ or similar from a pre-cutover
-// dev install treat it as harmless cruft.
+// rows. They may be preserved by agentsImporter's local CWD copy, but
+// they must never become multi-device blob payloads: these dirs are
+// local CLI scratch that is either kojo-managed and regenerated on
+// first Chat (backend_claude.go writes .claude/settings.local.json) or
+// CLI-owned and outside kojo's write path (backend_codex.go only sets
+// cmd.Dir — any .codex/ that appears under agentDir is whatever the
+// codex binary chose to drop). The cross-path continuity that matters
+// for CLI transcripts is handled separately by `--migrate-external-cli`
+// (internal/migrate/externalcli) via symlink.
 //
-// credentials.{json,key} are NOT blob_refs rows. Runtime credentials
-// are owned by internal/agent/credential.go's canonical encrypted store
-// at <configdir>/credentials.db (with its host-bound encryption key at
-// <configdir>/credentials.key). Importing per-agent credential leaves
-// as blobs would create machine-bound secret artefacts that device
-// switch must never replicate.
+// credentials.{json,key} are NOT blob_refs rows. agentsImporter may
+// preserve them as local CWD files during v0→v1 migration, but runtime
+// credentials are owned by internal/agent/credential.go's canonical
+// encrypted store at <configdir>/credentials.db (with its host-bound
+// encryption key at <configdir>/credentials.key). Importing per-agent
+// credential leaves as blobs would create machine-bound secret
+// artefacts that device switch must never replicate.
 //
 // .cron_last is also NOT a blob_refs row, but for a different reason:
 // after Phase 2c-2 slice 12 the cron throttle moved to the kv table

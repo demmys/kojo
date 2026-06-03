@@ -122,6 +122,179 @@ func TestParseGrokStream_CancelStopsEarly(t *testing.T) {
 	}
 }
 
+func TestParseGrokStream_ToolCallStartedCompleted(t *testing.T) {
+	events, res := collectGrokEvents(t,
+		`{"type":"tool_call_started","tool_call_id":"call_1","tool_name":"read_file","tool_args_json":"{\"path\":\"go.mod\"}"}`,
+		`{"type":"tool_call_completed","tool_call_id":"call_1","tool_name":"read_file","result":{"content":"module kojo"}}`,
+		`{"type":"text","data":"done"}`,
+	)
+	if len(res.toolUses) != 1 {
+		t.Fatalf("toolUses len = %d, want 1", len(res.toolUses))
+	}
+	tu := res.toolUses[0]
+	if tu.ID != "call_1" || tu.Name != "read_file" {
+		t.Errorf("tool use id/name = %q/%q, want call_1/read_file", tu.ID, tu.Name)
+	}
+	if tu.Input != `{"path":"go.mod"}` {
+		t.Errorf("tool input = %q", tu.Input)
+	}
+	if !strings.Contains(tu.Output, "module kojo") {
+		t.Errorf("tool output = %q, want module kojo", tu.Output)
+	}
+
+	var sawUse, sawResult bool
+	for _, e := range events {
+		switch e.Type {
+		case "tool_use":
+			if e.ToolUseID == "call_1" && e.ToolName == "read_file" {
+				sawUse = true
+			}
+		case "tool_result":
+			if e.ToolUseID == "call_1" && e.ToolName == "read_file" && strings.Contains(e.ToolOutput, "module kojo") {
+				sawResult = true
+			}
+		}
+	}
+	if !sawUse {
+		t.Error("expected tool_use event")
+	}
+	if !sawResult {
+		t.Error("expected tool_result event")
+	}
+}
+
+func TestParseGrokStream_ACPToolCall(t *testing.T) {
+	events, res := collectGrokEvents(t,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call_2","title":"Reading README","kind":"read","status":"pending","rawInput":{"path":"README.md"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_2","status":"completed","content":[{"type":"content","content":{"type":"text","text":"README contents"}}],"rawOutput":{"content":"README contents"}}}}`,
+	)
+	if len(res.toolUses) != 1 {
+		t.Fatalf("toolUses len = %d, want 1", len(res.toolUses))
+	}
+	tu := res.toolUses[0]
+	if tu.ID != "call_2" || tu.Name != "Reading README" {
+		t.Errorf("tool use id/name = %q/%q, want call_2/Reading README", tu.ID, tu.Name)
+	}
+	if !strings.Contains(tu.Input, "README.md") {
+		t.Errorf("tool input = %q, want README.md", tu.Input)
+	}
+	if tu.Output != "README contents" {
+		t.Errorf("tool output = %q, want README contents", tu.Output)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events len = %d, want 2", len(events))
+	}
+	if events[0].Type != "tool_use" || events[1].Type != "tool_result" {
+		t.Errorf("events = %+v, want tool_use then tool_result", events)
+	}
+}
+
+func TestParseGrokStream_ACPMessageChunks(t *testing.T) {
+	events, res := collectGrokEvents(t,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}`,
+	)
+	if res.thinking != "thinking" {
+		t.Errorf("thinking = %q, want thinking", res.thinking)
+	}
+	if res.text != "answer" {
+		t.Errorf("text = %q, want answer", res.text)
+	}
+	if len(events) != 2 || events[0].Type != "thinking" || events[1].Type != "text" {
+		t.Errorf("events = %+v, want thinking then text", events)
+	}
+}
+
+func TestParseGrokStream_ACPProgressContentDoesNotCompleteTool(t *testing.T) {
+	events, res := collectGrokEvents(t,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call_3","title":"Searching","status":"pending","rawInput":{"query":"todo"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_3","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"Found 1 file"}}]}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_3","status":"completed","content":[{"type":"content","content":{"type":"text","text":"Final result"}}]}}}`,
+	)
+	if len(events) != 2 {
+		t.Fatalf("events len = %d, want 2: %+v", len(events), events)
+	}
+	if events[0].Type != "tool_use" || events[1].Type != "tool_result" {
+		t.Errorf("events = %+v, want tool_use then tool_result", events)
+	}
+	if events[1].ToolOutput != "Final result" {
+		t.Errorf("tool result output = %q, want Final result", events[1].ToolOutput)
+	}
+	if len(res.toolUses) != 1 || res.toolUses[0].Output != "Final result" {
+		t.Errorf("res.toolUses = %+v, want final output", res.toolUses)
+	}
+}
+
+func TestParseGrokChatHistoryToolUses_CurrentTurnBasicTools(t *testing.T) {
+	history := strings.Join([]string{
+		`{"type":"system","content":"system prompt"}`,
+		`{"type":"user","content":[{"type":"text","text":"previous turn"}]}`,
+		`{"type":"assistant","content":"","tool_calls":[{"id":"call-old","name":"Read","arguments":"{\"path\":\"old.txt\"}"}]}`,
+		`{"type":"tool_result","tool_call_id":"call-old","content":"old output"}`,
+		`{"type":"user","content":[{"type":"text","text":"current turn"}]}`,
+		`{"type":"assistant","content":"","tool_calls":[{"id":"call-read","name":"Read","arguments":"{\"path\":\"README.md\"}"},{"id":"call-write","name":"Write","arguments":"{\"path\":\"out.txt\",\"content\":\"ok\"}"}]}`,
+		`{"type":"tool_result","tool_call_id":"call-read","content":"README contents"}`,
+		`{"type":"tool_result","tool_call_id":"call-write","content":"The file out.txt has been written successfully."}`,
+		`{"type":"assistant","content":"done"}`,
+	}, "\n") + "\n"
+
+	tools, err := parseGrokChatHistoryToolUses(strings.NewReader(history))
+	if err != nil {
+		t.Fatalf("parseGrokChatHistoryToolUses: %v", err)
+	}
+	if len(tools) != 2 {
+		t.Fatalf("toolUses len = %d, want 2: %+v", len(tools), tools)
+	}
+	if tools[0].ID != "call-read" || tools[0].Name != "Read" {
+		t.Errorf("tools[0] id/name = %q/%q, want call-read/Read", tools[0].ID, tools[0].Name)
+	}
+	if tools[0].Input != `{"path":"README.md"}` {
+		t.Errorf("tools[0].Input = %q", tools[0].Input)
+	}
+	if tools[0].Output != "README contents" {
+		t.Errorf("tools[0].Output = %q", tools[0].Output)
+	}
+	if tools[1].ID != "call-write" || tools[1].Name != "Write" {
+		t.Errorf("tools[1] id/name = %q/%q, want call-write/Write", tools[1].ID, tools[1].Name)
+	}
+	if !strings.Contains(tools[1].Input, `"path":"out.txt"`) {
+		t.Errorf("tools[1].Input = %q, want out.txt", tools[1].Input)
+	}
+	if tools[1].Output != "The file out.txt has been written successfully." {
+		t.Errorf("tools[1].Output = %q", tools[1].Output)
+	}
+	for _, tool := range tools {
+		if tool.ID == "call-old" {
+			t.Fatalf("old turn tool leaked into current turn: %+v", tools)
+		}
+	}
+}
+
+func TestParseGrokChatHistoryToolUses_FunctionToolCallAndContentBlocks(t *testing.T) {
+	history := strings.Join([]string{
+		`{"type":"user","content":[{"type":"text","text":"search"}]}`,
+		`{"type":"assistant","content":"","tool_calls":[{"id":"call-grep","function":{"name":"Grep","arguments":"{\"pattern\":\"todo\"}"}}]}`,
+		`{"type":"tool_result","tool_call_id":"call-grep","content":[{"type":"text","text":"internal/agent/backend_grok.go"}]}`,
+	}, "\n") + "\n"
+
+	tools, err := parseGrokChatHistoryToolUses(strings.NewReader(history))
+	if err != nil {
+		t.Fatalf("parseGrokChatHistoryToolUses: %v", err)
+	}
+	if len(tools) != 1 {
+		t.Fatalf("toolUses len = %d, want 1: %+v", len(tools), tools)
+	}
+	if tools[0].Name != "Grep" {
+		t.Errorf("tool name = %q, want Grep", tools[0].Name)
+	}
+	if tools[0].Input != `{"pattern":"todo"}` {
+		t.Errorf("tool input = %q", tools[0].Input)
+	}
+	if tools[0].Output != "internal/agent/backend_grok.go" {
+		t.Errorf("tool output = %q", tools[0].Output)
+	}
+}
+
 func TestGrokEscapePath(t *testing.T) {
 	// Verified empirically against grok 0.1.216: each input is the
 	// cwd grok ran in, each output is the directory name it wrote

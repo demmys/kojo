@@ -260,7 +260,8 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 
 		if result.cancelled {
 			cmd.Wait()
-			emitCancelDone(ctx, ch, result.text, result.thinking, nil, nil)
+			enrichGrokToolUsesFromSessionHistory(dir, result, b.logger)
+			emitCancelDone(ctx, ch, result.text, result.thinking, result.toolUses, nil)
 			// Best-effort: drop a OneShot session that was created
 			// mid-cancel so it doesn't leak into the persistent
 			// store. We tolerate empty sessionID (turn died before
@@ -330,6 +331,8 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 			writeGrokSessionID(dir, result.sessionID, b.logger)
 		}
 
+		enrichGrokToolUsesFromSessionHistory(dir, result, b.logger)
+
 		// OneShot cleanup: remove the disposable session directory
 		// grok just created. Done outside the resumeID branch so
 		// a OneShot that happened to land on the same cwd as the
@@ -343,6 +346,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		msg := newAssistantMessage()
 		msg.Content = result.text
 		msg.Thinking = result.thinking
+		msg.ToolUses = result.toolUses
 
 		if result.sessionID != "" {
 			b.logger.Debug("grok session", "agent", agent.ID, "sessionId", result.sessionID, "oneShot", opts.OneShot)
@@ -356,19 +360,83 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 
 // grokStreamResult collects the streamed output of one grok invocation.
 type grokStreamResult struct {
-	text         string
-	thinking     string
-	sessionID    string
-	streamError  string // last {"type":"error","message":"..."} event payload
-	cancelled    bool
+	text        string
+	thinking    string
+	toolUses    []ToolUse
+	sessionID   string
+	streamError string // last {"type":"error","message":"..."} event payload
+	cancelled   bool
+}
+
+type grokStreamEvent struct {
+	grokToolPayload
+	Type    string          `json:"type"`
+	Data    json.RawMessage `json:"data"`
+	Message string          `json:"message"` // {"type":"error","message":"..."}
+	Method  string          `json:"method"`
+	Params  *struct {
+		Update grokToolPayload `json:"update"`
+	} `json:"params"`
+	StopReason string `json:"stopReason"`
+	SessionID  string `json:"sessionId"`
+}
+
+type grokToolPayload struct {
+	SessionUpdate   string          `json:"sessionUpdate"`
+	ID              string          `json:"id"`
+	ToolUseID       string          `json:"toolUseId"`
+	ToolCallID      string          `json:"toolCallId"`
+	ToolCallIDAlt   string          `json:"tool_call_id"`
+	ToolID          string          `json:"tool_id"`
+	ToolName        string          `json:"toolName"`
+	ToolNameAlt     string          `json:"tool_name"`
+	Name            string          `json:"name"`
+	Title           string          `json:"title"`
+	Kind            string          `json:"kind"`
+	Status          string          `json:"status"`
+	Command         string          `json:"command"`
+	ToolArgsJSON    string          `json:"tool_args_json"`
+	ToolInput       json.RawMessage `json:"toolInput"`
+	ToolOutput      json.RawMessage `json:"toolOutput"`
+	Input           json.RawMessage `json:"input"`
+	Output          json.RawMessage `json:"output"`
+	Args            json.RawMessage `json:"args"`
+	Arguments       json.RawMessage `json:"arguments"`
+	RawInput        json.RawMessage `json:"rawInput"`
+	RawOutput       json.RawMessage `json:"rawOutput"`
+	Result          json.RawMessage `json:"result"`
+	Content         json.RawMessage `json:"content"`
+	ErrorMessage    string          `json:"errorMessage"`
+	ErrorMessageAlt string          `json:"error_message"`
+	Message         string          `json:"message"`
+}
+
+type grokChatHistoryEntry struct {
+	Type       string             `json:"type"`
+	Content    json.RawMessage    `json:"content"`
+	ToolCalls  []grokChatToolCall `json:"tool_calls"`
+	ToolCallID string             `json:"tool_call_id"`
+}
+
+type grokChatToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+	Function  *struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
 }
 
 // parseGrokStream reads grok --output-format streaming-json lines from r
 // and emits ChatEvents through send. Recognised event shapes:
 //
-//	{"type":"thought","data":"..."}   reasoning delta
-//	{"type":"text","data":"..."}      assistant text delta
-//	{"type":"end","stopReason":"...","sessionId":"...","requestId":"..."}
+//	{"type":"thought","data":"..."}                         reasoning delta
+//	{"type":"text","data":"..."}                            assistant text delta
+//	{"type":"tool_call_started", ...}                        tool invocation
+//	{"type":"tool_call_completed", ...}                      tool result
+//	{"type":"end","stopReason":"...","sessionId":"..."}      turn end
+//	{"method":"session/update","params":{"update":{...}}}    ACP-compatible updates
 //
 // Unknown event types are skipped — keeps us forward-compatible with
 // future grok schema additions. A send that returns false (context
@@ -382,38 +450,123 @@ func parseGrokStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 
 	var textBuf, thinkBuf strings.Builder
+	var toolUses []ToolUse
+	resultSent := make(map[string]bool)
+	cancelled := func() {
+		res.text = textBuf.String()
+		res.thinking = thinkBuf.String()
+		res.toolUses = toolUses
+		res.cancelled = true
+	}
+
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}
-		var ev struct {
-			Type       string `json:"type"`
-			Data       string `json:"data"`
-			Message    string `json:"message"` // {"type":"error","message":"..."}
-			StopReason string `json:"stopReason"`
-			SessionID  string `json:"sessionId"`
-		}
+		var ev grokStreamEvent
 		if err := json.Unmarshal(line, &ev); err != nil {
 			logger.Debug("grok parse line", "err", err, "line", string(line))
 			continue
 		}
-		switch ev.Type {
+		eventType := ev.Type
+		payload := ev.grokToolPayload
+		if ev.Method == "session/update" && ev.Params != nil {
+			payload = ev.Params.Update
+			eventType = payload.SessionUpdate
+		}
+		if payload.Message == "" {
+			payload.Message = ev.Message
+		}
+		if payload.SessionUpdate != "" && eventType == "" {
+			eventType = payload.SessionUpdate
+		}
+		payload = mergeGrokDataPayload(payload, ev.Data)
+
+		switch eventType {
 		case "thought":
-			thinkBuf.WriteString(ev.Data)
-			if !send(ChatEvent{Type: "thinking", Delta: ev.Data}) {
-				res.text = textBuf.String()
-				res.thinking = thinkBuf.String()
-				res.cancelled = true
+			delta := grokRawString(ev.Data)
+			thinkBuf.WriteString(delta)
+			if !send(ChatEvent{Type: "thinking", Delta: delta}) {
+				cancelled()
 				return res
 			}
 		case "text":
-			textBuf.WriteString(ev.Data)
-			if !send(ChatEvent{Type: "text", Delta: ev.Data}) {
-				res.text = textBuf.String()
-				res.thinking = thinkBuf.String()
-				res.cancelled = true
+			delta := grokRawString(ev.Data)
+			textBuf.WriteString(delta)
+			if !send(ChatEvent{Type: "text", Delta: delta}) {
+				cancelled()
 				return res
+			}
+		case "agent_message_chunk":
+			delta := grokContentText(payload.Content)
+			if delta == "" {
+				delta = grokRawString(ev.Data)
+			}
+			if delta != "" {
+				textBuf.WriteString(delta)
+				if !send(ChatEvent{Type: "text", Delta: delta}) {
+					cancelled()
+					return res
+				}
+			}
+		case "agent_thought_chunk":
+			delta := grokContentText(payload.Content)
+			if delta == "" {
+				delta = grokRawString(ev.Data)
+			}
+			if delta != "" {
+				thinkBuf.WriteString(delta)
+				if !send(ChatEvent{Type: "thinking", Delta: delta}) {
+					cancelled()
+					return res
+				}
+			}
+		case "tool_call", "tool_call_started", "tool_started", "tool_use":
+			tu := grokToolUseFromPayload(payload)
+			var added bool
+			toolUses, added = appendOrUpdateGrokToolUse(toolUses, tu)
+			if added {
+				if !send(ChatEvent{Type: "tool_use", ToolUseID: tu.ID, ToolName: tu.Name, ToolInput: tu.Input}) {
+					cancelled()
+					return res
+				}
+			}
+			if grokToolPayloadIsTerminal(payload) || grokToolPayloadHasOutput(payload) {
+				output := grokToolOutput(payload)
+				key := grokToolKey(tu.ID, tu.Name)
+				if !resultSent[key] {
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: tu.ID, ToolName: tu.Name, ToolOutput: output}) {
+						cancelled()
+						return res
+					}
+					matchToolOutput(toolUses, tu.ID, tu.Name, output)
+					resultSent[key] = true
+				}
+			}
+		case "tool_call_update", "tool_call_completed", "tool_completed", "tool_result", "tool_call_failed":
+			tu := grokToolUseFromPayload(payload)
+			var added bool
+			toolUses, added = appendOrUpdateGrokToolUse(toolUses, tu)
+			if added {
+				if !send(ChatEvent{Type: "tool_use", ToolUseID: tu.ID, ToolName: tu.Name, ToolInput: tu.Input}) {
+					cancelled()
+					return res
+				}
+			}
+			if eventType == "tool_result" || eventType == "tool_call_completed" ||
+				eventType == "tool_completed" || eventType == "tool_call_failed" ||
+				grokToolPayloadIsTerminal(payload) || grokToolPayloadHasOutput(payload) {
+				output := grokToolOutput(payload)
+				key := grokToolKey(tu.ID, tu.Name)
+				if !resultSent[key] {
+					if !send(ChatEvent{Type: "tool_result", ToolUseID: tu.ID, ToolName: tu.Name, ToolOutput: output}) {
+						cancelled()
+						return res
+					}
+					matchToolOutput(toolUses, tu.ID, tu.Name, output)
+					resultSent[key] = true
+				}
 			}
 		case "end":
 			res.sessionID = ev.SessionID
@@ -434,7 +587,426 @@ func parseGrokStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool
 	}
 	res.text = textBuf.String()
 	res.thinking = thinkBuf.String()
+	res.toolUses = toolUses
 	return res
+}
+
+func enrichGrokToolUsesFromSessionHistory(cwd string, res *grokStreamResult, logger *slog.Logger) {
+	if res == nil || res.sessionID == "" {
+		return
+	}
+	toolUses, err := readGrokSessionHistoryToolUses(cwd, res.sessionID)
+	if err != nil {
+		logger.Debug("grok: read chat_history tool uses", "sessionId", res.sessionID, "err", err)
+		return
+	}
+	if len(toolUses) > 0 {
+		res.toolUses = toolUses
+	}
+}
+
+func readGrokSessionHistoryToolUses(cwd, sessionID string) ([]ToolUse, error) {
+	if !isGrokSessionID(sessionID) {
+		return nil, fmt.Errorf("invalid session id")
+	}
+	dir := grokSessionDir(cwd)
+	if dir == "" {
+		return nil, fmt.Errorf("grok session dir unavailable")
+	}
+	f, err := os.Open(filepath.Join(dir, sessionID, "chat_history.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return parseGrokChatHistoryToolUses(f)
+}
+
+func parseGrokChatHistoryToolUses(r io.Reader) ([]ToolUse, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+
+	var toolUses []ToolUse
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var entry grokChatHistoryEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		switch entry.Type {
+		case "user":
+			toolUses = nil
+		case "assistant":
+			for _, call := range entry.ToolCalls {
+				toolUses = append(toolUses, grokToolUseFromChatHistoryCall(call))
+			}
+		case "tool_result":
+			matchToolOutput(toolUses, entry.ToolCallID, "", grokChatHistoryContent(entry.Content))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return toolUses, err
+	}
+	return toolUses, nil
+}
+
+func grokToolUseFromChatHistoryCall(call grokChatToolCall) ToolUse {
+	name := call.Name
+	args := call.Arguments
+	if call.Function != nil {
+		if name == "" {
+			name = call.Function.Name
+		}
+		if len(args) == 0 {
+			args = call.Function.Arguments
+		}
+	}
+	if name == "" {
+		name = "tool"
+	}
+	return ToolUse{
+		ID:    call.ID,
+		Name:  name,
+		Input: grokJSONDisplay(args),
+	}
+}
+
+func grokChatHistoryContent(raw json.RawMessage) string {
+	if s := grokJSONString(raw); s != "" {
+		return s
+	}
+	if s := grokContentText(raw); s != "" {
+		return s
+	}
+	return grokJSONDisplay(raw)
+}
+
+func mergeGrokDataPayload(base grokToolPayload, data json.RawMessage) grokToolPayload {
+	raw := bytes.TrimSpace(data)
+	if len(raw) == 0 || raw[0] != '{' {
+		return base
+	}
+	var extra grokToolPayload
+	if err := json.Unmarshal(raw, &extra); err != nil {
+		return base
+	}
+	return overlayGrokToolPayload(base, extra)
+}
+
+func overlayGrokToolPayload(base, extra grokToolPayload) grokToolPayload {
+	if extra.SessionUpdate != "" {
+		base.SessionUpdate = extra.SessionUpdate
+	}
+	if extra.ID != "" {
+		base.ID = extra.ID
+	}
+	if extra.ToolUseID != "" {
+		base.ToolUseID = extra.ToolUseID
+	}
+	if extra.ToolCallID != "" {
+		base.ToolCallID = extra.ToolCallID
+	}
+	if extra.ToolCallIDAlt != "" {
+		base.ToolCallIDAlt = extra.ToolCallIDAlt
+	}
+	if extra.ToolID != "" {
+		base.ToolID = extra.ToolID
+	}
+	if extra.ToolName != "" {
+		base.ToolName = extra.ToolName
+	}
+	if extra.ToolNameAlt != "" {
+		base.ToolNameAlt = extra.ToolNameAlt
+	}
+	if extra.Name != "" {
+		base.Name = extra.Name
+	}
+	if extra.Title != "" {
+		base.Title = extra.Title
+	}
+	if extra.Kind != "" {
+		base.Kind = extra.Kind
+	}
+	if extra.Status != "" {
+		base.Status = extra.Status
+	}
+	if extra.Command != "" {
+		base.Command = extra.Command
+	}
+	if extra.ToolArgsJSON != "" {
+		base.ToolArgsJSON = extra.ToolArgsJSON
+	}
+	if len(extra.ToolInput) > 0 {
+		base.ToolInput = extra.ToolInput
+	}
+	if len(extra.ToolOutput) > 0 {
+		base.ToolOutput = extra.ToolOutput
+	}
+	if len(extra.Input) > 0 {
+		base.Input = extra.Input
+	}
+	if len(extra.Output) > 0 {
+		base.Output = extra.Output
+	}
+	if len(extra.Args) > 0 {
+		base.Args = extra.Args
+	}
+	if len(extra.Arguments) > 0 {
+		base.Arguments = extra.Arguments
+	}
+	if len(extra.RawInput) > 0 {
+		base.RawInput = extra.RawInput
+	}
+	if len(extra.RawOutput) > 0 {
+		base.RawOutput = extra.RawOutput
+	}
+	if len(extra.Result) > 0 {
+		base.Result = extra.Result
+	}
+	if len(extra.Content) > 0 {
+		base.Content = extra.Content
+	}
+	if extra.ErrorMessage != "" {
+		base.ErrorMessage = extra.ErrorMessage
+	}
+	if extra.ErrorMessageAlt != "" {
+		base.ErrorMessageAlt = extra.ErrorMessageAlt
+	}
+	if extra.Message != "" {
+		base.Message = extra.Message
+	}
+	return base
+}
+
+func grokJSONString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
+}
+
+func grokRawString(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
+}
+
+func grokJSONDisplay(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err == nil {
+		return buf.String()
+	}
+	return string(raw)
+}
+
+func grokRawObjectString(raw json.RawMessage, keys ...string) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	for _, key := range keys {
+		if v, ok := obj[key]; ok {
+			if s := grokRawString(v); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func grokContentText(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return ""
+	}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		blocks = []json.RawMessage{raw}
+	}
+	var parts []string
+	for _, block := range blocks {
+		if text := grokContentBlockText(block); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func grokContentBlockText(raw json.RawMessage) string {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return grokRawString(raw)
+	}
+	if nested, ok := obj["content"]; ok {
+		if text := grokContentBlockText(nested); text != "" {
+			return text
+		}
+	}
+	for _, key := range []string{"text", "output", "rawOutput", "result"} {
+		if v, ok := obj[key]; ok {
+			if text := grokRawString(v); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func grokToolUseFromPayload(p grokToolPayload) ToolUse {
+	return ToolUse{
+		ID:    grokToolID(p),
+		Name:  grokToolName(p),
+		Input: grokToolInput(p),
+	}
+}
+
+func grokToolID(p grokToolPayload) string {
+	for _, v := range []string{p.ToolUseID, p.ToolCallID, p.ToolCallIDAlt, p.ToolID, p.ID} {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func grokToolName(p grokToolPayload) string {
+	for _, v := range []string{p.ToolName, p.ToolNameAlt, p.Name} {
+		if v != "" {
+			return v
+		}
+	}
+	if v := grokRawObjectString(p.RawInput, "tool_name", "toolName", "name"); v != "" {
+		return v
+	}
+	if p.Command != "" {
+		return "shell"
+	}
+	if p.Title != "" {
+		return p.Title
+	}
+	if p.Kind != "" {
+		return p.Kind
+	}
+	return "tool"
+}
+
+func grokToolInput(p grokToolPayload) string {
+	if s := grokJSONDisplay(p.ToolInput); s != "" {
+		return s
+	}
+	if p.ToolArgsJSON != "" {
+		return p.ToolArgsJSON
+	}
+	for _, raw := range []json.RawMessage{p.Args, p.Arguments, p.Input} {
+		if s := grokJSONDisplay(raw); s != "" {
+			return s
+		}
+	}
+	if p.Command != "" {
+		return p.Command
+	}
+	if s := grokRawObjectString(p.RawInput, "tool_args_json", "arguments", "args"); s != "" {
+		return s
+	}
+	return grokJSONDisplay(p.RawInput)
+}
+
+func grokToolOutput(p grokToolPayload) string {
+	for _, raw := range []json.RawMessage{p.ToolOutput, p.Output} {
+		if s := grokJSONDisplay(raw); s != "" {
+			return s
+		}
+	}
+	if s := grokContentText(p.Content); s != "" {
+		return s
+	}
+	for _, raw := range []json.RawMessage{p.RawOutput, p.Result} {
+		if s := grokJSONDisplay(raw); s != "" {
+			return s
+		}
+	}
+	for _, v := range []string{p.ErrorMessage, p.ErrorMessageAlt} {
+		if v != "" {
+			return "error: " + v
+		}
+	}
+	if p.Message != "" && strings.EqualFold(p.Status, "failed") {
+		return "error: " + p.Message
+	}
+	return ""
+}
+
+func grokToolPayloadHasOutput(p grokToolPayload) bool {
+	return len(bytes.TrimSpace(p.ToolOutput)) > 0 ||
+		len(bytes.TrimSpace(p.Output)) > 0 ||
+		len(bytes.TrimSpace(p.RawOutput)) > 0 ||
+		len(bytes.TrimSpace(p.Result)) > 0 ||
+		p.ErrorMessage != "" ||
+		p.ErrorMessageAlt != ""
+}
+
+func grokToolPayloadIsTerminal(p grokToolPayload) bool {
+	switch strings.ToLower(p.Status) {
+	case "completed", "failed", "cancelled", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+func appendOrUpdateGrokToolUse(toolUses []ToolUse, tu ToolUse) ([]ToolUse, bool) {
+	if tu.Name == "" {
+		tu.Name = "tool"
+	}
+	for i := len(toolUses) - 1; i >= 0; i-- {
+		if tu.ID != "" {
+			if toolUses[i].ID != tu.ID {
+				continue
+			}
+		} else if toolUses[i].Name != tu.Name || toolUses[i].Output != "" {
+			continue
+		}
+		if toolUses[i].Name == "" || toolUses[i].Name == "tool" {
+			toolUses[i].Name = tu.Name
+		}
+		if toolUses[i].Input == "" && tu.Input != "" {
+			toolUses[i].Input = tu.Input
+		}
+		return toolUses, false
+	}
+	return append(toolUses, tu), true
+}
+
+func grokToolKey(id, name string) string {
+	if id != "" {
+		return "id:" + id
+	}
+	return "name:" + name
 }
 
 // grokHome returns the root directory grok uses for its on-disk state.
@@ -692,8 +1264,8 @@ func isStaleSessionError(msg string) bool {
 		"session not found",
 		"unknown session",
 		"could not find session",
-		"session does not exist",     // grok 0.1.x: "Couldn't create session: Session does not exist"
-		"couldn't create session",    // same family, different prefix
+		"session does not exist",  // grok 0.1.x: "Couldn't create session: Session does not exist"
+		"couldn't create session", // same family, different prefix
 	}
 	for _, n := range staleNeedles {
 		if strings.Contains(lower, n) {

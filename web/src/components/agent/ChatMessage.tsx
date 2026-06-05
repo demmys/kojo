@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useEffect, useRef } from "react";
+import { memo, useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { AgentMessage, AgentMessageAttachment } from "../../lib/agentApi";
 import { ToolUseCard } from "./ToolUseCard";
 import { AgentAvatar } from "./AgentAvatar";
@@ -10,6 +10,11 @@ import { formatSize } from "../../lib/utils";
 // File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
 const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv|ogv|m4v|flv|wmv)$/i;
+type MediaPreviewType = "image" | "video";
+type MediaPreviewItem = {
+  path: string;
+  type: MediaPreviewType;
+};
 
 // Match absolute file paths (Unix, ~/-relative, or Windows-style) with any file
 // extension (1-10 chars). Bare chat autolinks intentionally reject whitespace:
@@ -34,6 +39,13 @@ function getFileType(path: string): "image" | "video" | "other" {
   if (IMAGE_EXTS.test(path)) return "image";
   if (VIDEO_EXTS.test(path)) return "video";
   return "other";
+}
+
+function attachmentPreviewType(att: AgentMessageAttachment): MediaPreviewType | null {
+  const extType = getFileType(att.name || att.path);
+  if (att.mime.startsWith("image/") || extType === "image") return "image";
+  if (att.mime.startsWith("video/") || extType === "video") return "video";
+  return null;
 }
 
 interface ChatMessageProps {
@@ -285,7 +297,25 @@ function ImageAttachmentChip({
 
 /** Display file attachments on a message */
 export function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
-  const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
+  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const previewable = useMemo<MediaPreviewItem[]>(
+    () =>
+      attachments.flatMap((att) => {
+        const type = attachmentPreviewType(att);
+        return type ? [{ path: att.path, type }] : [];
+      }),
+    [attachments],
+  );
+  const previewIndex = previewPath ? previewable.findIndex((item) => item.path === previewPath) : -1;
+  const preview = previewIndex >= 0 ? previewable[previewIndex] : null;
+  const navigatePreview = useCallback(
+    (dir: -1 | 1) => {
+      if (previewIndex < 0 || previewable.length <= 1) return;
+      const next = (previewIndex + dir + previewable.length) % previewable.length;
+      setPreviewPath(previewable[next].path);
+    },
+    [previewIndex, previewable],
+  );
 
   return (
     <>
@@ -293,24 +323,22 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
         {attachments.map((att) => {
           const url = attachmentURL(att.path);
           const thumbUrl = attachmentThumbURL(att.path, 400);
-          const extType = getFileType(att.name || att.path);
-          const isImage = att.mime.startsWith("image/") || extType === "image";
-          const isVideo = !isImage && (att.mime.startsWith("video/") || extType === "video");
-          if (isImage) {
+          const previewType = attachmentPreviewType(att);
+          if (previewType === "image") {
             return (
               <ImageAttachmentChip
                 key={att.path}
                 att={att}
                 url={thumbUrl}
-                onPreview={() => setPreview({ path: att.path, type: "image" })}
+                onPreview={() => setPreviewPath(att.path)}
               />
             );
           }
-          if (isVideo) {
+          if (previewType === "video") {
             return (
               <button
                 key={att.path}
-                onClick={() => setPreview({ path: att.path, type: "video" })}
+                onClick={() => setPreviewPath(att.path)}
                 className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs hover:opacity-80 transition-opacity ${
                   isUser ? "bg-blue-500/30" : "bg-neutral-700/50"
                 }`}
@@ -346,7 +374,14 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
         })}
       </div>
       {preview && (
-        <MediaOverlay path={preview.path} type={preview.type} onClose={() => setPreview(null)} />
+        <MediaOverlay
+          path={preview.path}
+          type={preview.type}
+          currentIndex={previewIndex}
+          total={previewable.length}
+          onClose={() => setPreviewPath(null)}
+          onNavigate={navigatePreview}
+        />
       )}
     </>
   );
@@ -983,17 +1018,77 @@ export function FileTextContent({
 export function MediaOverlay({
   path,
   type,
+  label,
+  currentIndex,
+  total,
   onClose,
+  onNavigate,
 }: {
   path: string;
-  type: "image" | "video";
+  type: MediaPreviewType;
+  label?: string;
+  currentIndex?: number;
+  total?: number;
   onClose: () => void;
+  onNavigate?: (dir: -1 | 1) => void;
 }) {
   // attachmentURL routes kojo:// → /api/v1/blob/... and falls back
   // to the file browser raw endpoint for legacy filesystem paths.
   const rawUrl = attachmentURL(path);
   const [videoError, setVideoError] = useState(false);
+  const [mediaWidth, setMediaWidth] = useState<number | null>(null);
+  const mediaFrameRef = useRef<HTMLDivElement>(null);
   const fileName = path.split(/[/\\]/).pop() || path;
+  const caption = label ?? path;
+  const canNavigate = !!onNavigate && (total ?? 0) > 1;
+
+  const updateMediaWidth = useCallback(() => {
+    const el = mediaFrameRef.current;
+    if (!el) return;
+    const width = el.getBoundingClientRect().width;
+    if (width > 0) setMediaWidth(Math.round(width));
+  }, []);
+
+  useEffect(() => {
+    setVideoError(false);
+    setMediaWidth(null);
+  }, [rawUrl, type]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (!canNavigate) return;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        onNavigate?.(-1);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        onNavigate?.(1);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [canNavigate, onClose, onNavigate]);
+
+  useEffect(() => {
+    const el = mediaFrameRef.current;
+    if (!el) return;
+    updateMediaWidth();
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(updateMediaWidth);
+      observer.observe(el);
+    }
+    window.addEventListener("resize", updateMediaWidth);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", updateMediaWidth);
+    };
+  }, [path, type, videoError, updateMediaWidth]);
 
   const handleBackdrop = useCallback(
     (e: React.MouseEvent) => {
@@ -1007,50 +1102,98 @@ export function MediaOverlay({
       className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
       onClick={handleBackdrop}
     >
-      <div className="relative max-w-[90vw] max-h-[90vh]">
+      <div className="relative flex max-w-[90vw] max-h-[90vh] flex-col items-center">
         <button
+          type="button"
           onClick={onClose}
           className="absolute -top-3 -right-3 w-8 h-8 bg-neutral-800 hover:bg-neutral-700 rounded-full flex items-center justify-center text-neutral-300 hover:text-white z-10 shadow-lg"
+          aria-label="Close preview"
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
           </svg>
         </button>
 
-        {type === "image" ? (
-          <img
-            src={rawUrl}
-            alt={path}
-            className="max-w-[90vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
-          />
-        ) : videoError ? (
-          <div className="flex flex-col items-center gap-3 p-8 bg-neutral-900 rounded-lg shadow-2xl">
-            <svg className="w-12 h-12 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
-            </svg>
-            <p className="text-sm text-neutral-400">This video format cannot be played in the browser.</p>
-            <a
-              href={`${rawUrl}&download=1`}
-              download={fileName}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors"
-              onClick={(e) => e.stopPropagation()}
-            >
-              Download
-            </a>
+        {canNavigate && currentIndex != null && total != null && (
+          <div className="absolute -top-7 left-0 right-0 text-center text-xs text-neutral-500 pointer-events-none">
+            {currentIndex + 1} / {total}
           </div>
-        ) : (
-          <video
-            src={rawUrl}
-            controls
-            autoPlay
-            playsInline
-            onError={() => setVideoError(true)}
-            className="max-w-[90vw] max-h-[85vh] rounded-lg shadow-2xl"
-          />
         )}
 
-        <div className="text-center mt-2 text-xs text-neutral-400 font-mono truncate">
-          {path}
+        {canNavigate && (
+          <>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onNavigate?.(-1);
+              }}
+              className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/35 text-neutral-400 transition-colors hover:bg-black/55 hover:text-white"
+              aria-label="Previous preview"
+              title="Previous"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onNavigate?.(1);
+              }}
+              className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/35 text-neutral-400 transition-colors hover:bg-black/55 hover:text-white"
+              aria-label="Next preview"
+              title="Next"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
+            </button>
+          </>
+        )}
+
+        <div ref={mediaFrameRef} className="inline-flex max-w-[90vw] items-center justify-center">
+          {type === "image" ? (
+            <img
+              src={rawUrl}
+              alt={caption}
+              onLoad={updateMediaWidth}
+              className="mx-auto block max-w-[90vw] max-h-[85vh] object-contain rounded-lg shadow-2xl"
+            />
+          ) : videoError ? (
+            <div className="flex flex-col items-center gap-3 p-8 bg-neutral-900 rounded-lg shadow-2xl">
+              <svg className="w-12 h-12 text-neutral-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+              </svg>
+              <p className="text-sm text-neutral-400">This video format cannot be played in the browser.</p>
+              <a
+                href={`${rawUrl}&download=1`}
+                download={fileName}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition-colors"
+                onClick={(e) => e.stopPropagation()}
+              >
+                Download
+              </a>
+            </div>
+          ) : (
+            <video
+              src={rawUrl}
+              controls
+              autoPlay
+              playsInline
+              onLoadedMetadata={updateMediaWidth}
+              onError={() => setVideoError(true)}
+              className="mx-auto block max-w-[90vw] max-h-[85vh] rounded-lg shadow-2xl"
+            />
+          )}
+        </div>
+
+        <div
+          className="mt-2 max-w-[90vw] whitespace-pre-wrap text-center text-xs text-neutral-400 font-mono wrap-anywhere"
+          style={{ width: mediaWidth ? `${mediaWidth}px` : "min(90vw, 32rem)" }}
+        >
+          {caption}
         </div>
       </div>
     </div>

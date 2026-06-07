@@ -777,19 +777,20 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		pendingDelta.Reset()
 	}
 
-	// Best-effort cleanup of orphaned streams is deferred to AFTER the
-	// final response delivery AND released asynchronously so the dead-
-	// stream loop never blocks the thread mutex. Each dead message keeps
-	// whatever partial text it received as a historical artifact; we
-	// deliberately do NOT delete or chat.update them — the final
-	// streamTS / batch post below carries the FULL reply, and rewriting
-	// partials would duplicate content. Trade-off: the channel can
-	// render up to maxStreamRestarts+1 partial messages (initial open +
-	// every restart that died) plus the one full reply; switching to
-	// chat.delete for cleaner UI is a follow-up. Stop indicator hygiene
-	// is also strictly optional — Slack auto-finalizes orphaned streams
-	// via TTL within minutes — so a missed cleanup costs nothing more
-	// than a few minutes of stale indicator.
+	// Orphaned streams from earlier restarts are cleaned up AFTER the
+	// final response delivery, asynchronously so the cleanup loop never
+	// blocks the thread mutex. A dead stream message ends in stale
+	// progress indicators (e.g. "_Running command…_") because the stream
+	// died mid-response (typically Slack's stream TTL on a long turn)
+	// before finalize could overwrite it. Once the full reply has been
+	// delivered elsewhere — chat.update on the live stream, or batch post
+	// — those partials are pure duplicates frozen on a progress indicator,
+	// so we chat.delete them, leaving exactly one clean reply in the
+	// channel. If the final delivery FAILED (or the turn produced no
+	// text), we instead keep each partial as a debugging / retry artifact
+	// and only StopStream it. finalDelivered records which case we are in;
+	// each delivery branch below sets it.
+	finalDelivered := false
 
 	if streamTS != "" {
 		// Stop stream (no text — just finalize the typing indicator).
@@ -879,6 +880,10 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 				noticeCancel()
 			}
+			// The live stream now holds the full clean reply (or, on
+			// chat.update failure, we posted chunks[0] as a fresh message).
+			// Either way, dead partials are now superseded.
+			finalDelivered = deliveredAll
 		} else {
 			// Stream was started — usually by the first tool_use event —
 			// but the assistant never produced any reply text. Keep the
@@ -913,6 +918,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 			noticeCancel()
 		}
+		// Batch post carried the full reply (StartStream failed or every
+		// stream died and we fell back). Dead partials are superseded.
+		finalDelivered = deliveredAll
 	} else if hasError || streamFailed {
 		// Either an explicit agent error, or StartStream failed and the
 		// turn produced no text. Surface a generic failure rather than
@@ -928,25 +936,38 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	clearCancel()
 
 	// Cleanup orphaned streams from earlier restarts — async because
-	// sendToAgent still holds the per-thread mutex at this point, and
-	// up to maxStreamRestarts StopStream calls (each with its own 5s
-	// timeout) would otherwise stall the next message in the same
-	// thread for tens of seconds for purely cosmetic indicator cleanup.
-	// Slack auto-finalizes orphaned streams via TTL within minutes if
-	// this goroutine never lands its calls, so the worst-case cost of
-	// dropping the cleanup entirely is a few minutes of stale indicator.
-	// The goroutine uses context.Background() so it survives sendToAgent
-	// returning; per-call timeouts cap the total wall time.
+	// sendToAgent still holds the per-thread mutex at this point, and up
+	// to maxStreamRestarts cleanup calls (each with its own 5s timeout)
+	// would otherwise stall the next message in the same thread for tens
+	// of seconds. The goroutine uses context.Background() so it survives
+	// sendToAgent returning; per-call timeouts cap the total wall time.
+	//
+	// When the final reply was delivered (finalDelivered), each dead
+	// partial is a duplicate frozen on a stale progress indicator, so we
+	// chat.delete it outright — that is what restores the "one clean
+	// reply" behavior after a mid-response stream restart. When delivery
+	// failed (or produced no text) we keep the partial as an artifact and
+	// only StopStream it. Either call is best-effort; on failure Slack
+	// still auto-finalizes the orphaned stream via TTL within minutes, so
+	// a dropped cleanup costs at most a stale indicator (delete failure
+	// additionally leaves the duplicate partial visible until manually
+	// cleared, no worse than the pre-restart behavior).
 	if len(deadStreams) > 0 {
 		streams := deadStreams // capture so the closure can be run sync (tests) or async (prod)
+		delivered := finalDelivered
 		cleanup := func() {
 			for _, ts := range streams {
-				stopCtx, stopCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
-				if _, _, err := b.api.StopStreamContext(stopCtx, channel, ts); err != nil {
+				opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				if delivered {
+					if _, _, err := b.api.DeleteMessageContext(opCtx, channel, ts); err != nil {
+						b.logger.Debug("failed to delete orphaned slack stream",
+							"channel", channel, "streamTS", ts, "err", err)
+					}
+				} else if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
 					b.logger.Debug("failed to stop orphaned slack stream",
 						"channel", channel, "streamTS", ts, "err", err)
 				}
-				stopCancel()
+				opCancel()
 			}
 		}
 		if b.runAsync != nil {

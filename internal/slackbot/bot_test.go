@@ -456,19 +456,23 @@ func (m *scriptedMgr) CanResumeSession(_, _ string) bool { return false }
 // and the issued/stopped lists are mutated from the HTTP handler
 // goroutine; the test reads them only after sendToAgent returns.
 type streamScript struct {
-	streamTSs []string // returned by chat.startStream, in order
-	killAt    []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
+	streamTSs  []string // returned by chat.startStream, in order
+	killAt     []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
+	failUpdate bool     // chat.update returns an error (simulate finalize replacement failure)
+	failPost   bool     // chat.postMessage returns an error (simulate batch/fallback delivery failure)
 
-	startCalls    int
-	appendCalls   int
-	stopCalls     int
-	updateCalls   int
-	postCalls     int
-	issuedTS      []string // ts values returned by chat.startStream
-	stoppedTS     []string // ts values seen by chat.stopStream
-	appendOnTS    []string // ts the bot tried to append to (in order)
-	lastUpdateTS  string
-	lastUpdateMD  string
+	startCalls   int
+	appendCalls  int
+	stopCalls    int
+	updateCalls  int
+	postCalls    int
+	deleteCalls  int
+	issuedTS     []string // ts values returned by chat.startStream
+	stoppedTS    []string // ts values seen by chat.stopStream
+	deletedTS    []string // ts values seen by chat.delete (dead-stream cleanup)
+	appendOnTS   []string // ts the bot tried to append to (in order)
+	lastUpdateTS string
+	lastUpdateMD string
 }
 
 // newStreamServer returns a mock Slack server that delegates streaming
@@ -508,10 +512,22 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			script.updateCalls++
 			script.lastUpdateTS = r.FormValue("ts")
 			script.lastUpdateMD = r.FormValue("markdown_text")
+			if script.failUpdate {
+				fmt.Fprintf(w, `{"ok":false,"error":"message_not_found"}`)
+				return
+			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/chat.postMessage":
 			script.postCalls++
+			if script.failPost {
+				fmt.Fprintf(w, `{"ok":false,"error":"channel_not_found"}`)
+				return
+			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.999"}`)
+		case "/chat.delete":
+			script.deleteCalls++
+			script.deletedTS = append(script.deletedTS, r.FormValue("ts"))
+			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/conversations.history", "/conversations.replies":
 			fmt.Fprintf(w, `{"ok":true,"messages":[]}`)
 		case "/assistant.threads.setStatus":
@@ -563,8 +579,9 @@ func newBotWithStream(t *testing.T, mgr ChatManager, srv *httptest.Server) *Bot 
 //     and won't open a new stream until the throttle clears, we use a
 //     second tool_use which bypasses the throttle),
 //   - flush the carried-over delta + new indicator on ts-2,
-//   - StopStream the dead ts-1 during finalize cleanup,
-//   - chat.update ts-2 with the full response text.
+//   - chat.update ts-2 with the full response text,
+//   - chat.delete the dead ts-1 during finalize cleanup (the full reply
+//     landed on ts-2, so the frozen ts-1 partial is a duplicate).
 //
 // This is the integration guard for the silent-truncation bug that was
 // the original motivation for these changes.
@@ -594,8 +611,11 @@ func TestSendToAgentRestartsOnDeadStream(t *testing.T) {
 	if len(script.issuedTS) >= 2 && script.issuedTS[0] != "stream.1" {
 		t.Errorf("first startStream returned %q, want %q", script.issuedTS[0], "stream.1")
 	}
-	if !containsString(script.stoppedTS, "stream.1") {
-		t.Errorf("StopStream not called on dead stream.1; stoppedTS=%v", script.stoppedTS)
+	if !containsString(script.deletedTS, "stream.1") {
+		t.Errorf("chat.delete not called on dead stream.1; deletedTS=%v", script.deletedTS)
+	}
+	if containsString(script.deletedTS, "stream.2") {
+		t.Errorf("chat.delete must NOT touch the live final stream.2; deletedTS=%v", script.deletedTS)
 	}
 	if script.lastUpdateTS != "stream.2" {
 		t.Errorf("final chat.update targeted %q, want %q", script.lastUpdateTS, "stream.2")
@@ -609,8 +629,9 @@ func TestSendToAgentRestartsOnDeadStream(t *testing.T) {
 // to die so the bot exhausts its maxStreamRestarts budget. After the cap
 // trips, the remaining text must reach the user via chat.postMessage
 // (batch fallback) rather than being silently dropped. Also asserts that
-// every dead streamTS gets a StopStream during finalize cleanup so the
-// channel doesn't render N stuck streaming indicators.
+// every dead streamTS gets chat.delete'd during finalize cleanup (the
+// full reply landed via batch post, so the N frozen partials are
+// duplicates) so the channel doesn't render N stuck streaming messages.
 func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
 	// Generate maxStreamRestarts+2 stream TSs so the bot has more
 	// inventory than it can possibly use. The cap check must trip
@@ -653,14 +674,49 @@ func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
 		t.Errorf("chat.startStream called %d times, want %d (initial + maxStreamRestarts)",
 			script.startCalls, maxStreamRestarts+1)
 	}
-	// All dead streams should be stopped during finalize.
-	if len(script.stoppedTS) != script.startCalls {
-		t.Errorf("StopStream called on %d streams, want %d (every issued stream)",
-			len(script.stoppedTS), script.startCalls)
+	// All dead streams should be chat.delete'd during finalize: every
+	// issued stream died, the batch post carried the full reply, so each
+	// frozen partial is a duplicate that must be removed.
+	if len(script.deletedTS) != script.startCalls {
+		t.Errorf("chat.delete called on %d streams, want %d (every issued stream)",
+			len(script.deletedTS), script.startCalls)
 	}
 	// Fallback path: at least one chat.postMessage for the final text.
 	if script.postCalls == 0 {
 		t.Error("expected at least one chat.postMessage as batch-fallback after cap, got 0")
+	}
+}
+
+// TestSendToAgentKeepsDeadStreamWhenDeliveryFails verifies the safety net:
+// if the final reply could NOT be delivered (chat.update fails AND the
+// chat.postMessage fallback fails), the dead partial is preserved as a
+// debugging/retry artifact — StopStream'd, not chat.delete'd. Deleting it
+// there would leave the user with no content at all.
+func TestSendToAgentKeepsDeadStreamWhenDeliveryFails(t *testing.T) {
+	script := &streamScript{
+		streamTSs:  []string{"stream.1", "stream.2"},
+		killAt:     []int{0}, // kill the first append → drop stream.1, restart to stream.2
+		failUpdate: true,     // finalize chat.update on stream.2 fails
+		failPost:   true,     // batch/fallback postMessage also fails
+	}
+	srv := newStreamServer(t, script)
+
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "tool_use", ToolName: "Bash"},
+		{Type: "tool_use", ToolName: "Read"},
+		{Type: "text", Delta: "hello world"},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	// Delivery failed, so the dead stream.1 must be kept (StopStream),
+	// not deleted.
+	if containsString(script.deletedTS, "stream.1") {
+		t.Errorf("dead stream.1 was deleted despite delivery failure; deletedTS=%v", script.deletedTS)
+	}
+	if !containsString(script.stoppedTS, "stream.1") {
+		t.Errorf("dead stream.1 should be StopStream'd as a retry artifact; stoppedTS=%v", script.stoppedTS)
 	}
 }
 

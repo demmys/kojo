@@ -2,12 +2,14 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
@@ -676,13 +678,23 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			}
 
 		case "tool_use":
-			// Update assistant typing status to show which tool is running.
-			status := toolStatusText(evt.ToolName)
+			// Surface what the agent is actually doing, not just which
+			// tool fired. Codex routes everything through "shell", so
+			// without the command detail every step would read the same
+			// generic "Running command…". toolStatusText / -Indicator
+			// pull the shell command / file path / search pattern out of
+			// the tool input.
+
+			// Update assistant typing status (plain text) to show which
+			// tool is running.
 			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 				ChannelID: channel,
 				ThreadTS:  threadTS,
-				Status:    status,
+				Status:    toolStatusText(evt.ToolName, evt.ToolInput),
 			})
+
+			// Inline stream indicator (Slack mrkdwn).
+			indicator := toolStatusIndicator(evt.ToolName, evt.ToolInput)
 
 			// Append a tool-use indicator to the stream so the user sees
 			// progress during long tool executions. The final chat.update
@@ -710,7 +722,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 					continue
 				}
 			}
-			if !b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_") {
+			if !b.appendStream(ctx, channel, streamTS, indicator) {
 				// Indicator append died. The indicator itself is
 				// ephemeral (finalize chat.update overwrites it),
 				// so no need to carry it forward. We deliberately
@@ -1064,35 +1076,165 @@ func sanitizeDisplayName(name string) string {
 	return out
 }
 
-// toolStatusText returns a human-readable status string for the given tool name.
-func toolStatusText(toolName string) string {
+// toolDetailMaxLen caps how many runes of a tool's salient argument
+// (command, file path, search pattern …) are shown in the progress
+// indicator so a long command line doesn't blow up the Slack message.
+const toolDetailMaxLen = 120
+
+// toolStatusLabel returns a human-readable action label for a tool,
+// without trailing ellipsis or detail. The second return value reports
+// whether the tool was recognized: recognized labels are fixed, literal
+// strings (safe to drop into Slack mrkdwn italics), whereas unrecognized
+// tools have no fixed label and their (agent/server-derived) name must be
+// surfaced via a code span — see toolStatusIndicator.
+//
+// Codex routes every file read/edit/search through its sandboxed shell,
+// so its tool name is always "shell" (see backend_codex.go). We map
+// "shell" to the same "Running command" label as Claude's "Bash" — the
+// shell command itself, surfaced via toolStatusDetail, tells the user
+// what is actually happening.
+func toolStatusLabel(toolName string) (label string, known bool) {
 	switch toolName {
-	case "Bash":
-		return "Running command…"
+	case "Bash", "shell":
+		return "Running command", true
 	case "Read":
-		return "Reading file…"
+		return "Reading file", true
 	case "Write":
-		return "Writing file…"
-	case "Edit":
-		return "Editing file…"
+		return "Writing file", true
+	case "Edit", "MultiEdit":
+		return "Editing file", true
 	case "Grep":
-		return "Searching code…"
+		return "Searching code", true
 	case "Glob":
-		return "Finding files…"
+		return "Finding files", true
 	case "Agent", "Task":
-		return "Running sub-agent…"
+		return "Running sub-agent", true
 	case "WebFetch":
-		return "Fetching web page…"
+		return "Fetching web page", true
 	case "WebSearch":
-		return "Searching the web…"
+		return "Searching the web", true
 	case "NotebookEdit":
-		return "Editing notebook…"
+		return "Editing notebook", true
 	default:
+		return "", false
+	}
+}
+
+// toolStatusDetail extracts the single most salient argument from a tool
+// invocation's input — the shell command, the file path, the search
+// pattern — so the user can tell what the agent is actually doing rather
+// than just "Running command…". Returns "" when no useful detail is
+// available (the caller then falls back to the bare label).
+//
+// Claude tool inputs are JSON objects (e.g. {"command":"git status"}).
+// Codex's "shell" tool input is the raw command string, not JSON, so it
+// is used verbatim.
+func toolStatusDetail(toolName, toolInput string) string {
+	if toolInput == "" {
+		return ""
+	}
+	var detail string
+	switch toolName {
+	case "shell":
+		detail = toolInput // Codex: raw command string, not JSON.
+	case "Bash":
+		detail = jsonStringField(toolInput, "command")
+	case "Read", "Write", "Edit", "MultiEdit":
+		detail = jsonStringField(toolInput, "file_path")
+	case "NotebookEdit":
+		detail = jsonStringField(toolInput, "notebook_path")
+	case "Grep", "Glob":
+		detail = jsonStringField(toolInput, "pattern")
+	case "WebFetch":
+		detail = jsonStringField(toolInput, "url")
+	case "WebSearch":
+		detail = jsonStringField(toolInput, "query")
+	default:
+		return ""
+	}
+	return cleanToolDetail(detail)
+}
+
+// jsonStringField returns the string value of a top-level field in a JSON
+// object, or "" if the input is not a JSON object, the field is missing,
+// or the value is not a string. Tolerant of partial/invalid input.
+func jsonStringField(raw, field string) string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return ""
+	}
+	v, ok := m[field]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
+}
+
+// cleanToolDetail normalizes a tool detail for display in the Slack
+// indicator: collapses whitespace/newlines to single spaces, neutralizes
+// backticks (which would break the inline code span), and truncates on a
+// rune boundary.
+func cleanToolDetail(s string) string {
+	// Bound work up front: the final result is capped at toolDetailMaxLen
+	// runes, so there is no point normalizing a megabyte-long heredoc
+	// command. Slice generously (a rune is at most 4 bytes, and
+	// whitespace collapsing only shrinks the string) before the O(n)
+	// Fields pass. The byte slice may land mid-rune; ToValidUTF8 drops
+	// the resulting partial bytes so no invalid UTF-8 reaches Slack —
+	// strings.Fields does not sanitize invalid encodings on its own.
+	if max := toolDetailMaxLen * 4; len(s) > max {
+		s = strings.ToValidUTF8(s[:max], "")
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "`", "'")
+	if utf8.RuneCountInString(s) > toolDetailMaxLen {
+		s = string([]rune(s)[:toolDetailMaxLen]) + "…"
+	}
+	return s
+}
+
+// toolStatusText returns a plain-text status string (label plus salient
+// detail) for the assistant typing indicator. Plain text needs no markdown
+// escaping, so the raw tool name is used for unrecognized tools.
+func toolStatusText(toolName, toolInput string) string {
+	label, known := toolStatusLabel(toolName)
+	if !known {
 		if toolName == "" {
 			return "Working…"
 		}
-		return "Using " + toolName + "…"
+		label = "Using " + toolName
 	}
+	if detail := toolStatusDetail(toolName, toolInput); detail != "" {
+		return label + ": " + detail
+	}
+	return label + "…"
+}
+
+// toolStatusIndicator builds the inline progress line shown in the Slack
+// stream (Slack mrkdwn). Only fixed label words ever sit inside the
+// italic span; every piece of dynamic text — the command/path/pattern
+// detail, or an unrecognized tool's name — goes in an inline code span so
+// its markdown-significant characters (_, *, ~, etc.) cannot break the
+// surrounding formatting.
+func toolStatusIndicator(toolName, toolInput string) string {
+	label, known := toolStatusLabel(toolName)
+	if !known {
+		if toolName == "" {
+			return "\n\n_⏳ Working…_"
+		}
+		return "\n\n_⏳ Using_ `" + cleanToolDetail(toolName) + "`"
+	}
+	if detail := toolStatusDetail(toolName, toolInput); detail != "" {
+		return "\n\n_⏳ " + label + ":_ `" + detail + "`"
+	}
+	return "\n\n_⏳ " + label + "…_"
 }
 
 // appendStream appends text to a streaming Slack message with rate limit

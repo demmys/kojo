@@ -1231,28 +1231,53 @@ func toolStatusDetail(toolName, toolInput string) string {
 	case "WebSearch":
 		detail = jsonStringField(toolInput, "query")
 	default:
+		// Tools whose detail we never surface (e.g. Agent/Task, whose input
+		// carries a potentially large sub-agent prompt) bail out here without
+		// decoding the JSON at all.
 		return ""
 	}
 	return cleanToolDetail(detail)
 }
 
-// jsonStringField returns the string value of a top-level field in a JSON
-// object, or "" if the input is not a JSON object, the field is missing,
-// or the value is not a string. Tolerant of partial/invalid input.
+// toolDetailFields enumerates the salient tool-input fields surfaced in the
+// Slack progress indicator. Decoding into this struct (rather than a generic
+// map[string]json.RawMessage) lets encoding/json skip fields not listed here
+// — e.g. Edit/MultiEdit's potentially huge old_string / new_string — via the
+// scanner, without allocating or copying their bytes for payload we never read.
+type toolDetailFields struct {
+	Command      string `json:"command"`
+	FilePath     string `json:"file_path"`
+	NotebookPath string `json:"notebook_path"`
+	Pattern      string `json:"pattern"`
+	URL          string `json:"url"`
+	Query        string `json:"query"`
+}
+
+// jsonStringField returns the string value of one top-level field of a JSON
+// object, or "" if the input is not a JSON object, the field is missing or not
+// a string, or the input is partial/invalid. Only the fields enumerated in
+// toolDetailFields are recognized; any other field name returns "".
 func jsonStringField(raw, field string) string {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+	var f toolDetailFields
+	if err := json.Unmarshal([]byte(raw), &f); err != nil {
 		return ""
 	}
-	v, ok := m[field]
-	if !ok {
+	switch field {
+	case "command":
+		return f.Command
+	case "file_path":
+		return f.FilePath
+	case "notebook_path":
+		return f.NotebookPath
+	case "pattern":
+		return f.Pattern
+	case "url":
+		return f.URL
+	case "query":
+		return f.Query
+	default:
 		return ""
 	}
-	var s string
-	if err := json.Unmarshal(v, &s); err != nil {
-		return ""
-	}
-	return s
 }
 
 // cleanToolDetail normalizes a tool detail for display in the Slack

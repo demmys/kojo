@@ -48,6 +48,13 @@ type ChatOptions struct {
 	// the call site rather than silently leaking context across keys.
 	SessionKey string
 
+	// RecentMessagesContext is a short, bounded transcript excerpt the
+	// backend may prepend when it has to start a fresh persistent session
+	// instead of resuming an existing one. Claude uses this as a continuity
+	// fallback for missing/empty/reset JSONL sessions; when --resume works,
+	// it is intentionally ignored to avoid duplicating history.
+	RecentMessagesContext string
+
 	// SystemPromptExtra is appended verbatim to the systemPrompt argument
 	// AFTER the backend's normal prompt assembly. Use it to inject
 	// per-conversation context (e.g. Slack channel/thread info) without

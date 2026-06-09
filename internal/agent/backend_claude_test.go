@@ -152,6 +152,70 @@ func TestBuildClaudeArgs_SessionKey(t *testing.T) {
 	})
 }
 
+func TestBuildClaudeInvocation_BootstrapRecentContext(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := &ClaudeBackend{logger: logger}
+	dir := filepath.Join(home, "agent")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := &Agent{ID: "ag_bootstrap"}
+	sessionID := agentIDToUUID(a.ID)
+
+	fresh := b.buildClaudeInvocation(a, "", dir, false, nil, false, "")
+	if !fresh.bootstrapRecentContext {
+		t.Fatalf("fresh persistent session should bootstrap recent context: %+v", fresh)
+	}
+	if !hasArgPair(fresh.args, "--session-id", sessionID) {
+		t.Fatalf("fresh invocation should use --session-id %s, got %v", sessionID, fresh.args)
+	}
+
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectDir := claudeProjectDir(absDir)
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionFile := filepath.Join(projectDir, sessionID+".jsonl")
+	entry := `{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":0}}}`
+	if err := os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := b.buildClaudeInvocation(a, "", dir, false, nil, false, "")
+	if resumed.bootstrapRecentContext {
+		t.Fatalf("resumed session must not duplicate recent context: %+v", resumed)
+	}
+	if !hasArgPair(resumed.args, "--resume", sessionID) {
+		t.Fatalf("resumed invocation should use --resume %s, got %v", sessionID, resumed.args)
+	}
+
+	oneShot := b.buildClaudeInvocation(a, "", dir, true, nil, false, "")
+	if oneShot.bootstrapRecentContext {
+		t.Fatalf("one-shot invocation should not bootstrap transcript context: %+v", oneShot)
+	}
+	for i := range oneShot.args {
+		if oneShot.args[i] == "--resume" || oneShot.args[i] == "--session-id" {
+			t.Fatalf("one-shot invocation should not carry session flags: %v", oneShot.args)
+		}
+	}
+}
+
+func hasArgPair(args []string, key, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == key && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBackendSupportsSessionKey(t *testing.T) {
 	t.Run("claude supports", func(t *testing.T) {
 		b := &ClaudeBackend{}

@@ -55,7 +55,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// Manager.ChatOneShot. The backend treats systemPrompt as the final
 	// system prompt to pass to --system-prompt, with the cacheable prefix
 	// already placed at offset 0.
-	args := b.buildClaudeArgs(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
+	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
+	args := inv.args
+	if inv.bootstrapRecentContext && opts.RecentMessagesContext != "" {
+		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
+	}
 
 	// Expected session ID for THIS branch, used as the recovery fallback if
 	// Claude exits before result.streamSessionID is set. Without this anchor,
@@ -211,12 +215,21 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	return ch, nil
 }
 
+type claudeInvocation struct {
+	args                   []string
+	bootstrapRecentContext bool
+}
+
 // buildClaudeArgs constructs the CLI arguments for a Claude chat invocation.
 //
 // sessionKey, when non-empty, overrides the default agent-ID-based session
 // identifier. The key hashes to a deterministic UUID so successive calls in
 // the same logical conversation (e.g. a Slack thread) land on the same JSONL.
 func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool, sessionKey string) []string {
+	return b.buildClaudeInvocation(agent, systemPrompt, dir, oneShot, mcpServers, automatedTrigger, sessionKey).args
+}
+
+func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string, dir string, oneShot bool, mcpServers map[string]mcpServerEntry, automatedTrigger bool, sessionKey string) claudeInvocation {
 	args := []string{
 		"-p",
 		"--output-format", "stream-json",
@@ -277,15 +290,17 @@ func (b *ClaudeBackend) buildClaudeArgs(agent *Agent, systemPrompt string, dir s
 	// session resumption entirely. When SessionKey is set the call still
 	// resumes — but against the key-derived UUID, isolating that branch
 	// (Slack thread, etc.) from the agent's main session.
+	bootstrapRecentContext := false
 	if sessionID := expectedClaudeSessionID(agent.ID, sessionKey, oneShot); sessionID != "" {
 		if sessionFileUsable(dir, sessionID, automatedTrigger, agent.ID, agent.ResumeIdleDuration(), b.logger) {
 			args = append(args, "--resume", sessionID)
 		} else {
 			args = append(args, "--session-id", sessionID)
+			bootstrapRecentContext = true
 		}
 	}
 
-	return args
+	return claudeInvocation{args: args, bootstrapRecentContext: bootstrapRecentContext}
 }
 
 // streamParseResult holds the accumulated state from parsing a Claude stream.

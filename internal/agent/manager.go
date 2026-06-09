@@ -1584,11 +1584,12 @@ func (m *Manager) HasCredentials() bool {
 // keys on the system prompt prefix, and any per-turn change there
 // invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy       Agent
-	backend         ChatBackend
-	sysPrompt       string
-	volatileContext string
-	mcpServers      map[string]mcpServerEntry
+	agentCopy             Agent
+	backend               ChatBackend
+	sysPrompt             string
+	volatileContext       string
+	recentMessagesContext string
+	mcpServers            map[string]mcpServerEntry
 }
 
 // prepareChat performs the common setup for Chat and ChatOneShot:
@@ -1733,13 +1734,18 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
+	recentMessagesContext := ""
+	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) {
+		recentMessagesContext = m.BuildRecentMessagesContext(ctx, agentID)
+	}
 
 	return &chatPrep{
-		agentCopy:       agentCopy,
-		backend:         backend,
-		sysPrompt:       sysPrompt,
-		volatileContext: volatileContext,
-		mcpServers:      mcpServers,
+		agentCopy:             agentCopy,
+		backend:               backend,
+		sysPrompt:             sysPrompt,
+		volatileContext:       volatileContext,
+		recentMessagesContext: recentMessagesContext,
+		mcpServers:            mcpServers,
 	}, nil
 }
 
@@ -1853,8 +1859,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
-		MCPServers:       prep.mcpServers,
-		AutomatedTrigger: role == "system",
+		MCPServers:            prep.mcpServers,
+		AutomatedTrigger:      role == "system",
+		RecentMessagesContext: prep.recentMessagesContext,
 	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}

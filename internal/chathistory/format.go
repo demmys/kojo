@@ -94,7 +94,7 @@ func FormatForInjection(msgs []HistoryMessage, botUserID string, maxMessages, ma
 //     FormatForInjection so all messages are emitted in order with no
 //     head/tail omission marker. FormatForInjection's own maxChars trim
 //     still applies, so if maxChars is tight enough to drop entries it
-//     will emit its own "(以下省略)" legacy footer instead.
+//     will emit its own "...(older messages omitted)" footer instead.
 //   - When len(msgs) >  head+tail, the output is head + "...(N件のメッセージ
 //     を省略)..." + tail.
 //   - maxChars caps the rendered length. The tail is treated as more

@@ -209,7 +209,7 @@ func TestFormatForInjectionHeadTail_MaxCharsTrimsHeadFirst(t *testing.T) {
 	// Head entries (0..2) should be dropped before any tail entry.
 	for i := 0; i < 3; i++ {
 		if strings.Contains(result, fmt.Sprintf("M%02d", i)) {
-			t.Errorf("head entry M%02d should have been dropped before tail under maxChars=8000", i)
+			t.Errorf("head entry M%02d should have been dropped before tail under maxChars=11000", i)
 		}
 	}
 	// Marker still present.

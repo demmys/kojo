@@ -2064,9 +2064,11 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	receivedDone := false
 
 	// Streaming kojo-attach: poll the staging directory during the
-	// turn so files appear in the UI as they are written, not only
-	// when the turn completes. A provisional messageID is used for
-	// blob paths — it's unique per-turn, so no collision risk.
+	// turn so files appear in the UI as they are written, not at
+	// turn completion only. Ingested staged files are removed, so
+	// a later tool call should not expect them to still be there.
+	// A provisional messageID is used for blob paths — it's
+	// unique per-turn, so no collision risk.
 	// The watcher's pending list (returned by StopAndDrain) is the
 	// definitive source of streamed attachments — the channel is
 	// used only for real-time UI notification.

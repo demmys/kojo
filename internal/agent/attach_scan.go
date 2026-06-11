@@ -75,7 +75,7 @@ const attachMaxBytes int64 = 10 << 30
 // and returns one MessageAttachment per successful ingest. The
 // staging directory is emptied (including any files we refused
 // to ingest) before returning so a misbehaved agent cannot stash
-// state across turns.
+// state for a later tool call or turn.
 //
 // Per-file failures are logged at warn level and the file is
 // removed from disk; the rest of the batch continues. Whole-batch

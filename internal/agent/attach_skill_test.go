@@ -39,6 +39,17 @@ func TestSyncAttachSkill_Install(t *testing.T) {
 	if !strings.Contains(str, "--clean-max-age-days") {
 		t.Errorf("SKILL.md missing attachment retention note")
 	}
+	if !strings.Contains(str, "between tool calls") {
+		t.Errorf("SKILL.md missing between-tool-calls cleanup note")
+	}
+	for _, stale := range []string{
+		"the moment your turn ends",
+		"The directory is emptied after every turn",
+	} {
+		if strings.Contains(str, stale) {
+			t.Errorf("SKILL.md still contains stale turn-end wording %q", stale)
+		}
+	}
 }
 
 // TestSyncAttachSkill_Disable removes a prior install and leaves

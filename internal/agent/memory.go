@@ -553,9 +553,9 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	// path is stable.
 	attachStage := filepath.Join(dir, attachStagingSubpath)
 	sb.WriteString("\n## Sending file attachments to the user\n\n")
-	sb.WriteString(fmt.Sprintf("To send a file (image, audio, video, PDF, archive — anything) as a downloadable attachment on your NEXT reply, write the file into `%s/<basename>`. kojo scans this directory the moment your turn ends, moves every regular file out of it, and attaches them to the message you just sent. The user sees image / video thumbnails inline and a download chip for other types.\n", attachStage))
+	sb.WriteString(fmt.Sprintf("To send a file (image, audio, video, PDF, archive — anything) as a downloadable attachment on your NEXT reply, write the file into `%s/<basename>`. kojo watches this directory while your reply is in progress, ingests regular files as they land, removes staged copies after ingest, and attaches them to the message you are sending. By your next tool call, files you already staged may be gone. The user sees image / video thumbnails inline and a download chip for other types.\n", attachStage))
 	sb.WriteString("Rules:\n")
-	sb.WriteString(fmt.Sprintf("- `mkdir -p %s` before the first write of a turn (the daemon empties the directory between turns).\n", attachStage))
+	sb.WriteString(fmt.Sprintf("- `mkdir -p %s` before writing. Treat this directory as cleanup territory, not storage; kojo may remove staged files between tool calls.\n", attachStage))
 	sb.WriteString("- Plain filenames only. Subdirectories under the staging dir are ignored. Dotfiles are rejected.\n")
 	sb.WriteString("- Per-file cap is 10 GiB. Empty files are skipped.\n")
 	sb.WriteString("- Attachment bodies are delivery artifacts, not long-term storage; Kojo blob cleanup may remove them after --clean-max-age-days (default: 7 days), while chat metadata can remain.\n")

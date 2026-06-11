@@ -17,12 +17,12 @@ import (
 //
 //	<agentDir>/.kojo/attach/
 //
-// During the turn the LLM may write any number of files there. When
-// the turn completes, manager.processChatEvents calls
-// ScanAndIngestAttachments (attach_scan.go) which moves every file
-// out of that directory into the blob store and attaches a
-// MessageAttachment to the assistant Message. On non-hub peers the
-// bytes are also forwarded to hub via the peer-signed ingest
+// During the turn the LLM may write any number of files there. The
+// streaming watcher ingests files as they appear, removes them from
+// the staging directory after ingest, and surfaces them immediately
+// in the UI. A final ScanAndIngestAttachments pass catches leftover
+// files before the assistant Message is persisted. On non-hub peers
+// the bytes are also forwarded to hub via the peer-signed ingest
 // endpoint so the UI (which always lives on hub) can preview /
 // download them through the standard /api/v1/blob/{scope}/{path}
 // route.
@@ -60,9 +60,9 @@ const attachStagingSubpath = ".kojo/attach"
 // https://code.claude.com/docs/en/skills.md.
 //
 // The skill is intentionally short and concrete: tell the agent
-// where to write files, what kojo does after the turn, and a few
-// gotchas (subdirectories not preserved, only files written under
-// .kojo/attach are picked up).
+// where to write files, what kojo does between tool calls, and a
+// few gotchas (subdirectories not preserved, only files written
+// under .kojo/attach are picked up).
 const attachSkillBody = `---
 name: kojo-attach
 description: Send a file (image, audio, video, PDF, archive, anything) to the user as a downloadable attachment on your next reply. Use whenever you need to surface bytes the user must see in the chat UI — generated images, rendered charts, fetched documents, build artifacts. The file is forwarded to the user automatically; you do NOT have to paste a link or describe a path in your reply.
@@ -87,11 +87,12 @@ description: Send a file (image, audio, video, PDF, archive, anything) to the us
    ` + "```" + `
 
 3. The file appears in the user's chat UI immediately — kojo
-   watches the directory for changes while your turn is in
-   progress and streams each file as soon as it lands. When your
-   turn ends, any remaining files are swept up and attached to
-   the final message. On non-hub peers a copy is also forwarded
-   to hub so the UI can download it.
+   watches the directory while your reply is in progress, streams
+   each file as soon as it lands, and removes the staged copy after
+   ingest. By your next tool call, files you already staged may be
+   gone. A final sweep catches any leftover files before the reply
+   is saved. On non-hub peers a copy is also forwarded to hub so
+   the UI can download it.
 
 ## Rules
 
@@ -101,8 +102,9 @@ description: Send a file (image, audio, video, PDF, archive, anything) to the us
 - Per-file size is capped at 10 GiB (the same ceiling the user
   upload path enforces). Anything larger is skipped with a
   warning in the daemon log.
-- The directory is emptied after every turn. Do not stash files
-  there hoping to reference them in a later turn — copy them
+- The directory is cleanup territory, not storage. Kojo removes
+  files after ingest, which can happen between tool calls. Do not
+  stash files there hoping to reference them later — copy them
   somewhere else if you need them.
 - Attachment bodies are delivery artifacts, not long-term storage.
   Kojo blob cleanup may remove them after ` + "`--clean-max-age-days`" + `

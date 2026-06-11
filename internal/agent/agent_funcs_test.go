@@ -3,6 +3,7 @@ package agent
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,35 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 		// Every mention of today's diary in the prompt must be absolute.
 		if !strings.Contains(line, todayDiary) {
 			t.Errorf("line mentions today's diary but not absolutely: %q", line)
+		}
+	}
+}
+
+func TestBuildSystemPrompt_AttachCleanupContract(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	a := &Agent{ID: "ag_test_attach_prompt"}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	prompt := buildSystemPrompt(a, logger, "", nil, false)
+
+	mustContain := []string{
+		"Sending file attachments to the user",
+		filepath.Join(agentDir(a.ID), attachStagingSubpath) + "/<basename>",
+		"between tool calls",
+		"cleanup territory, not storage",
+	}
+	for _, s := range mustContain {
+		if !strings.Contains(prompt, s) {
+			t.Errorf("system prompt missing attach cleanup fragment %q", s)
+		}
+	}
+	for _, stale := range []string{
+		"the moment your turn ends",
+		"empties the directory between turns",
+	} {
+		if strings.Contains(prompt, stale) {
+			t.Errorf("system prompt still contains stale turn-end wording %q", stale)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -543,6 +544,183 @@ func TestOpenUploadPath(t *testing.T) {
 			if msg == "" {
 				t.Errorf("kind %q produced empty message", kind)
 			}
+		}
+	})
+}
+
+func TestToMessageInfo(t *testing.T) {
+	t.Run("minimal user message preserves user/text keys", func(t *testing.T) {
+		got := toMessageInfo(slack.Msg{
+			User:      "U123",
+			Text:      "hello",
+			Timestamp: "1700000000.000100",
+		}, nil)
+		if got.User != "U123" || got.Text != "hello" || got.Timestamp != "1700000000.000100" {
+			t.Fatalf("basic fields lost: %+v", got)
+		}
+		// Confirm JSON shape: "user" and "text" must always be present
+		// (legacy consumers may rely on these keys existing) while richer
+		// optional fields stay omitted.
+		raw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(raw)
+		for _, mustHave := range []string{`"user":"U123"`, `"text":"hello"`, `"timestamp":"1700000000.000100"`} {
+			if !strings.Contains(s, mustHave) {
+				t.Errorf("expected %q in %s", mustHave, s)
+			}
+		}
+		for _, mustNot := range []string{`"files"`, `"reactions"`, `"attachments"`, `"blocks"`, `"metadata"`, `"edited"`, `"bot_id"`, `"username"`, `"app_id"`} {
+			if strings.Contains(s, mustNot) {
+				t.Errorf("did not expect %q in %s", mustNot, s)
+			}
+		}
+	})
+
+	t.Run("bot message exposes bot_id/username/app_id", func(t *testing.T) {
+		got := toMessageInfo(slack.Msg{
+			Type:      "message",
+			SubType:   "bot_message",
+			BotID:     "B123",
+			Username:  "ReleaseBot",
+			Text:      "",
+			Timestamp: "1700000001.000200",
+			BotProfile: &slack.BotProfile{
+				AppID: "A999",
+			},
+		}, nil)
+		if got.BotID != "B123" || got.Username != "ReleaseBot" || got.AppID != "A999" {
+			t.Fatalf("bot fields lost: %+v", got)
+		}
+		if got.SubType != "bot_message" {
+			t.Errorf("subtype lost")
+		}
+		// User key still emitted as empty string for compatibility.
+		raw, _ := json.Marshal(got)
+		if !strings.Contains(string(raw), `"user":""`) {
+			t.Errorf("expected empty user key in %s", raw)
+		}
+	})
+
+	t.Run("files attachments reactions edited preserved", func(t *testing.T) {
+		got := toMessageInfo(slack.Msg{
+			User:      "U1",
+			Text:      "see file",
+			Timestamp: "1700000002.000300",
+			Edited:    &slack.Edited{User: "U1", Timestamp: "1700000003.000400"},
+			Files: []slack.File{{
+				ID:                 "F1",
+				Name:               "report.pdf",
+				Title:              "Q4 report",
+				Mimetype:           "application/pdf",
+				Filetype:           "pdf",
+				PrettyType:         "PDF",
+				Size:               4096,
+				URLPrivate:         "https://files.slack.com/private/F1",
+				URLPrivateDownload: "https://files.slack.com/private/F1/download",
+				Permalink:          "https://workspace.slack.com/files/U1/F1",
+				PermalinkPublic:    "https://slack-files.com/pub/F1",
+				User:               "U1",
+			}},
+			Reactions: []slack.ItemReaction{{
+				Name:  "thumbsup",
+				Count: 2,
+				Users: []string{"U2", "U3"},
+			}},
+			Attachments: []slack.Attachment{{
+				Color:       "good",
+				Fallback:    "fb",
+				Title:       "Build #42",
+				TitleLink:   "https://ci.example.com/42",
+				Pretext:     "ok",
+				Text:        "passed",
+				AuthorName:  "ci",
+				AuthorLink:  "https://ci.example.com",
+				ServiceName: "CI",
+				FromURL:     "https://ci.example.com/42",
+				ImageURL:    "https://ci.example.com/42.png",
+				ThumbURL:    "https://ci.example.com/42-thumb.png",
+				Footer:      "ci-bot",
+				Fields: []slack.AttachmentField{
+					{Title: "branch", Value: "main", Short: true},
+				},
+			}},
+		}, nil)
+		if got.Edited == nil || got.Edited.User != "U1" || got.Edited.Timestamp != "1700000003.000400" {
+			t.Errorf("edited info lost: %+v", got.Edited)
+		}
+		if len(got.Files) != 1 || got.Files[0].ID != "F1" || got.Files[0].URLPrivate == "" || got.Files[0].Permalink == "" {
+			t.Errorf("files lost: %+v", got.Files)
+		}
+		if len(got.Reactions) != 1 || got.Reactions[0].Name != "thumbsup" || got.Reactions[0].Count != 2 || !reflect.DeepEqual(got.Reactions[0].Users, []string{"U2", "U3"}) {
+			t.Errorf("reactions lost: %+v", got.Reactions)
+		}
+		if len(got.Attachments) != 1 {
+			t.Fatalf("attachments lost: %+v", got.Attachments)
+		}
+		att := got.Attachments[0]
+		if att.Title != "Build #42" || att.Color != "good" || att.Footer != "ci-bot" || att.ImageURL == "" {
+			t.Errorf("attachment scalar fields lost: %+v", att)
+		}
+		if len(att.Fields) != 1 || att.Fields[0].Title != "branch" || att.Fields[0].Value != "main" || !att.Fields[0].Short {
+			t.Errorf("attachment fields lost: %+v", att.Fields)
+		}
+	})
+
+	t.Run("block kit blocks are re-encoded as JSON", func(t *testing.T) {
+		section := slack.NewSectionBlock(
+			slack.NewTextBlockObject(slack.MarkdownType, "*hello*", false, false),
+			nil, nil,
+		)
+		got := toMessageInfo(slack.Msg{
+			User:      "U1",
+			Text:      "fallback text",
+			Timestamp: "1700000004.000500",
+			Blocks:    slack.Blocks{BlockSet: []slack.Block{section}},
+		}, nil)
+		if len(got.Blocks) == 0 {
+			t.Fatalf("blocks dropped")
+		}
+		var decoded []map[string]any
+		if err := json.Unmarshal(got.Blocks, &decoded); err != nil {
+			t.Fatalf("blocks not valid JSON: %v (%s)", err, got.Blocks)
+		}
+		if len(decoded) != 1 || decoded[0]["type"] != "section" {
+			t.Fatalf("expected single section block, got %s", got.Blocks)
+		}
+		raw := string(got.Blocks)
+		if !strings.Contains(raw, `*hello*`) {
+			t.Errorf("section block content missing: %s", raw)
+		}
+	})
+
+	t.Run("metadata passed through when present", func(t *testing.T) {
+		got := toMessageInfo(slack.Msg{
+			User:      "U1",
+			Text:      "evt",
+			Timestamp: "1700000005.000600",
+			Metadata: slack.SlackMetadata{
+				EventType:    "deploy_finished",
+				EventPayload: map[string]any{"service": "kojo", "ok": true},
+			},
+		}, nil)
+		if got.Metadata == nil || got.Metadata.EventType != "deploy_finished" {
+			t.Fatalf("metadata lost: %+v", got.Metadata)
+		}
+		if v, ok := got.Metadata.EventPayload["service"].(string); !ok || v != "kojo" {
+			t.Errorf("event payload lost: %+v", got.Metadata.EventPayload)
+		}
+	})
+
+	t.Run("absent metadata stays nil", func(t *testing.T) {
+		got := toMessageInfo(slack.Msg{
+			User:      "U1",
+			Text:      "no meta",
+			Timestamp: "1700000006.000700",
+		}, nil)
+		if got.Metadata != nil {
+			t.Errorf("expected nil metadata, got %+v", got.Metadata)
 		}
 	})
 }

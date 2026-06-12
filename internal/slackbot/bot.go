@@ -2,12 +2,14 @@ package slackbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
@@ -22,13 +24,24 @@ type ChatManager interface {
 	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error)
 	// CanResumeSession reports whether the next ChatOneShot for this
-	// (agentID, sessionKey) pair is likely to resume an existing backend
-	// session. True when the backend honors SessionKey AND the on-disk
-	// session artifact exists AND is non-empty. The Slack bot uses this
-	// to gate the "skip FormatForInjection(history)" optimization: when
-	// false (backend ignores SessionKey, or the session file was removed
-	// /empty), history must be re-injected because the backend will see
-	// no prior context.
+	// (agentID, sessionKey) pair is likely to resume an existing
+	// backend session. True when the backend honors SessionKey AND
+	// the on-disk session artifact exists AND is non-empty. The
+	// Slack bot uses this to choose between two injection modes:
+	//   - false (backend runs OneShot, or the session file was removed
+	//     or empty) → inject the full thread via FormatForInjection so
+	//     the model has every prior message.
+	//   - true AND we have already replied in this conversation →
+	//     inject only a head+tail safety net via
+	//     FormatForInjectionHeadTail. The backend's resumed transcript
+	//     already carries the bulk of the conversation; the safety net
+	//     covers the mid-thread session-reset edge case documented at
+	//     Manager.CanResumeSession (sessionResetThresholdTokens) and
+	//     the user-message delta gap between the last bot reply and
+	//     this turn.
+	//   - true but no prior bot reply (first turn of a resumable
+	//     session) → still use full FormatForInjection so the seeded
+	//     session gets the complete Slack context.
 	CanResumeSession(agentID, sessionKey string) bool
 }
 
@@ -67,6 +80,14 @@ type Bot struct {
 	// sleeps and run the retry loop without real wall-clock delays. nil
 	// in production.
 	rateLimitSleep func(time.Duration) <-chan time.Time
+
+	// runAsync, when non-nil, replaces the bare `go fn()` used by
+	// sendToAgent for fire-and-forget background work (currently:
+	// dead-stream cleanup after the thread mutex is released). Tests
+	// use this to run the work synchronously so they can observe the
+	// resulting Slack API calls. nil in production, where the default
+	// `go fn()` semantics are used.
+	runAsync func(func())
 }
 
 const (
@@ -109,6 +130,25 @@ const (
 	// mislead users who hit a non-length failure. Centralized so the
 	// stream-finalize and batch-fallback paths cannot drift apart.
 	deliveryFailureNotice = "_⚠️ The full response could not be delivered to Slack. Check kojo logs for details._"
+
+	// slackErrNotStreaming is the Slack chat.appendStream / chat.stopStream
+	// error code returned when the target message is no longer in
+	// streaming state. Once a stream is finalized — by an explicit
+	// chat.stopStream, by the Slack-side inactivity TTL, or by any other
+	// path that closes it — every subsequent chat.appendStream on the
+	// same ts fails with this error. The bot uses this signal to abandon
+	// the dead streamTS and start a fresh stream so the user keeps
+	// seeing live progress instead of a silently truncated reply.
+	slackErrNotStreaming = "message_not_in_streaming_state"
+
+	// maxStreamRestarts caps how many times sendToAgent will open a new
+	// streaming message in a single turn after the previous one died.
+	// Each restart leaves an orphaned partial-content message in the
+	// thread, so we don't want an unbounded chain of them if Slack is
+	// closing streams faster than we can append. Past this cap the bot
+	// stops trying to stream and relies on the finalize-time chat.update
+	// / postMessage fallback to deliver the full reply.
+	maxStreamRestarts = 5
 )
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -356,6 +396,28 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 // streamAppendInterval is the minimum interval between AppendStream calls.
 const streamAppendInterval = 1 * time.Second
 
+// streamHeartbeatInterval is the maximum idle time tolerated on an open
+// Slack stream before a keepalive append is sent. Slack finalizes a
+// streaming message after a short inactivity TTL (observed: a 12s gap
+// survived, a 20.6s gap died), so the keepalive target stays well under
+// that. Only consulted while a stream is open and no real append has
+// happened for this long. Without this, silent stretches — codex
+// reasoning (emitted as thinking, which the bot does not stream), context
+// compaction, or long tool polling — let the stream die mid-turn and the
+// next real append fails with message_not_in_streaming_state.
+const streamHeartbeatInterval = 7 * time.Second
+
+// streamHeartbeatTick is how often the streaming loop wakes to check
+// whether a keepalive is due. The worst-case gap between appends during
+// silence is streamHeartbeatInterval + streamHeartbeatTick (~10s),
+// comfortably under Slack's inactivity TTL.
+const streamHeartbeatTick = 3 * time.Second
+
+// streamHeartbeatPayload is appended to keep an idle stream alive. A
+// zero-width space renders invisibly in Slack and is overwritten by the
+// finalize chat.update, so the user never sees the keepalive.
+const streamHeartbeatPayload = "\u200B"
+
 func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string) {
 	// Serialize processing within the same thread to maintain history
 	// consistency. The lock must cover both history fetching and prompt
@@ -399,6 +461,29 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// From here on, the thread handle used for posting/streaming.
 	threadTS := replyTS
 
+	// Drop the current user message from `history` before it feeds the
+	// injection formatters. FetchThreadHistory pulls the just-arrived
+	// message back from Slack, and the new-thread path above persists it
+	// via WriteMessages so a subsequent FetchChannelHistory call also
+	// surfaces it once it appears in chat_history. Meanwhile we re-emit
+	// the same text verbatim in the prompt's
+	// "[Slack @user|channel:… thread:…] text" suffix immediately below.
+	// Letting it appear in both the transcript header AND the suffix
+	// makes the model see the current turn twice on every head+tail
+	// resume — once labeled as recap, once as the live request — which
+	// was a pre-existing wart in the first-turn full-inject path but
+	// becomes the steady state once the safety net runs every turn.
+	if messageTS != "" {
+		filtered := make([]chathistory.HistoryMessage, 0, len(history))
+		for _, m := range history {
+			if m.MessageID == messageTS {
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		history = filtered
+	}
+
 	// Build a session key that maps 1:1 to the chat_history file unit
 	// (per-thread or per-channel). This gives each Slack conversation its
 	// own resumable backend session with full context across messages.
@@ -407,30 +492,54 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// per channel, which matches the chat_history layout.
 	sessionKey := slackSessionKey(b.agentID, channel, threadTS)
 
-	// Decide whether to inject history into the user message.
+	// Decide how to inject Slack history into the user message.
 	//
-	// When the backend supports SessionKey-based resumption (claude), the
-	// first turn seeds the session with FormatForInjection(history); the
-	// backend then carries that context internally on every subsequent
-	// resume. Re-injecting on later turns duplicates every prior Slack
-	// message — once in the resumed transcript, once in the new user
-	// payload — burning context and risking confusion. So skip injection
-	// once both signals agree:
+	// Three regimes, gated by whether the backend already holds prior
+	// conversation context in its session:
 	//
-	//   (a) the chat_history records a prior bot reply (we already had a
-	//       turn in this conversation), AND
-	//   (b) the backend's session artifact for this conversation still
-	//       exists on disk (claude /clear, upgrade or manual cleanup can
-	//       remove it independently of Slack-side history, so signal (a)
-	//       alone is not safe).
+	//   1. Backend cannot resume (codex, gemini, …) OR this is the very
+	//      first turn in the thread → full FormatForInjection. The model
+	//      has no other source of Slack context, so we send everything
+	//      that fits under DefaultMaxMessages / DefaultMaxChars.
 	//
-	// For backends that don't support resume (codex, …) the
-	// ChatOneShot call falls back to OneShot:true, which carries no prior
-	// context across turns. Those backends must keep receiving injected
-	// history on every turn or they lose the conversation entirely.
-	injectHistory := true
+	//   2. Backend can resume AND it already replied at least once
+	//      → FormatForInjectionHeadTail (head + omission marker + tail).
+	//      The resumed transcript already carries the full conversation,
+	//      so we only re-inject a small safety-net excerpt: the opening
+	//      few turns (which anchor the framing) and the last few turns
+	//      (which protect against two failure modes — see below).
+	//
+	//   3. History is empty → no injection.
+	//
+	// Why the head+tail safety net instead of skipping injection entirely
+	// when the backend can resume? Two failure modes the previous
+	// skip-on-resume policy did not cover:
+	//
+	//   (a) Mid-thread session reset. When the Claude session crosses
+	//       sessionResetThresholdTokens (see manager.go), sessionFileUsable
+	//       deletes the JSONL and Claude starts fresh on the next turn.
+	//       Without injection the new session has zero Slack context until
+	//       the user re-shares it.
+	//   (b) Delta gap. User messages that arrived after the last bot
+	//       reply are not in the resumed transcript (they post-date it),
+	//       so the model sees them only as referenced text in the new
+	//       user payload. The tail covers this gap.
+	//
+	// The head/tail excerpt overlaps content the resumed session already
+	// has, but FormatForInjectionHeadTail emits at most head+tail+1 lines
+	// under a "[Chat conversation history]" header, so the duplication
+	// cost is small and the framing tells the model these are recap
+	// snippets, not new events.
+	//
+	// "Already replied" is detected via the same bot-reply heuristic as
+	// before: a chat_history entry whose UserID matches our bot user or
+	// whose MessageID has the local ".bot" suffix. CanResumeSession
+	// additionally verifies the session artifact still exists on disk —
+	// claude /clear, upgrade or manual cleanup can remove it independently
+	// of Slack-side history, so the chat_history signal alone is not safe.
+	useHeadTail := false
 	if len(history) > 0 && b.mgr.CanResumeSession(b.agentID, sessionKey) {
-		// Match our own bot replies via two reliable signals:
+		// Match our own bot replies only. Two reliable signals are OR'd:
 		//
 		//   (1) UserID == b.botUserID — set by every AppendMessages write
 		//       below, and also by Slack for modern apps that expose User
@@ -440,15 +549,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		//       empty User and only BotID set, where (1) would miss them.
 		//
 		// We deliberately do NOT match on IsBot alone, because unrelated
-		// bot posts in the same channel (GitHub, Datadog, …) would
-		// falsely suppress injection on the very first turn and start
-		// the resumed session with no Slack context.
+		// bot posts in the same channel (GitHub, Datadog, …) would falsely
+		// downgrade the first-turn injection from full to head+tail and
+		// start the resumed Claude session with truncated Slack context.
 		for i := range history {
 			if !history[i].IsBot {
 				continue
 			}
 			if history[i].UserID == b.botUserID || strings.HasSuffix(history[i].MessageID, ".bot") {
-				injectHistory = false
+				useHeadTail = true
 				break
 			}
 		}
@@ -456,8 +565,12 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 
 	// Build enriched message with conversation history (when needed).
 	var sb strings.Builder
-	if injectHistory && len(history) > 0 {
-		sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+	if len(history) > 0 {
+		if useHeadTail {
+			sb.WriteString(chathistory.FormatForInjectionHeadTail(history, b.botUserID, chathistory.DefaultHeadCount, chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
+		} else {
+			sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+		}
 		sb.WriteString("\n---\n\n")
 	}
 	safeDisplay := sanitizeDisplayName(displayName)
@@ -495,18 +608,51 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 
 	var response strings.Builder     // full response text
 	var pendingDelta strings.Builder // text not yet flushed via AppendStream
-	var streamTS string              // ts of the streaming message (empty = not started or fallback)
+	var streamTS string              // ts of the streaming message (empty = not started, dead, or fallback)
+	var deadStreams []string         // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
 	var lastAppend time.Time
 	hasError := false
-	streamFailed := false // true if StartStream failed, use fallback
+	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
+
+	// dropStream parks the current streamTS in deadStreams and clears
+	// streamTS so the next startStream() opens a fresh streaming
+	// message. Called when appendStream signals the stream is no longer
+	// in streaming state (Slack-side TTL expiry, external stopStream,
+	// etc.). The orphaned dead stream keeps the partial text it
+	// already received — finalize stops it best-effort so Slack stops
+	// rendering the streaming indicator.
+	dropStream := func() {
+		if streamTS == "" {
+			return
+		}
+		deadStreams = append(deadStreams, streamTS)
+		streamTS = ""
+	}
 
 	// startStream initializes the Slack stream lazily on the first text
-	// or tool_use event. Returns true if the stream is active.
+	// or tool_use event, AND re-initializes it after a previous stream
+	// died (deadStreams non-empty, streamTS == ""). Returns true if the
+	// stream is active. After maxStreamRestarts orphaned streams the
+	// turn gives up on streaming entirely and falls back to the
+	// chat.update / batch-post finalize paths.
 	startStream := func() bool {
 		if streamTS != "" {
 			return true
 		}
 		if streamFailed {
+			return false
+		}
+		// deadStreams holds every streamTS that died this turn — its
+		// length equals the number of completed restart attempts so far
+		// (the initial open is not counted as a restart). Allow up to
+		// maxStreamRestarts further restart attempts: opening when
+		// len(deadStreams) == maxStreamRestarts is the maxStreamRestarts-th
+		// restart and is permitted; the next attempt (len == maxStreamRestarts+1)
+		// trips the cap and falls back to batch post.
+		if len(deadStreams) > maxStreamRestarts {
+			b.logger.Warn("slack stream restart limit reached, falling back to batch post for remainder",
+				"channel", channel, "deadStreams", len(deadStreams))
+			streamFailed = true
 			return false
 		}
 		opts := []slack.MsgOption{}
@@ -524,7 +670,41 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		return true
 	}
 
-	for evt := range events {
+	// The stream is driven by a select rather than a plain `range events`
+	// so a keepalive ticker can fire even while the events channel is
+	// blocked (e.g. during a 50s+ context compaction, when the backend
+	// emits nothing at all). A separate heartbeat goroutine was rejected:
+	// it would race the main loop on streamTS / deadStreams / lastAppend
+	// and could interleave concurrent AppendStream calls on the same
+	// streamTS. Keeping everything in one goroutine avoids that entirely.
+	heartbeat := time.NewTicker(streamHeartbeatTick)
+	defer heartbeat.Stop()
+streamLoop:
+	for {
+		var evt agent.ChatEvent
+		select {
+		case <-heartbeat.C:
+			// Keep an open, genuinely-idle stream in streaming state.
+			// appendStream returns false only on the stream-closed
+			// signal; on that we park the dead stream so the next real
+			// event opens a fresh one (same recovery path as a real
+			// append failing). Rate-limit / transient errors keep the
+			// streamTS, so a 429 storm won't churn the stream here.
+			if streamTS != "" && time.Since(lastAppend) >= streamHeartbeatInterval {
+				if b.appendStream(ctx, channel, streamTS, streamHeartbeatPayload) {
+					lastAppend = time.Now()
+				} else {
+					dropStream()
+				}
+			}
+			continue
+		case e, ok := <-events:
+			if !ok {
+				break streamLoop
+			}
+			evt = e
+		}
+
 		switch evt.Type {
 		case "text":
 			response.WriteString(evt.Delta)
@@ -539,19 +719,38 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// Throttle AppendStream so a fast text-delta loop doesn't
 			// burn chat:write quota.
 			if pendingDelta.Len() > 0 && time.Since(lastAppend) >= streamAppendInterval {
-				b.appendStream(ctx, channel, streamTS, pendingDelta.String())
+				delta := pendingDelta.String()
 				pendingDelta.Reset()
 				lastAppend = time.Now()
+				if !b.appendStream(ctx, channel, streamTS, delta) {
+					// Stream died mid-response. Park it and carry the
+					// unflushed delta into pendingDelta so the NEXT
+					// text event opens a fresh stream and flushes the
+					// combined buffer. response.Builder already holds
+					// the full text for finalize chat.update.
+					pendingDelta.WriteString(delta)
+					dropStream()
+				}
 			}
 
 		case "tool_use":
-			// Update assistant typing status to show which tool is running.
-			status := toolStatusText(evt.ToolName)
+			// Surface what the agent is actually doing, not just which
+			// tool fired. Codex routes everything through "shell", so
+			// without the command detail every step would read the same
+			// generic "Running command…". toolStatusText / -Indicator
+			// pull the shell command / file path / search pattern out of
+			// the tool input.
+
+			// Update assistant typing status (plain text) to show which
+			// tool is running.
 			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 				ChannelID: channel,
 				ThreadTS:  threadTS,
-				Status:    status,
+				Status:    toolStatusText(evt.ToolName, evt.ToolInput),
 			})
+
+			// Inline stream indicator (Slack mrkdwn).
+			indicator := toolStatusIndicator(evt.ToolName, evt.ToolInput)
 
 			// Append a tool-use indicator to the stream so the user sees
 			// progress during long tool executions. The final chat.update
@@ -562,17 +761,41 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			// most once per tool invocation (not in a tight loop like
 			// text deltas), and a user staring at a long-running tool has
 			// no other signal that the agent is still working.
-			if startStream() {
-				// Flush any pending text delta first so the indicator
-				// appears after whatever text the agent has produced so
-				// far.
-				if pendingDelta.Len() > 0 {
-					b.appendStream(ctx, channel, streamTS, pendingDelta.String())
-					pendingDelta.Reset()
-				}
-				b.appendStream(ctx, channel, streamTS, "\n\n_⏳ "+status+"_")
-				lastAppend = time.Now()
+			if !startStream() {
+				continue
 			}
+			// Flush any pending text delta first so the indicator
+			// appears after whatever text the agent has produced so
+			// far. On dead-stream signal, park the streamTS and carry
+			// the delta to the next event — same pattern as the text
+			// case above.
+			if pendingDelta.Len() > 0 {
+				delta := pendingDelta.String()
+				pendingDelta.Reset()
+				if !b.appendStream(ctx, channel, streamTS, delta) {
+					pendingDelta.WriteString(delta)
+					dropStream()
+					continue
+				}
+			}
+			if !b.appendStream(ctx, channel, streamTS, indicator) {
+				// Indicator append died. The indicator itself is
+				// ephemeral (finalize chat.update overwrites it),
+				// so no need to carry it forward. We deliberately
+				// do NOT reopen a fresh stream right here to
+				// re-emit the indicator: tool_use fires once per
+				// invocation, and during a long-running tool no
+				// further events arrive that would refresh the
+				// status anyway. The next text/tool_use event will
+				// startStream() and the user will see live
+				// progress resume. The status text already lives
+				// in SetAssistantThreadsStatusContext above, so
+				// the user still sees "running command…" in the
+				// assistant typing indicator while the gap lasts.
+				dropStream()
+				continue
+			}
+			lastAppend = time.Now()
 
 		case "tool_result":
 			// Revert the assistant status to "Thinking…" while the agent
@@ -598,11 +821,32 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	finCtx, finCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	defer finCancel()
 
-	// Flush any remaining text delta before finalizing.
+	// Flush any remaining text delta before finalizing. If the final
+	// flush also hits a dead stream, park it so the code below falls
+	// through to the batch-post path — response.Builder still holds the
+	// full text so the user gets the complete reply, just without the
+	// chat.update streaming-replacement effect.
 	if streamTS != "" && pendingDelta.Len() > 0 {
-		b.appendStream(finCtx, channel, streamTS, pendingDelta.String())
+		if !b.appendStream(finCtx, channel, streamTS, pendingDelta.String()) {
+			dropStream()
+		}
 		pendingDelta.Reset()
 	}
+
+	// Orphaned streams from earlier restarts are cleaned up AFTER the
+	// final response delivery, asynchronously so the cleanup loop never
+	// blocks the thread mutex. A dead stream message ends in stale
+	// progress indicators (e.g. "_Running command…_") because the stream
+	// died mid-response (typically Slack's stream TTL on a long turn)
+	// before finalize could overwrite it. Once the full reply has been
+	// delivered elsewhere — chat.update on the live stream, or batch post
+	// — those partials are pure duplicates frozen on a progress indicator,
+	// so we chat.delete them, leaving exactly one clean reply in the
+	// channel. If the final delivery FAILED (or the turn produced no
+	// text), we instead keep each partial as a debugging / retry artifact
+	// and only StopStream it. finalDelivered records which case we are in;
+	// each delivery branch below sets it.
+	finalDelivered := false
 
 	if streamTS != "" {
 		// Stop stream (no text — just finalize the typing indicator).
@@ -692,6 +936,10 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 				b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 				noticeCancel()
 			}
+			// The live stream now holds the full clean reply (or, on
+			// chat.update failure, we posted chunks[0] as a fresh message).
+			// Either way, dead partials are now superseded.
+			finalDelivered = deliveredAll
 		} else {
 			// Stream was started — usually by the first tool_use event —
 			// but the assistant never produced any reply text. Keep the
@@ -726,10 +974,17 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 			noticeCancel()
 		}
-	} else if hasError || streamFailed {
-		// Either an explicit agent error, or StartStream failed and the
-		// turn produced no text. Surface a generic failure rather than
-		// going silent on the user.
+		// Batch post carried the full reply (StartStream failed or every
+		// stream died and we fell back). Dead partials are superseded.
+		finalDelivered = deliveredAll
+	} else if hasError || streamFailed || len(deadStreams) > 0 {
+		// Either an explicit agent error, StartStream failed, or a stream
+		// was opened and then died (every streamTS dropped, so streamTS is
+		// now "") before the turn produced any text. Without the
+		// len(deadStreams) check the last case would fall through every
+		// branch and go silent — the keepalive heartbeat makes this more
+		// likely by proactively dropping a TTL-dead stream during a long
+		// silence. Surface a generic failure rather than going silent.
 		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
 	}
 
@@ -739,6 +994,48 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	b.clearAssistantStatus(clearCtx, channel, threadTS)
 	clearCancel()
+
+	// Cleanup orphaned streams from earlier restarts — async because
+	// sendToAgent still holds the per-thread mutex at this point, and up
+	// to maxStreamRestarts cleanup calls (each with its own 5s timeout)
+	// would otherwise stall the next message in the same thread for tens
+	// of seconds. The goroutine uses context.Background() so it survives
+	// sendToAgent returning; per-call timeouts cap the total wall time.
+	//
+	// When the final reply was delivered (finalDelivered), each dead
+	// partial is a duplicate frozen on a stale progress indicator, so we
+	// chat.delete it outright — that is what restores the "one clean
+	// reply" behavior after a mid-response stream restart. When delivery
+	// failed (or produced no text) we keep the partial as an artifact and
+	// only StopStream it. Either call is best-effort; on failure Slack
+	// still auto-finalizes the orphaned stream via TTL within minutes, so
+	// a dropped cleanup costs at most a stale indicator (delete failure
+	// additionally leaves the duplicate partial visible until manually
+	// cleared, no worse than the pre-restart behavior).
+	if len(deadStreams) > 0 {
+		streams := deadStreams // capture so the closure can be run sync (tests) or async (prod)
+		delivered := finalDelivered
+		cleanup := func() {
+			for _, ts := range streams {
+				opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				if delivered {
+					if _, _, err := b.api.DeleteMessageContext(opCtx, channel, ts); err != nil {
+						b.logger.Debug("failed to delete orphaned slack stream",
+							"channel", channel, "streamTS", ts, "err", err)
+					}
+				} else if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
+					b.logger.Debug("failed to stop orphaned slack stream",
+						"channel", channel, "streamTS", ts, "err", err)
+				}
+				opCancel()
+			}
+		}
+		if b.runAsync != nil {
+			b.runAsync(cleanup)
+		} else {
+			go cleanup()
+		}
+	}
 
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
@@ -860,43 +1157,207 @@ func sanitizeDisplayName(name string) string {
 	return out
 }
 
-// toolStatusText returns a human-readable status string for the given tool name.
-func toolStatusText(toolName string) string {
+// toolDetailMaxLen caps how many runes of a tool's salient argument
+// (command, file path, search pattern …) are shown in the progress
+// indicator so a long command line doesn't blow up the Slack message.
+const toolDetailMaxLen = 120
+
+// toolStatusLabel returns a human-readable action label for a tool,
+// without trailing ellipsis or detail. The second return value reports
+// whether the tool was recognized: recognized labels are fixed, literal
+// strings (safe to drop into Slack mrkdwn italics), whereas unrecognized
+// tools have no fixed label and their (agent/server-derived) name must be
+// surfaced via a code span — see toolStatusIndicator.
+//
+// Codex routes every file read/edit/search through its sandboxed shell,
+// so its tool name is always "shell" (see backend_codex.go). We map
+// "shell" to the same "Running command" label as Claude's "Bash" — the
+// shell command itself, surfaced via toolStatusDetail, tells the user
+// what is actually happening.
+func toolStatusLabel(toolName string) (label string, known bool) {
 	switch toolName {
-	case "Bash":
-		return "Running command…"
+	case "Bash", "shell":
+		return "Running command", true
 	case "Read":
-		return "Reading file…"
+		return "Reading file", true
 	case "Write":
-		return "Writing file…"
-	case "Edit":
-		return "Editing file…"
+		return "Writing file", true
+	case "Edit", "MultiEdit":
+		return "Editing file", true
 	case "Grep":
-		return "Searching code…"
+		return "Searching code", true
 	case "Glob":
-		return "Finding files…"
+		return "Finding files", true
 	case "Agent", "Task":
-		return "Running sub-agent…"
+		return "Running sub-agent", true
 	case "WebFetch":
-		return "Fetching web page…"
+		return "Fetching web page", true
 	case "WebSearch":
-		return "Searching the web…"
+		return "Searching the web", true
 	case "NotebookEdit":
-		return "Editing notebook…"
+		return "Editing notebook", true
 	default:
-		if toolName == "" {
-			return "Working…"
-		}
-		return "Using " + toolName + "…"
+		return "", false
 	}
 }
 
-// appendStream appends text to a streaming Slack message with rate limit retry.
-func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) {
+// toolStatusDetail extracts the single most salient argument from a tool
+// invocation's input — the shell command, the file path, the search
+// pattern — so the user can tell what the agent is actually doing rather
+// than just "Running command…". Returns "" when no useful detail is
+// available (the caller then falls back to the bare label).
+//
+// Claude tool inputs are JSON objects (e.g. {"command":"git status"}).
+// Codex's "shell" tool input is the raw command string, not JSON, so it
+// is used verbatim.
+func toolStatusDetail(toolName, toolInput string) string {
+	if toolInput == "" {
+		return ""
+	}
+	var detail string
+	switch toolName {
+	case "shell":
+		detail = toolInput // Codex: raw command string, not JSON.
+	case "Bash":
+		detail = jsonStringField(toolInput, "command")
+	case "Read", "Write", "Edit", "MultiEdit":
+		detail = jsonStringField(toolInput, "file_path")
+	case "NotebookEdit":
+		detail = jsonStringField(toolInput, "notebook_path")
+	case "Grep", "Glob":
+		detail = jsonStringField(toolInput, "pattern")
+	case "WebFetch":
+		detail = jsonStringField(toolInput, "url")
+	case "WebSearch":
+		detail = jsonStringField(toolInput, "query")
+	default:
+		// Tools whose detail we never surface (e.g. Agent/Task, whose input
+		// carries a potentially large sub-agent prompt) bail out here without
+		// decoding the JSON at all.
+		return ""
+	}
+	return cleanToolDetail(detail)
+}
+
+// toolDetailFields enumerates the salient tool-input fields surfaced in the
+// Slack progress indicator. Decoding into this struct (rather than a generic
+// map[string]json.RawMessage) lets encoding/json skip fields not listed here
+// — e.g. Edit/MultiEdit's potentially huge old_string / new_string — via the
+// scanner, without allocating or copying their bytes for payload we never read.
+type toolDetailFields struct {
+	Command      string `json:"command"`
+	FilePath     string `json:"file_path"`
+	NotebookPath string `json:"notebook_path"`
+	Pattern      string `json:"pattern"`
+	URL          string `json:"url"`
+	Query        string `json:"query"`
+}
+
+// jsonStringField returns the string value of one top-level field of a JSON
+// object, or "" if the input is not a JSON object, the field is missing or not
+// a string, or the input is partial/invalid. Only the fields enumerated in
+// toolDetailFields are recognized; any other field name returns "".
+func jsonStringField(raw, field string) string {
+	var f toolDetailFields
+	if err := json.Unmarshal([]byte(raw), &f); err != nil {
+		return ""
+	}
+	switch field {
+	case "command":
+		return f.Command
+	case "file_path":
+		return f.FilePath
+	case "notebook_path":
+		return f.NotebookPath
+	case "pattern":
+		return f.Pattern
+	case "url":
+		return f.URL
+	case "query":
+		return f.Query
+	default:
+		return ""
+	}
+}
+
+// cleanToolDetail normalizes a tool detail for display in the Slack
+// indicator: collapses whitespace/newlines to single spaces, neutralizes
+// backticks (which would break the inline code span), and truncates on a
+// rune boundary.
+func cleanToolDetail(s string) string {
+	// Bound work up front: the final result is capped at toolDetailMaxLen
+	// runes, so there is no point normalizing a megabyte-long heredoc
+	// command. Slice generously (a rune is at most 4 bytes, and
+	// whitespace collapsing only shrinks the string) before the O(n)
+	// Fields pass. The byte slice may land mid-rune; ToValidUTF8 drops
+	// the resulting partial bytes so no invalid UTF-8 reaches Slack —
+	// strings.Fields does not sanitize invalid encodings on its own.
+	if max := toolDetailMaxLen * 4; len(s) > max {
+		s = strings.ToValidUTF8(s[:max], "")
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "`", "'")
+	if utf8.RuneCountInString(s) > toolDetailMaxLen {
+		s = string([]rune(s)[:toolDetailMaxLen]) + "…"
+	}
+	return s
+}
+
+// toolStatusText returns a plain-text status string (label plus salient
+// detail) for the assistant typing indicator. Plain text needs no markdown
+// escaping, so the raw tool name is used for unrecognized tools.
+func toolStatusText(toolName, toolInput string) string {
+	label, known := toolStatusLabel(toolName)
+	if !known {
+		if toolName == "" {
+			return "Working…"
+		}
+		label = "Using " + toolName
+	}
+	if detail := toolStatusDetail(toolName, toolInput); detail != "" {
+		return label + ": " + detail
+	}
+	return label + "…"
+}
+
+// toolStatusIndicator builds the inline progress line shown in the Slack
+// stream (Slack mrkdwn). Only fixed label words ever sit inside the
+// italic span; every piece of dynamic text — the command/path/pattern
+// detail, or an unrecognized tool's name — goes in an inline code span so
+// its markdown-significant characters (_, *, ~, etc.) cannot break the
+// surrounding formatting.
+func toolStatusIndicator(toolName, toolInput string) string {
+	label, known := toolStatusLabel(toolName)
+	if !known {
+		if toolName == "" {
+			return "\n\n_⏳ Working…_"
+		}
+		return "\n\n_⏳ Using_ `" + cleanToolDetail(toolName) + "`"
+	}
+	if detail := toolStatusDetail(toolName, toolInput); detail != "" {
+		return "\n\n_⏳ " + label + ":_ `" + detail + "`"
+	}
+	return "\n\n_⏳ " + label + "…_"
+}
+
+// appendStream appends text to a streaming Slack message with rate limit
+// retry. Returns true if streamTS is still usable for further appends
+// (success, transient/unknown error, rate-limit exhaustion, ctx cancelled);
+// false if Slack reported the stream has left streaming state (TTL expiry,
+// external chat.stopStream, etc.) — the caller MUST abandon streamTS and
+// open a new stream for subsequent chunks. Returning bool instead of
+// silently swallowing the error closes the bug where, after a stream-side
+// TTL expiry, every later append in the same turn failed the same way and
+// the user saw no further updates AND no finalize chat.update (because
+// chat.update against a dead TS is best-effort and may also fail).
+func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) bool {
 	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
 		_, _, err := b.api.AppendStreamContext(ctx, channel, streamTS, slack.MsgOptionMarkdownText(text))
 		if err == nil {
-			return
+			return true
 		}
 		var rlErr *slack.RateLimitedError
 		if errors.As(err, &rlErr) {
@@ -914,7 +1375,11 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 				b.logger.Warn("failed to append slack stream after rate limit retries",
 					"channel", channel, "streamTS", streamTS,
 					"retryAfter", rlErr.RetryAfter, "err", err)
-				return
+				// Rate limiting doesn't kill the stream itself —
+				// it just means Slack is refusing OUR calls right
+				// now. Keep the streamTS so finalize chat.update
+				// still has a chance to land the full reply.
+				return true
 			}
 			delay := rlErr.RetryAfter
 			if delay == 0 {
@@ -928,12 +1393,46 @@ func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) 
 			case <-sleep(delay):
 				continue
 			case <-ctx.Done():
-				return
+				return true
 			}
 		}
+		if isStreamClosedErr(err) {
+			// Stream is irrecoverably dead from Slack's side. Log
+			// at Info (not Debug) so the restart event has an
+			// audit trail — diagnosing the silent-truncation bug
+			// required reconstructing this from 30+ identical
+			// Debug lines, which is the kind of toil this log
+			// level avoids.
+			b.logger.Info("slack stream closed mid-response, will restart on next chunk",
+				"channel", channel, "streamTS", streamTS, "err", err)
+			return false
+		}
 		b.logger.Debug("append stream failed", "err", err)
-		return
+		// Unknown non-rate-limit error: don't churn the stream — Slack
+		// has been known to return transient 5xx that don't kill the
+		// streaming state. Caller keeps the same streamTS; if the
+		// error WAS terminal, the next append will return the
+		// stream-closed signal and we'll restart then.
+		return true
 	}
+	return true
+}
+
+// isStreamClosedErr reports whether err is the Slack
+// "message_not_in_streaming_state" response, which signals that the
+// streaming message identified by streamTS has been finalized
+// server-side and cannot be appended to. Detected via the typed
+// SlackErrorResponse rather than string match so a wrapped error from a
+// future slack-go change still trips the same code path.
+func isStreamClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var sErr slack.SlackErrorResponse
+	if errors.As(err, &sErr) {
+		return sErr.Err == slackErrNotStreaming
+	}
+	return false
 }
 
 // finalizeUpdateOpts returns the slack.MsgOption slice used by the

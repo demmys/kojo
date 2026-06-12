@@ -96,7 +96,7 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 
 	// --- slack_get_channel_history ---
 	historyTool := mcp.NewTool("slack_get_channel_history",
-		mcp.WithDescription("Get recent messages from a Slack channel. Returns messages in reverse chronological order (newest first)."),
+		mcp.WithDescription("Get recent messages from a Slack channel. Returns messages in reverse chronological order (newest first). Each message includes text, author (user/bot/app), timestamp, thread_ts, subtype, edited info, files (id/name/mimetype/size/permalink/url_private), reactions, attachments (title/text/fields/image_url/footer), Block Kit blocks (re-encoded JSON; unknown block types may be lossy), and metadata."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID or #channel-name")),
 		mcp.WithNumber("limit", mcp.Description("Number of messages to retrieve (default 20, max 100)")),
 		mcp.WithString("oldest", mcp.Description("Only messages after this Unix timestamp")),
@@ -106,7 +106,7 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 
 	// --- slack_get_thread_replies ---
 	threadRepliesTool := mcp.NewTool("slack_get_thread_replies",
-		mcp.WithDescription("Get all replies in a message thread."),
+		mcp.WithDescription("Get all replies in a message thread. Each message includes text, author (user/bot/app), timestamp, edited info, files (id/name/mimetype/size/permalink/url_private), reactions, attachments (title/text/fields/image_url/footer), Block Kit blocks (re-encoded JSON; unknown block types may be lossy), and metadata."),
 		mcp.WithString("channel", mcp.Required(), mcp.Description("Channel ID where the thread exists")),
 		mcp.WithString("thread_ts", mcp.Required(), mcp.Description("Timestamp of the parent message (thread root)")),
 		mcp.WithNumber("limit", mcp.Description("Maximum number of replies to return (default 50, max 200)")),
@@ -773,14 +773,193 @@ const (
 )
 
 // messageInfo is the JSON shape returned by slack_get_channel_history and
-// slack_get_thread_replies.
+// slack_get_thread_replies. Fields beyond the bare message text are included
+// so the agent can see files, reactions, rich-layout blocks, edits, and
+// bot-posted messages.
 type messageInfo struct {
-	User       string `json:"user"`
-	Text       string `json:"text"`
-	Timestamp  string `json:"timestamp"`
-	ThreadTS   string `json:"thread_ts,omitempty"`
-	ReplyCount int    `json:"reply_count,omitempty"`
-	SubType    string `json:"subtype,omitempty"`
+	// User and Text intentionally do NOT use omitempty: these keys were
+	// always present in the prior shape and consumers may rely on the key
+	// existing (with an empty string for bot/system messages).
+	User        string              `json:"user"`
+	Username    string              `json:"username,omitempty"`
+	BotID       string              `json:"bot_id,omitempty"`
+	AppID       string              `json:"app_id,omitempty"`
+	Text        string              `json:"text"`
+	Timestamp   string              `json:"timestamp"`
+	ThreadTS    string              `json:"thread_ts,omitempty"`
+	ReplyCount  int                 `json:"reply_count,omitempty"`
+	SubType     string              `json:"subtype,omitempty"`
+	Edited      *messageEdited      `json:"edited,omitempty"`
+	Files       []messageFile       `json:"files,omitempty"`
+	Reactions   []messageReaction   `json:"reactions,omitempty"`
+	Attachments []messageAttachment `json:"attachments,omitempty"`
+	// Blocks is the re-serialized form of slack-go's Blocks struct (not the
+	// raw Slack API JSON). Unknown / future block types that slack-go cannot
+	// decode will be missing.
+	Blocks   json.RawMessage  `json:"blocks,omitempty"`
+	Metadata *messageMetadata `json:"metadata,omitempty"`
+}
+
+type messageEdited struct {
+	User      string `json:"user,omitempty"`
+	Timestamp string `json:"ts,omitempty"`
+}
+
+// messageFile is a slimmed-down view of a Slack file shared in a message.
+// We deliberately drop the dozen-plus thumbnail fields and keep only the
+// metadata an agent needs to identify and (optionally) fetch the file.
+type messageFile struct {
+	ID                 string `json:"id,omitempty"`
+	Name               string `json:"name,omitempty"`
+	Title              string `json:"title,omitempty"`
+	Mimetype           string `json:"mimetype,omitempty"`
+	Filetype           string `json:"filetype,omitempty"`
+	PrettyType         string `json:"pretty_type,omitempty"`
+	Size               int    `json:"size,omitempty"`
+	URLPrivate         string `json:"url_private,omitempty"`
+	URLPrivateDownload string `json:"url_private_download,omitempty"`
+	Permalink          string `json:"permalink,omitempty"`
+	PermalinkPublic    string `json:"permalink_public,omitempty"`
+	User               string `json:"user,omitempty"`
+}
+
+type messageReaction struct {
+	Name  string   `json:"name"`
+	Count int      `json:"count"`
+	Users []string `json:"users,omitempty"`
+}
+
+// messageAttachment trims slack.Attachment to the fields agents typically
+// need (text+layout, not unfurl-specific thumbnail dimensions).
+type messageAttachment struct {
+	Color       string                   `json:"color,omitempty"`
+	Fallback    string                   `json:"fallback,omitempty"`
+	Title       string                   `json:"title,omitempty"`
+	TitleLink   string                   `json:"title_link,omitempty"`
+	Pretext     string                   `json:"pretext,omitempty"`
+	Text        string                   `json:"text,omitempty"`
+	AuthorName  string                   `json:"author_name,omitempty"`
+	AuthorLink  string                   `json:"author_link,omitempty"`
+	ServiceName string                   `json:"service_name,omitempty"`
+	FromURL     string                   `json:"from_url,omitempty"`
+	ImageURL    string                   `json:"image_url,omitempty"`
+	ThumbURL    string                   `json:"thumb_url,omitempty"`
+	Footer      string                   `json:"footer,omitempty"`
+	Fields      []messageAttachmentField `json:"fields,omitempty"`
+	Blocks      json.RawMessage          `json:"blocks,omitempty"`
+}
+
+type messageAttachmentField struct {
+	Title string `json:"title,omitempty"`
+	Value string `json:"value,omitempty"`
+	Short bool   `json:"short,omitempty"`
+}
+
+type messageMetadata struct {
+	EventType    string         `json:"event_type,omitempty"`
+	EventPayload map[string]any `json:"event_payload,omitempty"`
+}
+
+// toMessageInfo flattens a slack.Msg into the agent-facing messageInfo shape.
+// Empty slices/pointers stay nil so json.Marshal omits them via omitempty.
+// logger may be nil; if non-nil, block-marshal failures are reported as warnings
+// rather than silently dropping the field.
+func toMessageInfo(m slack.Msg, logger *slog.Logger) messageInfo {
+	info := messageInfo{
+		User:       m.User,
+		Username:   m.Username,
+		BotID:      m.BotID,
+		Text:       m.Text,
+		Timestamp:  m.Timestamp,
+		ThreadTS:   m.ThreadTimestamp,
+		ReplyCount: m.ReplyCount,
+		SubType:    m.SubType,
+	}
+	if m.BotProfile != nil {
+		info.AppID = m.BotProfile.AppID
+	}
+	if m.Edited != nil {
+		info.Edited = &messageEdited{User: m.Edited.User, Timestamp: m.Edited.Timestamp}
+	}
+	if len(m.Files) > 0 {
+		info.Files = make([]messageFile, 0, len(m.Files))
+		for _, f := range m.Files {
+			info.Files = append(info.Files, messageFile{
+				ID:                 f.ID,
+				Name:               f.Name,
+				Title:              f.Title,
+				Mimetype:           f.Mimetype,
+				Filetype:           f.Filetype,
+				PrettyType:         f.PrettyType,
+				Size:               f.Size,
+				URLPrivate:         f.URLPrivate,
+				URLPrivateDownload: f.URLPrivateDownload,
+				Permalink:          f.Permalink,
+				PermalinkPublic:    f.PermalinkPublic,
+				User:               f.User,
+			})
+		}
+	}
+	if len(m.Reactions) > 0 {
+		info.Reactions = make([]messageReaction, 0, len(m.Reactions))
+		for _, r := range m.Reactions {
+			info.Reactions = append(info.Reactions, messageReaction{
+				Name:  r.Name,
+				Count: r.Count,
+				Users: r.Users,
+			})
+		}
+	}
+	if len(m.Attachments) > 0 {
+		info.Attachments = make([]messageAttachment, 0, len(m.Attachments))
+		for _, a := range m.Attachments {
+			att := messageAttachment{
+				Color:       a.Color,
+				Fallback:    a.Fallback,
+				Title:       a.Title,
+				TitleLink:   a.TitleLink,
+				Pretext:     a.Pretext,
+				Text:        a.Text,
+				AuthorName:  a.AuthorName,
+				AuthorLink:  a.AuthorLink,
+				ServiceName: a.ServiceName,
+				FromURL:     a.FromURL,
+				ImageURL:    a.ImageURL,
+				ThumbURL:    a.ThumbURL,
+				Footer:      a.Footer,
+			}
+			if len(a.Fields) > 0 {
+				att.Fields = make([]messageAttachmentField, 0, len(a.Fields))
+				for _, f := range a.Fields {
+					att.Fields = append(att.Fields, messageAttachmentField{
+						Title: f.Title, Value: f.Value, Short: f.Short,
+					})
+				}
+			}
+			if len(a.Blocks.BlockSet) > 0 {
+				if b, err := json.Marshal(a.Blocks); err == nil {
+					att.Blocks = b
+				} else if logger != nil {
+					logger.Warn("failed to marshal attachment blocks", "ts", m.Timestamp, "err", err)
+				}
+			}
+			info.Attachments = append(info.Attachments, att)
+		}
+	}
+	if len(m.Blocks.BlockSet) > 0 {
+		if b, err := json.Marshal(m.Blocks); err == nil {
+			info.Blocks = b
+		} else if logger != nil {
+			logger.Warn("failed to marshal message blocks", "ts", m.Timestamp, "err", err)
+		}
+	}
+	if m.Metadata.EventType != "" || len(m.Metadata.EventPayload) > 0 {
+		info.Metadata = &messageMetadata{
+			EventType:    m.Metadata.EventType,
+			EventPayload: m.Metadata.EventPayload,
+		}
+	}
+	return info
 }
 
 func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) mcpserver.ToolHandlerFunc {
@@ -814,10 +993,11 @@ func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) m
 		}
 
 		params := &slack.GetConversationHistoryParameters{
-			ChannelID: resolvedChannel,
-			Limit:     limit,
-			Oldest:    oldest,
-			Latest:    latest,
+			ChannelID:          resolvedChannel,
+			Limit:              limit,
+			Oldest:             oldest,
+			Latest:             latest,
+			IncludeAllMetadata: true,
 		}
 
 		resp, err := api.GetConversationHistoryContext(ctx, params)
@@ -828,14 +1008,7 @@ func slackGetChannelHistoryHandler(agents *agent.Manager, logger *slog.Logger) m
 
 		messages := make([]messageInfo, 0, len(resp.Messages))
 		for _, m := range resp.Messages {
-			messages = append(messages, messageInfo{
-				User:       m.User,
-				Text:       m.Text,
-				Timestamp:  m.Timestamp,
-				ThreadTS:   m.ThreadTimestamp,
-				ReplyCount: m.ReplyCount,
-				SubType:    m.SubType,
-			})
+			messages = append(messages, toMessageInfo(m.Msg, logger))
 		}
 
 		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_get_channel_history", "messageCount", len(messages))
@@ -879,9 +1052,10 @@ func slackGetThreadRepliesHandler(agents *agent.Manager, logger *slog.Logger) mc
 		}
 
 		params := &slack.GetConversationRepliesParameters{
-			ChannelID: channel,
-			Timestamp: threadTS,
-			Limit:     limit,
+			ChannelID:          channel,
+			Timestamp:          threadTS,
+			Limit:              limit,
+			IncludeAllMetadata: true,
 		}
 
 		msgs, _, _, err := api.GetConversationRepliesContext(ctx, params)
@@ -892,13 +1066,7 @@ func slackGetThreadRepliesHandler(agents *agent.Manager, logger *slog.Logger) mc
 
 		messages := make([]messageInfo, 0, len(msgs))
 		for _, m := range msgs {
-			messages = append(messages, messageInfo{
-				User:      m.User,
-				Text:      m.Text,
-				Timestamp: m.Timestamp,
-				ThreadTS:  m.ThreadTimestamp,
-				SubType:   m.SubType,
-			})
+			messages = append(messages, toMessageInfo(m.Msg, logger))
 		}
 
 		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_get_thread_replies", "messageCount", len(messages))

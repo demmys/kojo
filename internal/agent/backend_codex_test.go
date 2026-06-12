@@ -2,9 +2,12 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
 // rpcLine builds a JSON-RPC notification line for testing.
@@ -104,7 +107,7 @@ func TestCodexLineScanner(t *testing.T) {
 		}
 	})
 
-	t.Run("oversized line", func(t *testing.T) {
+	t.Run("large line under cap", func(t *testing.T) {
 		big := strings.Repeat("z", 5*1024*1024)
 		lines, err := collect(big + "\n")
 		if err != nil {
@@ -117,6 +120,17 @@ func TestCodexLineScanner(t *testing.T) {
 				}
 				return -1
 			}(), len(big))
+		}
+	})
+
+	t.Run("line over cap", func(t *testing.T) {
+		tooBig := strings.Repeat("z", chathistory.MaxJSONLLineBytes+1)
+		lines, err := collect(tooBig + "\n")
+		if !errors.Is(err, chathistory.ErrLineTooLarge) {
+			t.Fatalf("Err = %v, want ErrLineTooLarge", err)
+		}
+		if len(lines) != 0 {
+			t.Fatalf("lines = %d, want 0 when line exceeds cap", len(lines))
 		}
 	})
 }
@@ -163,7 +177,8 @@ func equalStrings(a, b []string) bool {
 // "bufio.Scanner: token too long" hang: a single item/completed notification
 // carrying a multi-MB aggregatedOutput (e.g. a command that printed a huge
 // blob) must be read intact instead of killing the stream. bufio.Scanner with
-// a 1MB max token would have failed here; codexLineScanner must not.
+// a 1MB max token would have failed here; codexLineScanner must read it while
+// still enforcing its larger MaxJSONLLineBytes safety cap.
 func TestParseCodexStream_OversizedLine(t *testing.T) {
 	bigOutput := strings.Repeat("x", 3*1024*1024) // 3MB, well over the old 1MB cap
 	events, result := collectCodexEvents(t, 1,

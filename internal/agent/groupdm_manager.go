@@ -197,6 +197,16 @@ func (m *GroupDMManager) APIBase() string {
 // style controls the communication style ("efficient" or "expressive"; empty = "efficient").
 // venue is the physical-setting hint ("chatroom" or "colocated"; empty = defaultGroupDMVenue).
 func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue) (*GroupDM, error) {
+	return m.create(name, memberIDs, cooldown, style, venue, false)
+}
+
+// CreateWithNotify creates a group and optionally sends a system notification
+// to every member after the row is persisted.
+func (m *GroupDMManager) CreateWithNotify(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers bool) (*GroupDM, error) {
+	return m.create(name, memberIDs, cooldown, style, venue, notifyMembers)
+}
+
+func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers bool) (*GroupDM, error) {
 	if len(memberIDs) < 2 {
 		return nil, ErrGroupTooFew
 	}
@@ -279,6 +289,13 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 	}
 	m.mu.Unlock()
 	m.logger.Info("group DM created", "id", g.ID, "name", g.Name)
+
+	if notifyMembers {
+		for _, mem := range snapshot.Members {
+			go m.notifyGroupCreated(mem.AgentID, snapshot.ID, snapshot.Name, snapshot.Members)
+		}
+	}
+
 	return m.copyGroup(g), nil
 }
 
@@ -525,6 +542,26 @@ func (m *GroupDMManager) notifyGroupDeleted(agentID, groupID, groupName string) 
 		groupName,
 	)
 	m.sendSystemNotification(agentID, notification, "group_deleted:"+groupID)
+}
+
+// notifyGroupCreated sends a lightweight notification about a new group.
+// Unlike message notifications, this does not enforce cooldown.
+func (m *GroupDMManager) notifyGroupCreated(agentID, groupID, groupName string, members []GroupMember) {
+	names := make([]string, 0, len(members))
+	for _, mem := range members {
+		if mem.AgentName != "" {
+			names = append(names, mem.AgentName)
+		}
+	}
+	memberList := strings.Join(names, ", ")
+	if memberList == "" {
+		memberList = "the selected members"
+	}
+	notification := fmt.Sprintf(
+		"[Group DM: %s] This group was created with %s. No reply is required.",
+		groupName, memberList,
+	)
+	m.sendSystemNotification(agentID, notification, "group_created:"+groupID)
 }
 
 // PostMessage posts a message to a group and optionally notifies other members.

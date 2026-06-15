@@ -123,11 +123,12 @@ func (s *Server) handleListGroupDMs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name      string   `json:"name"`
-		MemberIDs []string `json:"memberIds"`
-		Cooldown  int      `json:"cooldown"`
-		Style     string   `json:"style"`
-		Venue     string   `json:"venue"`
+		Name          string   `json:"name"`
+		MemberIDs     []string `json:"memberIds"`
+		Cooldown      int      `json:"cooldown"`
+		Style         string   `json:"style"`
+		Venue         string   `json:"venue"`
+		NotifyMembers bool     `json:"notifyMembers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -158,8 +159,8 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	g, err := s.groupdms.Create(req.Name, req.MemberIDs, req.Cooldown,
-		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue))
+	g, err := s.groupdms.CreateWithNotify(req.Name, req.MemberIDs, req.Cooldown,
+		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue), req.NotifyMembers)
 	if err != nil {
 		// Don't leak whether a memberId names an unknown / archived agent
 		// to non-Owners — that would let an agent enumerate hidden or

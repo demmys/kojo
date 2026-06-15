@@ -2,6 +2,7 @@ import { get, post, del, patch } from "./httpClient";
 import type { AgentMessageAttachment } from "./agentApi";
 
 export type GroupDMStyle = "efficient" | "expressive";
+export type NotifyMode = "realtime" | "digest" | "muted";
 
 /** Physical-setting hint that calibrates how members should speak.
  * "chatroom" (default): closed online chat — text-only, no co-presence.
@@ -33,6 +34,8 @@ export interface GroupMember {
   agentId: string;
   agentName: string;
   status?: "online" | "offline" | "busy" | "unknown";
+  notifyMode?: NotifyMode;
+  digestWindow?: number;
 }
 
 export interface GroupMessage {
@@ -53,7 +56,12 @@ export const groupdmApi = {
   create: (
     name: string,
     memberIds: string[],
-    opts?: { style?: GroupDMStyle; venue?: GroupDMVenue; cooldown?: number },
+    opts?: {
+      style?: GroupDMStyle;
+      venue?: GroupDMVenue;
+      cooldown?: number;
+      notifyMembers?: boolean;
+    },
   ) =>
     post<GroupDMInfo>("/api/v1/groupdms", { name, memberIds, ...(opts ?? {}) }),
 

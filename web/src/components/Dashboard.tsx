@@ -68,6 +68,12 @@ export function Dashboard() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [groupDMs, setGroupDMs] = useState<GroupDMInfo[]>([]);
   const [cronPaused, setCronPaused] = useState(false);
+  const [showCreateGroupDialog, setShowCreateGroupDialog] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [newGroupMemberIds, setNewGroupMemberIds] = useState<Set<string>>(new Set());
+  const [newGroupNotifyMembers, setNewGroupNotifyMembers] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [createGroupError, setCreateGroupError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(() => {
     try {
@@ -83,6 +89,7 @@ export function Dashboard() {
   });
   const navigate = useNavigate();
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
+  const createGroupDialogRef = useRef<HTMLDivElement>(null);
   // peerCacheRef holds the last successful session list per peer.
   // Lives outside the loadSessions effect so deleteGroup can evict
   // entries it just removed — otherwise a delete would visibly
@@ -265,6 +272,10 @@ export function Dashboard() {
   }, []);
 
   useEffect(() => {
+    if (showCreateGroupDialog) createGroupDialogRef.current?.focus();
+  }, [showCreateGroupDialog]);
+
+  useEffect(() => {
     const loadPaused = () => agentApi.cronPaused().then(setCronPaused).catch(console.error);
     loadPaused();
     const interval = setInterval(loadPaused, 5000);
@@ -283,6 +294,47 @@ export function Dashboard() {
     if (diff !== 0 && !Number.isNaN(diff)) return diff;
     return a.id.localeCompare(b.id);
   });
+  const selectedNewGroupMembers = sortedAgents.filter((a) => newGroupMemberIds.has(a.id));
+
+  const resetCreateGroupForm = () => {
+    setNewGroupName("");
+    setNewGroupMemberIds(new Set());
+    setNewGroupNotifyMembers(false);
+    setCreateGroupError("");
+  };
+
+  const toggleNewGroupMember = (agentId: string) => {
+    setNewGroupMemberIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(agentId)) next.delete(agentId);
+      else next.add(agentId);
+      return next;
+    });
+  };
+
+  const submitCreateGroup = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const memberIds = [...newGroupMemberIds];
+    if (memberIds.length < 2) {
+      setCreateGroupError("Select at least 2 members");
+      return;
+    }
+    setCreatingGroup(true);
+    setCreateGroupError("");
+    try {
+      const created = await groupdmApi.create(newGroupName.trim(), memberIds, {
+        notifyMembers: newGroupNotifyMembers,
+      });
+      setGroupDMs((prev) => [created, ...prev.filter((g) => g.id !== created.id)]);
+      resetCreateGroupForm();
+      setShowCreateGroupDialog(false);
+      navigate(`/groupdms/${created.id}`);
+    } catch (err) {
+      setCreateGroupError(err instanceof Error ? err.message : "Failed to create group");
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
 
   const toggleExpand = (key: string) => {
     setExpanded((prev) => {
@@ -543,6 +595,16 @@ export function Dashboard() {
         <section>
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">Group DMs</h2>
+            <button
+              onClick={() => {
+                resetCreateGroupForm();
+                setShowCreateGroupDialog(true);
+              }}
+              disabled={sortedAgents.length < 2}
+              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40"
+            >
+              + Group
+            </button>
           </div>
           {groupDMs.length === 0 && (
             <p className="text-neutral-500 text-center py-8 text-sm">No group DMs</p>
@@ -718,6 +780,124 @@ export function Dashboard() {
           </div>
         </section>
       </main>
+
+      {showCreateGroupDialog && (
+        <div
+          ref={createGroupDialogRef}
+          tabIndex={-1}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 outline-none"
+          onClick={(e) => {
+            if (e.target === e.currentTarget && !creatingGroup) {
+              setShowCreateGroupDialog(false);
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && !creatingGroup) setShowCreateGroupDialog(false);
+          }}
+        >
+          <form
+            onSubmit={submitCreateGroup}
+            className="w-full max-w-[420px] max-h-[85vh] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl flex flex-col"
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-800 shrink-0">
+              <h3 className="text-sm font-medium text-neutral-200">New group DM</h3>
+              <button
+                type="button"
+                onClick={() => setShowCreateGroupDialog(false)}
+                disabled={creatingGroup}
+                className="p-1 text-neutral-500 hover:text-neutral-300 rounded disabled:opacity-40"
+                aria-label="Close"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-4 h-4">
+                  <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-4 space-y-4 overflow-y-auto">
+              <label className="block">
+                <span className="block text-xs text-neutral-500 mb-1">Name</span>
+                <input
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  placeholder={selectedNewGroupMembers.map((a) => a.name).join(", ")}
+                  disabled={creatingGroup}
+                  className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-neutral-500 disabled:opacity-50"
+                  autoFocus
+                />
+              </label>
+
+              <label className="flex items-center gap-2 text-sm text-neutral-300 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={newGroupNotifyMembers}
+                  onChange={(e) => setNewGroupNotifyMembers(e.target.checked)}
+                  disabled={creatingGroup}
+                  className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                />
+                Notify members
+              </label>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-neutral-500">Members</span>
+                  <span className="text-[10px] text-neutral-600">{newGroupMemberIds.size} selected</span>
+                </div>
+                <div className="space-y-1.5">
+                  {sortedAgents.map((agent) => {
+                    const checked = newGroupMemberIds.has(agent.id);
+                    return (
+                      <label
+                        key={agent.id}
+                        className={`flex items-center gap-3 p-2 rounded border cursor-pointer select-none ${
+                          checked
+                            ? "bg-blue-950/30 border-blue-800/60"
+                            : "bg-neutral-950 border-neutral-800 hover:border-neutral-700"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleNewGroupMember(agent.id)}
+                          disabled={creatingGroup}
+                          className="rounded border-neutral-600 bg-neutral-800 text-blue-500 focus:ring-blue-500/30"
+                        />
+                        <AgentAvatar agentId={agent.id} name={agent.name} size="sm" cacheBust={agent.avatarHash} />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm text-neutral-200 truncate">{agent.name}</div>
+                          <div className="text-[10px] text-neutral-600 font-mono truncate">{agent.tool}</div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {createGroupError && (
+                <p className="text-xs text-red-400">{createGroupError}</p>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 px-4 py-3 border-t border-neutral-800 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowCreateGroupDialog(false)}
+                disabled={creatingGroup}
+                className="px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={creatingGroup || newGroupMemberIds.size < 2}
+                className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded disabled:opacity-50"
+              >
+                {creatingGroup ? "Creating..." : "Create"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

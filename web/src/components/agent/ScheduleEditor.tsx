@@ -68,6 +68,9 @@ interface Props {
 // the server will reject.
 const CRON_MESSAGE_MAX_LEN = (1 << 20) / 4;
 
+// Mirrors Go time.Duration overflow guard: floor(MaxInt64 / time.Minute / 60).
+const MAX_TIMEOUT_HOURS = 2_562_047;
+
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
   const [h, m] = hhmm.split(":").map(Number);
@@ -227,6 +230,27 @@ export function ScheduleEditor({
   // and re-emit a freshly-built expression on each input change.
   const parsed = parseCronExpr(cronExpr);
 
+  const customTimeoutValue = () =>
+    timeoutMinutes > 60 && timeoutMinutes % 60 === 0 ? String(timeoutMinutes / 60) : "";
+
+  const [customTimeoutHours, setCustomTimeoutHours] = useState(customTimeoutValue);
+  useEffect(() => {
+    setCustomTimeoutHours(customTimeoutValue());
+  }, [timeoutMinutes]);
+
+  const syncCustomTimeoutHours = () => {
+    setCustomTimeoutHours(customTimeoutValue());
+  };
+
+  const updateCustomTimeoutHours = (value: string) => {
+    if (value !== "" && !/^\d+$/.test(value)) return;
+    setCustomTimeoutHours(value);
+    const hours = Number(value);
+    if (!Number.isInteger(hours) || hours < 2 || hours > MAX_TIMEOUT_HOURS) return;
+    const nextMinutes = hours * 60;
+    if (nextMinutes !== timeoutMinutes) onTimeoutChange(nextMinutes);
+  };
+
   // ---- Silent hours toggle (unchanged from the old editor) ----
   const [silentEnabled, setSilentEnabled] = useState(silentStart !== "" && silentEnd !== "");
   useEffect(() => {
@@ -349,7 +373,7 @@ export function ScheduleEditor({
       {/* Timeout */}
       {(enabled || onCheckin) && (
         <Field label={t("sched.timeout")} help={t("sched.timeoutHelp")}>
-          <div className="flex flex-wrap gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             {TIMEOUT_PRESETS.map((opt) => (
               <button
                 key={opt.value}
@@ -360,6 +384,22 @@ export function ScheduleEditor({
                 {opt.label}
               </button>
             ))}
+            <label className="ml-1 flex items-center gap-1.5 text-[13px] text-ink-dim">
+              <span>Custom</span>
+              <Input
+                type="number"
+                min={2}
+                max={MAX_TIMEOUT_HOURS}
+                step={1}
+                inputMode="numeric"
+                value={customTimeoutHours}
+                onChange={(e) => updateCustomTimeoutHours(e.target.value)}
+                onBlur={syncCustomTimeoutHours}
+                className="w-20 px-2 py-1.5"
+                placeholder="hours"
+              />
+              <span>h</span>
+            </label>
           </div>
         </Field>
       )}

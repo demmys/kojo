@@ -216,15 +216,25 @@ func validateCronMessage(s string) (string, error) {
 	return trimmed, nil
 }
 
-// allowedTimeouts defines the valid timeoutMinutes values.
+// maxTimeoutMinutes is the largest timeout that can be converted to
+// time.Duration without overflowing when multiplied by time.Minute.
+const maxTimeoutMinutes = int64(1<<63-1) / int64(time.Minute)
+
+// allowedTimeouts defines the legacy minute-level timeoutMinutes presets.
 // 0 means "use default" (10 minutes at runtime) for backward compatibility.
+// Values above one hour are accepted as whole-hour durations so long-running
+// check-ins can opt into arbitrary hour-based timeouts without expanding this
+// whitelist forever.
 var allowedTimeouts = map[int]bool{
 	0: true, 5: true, 10: true, 15: true, 20: true, 30: true, 45: true, 60: true,
 }
 
 // ValidTimeout returns true if the given timeout is in the allowed set.
 func ValidTimeout(minutes int) bool {
-	return allowedTimeouts[minutes]
+	if allowedTimeouts[minutes] {
+		return true
+	}
+	return minutes > 60 && minutes%60 == 0 && int64(minutes) <= maxTimeoutMinutes
 }
 
 // allowedResumeIdles defines the valid resumeIdleMinutes values.

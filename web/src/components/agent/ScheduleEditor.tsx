@@ -56,6 +56,9 @@ const DEFAULT_CRON_MESSAGE_HINT =
 // the server will reject.
 const CRON_MESSAGE_MAX_LEN = (1 << 20) / 4;
 
+// Mirrors Go time.Duration overflow guard: floor(MaxInt64 / time.Minute / 60).
+const MAX_TIMEOUT_HOURS = 2_562_047;
+
 /** Parse "HH:MM" to minutes since midnight. */
 function toMinutes(hhmm: string): number {
   const [h, m] = hhmm.split(":").map(Number);
@@ -206,6 +209,27 @@ export function ScheduleEditor({
   // and re-emit a freshly-built expression on each input change.
   const parsed = parseCronExpr(cronExpr);
 
+  const customTimeoutValue = () =>
+    timeoutMinutes > 60 && timeoutMinutes % 60 === 0 ? String(timeoutMinutes / 60) : "";
+
+  const [customTimeoutHours, setCustomTimeoutHours] = useState(customTimeoutValue);
+  useEffect(() => {
+    setCustomTimeoutHours(customTimeoutValue());
+  }, [timeoutMinutes]);
+
+  const syncCustomTimeoutHours = () => {
+    setCustomTimeoutHours(customTimeoutValue());
+  };
+
+  const updateCustomTimeoutHours = (value: string) => {
+    if (value !== "" && !/^\d+$/.test(value)) return;
+    setCustomTimeoutHours(value);
+    const hours = Number(value);
+    if (!Number.isInteger(hours) || hours < 2 || hours > MAX_TIMEOUT_HOURS) return;
+    const nextMinutes = hours * 60;
+    if (nextMinutes !== timeoutMinutes) onTimeoutChange(nextMinutes);
+  };
+
   // ---- Silent hours toggle (unchanged from the old editor) ----
   const [silentEnabled, setSilentEnabled] = useState(silentStart !== "" && silentEnd !== "");
   useEffect(() => {
@@ -329,7 +353,7 @@ export function ScheduleEditor({
       {(enabled || onCheckin) && (
         <div>
           <label className="block text-sm text-neutral-400 mb-2">Timeout</label>
-          <div className="flex gap-1.5 flex-wrap">
+          <div className="flex gap-1.5 flex-wrap items-center">
             {TIMEOUT_PRESETS.map((opt) => (
               <button
                 key={opt.value}
@@ -344,9 +368,25 @@ export function ScheduleEditor({
                 {opt.label}
               </button>
             ))}
+            <label className="flex items-center gap-1.5 ml-1 text-sm text-neutral-400">
+              <span>Custom</span>
+              <input
+                type="number"
+                min={2}
+                max={MAX_TIMEOUT_HOURS}
+                step={1}
+                inputMode="numeric"
+                value={customTimeoutHours}
+                onChange={(e) => updateCustomTimeoutHours(e.target.value)}
+                onBlur={syncCustomTimeoutHours}
+                className="w-20 px-2 py-1.5 bg-neutral-900 border border-neutral-800 rounded text-sm text-neutral-200 focus:outline-none focus:border-amber-700/80"
+                placeholder="hours"
+              />
+              <span>h</span>
+            </label>
           </div>
           <p className="mt-1.5 text-[11px] text-neutral-600">
-            Max duration for each scheduled or manual check-in run.
+            Max duration for each scheduled or manual check-in run. Presets stay minute-based; custom values are whole hours from 2h.
           </p>
         </div>
       )}

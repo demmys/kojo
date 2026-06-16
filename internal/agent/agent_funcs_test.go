@@ -157,6 +157,15 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
 	}
+	// grok ships all effort levels (including xhigh and max) for every model
+	for _, m := range []string{"grok-build", "grok-composer-2.5-fast"} {
+		if !ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be valid for grok model %q", m)
+		}
+		if !ValidModelEffort(m, "max") {
+			t.Errorf("expected max to be valid for grok model %q", m)
+		}
+	}
 	// Fable 5 supports max effort (Mythos-class, like opus)
 	if !ValidModelEffort("claude-fable-5", "max") {
 		t.Errorf("expected max to be valid for claude-fable-5")

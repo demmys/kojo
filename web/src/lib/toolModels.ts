@@ -22,7 +22,7 @@ export const toolModels: Record<string, ToolModelConfig> = {
   },
   grok: {
     default: "grok-build",
-    models: ["grok-build"],
+    models: ["grok-build", "grok-composer-2.5-fast"],
   },
   custom: {
     default: "",
@@ -49,7 +49,7 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "grok-build"]);
+const xhighModels = new Set(["opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "grok-build", "grok-composer-2.5-fast"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 
 /**
@@ -57,6 +57,8 @@ const codexEffortModels = new Set(toolModels.codex.models);
  * Per https://code.claude.com/docs/en/model-config, Opus 4.8 supports xhigh but
  * defaults to high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated
  * as Opus 4.8, so it defaults to high. grok-build keeps xhigh default.
+ * grok-composer-2.5-fast supports xhigh but defaults to high — it is the
+ * "fast" tier, so maxing reasoning by default defeats the point.
  */
 const defaultXhighModels = new Set(["claude-opus-4-7", "grok-build"]);
 

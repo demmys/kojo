@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type ServerInfo } from "../lib/api";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
+import { modelsForTool } from "../lib/toolModels";
 
 export function NewSession() {
   const navigate = useNavigate();
@@ -61,6 +62,7 @@ export function NewSession() {
     // new info() is still in flight.
     setInfo(undefined);
     setTool("");
+    setModel("");
     setWorkDir("");
     setInfoLoading(true);
     api.info(peerId).then((info) => {
@@ -131,7 +133,13 @@ export function NewSession() {
     setError("");
     try {
       let parsedArgs = args.trim() ? args.trim().split(/\s+/) : [];
-      if (model && !parsedArgs.includes("--model")) {
+      // Skip the dropdown model when the user already passed a model
+      // flag in Additional Arguments (--model / -m, split or joined
+      // form) so we never inject a duplicate the CLI would reject.
+      const hasModelArg = parsedArgs.some(
+        (a) => a === "--model" || a === "-m" || a.startsWith("--model=") || a.startsWith("-m="),
+      );
+      if (model && !hasModelArg) {
         parsedArgs = ["--model", model, ...parsedArgs];
       }
       const peerId = selectedPeerId && selectedPeerId !== selfPeerId ? selectedPeerId : undefined;
@@ -230,6 +238,25 @@ export function NewSession() {
               ))}
           </div>
         </div>
+
+        {/* Model (tools with a known whitelist) */}
+        {modelsForTool(tool).length > 0 && (
+          <div>
+            <label className="block text-sm text-neutral-400 mb-2">Model</label>
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+            >
+              <option value="">(default)</option>
+              {modelsForTool(tool).map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {/* Working directory */}
         <div ref={wrapperRef} className="relative">

@@ -148,9 +148,10 @@ func NormalizeThinkingMode(mode string) string {
 var xhighModels = map[string]bool{
 	"opus": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok's --effort flag accepts low/medium/high/xhigh/max for
-	// every model it ships (only grok-build today). Keep this in
-	// sync with web/src/lib/toolModels.ts xhighModels.
-	"grok-build": true,
+	// every model it ships. Keep this in sync with
+	// web/src/lib/toolModels.ts xhighModels.
+	"grok-build":             true,
+	"grok-composer-2.5-fast": true,
 	"gpt-5.5":    true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }

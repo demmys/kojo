@@ -33,6 +33,9 @@ export function GroupDMChat() {
   const [showVenueMenu, setShowVenueMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
   const [cooldownInput, setCooldownInput] = useState("");
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput] = useState("");
+  const nameInputRef = useRef<HTMLInputElement>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [deleteNotify, setDeleteNotify] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -78,6 +81,13 @@ export function GroupDMChat() {
     });
   }, [id]);
 
+  useEffect(() => {
+    if (editingName) {
+      nameInputRef.current?.focus();
+      nameInputRef.current?.select();
+    }
+  }, [editingName]);
+
   // Focus delete dialog overlay for Escape key
   useEffect(() => {
     if (showDeleteDialog) deleteDialogRef.current?.focus();
@@ -95,6 +105,7 @@ export function GroupDMChat() {
     setMessages([]);
     setHasMore(false);
     setNotFound(false);
+    setEditingName(false);
     setShowDeleteDialog(false);
     setDeleteNotify(false);
     setDeleteError("");
@@ -321,7 +332,47 @@ export function GroupDMChat() {
           ))}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="font-medium text-sm truncate">{group.name}</div>
+          {editingName ? (
+            <input
+              ref={nameInputRef}
+              type="text"
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              onBlur={() => {
+                const trimmed = nameInput.trim();
+                setEditingName(false);
+                if (trimmed && trimmed !== group.name) {
+                  groupdmApi.rename(group.id, trimmed).then(setGroup).catch((err) =>
+                    console.error("Failed to rename group", err),
+                  );
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setNameInput(group.name);
+                  setEditingName(false);
+                } else if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              className="w-full px-1.5 py-0.5 text-sm font-medium bg-neutral-800 border border-neutral-600 rounded text-neutral-200 focus:outline-none focus:border-neutral-400"
+              aria-label="Group name"
+              maxLength={100}
+            />
+          ) : (
+            <button
+              type="button"
+              className="font-medium text-sm truncate cursor-pointer hover:text-neutral-100 bg-transparent border-none p-0 text-left text-neutral-200 w-full"
+              onClick={() => {
+                setNameInput(group.name);
+                setEditingName(true);
+              }}
+              title="Click to rename"
+            >
+              {group.name}
+            </button>
+          )}
           <div className="text-xs text-neutral-500 truncate">
             {group.members.length <= 3
               ? group.members.map((m) => m.agentName).join(", ")

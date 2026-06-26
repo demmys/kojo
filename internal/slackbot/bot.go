@@ -122,12 +122,13 @@ const (
 	// chunkPostTimeoutBase/PerChunk/Max bound the timeout budget used when
 	// posting chunks[1:] (and any postMessage fallback for chunks[0]).
 	// postMessage's rate-limit retry alone can spend 1+2+3=6 s on a single
-	// 429, so a finalize block that fires 5 chunks could need 30 s+ before
-	// any one of them gives up. We give a per-chunk allowance covering that
-	// worst case + HTTP RTT, capped at chunkPostTimeoutMax so a runaway
-	// reply (hundreds of chunks) does not hold the goroutine for minutes.
+	// 429. If Slack rejects markdown_text and we fall back to legacy text,
+	// a chunk can theoretically spend that retry chain twice. We give a
+	// per-chunk allowance covering that worst case + HTTP RTT, capped at
+	// chunkPostTimeoutMax so a runaway reply (hundreds of chunks) does not
+	// hold the goroutine for minutes.
 	chunkPostTimeoutBase     = 10 * time.Second
-	chunkPostTimeoutPerChunk = 7 * time.Second
+	chunkPostTimeoutPerChunk = 14 * time.Second
 	chunkPostTimeoutMax      = 90 * time.Second
 
 	// deliveryFailureNotice is the user-visible message posted when one or
@@ -973,6 +974,10 @@ streamLoop:
 
 			deliveredAll := true
 			_, _, _, updateErr := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...)
+			if updateErr != nil && shouldFallbackToLegacyText(updateErr) {
+				b.logger.Warn("slack markdown_text update rejected; falling back to fresh post",
+					"channel", channel, "threadTS", threadTS, "streamTS", streamTS, "err", updateErr)
+			}
 			if updateErr != nil {
 				b.logger.Warn("failed to update stream message with final text", "err", updateErr)
 			}
@@ -1002,9 +1007,13 @@ streamLoop:
 				// If even chunks[0] fails, do NOT post the remaining
 				// chunks — emitting chunks[1:] without their lead would
 				// just confuse the user. Skip straight to the delivery
-				// failure notice.
+				// failure notice. If the fresh post succeeds, mark the
+				// stopped stream for cleanup so the thread does not keep
+				// both a stale partial stream and the full fallback reply.
 				if !b.postMessage(chunkCtx, channel, threadTS, chunks[0]) {
 					deliveredAll = false
+				} else {
+					deadStreams = append(deadStreams, streamTS)
 				}
 			}
 			// Remaining chunks: post as follow-up messages, but only if
@@ -1076,10 +1085,11 @@ streamLoop:
 
 	// Cleanup orphaned streams from earlier restarts — async because
 	// sendToAgent still holds the per-thread mutex at this point, and up
-	// to maxStreamRestarts cleanup calls (each with its own 5s timeout)
-	// would otherwise stall the next message in the same thread for tens
-	// of seconds. The goroutine uses context.Background() so it survives
-	// sendToAgent returning; per-call timeouts cap the total wall time.
+	// to maxStreamRestarts cleanup calls (each with its own timeout and
+	// rate-limit retry budget) would otherwise stall the next message in
+	// the same thread for tens of seconds. The goroutine uses
+	// context.Background() so it survives sendToAgent returning; per-call
+	// timeouts cap the total wall time.
 	//
 	// When the final reply was delivered (finalDelivered), each dead
 	// partial is a duplicate frozen on a stale progress indicator, so we
@@ -1096,17 +1106,21 @@ streamLoop:
 		delivered := finalDelivered
 		cleanup := func() {
 			for _, ts := range streams {
-				opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 				if delivered {
-					if _, _, err := b.api.DeleteMessageContext(opCtx, channel, ts); err != nil {
+					opCtx, opCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1))
+					if err := b.deleteMessageWithRetry(opCtx, channel, ts); err != nil {
 						b.logger.Debug("failed to delete orphaned slack stream",
 							"channel", channel, "streamTS", ts, "err", err)
 					}
-				} else if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
-					b.logger.Debug("failed to stop orphaned slack stream",
-						"channel", channel, "streamTS", ts, "err", err)
+					opCancel()
+				} else {
+					opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+					if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
+						b.logger.Debug("failed to stop orphaned slack stream",
+							"channel", channel, "streamTS", ts, "err", err)
+					}
+					opCancel()
 				}
-				opCancel()
 			}
 		}
 		if b.runAsync != nil {
@@ -1609,7 +1623,9 @@ func (b *Bot) postChunks(ctx context.Context, channel, threadTS string, chunks [
 // time we get here. Best effort; if this also fails the postMessage log
 // entries are the trail.
 func (b *Bot) postDeliveryFailureNotice(channel, threadTS string) {
-	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+	// Use the same single-message budget as ordinary posts: postMessage may
+	// retry markdown_text and then legacy text if Slack rejects the new renderer.
+	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1))
 	b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 	noticeCancel()
 }
@@ -1628,6 +1644,44 @@ func (b *Bot) setStatus(ctx context.Context, channel, threadTS, status string) {
 // clearAssistantStatus clears the assistant typing indicator (best-effort).
 func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string) {
 	b.setStatus(ctx, channel, threadTS, "") // empty = clear
+}
+
+func postMessageOpts(threadTS string, opts ...slack.MsgOption) []slack.MsgOption {
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	return opts
+}
+
+func shouldFallbackToLegacyText(err error) bool {
+	var slackErr slack.SlackErrorResponse
+	if errors.As(err, &slackErr) {
+		switch slackErr.Err {
+		case "invalid_blocks_format", "markdown_text_conflict":
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bot) postMessageWithRetry(ctx context.Context, channel string, opts []slack.MsgOption) (rlOutcome, error) {
+	return b.withRateLimitRetry(ctx, func() error {
+		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
+		return err
+	}, func(wait time.Duration) {
+		b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+	})
+}
+
+func (b *Bot) deleteMessageWithRetry(ctx context.Context, channel, ts string) error {
+	outcome, err := b.withRateLimitRetry(ctx, func() error {
+		_, _, e := b.api.DeleteMessageContext(ctx, channel, ts)
+		return e
+	}, nil)
+	if outcome == rlSuccess {
+		return nil
+	}
+	return err
 }
 
 // postMessage sends a message to Slack with rate-limit retry. Returns
@@ -1660,28 +1714,25 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// <@U…>, …) the same way as the chat.update path. Mention misuse
 	// is controlled by the agent's system prompt, not by escaping at
 	// this layer.
-	opts := []slack.MsgOption{
-		slack.MsgOptionMarkdownText(text),
-	}
-	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
-	}
-
-	// Rate-limit backoff (attempt loop, delay, injectable sleep, and the
-	// "don't sleep past the final attempt" guard that protects the 1+2+3 s
-	// chunkPostTimeout budget) lives in withRateLimitRetry. Unlike
-	// appendStream, postMessage treats every terminal outcome — exhaustion,
-	// ctx cancellation, and any non-rate-limit error — as a delivery
-	// failure (return false).
-	outcome, err := b.withRateLimitRetry(ctx, func() error {
-		_, _, e := b.api.PostMessageContext(ctx, channel, opts...)
-		return e
-	}, func(wait time.Duration) {
-		b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
-	})
-	switch outcome {
-	case rlSuccess:
+	markdownOpts := postMessageOpts(threadTS, slack.MsgOptionMarkdownText(text))
+	outcome, err := b.postMessageWithRetry(ctx, channel, markdownOpts)
+	if outcome == rlSuccess {
 		return true
+	}
+	if outcome == rlOtherErr && shouldFallbackToLegacyText(err) {
+		b.logger.Warn("slack markdown_text post rejected, retrying with legacy text",
+			"channel", channel, "threadTS", threadTS, "err", err)
+		legacyOpts := postMessageOpts(threadTS, slack.MsgOptionText(PlainToSlack(text), false))
+		legacyOutcome, legacyErr := b.postMessageWithRetry(ctx, channel, legacyOpts)
+		if legacyOutcome == rlSuccess {
+			return true
+		}
+		b.logger.Warn("failed to post slack message after legacy text fallback",
+			"channel", channel, "threadTS", threadTS,
+			"markdownErr", err, "err", legacyErr)
+		return false
+	}
+	switch outcome {
 	case rlExhausted:
 		// Include err and RetryAfter so production logs can distinguish
 		// a Slack hard 429 from a slow recovery — without these the

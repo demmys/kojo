@@ -121,6 +121,17 @@ type Server struct {
 	// back up without a daemon restart. Set via
 	// SetOnAgentForceReclaimed.
 	onAgentForceReclaimed func(ctx context.Context, agentID string)
+	// onLocalAgentActivated fires when this daemon creates or
+	// re-activates an agent that is immediately owned locally
+	// (create / fork / unarchive). cmd/kojo wires it to
+	// AgentLockGuard.AddAgent so agents born after daemon boot get
+	// a live agent_locks row without waiting for a restart.
+	onLocalAgentActivated func(ctx context.Context, agentID string)
+	// onLocalAgentDeactivated fires when this daemon archives or
+	// deletes a locally-owned agent. cmd/kojo wires it to
+	// AgentLockGuard.RemoveAgent so inactive agents stop refreshing
+	// runtime ownership leases.
+	onLocalAgentDeactivated func(ctx context.Context, agentID string)
 	// Queue-and-forward drain scheduler state (handoff_queue_handlers.go).
 	// One drain pass in flight at a time; triggers that land mid-pass
 	// set the rerun flag instead of stacking goroutines.
@@ -1536,6 +1547,19 @@ func (s *Server) SetOnAgentReleasedAsSource(fn func(ctx context.Context, agentID
 // reclaim hook. See onAgentForceReclaimed for the contract.
 func (s *Server) SetOnAgentForceReclaimed(fn func(ctx context.Context, agentID string)) {
 	s.onAgentForceReclaimed = fn
+}
+
+// SetOnLocalAgentActivated installs the local lifecycle hook used
+// when an agent becomes active on this daemon outside the peer-sync
+// finalize path (create / fork / unarchive).
+func (s *Server) SetOnLocalAgentActivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentActivated = fn
+}
+
+// SetOnLocalAgentDeactivated installs the local lifecycle hook used
+// when an agent stops being active on this daemon via archive/delete.
+func (s *Server) SetOnLocalAgentDeactivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentDeactivated = fn
 }
 
 // SetOnAgentRuntimePurged installs the inter-peer state-probe

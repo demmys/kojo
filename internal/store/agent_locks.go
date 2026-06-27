@@ -531,7 +531,7 @@ func handoffURISelector(blobURIs []string) handoffBlobSelector {
 // CompleteHandoff atomically transfers the agent_lock from its
 // current holder to targetPeer AND switches every blob_refs row in
 // the agent's prefix (kojo://global/agents/<id>/) to home_peer=
-// target AND clears handoff_pending. All three mutations run in
+// target AND clears handoff_pending. Both mutations run in
 // ONE transaction so a crash between them rolls back to the pre-
 // call state — no half-completed handoff can survive a daemon
 // restart.
@@ -543,11 +543,13 @@ func handoffURISelector(blobURIs []string) handoffBlobSelector {
 //
 // Returns ErrFencingMismatch when the lock exists but its
 // (holder, token) tuple doesn't match a freshly-read current state
-// — a concurrent abort / steal raced us. Returns ErrNotFound when
+// — a concurrent abort / steal raced us — OR when blob_refs exist
+// but there is no lock row to transfer. Returns ErrNotFound when
 // the agent has no agent_locks row at all AND no blob_refs rows in
 // the prefix; callers treat that as "no state to migrate" and
-// surface it as a 404. A no-lock-but-blobs case proceeds normally
-// (blobs switch, LockTransferred=false).
+// surface it as a 404. A no-lock-but-blobs case must fail before
+// any blob row is switched; blob-only migrations leave no fencing
+// authority and are unrecoverable without force-reclaim.
 func (s *Store) CompleteHandoff(ctx context.Context, agentID, targetPeer, blobURIPrefix string, leaseDurationMs int64) (*CompleteHandoffResult, error) {
 	if agentID == "" {
 		return nil, errors.New("store.CompleteHandoff: agent_id required")
@@ -632,9 +634,26 @@ func (s *Store) completeHandoffSelected(ctx context.Context, agentID, targetPeer
 		result.Lock = updated
 		result.LockTransferred = true
 	case errors.Is(lerr, ErrNotFound):
-		// No lock — proceed with the blob-only path.
-		result.Lock = nil
-		result.LockTransferred = false
+		// No lock. If there are no selected blob rows either, this
+		// is the idempotent "no state" shape handled below. If blobs
+		// DO exist, refuse before switching them: a blob-only
+		// migration would move data home without transferring a
+		// fencing authority.
+		if selector.where == "" {
+			return nil, ErrNotFound
+		}
+		var one int
+		row := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM blob_refs WHERE `+selector.where+` LIMIT 1`,
+			selector.args...)
+		switch berr := row.Scan(&one); {
+		case berr == nil:
+			return nil, ErrFencingMismatch
+		case errors.Is(berr, sql.ErrNoRows):
+			return nil, ErrNotFound
+		default:
+			return nil, fmt.Errorf("store.CompleteHandoff: probe blobs without lock: %w", berr)
+		}
 	default:
 		return nil, fmt.Errorf("store.CompleteHandoff: read lock: %w", lerr)
 	}

@@ -115,6 +115,17 @@ type Server struct {
 	// back up without a daemon restart. Set via
 	// SetOnAgentForceReclaimed.
 	onAgentForceReclaimed func(ctx context.Context, agentID string)
+	// onLocalAgentActivated fires when this daemon creates or
+	// re-activates an agent that is immediately owned locally
+	// (create / fork / unarchive). cmd/kojo wires it to
+	// AgentLockGuard.AddAgent so agents born after daemon boot get
+	// a live agent_locks row without waiting for a restart.
+	onLocalAgentActivated func(ctx context.Context, agentID string)
+	// onLocalAgentDeactivated fires when this daemon archives or
+	// deletes a locally-owned agent. cmd/kojo wires it to
+	// AgentLockGuard.RemoveAgent so inactive agents stop refreshing
+	// runtime ownership leases.
+	onLocalAgentDeactivated func(ctx context.Context, agentID string)
 	// onAgentRuntimePurged fires after the inter-peer state
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
@@ -150,16 +161,16 @@ type Server struct {
 	// (the same handle session.Manager gets) so the persistence
 	// path doesn't depend on an agent.Manager — tests can wire a
 	// bare *store.Store without spinning up a Manager.
-	pendingSyncDB   *store.Store
-	logger          *slog.Logger
-	mux             *http.ServeMux
-	httpSrv         *http.Server // public (Owner-trusted) listener
-	authSrv         *http.Server // agent-facing auth-required listener (lazy, loopback)
-	authTsnetSrv    *http.Server // peer-mode primary listener (lazy, tsnet+auth+tailnet identity)
-	authMu          sync.Mutex
-	devMode         bool
-	version         string
-	idempSweepOnce  sync.Once // guards StartIdempotencySweep
+	pendingSyncDB  *store.Store
+	logger         *slog.Logger
+	mux            *http.ServeMux
+	httpSrv        *http.Server // public (Owner-trusted) listener
+	authSrv        *http.Server // agent-facing auth-required listener (lazy, loopback)
+	authTsnetSrv   *http.Server // peer-mode primary listener (lazy, tsnet+auth+tailnet identity)
+	authMu         sync.Mutex
+	devMode        bool
+	version        string
+	idempSweepOnce sync.Once // guards StartIdempotencySweep
 	// nodeKeyResolver maps an HTTP request's RemoteAddr to the
 	// calling node's Tailscale NodeKey. cmd/kojo wires this from
 	// tsnet.LocalClient.WhoIs AFTER server.New returns — tsnet
@@ -322,24 +333,24 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
-		sessions:        sessMgr,
-		agents:          cfg.AgentManager,
-		groupdms:        cfg.GroupDMManager,
-		files:           filebrowser.New(logger),
-		git:             gitpkg.New(logger),
-		notify:          cfg.NotifyManager,
-		blob:            cfg.BlobStore,
-		blobMaxPutBytes: cfg.MaxBlobPutBytes,
-		events:          cfg.EventBus,
-		peerID:          cfg.PeerIdentity,
-		peerEvents:      cfg.PeerEvents,
-		peerPresence:    cfg.PeerPresence,
-		requireIfMatch:  cfg.RequireIfMatch,
-		pendingSyncKEK:  cfg.PendingSyncKEK,
-		pendingSyncDB:   cfg.Store,
-		logger:          logger,
-		devMode:         cfg.DevMode,
-		version:         cfg.Version,
+		sessions:             sessMgr,
+		agents:               cfg.AgentManager,
+		groupdms:             cfg.GroupDMManager,
+		files:                filebrowser.New(logger),
+		git:                  gitpkg.New(logger),
+		notify:               cfg.NotifyManager,
+		blob:                 cfg.BlobStore,
+		blobMaxPutBytes:      cfg.MaxBlobPutBytes,
+		events:               cfg.EventBus,
+		peerID:               cfg.PeerIdentity,
+		peerEvents:           cfg.PeerEvents,
+		peerPresence:         cfg.PeerPresence,
+		requireIfMatch:       cfg.RequireIfMatch,
+		pendingSyncKEK:       cfg.PendingSyncKEK,
+		pendingSyncDB:        cfg.Store,
+		logger:               logger,
+		devMode:              cfg.DevMode,
+		version:              cfg.Version,
 		unsafePeer:           cfg.Unsafe,
 		thumbPurgeDone:       make(chan struct{}),
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
@@ -1384,6 +1395,19 @@ func (s *Server) SetOnAgentReleasedAsSource(fn func(ctx context.Context, agentID
 // reclaim hook. See onAgentForceReclaimed for the contract.
 func (s *Server) SetOnAgentForceReclaimed(fn func(ctx context.Context, agentID string)) {
 	s.onAgentForceReclaimed = fn
+}
+
+// SetOnLocalAgentActivated installs the local lifecycle hook used
+// when an agent becomes active on this daemon outside the peer-sync
+// finalize path (create / fork / unarchive).
+func (s *Server) SetOnLocalAgentActivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentActivated = fn
+}
+
+// SetOnLocalAgentDeactivated installs the local lifecycle hook used
+// when an agent stops being active on this daemon via archive/delete.
+func (s *Server) SetOnLocalAgentDeactivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentDeactivated = fn
 }
 
 // SetOnAgentRuntimePurged installs the inter-peer state-probe

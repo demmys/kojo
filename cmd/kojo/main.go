@@ -693,7 +693,9 @@ func main() {
 				ids := make([]string, 0)
 				if !*peerMode {
 					for _, a := range agentMgr.List() {
-						ids = append(ids, a.ID)
+						if !a.Archived {
+							ids = append(ids, a.ID)
+						}
 					}
 				} else {
 					// Peer mode hosts no agent runtime, so
@@ -987,6 +989,38 @@ func main() {
 				}
 			}
 			return nil
+		})
+		// Local lifecycle: agents created / forked / unarchived
+		// after daemon boot are immediately runnable on this host,
+		// so they need to enter AgentLockGuard.desired right away.
+		// Without this, their first device-switch can reach
+		// complete with no agent_locks row and migrate blobs without
+		// a fencing authority.
+		srv.SetOnLocalAgentActivated(func(_ context.Context, agentID string) {
+			hookCtx, hookCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer hookCancel()
+			if agentMgr != nil && peerIdentity != nil {
+				if err := agentMgr.MarkAgentArrivedHere(hookCtx, agentID, peerIdentity.DeviceID); err != nil && logger != nil {
+					logger.Warn("local activation: mark arrived failed",
+						"agent", agentID, "err", err)
+				}
+			}
+			if capturedGuard != nil {
+				capturedGuard.AddAgent(hookCtx, agentID)
+			}
+		})
+		srv.SetOnLocalAgentDeactivated(func(_ context.Context, agentID string) {
+			hookCtx, hookCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer hookCancel()
+			if agentMgr != nil {
+				if err := agentMgr.ClearAgentArrivedHere(hookCtx, agentID); err != nil && logger != nil {
+					logger.Warn("local deactivation: clear arrived marker failed",
+						"agent", agentID, "err", err)
+				}
+			}
+			if capturedGuard != nil {
+				capturedGuard.RemoveAgent(hookCtx, agentID)
+			}
 		})
 		// Phase 2 (finalize): activate runtime state. Only
 		// runs after the orchestrator's complete succeeds;

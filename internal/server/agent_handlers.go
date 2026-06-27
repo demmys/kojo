@@ -505,7 +505,27 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), a.ID)
 	writeJSONResponse(w, http.StatusOK, a)
+}
+
+func (s *Server) reconcileLocalAgentLifecycle(ctx context.Context, agentID string) {
+	if s == nil || s.agents == nil || agentID == "" {
+		return
+	}
+	release := s.agents.LockPatch(agentID)
+	defer release()
+
+	a, ok := s.agents.Get(agentID)
+	if ok && !a.Archived {
+		if s.onLocalAgentActivated != nil {
+			s.onLocalAgentActivated(ctx, agentID)
+		}
+		return
+	}
+	if s.onLocalAgentDeactivated != nil {
+		s.onLocalAgentDeactivated(ctx, agentID)
+	}
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -842,6 +862,7 @@ func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), a.ID)
 	writeJSONResponse(w, http.StatusOK, a)
 }
 
@@ -917,6 +938,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), id)
 	// Echo the new ETag for archive=true (the row still exists with
 	// a bumped etag). For full delete the row is gone — no useful
 	// etag to return. readAgentETag returns "" when the row is
@@ -974,6 +996,7 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), id)
 	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do
 	// this — slackHub lives on the server, not the manager. The
 	// `!a.Archived` re-check guards against a concurrent

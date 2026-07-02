@@ -135,6 +135,83 @@ func TestCheckYolo_Disabled(t *testing.T) {
 	}
 }
 
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAppendYoloFlag(t *testing.T) {
+	const claudeFlag = "--dangerously-skip-permissions"
+	const codexFlag = "--dangerously-bypass-approvals-and-sandbox"
+
+	t.Run("claude gets the flag", func(t *testing.T) {
+		got := appendYoloFlag("claude", nil, true)
+		if !hasArg(got, claudeFlag) {
+			t.Fatalf("expected %q in %v", claudeFlag, got)
+		}
+	})
+
+	t.Run("codex gets the flag", func(t *testing.T) {
+		got := appendYoloFlag("codex", nil, true)
+		if !hasArg(got, codexFlag) {
+			t.Fatalf("expected %q in %v", codexFlag, got)
+		}
+	})
+
+	t.Run("grok gets no flag", func(t *testing.T) {
+		got := appendYoloFlag("grok", []string{"--foo"}, true)
+		if hasArg(got, claudeFlag) || hasArg(got, codexFlag) {
+			t.Fatalf("grok must not get a native yolo flag, got %v", got)
+		}
+	})
+
+	t.Run("custom gets no flag", func(t *testing.T) {
+		got := appendYoloFlag("custom", nil, true)
+		if hasArg(got, claudeFlag) || hasArg(got, codexFlag) {
+			t.Fatalf("custom must not get a native yolo flag, got %v", got)
+		}
+	})
+
+	t.Run("no flag when yolo off", func(t *testing.T) {
+		got := appendYoloFlag("claude", nil, false)
+		if hasArg(got, claudeFlag) {
+			t.Fatalf("expected no flag when yolo disabled, got %v", got)
+		}
+	})
+
+	t.Run("no duplicate when user already passed it", func(t *testing.T) {
+		got := appendYoloFlag("claude", []string{claudeFlag}, true)
+		count := 0
+		for _, a := range got {
+			if a == claudeFlag {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("expected exactly one %q, got %d in %v", claudeFlag, count, got)
+		}
+	})
+
+	t.Run("flag survives claude restart args", func(t *testing.T) {
+		// Simulate Create: yolo flag baked into the persisted args, plus the
+		// session-id that assignClaudeSessionID appends. buildRestartArgs
+		// reuses those persisted args, so the yolo flag must flow through.
+		created := appendYoloFlag("claude", nil, true)
+		_, runArgs := assignClaudeSessionID("claude", created)
+		restart := buildRestartArgs("claude", runArgs, "sess-123")
+		if !hasArg(restart, claudeFlag) {
+			t.Fatalf("expected %q to survive restart, got %v", claudeFlag, restart)
+		}
+		if !hasArg(restart, "--resume") {
+			t.Fatalf("expected restart to resume the session, got %v", restart)
+		}
+	})
+}
+
 func TestAnsiRe_StripsDECPrivateMode(t *testing.T) {
 	input := "\x1b[?25hvisible\x1b[?25l"
 	clean := ansiRe.ReplaceAll([]byte(input), []byte(""))

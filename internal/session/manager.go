@@ -131,6 +131,13 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	actualTool := customResult.actualTool
 	args = customResult.args
 
+	// Yolo mode via native CLI flags at creation time. claude / codex bake a
+	// tool-native permission-bypass flag into the persisted args (s.Args), so
+	// launch AND a later RESTART (buildRestartArgs copies s.Args for claude)
+	// relaunch with it. Keyed on the ORIGINAL tool, so "custom" (→ claude) and
+	// other tools get no flag and keep the PTY auto-approve machinery instead.
+	args = appendYoloFlag(tool, args, yoloMode)
+
 	toolPath, err := resolveToolPath(tool, actualTool)
 	if err != nil {
 		return nil, err
@@ -653,6 +660,40 @@ func resolveToolPath(tool, actualTool string) (string, error) {
 		return "", fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
 	}
 	return toolPath, nil
+}
+
+// yoloNativeFlag returns the tool-native permission-bypass flag for a tool,
+// or "" when the tool has no native flag (yolo is handled by the PTY
+// auto-approve machinery in that case). Keyed on the user-facing tool name.
+func yoloNativeFlag(tool string) string {
+	switch tool {
+	case "claude":
+		return "--dangerously-skip-permissions"
+	case "codex":
+		return "--dangerously-bypass-approvals-and-sandbox"
+	default:
+		return ""
+	}
+}
+
+// appendYoloFlag appends the tool-native yolo flag to args when yoloMode is
+// enabled and the tool supports one. It is a no-op when yolo is off, the tool
+// has no native flag, or the flag is already present (guards against a user
+// who passed the flag manually in Additional Arguments).
+func appendYoloFlag(tool string, args []string, yoloMode bool) []string {
+	if !yoloMode {
+		return args
+	}
+	flag := yoloNativeFlag(tool)
+	if flag == "" {
+		return args
+	}
+	for _, a := range args {
+		if a == flag {
+			return args
+		}
+	}
+	return append(args, flag)
 }
 
 // assignClaudeSessionID assigns a stable session ID for claude sessions

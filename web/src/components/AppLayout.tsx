@@ -34,9 +34,19 @@ export function AppLayout() {
   const showSidebar = isDesktop || isIndex;
 
   // Remount the detail pane when the conversation/session id changes, but
-  // not on session tab-only changes (same id → stable key).
+  // not on session tab-only changes (same id → stable key). The static
+  // "new / settings" panes get their own stable keys so switching to them
+  // from a conversation remounts cleanly and they don't collide with the
+  // "/" index key. (/agents/new already matches the id regex → "agents/new".)
   const m = location.pathname.match(/^\/(agents|groupdms|session)\/([^/]+)/);
-  const detailKey = m ? `${m[1]}/${m[2]}` : "index";
+  let detailKey = "index";
+  if (m) {
+    detailKey = `${m[1]}/${m[2]}`;
+  } else if (location.pathname === "/new") {
+    detailKey = "new";
+  } else if (location.pathname === "/settings") {
+    detailKey = "settings";
+  }
 
   return (
     <div className="h-full bg-app lg:grid lg:grid-cols-[360px_minmax(0,1fr)] lg:grid-rows-1">

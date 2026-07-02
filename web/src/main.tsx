@@ -38,16 +38,20 @@ createRoot(document.getElementById("root")!).render(
           <Route path="/session/:id/attachments" element={<SessionPage />} />
           <Route path="/agents/:id" element={<AgentChat />} />
           <Route path="/groupdms/:id" element={<GroupDMChat />} />
+          {/* Static "new / settings" panes: at lg+ they render in the right
+              pane beside the persistent Dashboard sidebar; below lg they drill
+              in full-page. React Router ranks static segments above dynamic
+              ones, so /agents/new wins over /agents/:id regardless of order. */}
+          <Route path="/new" element={<NewSession />} />
+          <Route path="/agents/new" element={<AgentCreate />} />
+          <Route path="/settings" element={<GlobalSettings />} />
         </Route>
         {/* Full-page routes — intentionally outside the 2-pane shell. */}
-        <Route path="/new" element={<NewSession />} />
         <Route path="/files" element={<FileBrowser />} />
         <Route path="/agents" element={<Navigate to="/" replace />} />
-        <Route path="/agents/new" element={<AgentCreate />} />
         <Route path="/agents/:id/settings" element={<AgentSettings />} />
         <Route path="/agents/:id/credentials" element={<AgentCredentials />} />
         <Route path="/agents/:id/data" element={<AgentDataBrowser />} />
-        <Route path="/settings" element={<GlobalSettings />} />
       </Routes>
     </BrowserRouter>
   </StrictMode>,

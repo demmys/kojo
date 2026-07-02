@@ -37,8 +37,8 @@ export function GlobalSettings() {
   );
 
   return (
-    <div className="min-h-full bg-app text-ink">
-      <PageHeader title="Settings" onBack={() => navigate("/")} />
+    <div className="h-full overflow-y-auto bg-app text-ink">
+      <PageHeader title="Settings" onBack={() => navigate("/")} hideBackAtLg />
 
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
         <ApiKeysSection gemini={gemini} embedding={embedding} />

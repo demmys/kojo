@@ -5,6 +5,13 @@ interface PageHeaderProps {
   children?: React.ReactNode;
   /** Optional row rendered under the title bar (e.g. mobile section nav). */
   below?: React.ReactNode;
+  /**
+   * Hide the back button at lg+ (≥1024px). Used by pages that render inside
+   * the AppLayout two-pane shell on desktop, where the persistent sidebar
+   * already provides navigation and a back arrow would be redundant. Below
+   * lg the page is full-screen, so the back button stays.
+   */
+  hideBackAtLg?: boolean;
 }
 
 /**
@@ -14,13 +21,15 @@ interface PageHeaderProps {
  * so its accessible name stays "←" — several navigation tests select it via
  * getByRole("button", { name: "←" }).
  */
-export function PageHeader({ title, onBack, children, below }: PageHeaderProps) {
+export function PageHeader({ title, onBack, children, below, hideBackAtLg }: PageHeaderProps) {
   return (
     <header className="sticky top-0 z-40 border-b border-hairline bg-app/85 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-[900px] items-center gap-2 px-4">
         <button
           onClick={onBack}
-          className="-ml-2 rounded-[10px] p-2 text-lg leading-none text-ink-dim transition-colors hover:bg-hover hover:text-ink"
+          className={`-ml-2 rounded-[10px] p-2 text-lg leading-none text-ink-dim transition-colors hover:bg-hover hover:text-ink${
+            hideBackAtLg ? " lg:hidden" : ""
+          }`}
         >
           ←
         </button>

@@ -171,8 +171,12 @@ export function NewSession() {
   };
 
   return (
-    <div className="min-h-full bg-app text-ink">
-      <PageHeader title="New Session" onBack={() => navigate("/", { replace: true })} />
+    <div className="h-full overflow-y-auto bg-app text-ink">
+      <PageHeader
+        title="New Session"
+        onBack={() => navigate("/", { replace: true })}
+        hideBackAtLg
+      />
 
       <main className="mx-auto max-w-[560px] px-4 py-4">
         <SectionCard>
@@ -301,7 +305,13 @@ export function NewSession() {
             >
               <div className="min-w-0">
                 <div className="text-[13px] text-ink">Yolo Mode</div>
-                <div className="text-[11px] text-ink-faint">Skip permission prompts</div>
+                <div className="text-[11px] text-ink-faint">
+                  {tool === "claude"
+                    ? "Launches with --dangerously-skip-permissions"
+                    : tool === "codex"
+                      ? "Launches with --dangerously-bypass-approvals-and-sandbox"
+                      : "Skip permission prompts"}
+                </div>
               </div>
               <span onClick={(e) => e.stopPropagation()}>
                 <Toggle checked={yoloMode} onChange={setYoloMode} aria-label="Yolo Mode" />

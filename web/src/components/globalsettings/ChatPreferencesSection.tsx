@@ -16,7 +16,7 @@ export function ChatPreferencesSection({ enterSends, setEnterSends }: Props) {
           <div className="mt-0.5 text-[12px] text-ink-faint">
             {enterSends
               ? "Enter to send, Shift+Enter for newline"
-              : "Shift+Enter to send, Enter for newline"}
+              : "Ctrl+Enter to send, Enter for newline"}
           </div>
         </div>
         <Toggle checked={enterSends} onChange={setEnterSends} aria-label="Send with Enter" />

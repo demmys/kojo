@@ -486,9 +486,11 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                   <div key={agent.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}`}>
                     <button
                       onClick={() => navigate(`/agents/${agent.id}`)}
-                      className="flex min-w-0 flex-1 items-center gap-3 py-3 pl-3 pr-1 text-left"
+                      className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
                     >
-                      <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
+                      {open && (
+                        <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
+                      )}
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
                           <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
@@ -497,7 +499,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                               転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
                             </span>
                           )}
-                          <RelTime value={ts} className="ml-auto" />
+                          {open && <RelTime value={ts} className="ml-auto" />}
                         </div>
                         {open && (
                           <>
@@ -598,17 +600,19 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                     <div key={g.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(g.id === activeGroupId)}`}>
                       <button
                         onClick={() => navigate(`/groupdms/${g.id}`)}
-                        className="flex min-w-0 flex-1 items-center gap-3 py-3 pl-3 pr-1 text-left"
+                        className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
                       >
-                        <div className="flex shrink-0 -space-x-1.5">
-                          {g.members.slice(0, 3).map((m) => (
-                            <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
-                          ))}
-                        </div>
+                        {open && (
+                          <div className="flex shrink-0 -space-x-1.5">
+                            {g.members.slice(0, 3).map((m) => (
+                              <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" />
+                            ))}
+                          </div>
+                        )}
                         <div className="min-w-0 flex-1">
                           <div className="flex items-baseline gap-2">
                             <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{g.name}</span>
-                            <RelTime value={g.updatedAt} className="ml-auto" />
+                            {open && <RelTime value={g.updatedAt} className="ml-auto" />}
                           </div>
                           {open && (
                             <div className="mt-0.5 truncate text-[13px] text-ink-dim">

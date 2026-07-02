@@ -216,19 +216,25 @@ export function StopButton({ onClick, title }: { onClick: () => void; title?: st
 }
 
 /**
- * Shared Enter-to-send keydown behavior. When `enterSends` is true, plain
- * Enter sends and Shift+Enter inserts a newline; when false the mapping is
- * reversed. IME composition (isComposing) never triggers a send.
+ * Shared Enter-to-send keydown behavior.
+ *
+ * Ctrl+Enter (and Cmd+Enter on macOS, via metaKey) always sends, in both
+ * modes. Beyond that: when `enterSends` is true, plain Enter sends and
+ * Shift+Enter inserts a newline; when false, Enter and Shift+Enter both
+ * insert a newline (only Ctrl/Cmd+Enter sends). IME composition
+ * (isComposing) never triggers a send.
  */
 export function enterToSend(
   e: React.KeyboardEvent,
   enterSends: boolean,
   onSend: () => void,
 ): void {
-  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-    if (enterSends ? !e.shiftKey : e.shiftKey) {
-      e.preventDefault();
-      onSend();
-    }
+  if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
+  // Ctrl+Enter / Cmd+Enter always sends; otherwise fall back to the
+  // enterSends preference (plain Enter sends, Shift+Enter is a newline).
+  const modSend = e.ctrlKey || e.metaKey;
+  if (modSend || (enterSends && !e.shiftKey)) {
+    e.preventDefault();
+    onSend();
   }
 }

@@ -554,7 +554,7 @@ export function GroupDMChat() {
               onChange={(e) => setInput(e.target.value)}
               onInput={handleTextareaInput}
               onKeyDown={handleKeyDown}
-              placeholder={`Message the group… (${enterSends ? "Enter" : "Shift+Enter"} to send)`}
+              placeholder={`Message the group… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`}
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />

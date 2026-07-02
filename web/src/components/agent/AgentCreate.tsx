@@ -277,8 +277,8 @@ export function AgentCreate() {
           : "";
 
   return (
-    <div className="min-h-full bg-app text-ink">
-      <PageHeader title="New Agent" onBack={() => navigate("/")} />
+    <div className="h-full overflow-y-auto bg-app text-ink">
+      <PageHeader title="New Agent" onBack={() => navigate("/")} hideBackAtLg />
 
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
         {/* ── Identity ── */}

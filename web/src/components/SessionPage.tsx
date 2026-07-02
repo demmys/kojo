@@ -10,6 +10,7 @@ import { FileBrowser } from "./FileBrowser";
 import { GitPanel } from "./GitPanel";
 import { SpecialKeysBar } from "./SpecialKeysBar";
 import { TerminalTab } from "./TerminalTab";
+import { enterToSend } from "./chatComposer";
 import { AttachmentsTab } from "./AttachmentsTab";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { Button } from "./ui/Button";
@@ -307,7 +308,7 @@ export function SessionPage() {
     : "run";
 
   return (
-    <div ref={containerRef} className="flex h-full flex-col bg-app text-ink">
+    <div ref={containerRef} className="flex h-full flex-col overflow-hidden bg-app text-ink">
       {/* Header */}
       <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline bg-app px-3">
         <button
@@ -439,13 +440,8 @@ export function SessionPage() {
                   <textarea
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.nativeEvent.isComposing && (enterSends ? !e.shiftKey : e.shiftKey)) {
-                        e.preventDefault();
-                        handleSend();
-                      }
-                    }}
-                    placeholder={enterSends ? "Message… (Enter to send)" : "Message… (Shift+Enter to send)"}
+                    onKeyDown={(e) => enterToSend(e, enterSends, handleSend)}
+                    placeholder={enterSends ? "Message… (Enter to send)" : "Message… (Ctrl+Enter to send)"}
                     rows={Math.min(input.split("\n").length, 5)}
                     className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
                   />

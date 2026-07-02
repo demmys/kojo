@@ -3,7 +3,7 @@
 package session
 
 import (
-	"fmt"
+	"errors"
 	"os"
 )
 
@@ -27,7 +27,7 @@ func (s *Session) Resize(cols, rows uint16) error {
 	// ConPTY resize: type-assert to *conPTY to access the underlying resize
 	cpty, ok := ptmx.(*conPTY)
 	if !ok {
-		return fmt.Errorf("PTY is not a ConPTY instance")
+		return errors.New("PTY is not a ConPTY instance")
 	}
 	if err := cpty.cpty.Resize(int(cols), int(rows)); err != nil {
 		return err

@@ -105,8 +105,7 @@ type oplogFlushResponse struct {
 // Splitting keeps the handler itself a thin orchestrator and lets
 // each step be tested in isolation.
 func (s *Server) handleOplogFlush(w http.ResponseWriter, r *http.Request) {
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable", "op-log replay requires store")
+	if _, ok := s.requireAgentStore(w, "op-log replay requires store"); !ok {
 		return
 	}
 	if !auth.FromContext(r.Context()).IsOwner() {

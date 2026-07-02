@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { agentApi } from "../../lib/agentApi";
+import { errMsg } from "../../lib/utils";
 
 /**
  * useGeminiApiKey encapsulates the Gemini API key configured/fallback status
@@ -72,7 +73,7 @@ export function useGeminiApiKey(
       setSaveToken((t) => t + 1);
       onSuccess();
     } catch (err) {
-      onError(err instanceof Error ? err.message : String(err));
+      onError(errMsg(err));
     } finally {
       setSaving(false);
     }
@@ -84,7 +85,7 @@ export function useGeminiApiKey(
       await agentApi.apiKeys.delete("gemini");
       setConfigured(false);
     } catch (err) {
-      onError(err instanceof Error ? err.message : String(err));
+      onError(errMsg(err));
     }
   }, [onError]);
 

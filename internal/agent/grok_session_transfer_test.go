@@ -41,11 +41,11 @@ func plantGrokSession(t *testing.T, agentID, sessionID string) string {
 		t.Fatalf("mkdir session subtree: %v", err)
 	}
 	for path, body := range map[string]string{
-		"events.jsonl":                   `{"type":"start"}` + "\n",
-		"chat_history.jsonl":             `{"role":"user","text":"hi"}` + "\n",
-		"summary.json":                   `{"messages":1}`,
-		"system_prompt.txt":              "you are a helpful agent",
-		"terminal/call-abc-1.log":        "tool output line 1\nline 2\n",
+		"events.jsonl":            `{"type":"start"}` + "\n",
+		"chat_history.jsonl":      `{"role":"user","text":"hi"}` + "\n",
+		"summary.json":            `{"messages":1}`,
+		"system_prompt.txt":       "you are a helpful agent",
+		"terminal/call-abc-1.log": "tool output line 1\nline 2\n",
 	} {
 		full := filepath.Join(sessionRoot, path)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {

@@ -348,9 +348,9 @@ func (s *Store) DeleteKV(ctx context.Context, namespace, key, ifMatchETag string
 	// + DELETE pair leaves a race window where the row got
 	// overwritten between our checks but we'd still delete it.
 	var (
-		res          interface{ RowsAffected() (int64, error) }
-		execErr      error
-		conditional  = ifMatchETag != ""
+		res         interface{ RowsAffected() (int64, error) }
+		execErr     error
+		conditional = ifMatchETag != ""
 	)
 	if conditional {
 		res, execErr = tx.ExecContext(ctx,

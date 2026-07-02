@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -181,7 +182,7 @@ func Take(ctx context.Context, st *store.Store, blobRoot, root string, opts Opti
 		HostHint:      hostHint,
 	}
 	manPath := filepath.Join(dst, ManifestFileName)
-	if err := writeJSONAtomic(manPath, manifest); err != nil {
+	if err := atomicfile.WriteJSON(manPath, manifest, 0o600); err != nil {
 		return dst, fmt.Errorf("snapshot.Take: manifest: %w", err)
 	}
 
@@ -220,7 +221,7 @@ func VerifyDB(dir string) error {
 		return fmt.Errorf("snapshot.Verify: db size %d != manifest %d", size, m.DBSize)
 	}
 	if hash != m.DBSHA256 {
-		return fmt.Errorf("snapshot.Verify: db sha256 mismatch")
+		return errors.New("snapshot.Verify: db sha256 mismatch")
 	}
 	return nil
 }
@@ -322,20 +323,4 @@ func hashFile(path string) (string, int64, error) {
 		return "", 0, err
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
-}
-
-func writeJSONAtomic(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
 }

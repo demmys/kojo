@@ -467,12 +467,11 @@ func (s *Server) handleListPeerPending(w http.ResponseWriter, r *http.Request) {
 			"pending peer requests are owner-only")
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"peer registry not initialized")
+	st, ok := s.requireAgentStore(w, "peer registry not initialized")
+	if !ok {
 		return
 	}
-	rows, err := s.agents.Store().ListPeerPending(r.Context())
+	rows, err := st.ListPeerPending(r.Context())
 	if err != nil {
 		s.logger.Error("pending: list failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error",
@@ -503,9 +502,8 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 			"approve is owner-only")
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"peer registry not initialized")
+	st, ok := s.requireAgentStore(w, "peer registry not initialized")
+	if !ok {
 		return
 	}
 	id := r.PathValue("deviceId")
@@ -513,7 +511,7 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	rec, err := s.agents.Store().ApprovePeerPending(r.Context(), id)
+	rec, err := st.ApprovePeerPending(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found",
@@ -536,9 +534,8 @@ func (s *Server) handleRejectPeerPending(w http.ResponseWriter, r *http.Request)
 			"reject is owner-only")
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"peer registry not initialized")
+	st, ok := s.requireAgentStore(w, "peer registry not initialized")
+	if !ok {
 		return
 	}
 	id := r.PathValue("deviceId")
@@ -546,7 +543,7 @@ func (s *Server) handleRejectPeerPending(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if err := s.agents.Store().DeletePeerPending(r.Context(), id); err != nil {
+	if err := st.DeletePeerPending(r.Context(), id); err != nil {
 		s.logger.Error("reject: failed", "device_id", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error",
 			"internal server error")

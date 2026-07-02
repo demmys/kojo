@@ -39,7 +39,6 @@ interface UseTerminalOptions {
 
 interface UseTerminalReturn {
   termRef: React.RefObject<Terminal | null>;
-  fitRef: React.RefObject<FitAddon | null>;
   autoScrollRef: React.RefObject<boolean>;
   /** Debounced fit that also sends resize and scrolls to bottom */
   safeFit: () => void;
@@ -342,5 +341,5 @@ export function useTerminal({
     term.options.scrollback = scrollback;
   }, [scrollback]);
 
-  return { termRef, fitRef, autoScrollRef, safeFit, immediateFit };
+  return { termRef, autoScrollRef, safeFit, immediateFit };
 }

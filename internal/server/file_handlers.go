@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/filebrowser"
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // --- File Browser Handlers ---
@@ -27,17 +28,25 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, result)
 }
 
+// writeFileViewError maps a filebrowser.View error onto the status
+// ladder shared by the global and agent-scoped file-view endpoints:
+// unsupported file type → 415, size cap → 413, anything else → 400.
+// The body carries err.Error() verbatim in every branch.
+func writeFileViewError(w http.ResponseWriter, err error) {
+	if errors.Is(err, filebrowser.ErrUnsupportedFile) {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error())
+	} else if errors.Is(err, filebrowser.ErrFileTooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
+	} else {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	}
+}
+
 func (s *Server) handleViewFile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	result, err := s.files.View(path)
 	if err != nil {
-		if errors.Is(err, filebrowser.ErrUnsupportedFile) {
-			writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error())
-		} else if errors.Is(err, filebrowser.ErrFileTooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
-		} else {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		}
+		writeFileViewError(w, err)
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, result)
@@ -63,7 +72,7 @@ func (s *Server) handleThumbFile(w http.ResponseWriter, r *http.Request) {
 
 // --- Upload Handler ---
 
-var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
+var uploadDir = uploadpath.Dir()
 
 // maxUploadSize caps how large a single attachment upload may be. Set
 // to 10 GiB so that legitimate large transfers (videos, datasets,

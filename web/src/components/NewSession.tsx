@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router";
 import { api, type ServerInfo } from "../lib/api";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { modelsForTool } from "../lib/toolModels";
+import { errMsg } from "../lib/utils";
 
 export function NewSession() {
   const navigate = useNavigate();
@@ -156,7 +157,7 @@ export function NewSession() {
         : `/session/${session.id}`;
       navigate(target, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
       setLoading(false);
     }
   };

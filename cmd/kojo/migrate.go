@@ -478,10 +478,7 @@ func verifyCompleteFile(path string) error {
 	// the user has explicitly asked for an upgrade.
 	dbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	st, err := store.Open(dbCtx, store.Options{
-		ConfigDir: filepath.Dir(path),
-		ReadOnly:  true,
-	})
+	st, err := openStore(dbCtx, filepath.Dir(path), true)
 	if err != nil {
 		return fmt.Errorf("open kojo.db: %w", err)
 	}

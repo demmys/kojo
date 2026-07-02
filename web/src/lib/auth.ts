@@ -89,18 +89,3 @@ export function appendTokenQuery(path: string): string {
   const sep = path.includes("?") ? "&" : "?";
   return `${path}${sep}token=${encodeURIComponent(tok)}`;
 }
-
-/** Wipe the stored token (used by a future "log out" flow). */
-export function clearOwnerToken() {
-  cachedToken = null;
-  try {
-    window.localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // ignore
-  }
-  try {
-    window.sessionStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // ignore
-  }
-}

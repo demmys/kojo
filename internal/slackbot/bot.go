@@ -589,11 +589,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
-	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
-		ChannelID: channel,
-		ThreadTS:  threadTS,
-		Status:    typingStatus,
-	})
+	b.setStatus(ctx, channel, threadTS, typingStatus)
 
 	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
 		SessionKey:        sessionKey,
@@ -743,11 +739,7 @@ streamLoop:
 
 			// Update assistant typing status (plain text) to show which
 			// tool is running.
-			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
-				ChannelID: channel,
-				ThreadTS:  threadTS,
-				Status:    toolStatusText(evt.ToolName, evt.ToolInput),
-			})
+			b.setStatus(ctx, channel, threadTS, toolStatusText(evt.ToolName, evt.ToolInput))
 
 			// Inline stream indicator (Slack mrkdwn).
 			indicator := toolStatusIndicator(evt.ToolName, evt.ToolInput)
@@ -800,11 +792,7 @@ streamLoop:
 		case "tool_result":
 			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
-			_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
-				ChannelID: channel,
-				ThreadTS:  threadTS,
-				Status:    typingStatus,
-			})
+			b.setStatus(ctx, channel, threadTS, typingStatus)
 
 		case "error":
 			hasError = true
@@ -920,21 +908,10 @@ streamLoop:
 			// once chunkCtx is cancelled or Slack is hard rate-limiting
 			// us, subsequent posts will fail the same way.
 			if deliveredAll {
-				for _, chunk := range chunks[1:] {
-					if !b.postMessage(chunkCtx, channel, threadTS, chunk) {
-						deliveredAll = false
-						break
-					}
-				}
+				deliveredAll = b.postChunks(chunkCtx, channel, threadTS, chunks[1:])
 			}
 			if !deliveredAll {
-				// Surface the delivery failure to the user with a fresh
-				// context — chunkCtx may already be expired at this point.
-				// Best effort; if this also fails the log entries from
-				// postMessage are the trail.
-				noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
-				b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
-				noticeCancel()
+				b.postDeliveryFailureNotice(channel, threadTS)
 			}
 			// The live stream now holds the full clean reply (or, on
 			// chat.update failure, we posted chunks[0] as a fresh message).
@@ -962,17 +939,9 @@ streamLoop:
 		chunkCtx, chunkCancel := context.WithTimeout(context.Background(), chunkPostTimeout(len(chunks)))
 		defer chunkCancel()
 
-		deliveredAll := true
-		for _, chunk := range chunks {
-			if !b.postMessage(chunkCtx, channel, threadTS, chunk) {
-				deliveredAll = false
-				break
-			}
-		}
+		deliveredAll := b.postChunks(chunkCtx, channel, threadTS, chunks)
 		if !deliveredAll {
-			noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
-			b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
-			noticeCancel()
+			b.postDeliveryFailureNotice(channel, threadTS)
 		}
 		// Batch post carried the full reply (StartStream failed or every
 		// stream died and we fell back). Dead partials are superseded.
@@ -1343,6 +1312,73 @@ func toolStatusIndicator(toolName, toolInput string) string {
 	return "\n\n_⏳ " + label + "…_"
 }
 
+// rlOutcome classifies why withRateLimitRetry returned control to the
+// caller. The caller owns the terminal semantics (return value, logging)
+// for each outcome; withRateLimitRetry only drives the rate-limit backoff.
+type rlOutcome int
+
+const (
+	rlSuccess   rlOutcome = iota // op returned nil
+	rlOtherErr                   // op returned a non-rate-limit error (in err)
+	rlExhausted                  // rate-limited on the final attempt (rlErr in err)
+	rlCtxDone                    // ctx cancelled during a backoff sleep
+)
+
+// withRateLimitRetry runs op in the attempt loop shared by appendStream and
+// postMessage: on a slack.RateLimitedError it sleeps (RetryAfter, or the
+// (attempt+1)*time.Second default) via the injectable rateLimitSleep and
+// retries, up to maxRateLimitRetry times. It handles ONLY rate-limit
+// retries — every other result is handed straight back to the caller, which
+// classifies it and decides success/failure:
+//
+//	rlSuccess    op returned nil
+//	rlOtherErr   op returned a non-rate-limit error (returned in err)
+//	rlExhausted  rate-limited on the final attempt (rlErr wrapped in err)
+//	rlCtxDone    ctx cancelled while waiting out a backoff (err = ctx.Err())
+//
+// No sleep runs after the final attempt (exhaustion returns immediately), so
+// the call/sleep counts match the pre-refactor loops exactly. onRetry, when
+// non-nil, runs just before each backoff sleep with the chosen delay so a
+// caller can log the wait; it is not invoked on the exhausting attempt.
+func (b *Bot) withRateLimitRetry(ctx context.Context, op func() error, onRetry func(delay time.Duration)) (rlOutcome, error) {
+	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
+		err := op()
+		if err == nil {
+			return rlSuccess, nil
+		}
+		var rlErr *slack.RateLimitedError
+		if !errors.As(err, &rlErr) {
+			return rlOtherErr, err
+		}
+		// No retries left — return without sleeping. Sleeping past the
+		// final attempt has no follow-up call to wait for and just
+		// delays the caller; both sites depend on this to keep the
+		// documented 1+2+3 s backoff chain (and sleep counts) exact.
+		if attempt == maxRateLimitRetry {
+			return rlExhausted, err
+		}
+		delay := rlErr.RetryAfter
+		if delay <= 0 {
+			delay = time.Duration(attempt+1) * time.Second
+		}
+		if onRetry != nil {
+			onRetry(delay)
+		}
+		sleep := b.rateLimitSleep
+		if sleep == nil {
+			sleep = time.After
+		}
+		select {
+		case <-sleep(delay):
+			continue
+		case <-ctx.Done():
+			return rlCtxDone, ctx.Err()
+		}
+	}
+	// Unreachable: exhaustion returns rlExhausted on the final attempt.
+	return rlSuccess, nil
+}
+
 // appendStream appends text to a streaming Slack message with rate limit
 // retry. Returns true if streamTS is still usable for further appends
 // (success, transient/unknown error, rate-limit exhaustion, ctx cancelled);
@@ -1354,67 +1390,51 @@ func toolStatusIndicator(toolName, toolInput string) string {
 // the user saw no further updates AND no finalize chat.update (because
 // chat.update against a dead TS is best-effort and may also fail).
 func (b *Bot) appendStream(ctx context.Context, channel, streamTS, text string) bool {
-	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
-		_, _, err := b.api.AppendStreamContext(ctx, channel, streamTS, slack.MsgOptionMarkdownText(text))
-		if err == nil {
-			return true
-		}
+	// Rate-limit backoff (and the "don't sleep past the final attempt"
+	// guard that keeps postMessage in lockstep) lives in withRateLimitRetry;
+	// only the terminal, appendStream-specific classification is here.
+	outcome, err := b.withRateLimitRetry(ctx, func() error {
+		_, _, e := b.api.AppendStreamContext(ctx, channel, streamTS, slack.MsgOptionMarkdownText(text))
+		return e
+	}, nil)
+	switch outcome {
+	case rlSuccess:
+		return true
+	case rlExhausted:
+		// Log on exhaustion so a sustained 429 storm leaves a trail —
+		// without this, stream deltas stop appearing in the channel
+		// with no log entry to correlate against (non-rate-limit
+		// errors hit the Debug log below).
 		var rlErr *slack.RateLimitedError
-		if errors.As(err, &rlErr) {
-			// No retries left — return without sleeping. Sleeping
-			// past the final attempt has no follow-up call to wait
-			// for and just delays the rest of the stream finalize
-			// path. Mirrors the same guard in postMessage so both
-			// retry sites stay in lockstep.
-			//
-			// Log on exhaustion so a sustained 429 storm leaves a
-			// trail — without this, stream deltas stop appearing in
-			// the channel with no log entry to correlate against
-			// (non-rate-limit errors hit the Debug log below).
-			if attempt == maxRateLimitRetry {
-				b.logger.Warn("failed to append slack stream after rate limit retries",
-					"channel", channel, "streamTS", streamTS,
-					"retryAfter", rlErr.RetryAfter, "err", err)
-				// Rate limiting doesn't kill the stream itself —
-				// it just means Slack is refusing OUR calls right
-				// now. Keep the streamTS so finalize chat.update
-				// still has a chance to land the full reply.
-				return true
-			}
-			delay := rlErr.RetryAfter
-			if delay == 0 {
-				delay = time.Duration(attempt+1) * time.Second
-			}
-			sleep := b.rateLimitSleep
-			if sleep == nil {
-				sleep = time.After
-			}
-			select {
-			case <-sleep(delay):
-				continue
-			case <-ctx.Done():
-				return true
-			}
-		}
-		if isStreamClosedErr(err) {
-			// Stream is irrecoverably dead from Slack's side. Log
-			// at Info (not Debug) so the restart event has an
-			// audit trail — diagnosing the silent-truncation bug
-			// required reconstructing this from 30+ identical
-			// Debug lines, which is the kind of toil this log
-			// level avoids.
-			b.logger.Info("slack stream closed mid-response, will restart on next chunk",
-				"channel", channel, "streamTS", streamTS, "err", err)
-			return false
-		}
-		b.logger.Debug("append stream failed", "err", err)
-		// Unknown non-rate-limit error: don't churn the stream — Slack
-		// has been known to return transient 5xx that don't kill the
-		// streaming state. Caller keeps the same streamTS; if the
-		// error WAS terminal, the next append will return the
-		// stream-closed signal and we'll restart then.
+		errors.As(err, &rlErr)
+		b.logger.Warn("failed to append slack stream after rate limit retries",
+			"channel", channel, "streamTS", streamTS,
+			"retryAfter", rlErr.RetryAfter, "err", err)
+		// Rate limiting doesn't kill the stream itself — it just means
+		// Slack is refusing OUR calls right now. Keep the streamTS so
+		// finalize chat.update still has a chance to land the full reply.
+		return true
+	case rlCtxDone:
 		return true
 	}
+	// rlOtherErr: classify the non-rate-limit error ourselves.
+	if isStreamClosedErr(err) {
+		// Stream is irrecoverably dead from Slack's side. Log
+		// at Info (not Debug) so the restart event has an
+		// audit trail — diagnosing the silent-truncation bug
+		// required reconstructing this from 30+ identical
+		// Debug lines, which is the kind of toil this log
+		// level avoids.
+		b.logger.Info("slack stream closed mid-response, will restart on next chunk",
+			"channel", channel, "streamTS", streamTS, "err", err)
+		return false
+	}
+	b.logger.Debug("append stream failed", "err", err)
+	// Unknown non-rate-limit error: don't churn the stream — Slack
+	// has been known to return transient 5xx that don't kill the
+	// streaming state. Caller keeps the same streamTS; if the
+	// error WAS terminal, the next append will return the
+	// stream-closed signal and we'll restart then.
 	return true
 }
 
@@ -1461,13 +1481,43 @@ func chunkPostTimeout(nChunks int) time.Duration {
 	return d
 }
 
-// clearAssistantStatus clears the assistant typing indicator (best-effort).
-func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string) {
+// postChunks posts chunks as sequential messages under ctx, stopping at the
+// first delivery failure — once ctx is cancelled or Slack is hard
+// rate-limiting us, subsequent posts fail the same way, so continuing would
+// only spam failed calls. Returns true iff every chunk reached the user.
+func (b *Bot) postChunks(ctx context.Context, channel, threadTS string, chunks []string) bool {
+	for _, chunk := range chunks {
+		if !b.postMessage(ctx, channel, threadTS, chunk) {
+			return false
+		}
+	}
+	return true
+}
+
+// postDeliveryFailureNotice surfaces a delivery failure to the user on a
+// fresh context — the chunk-posting context may already be expired by the
+// time we get here. Best effort; if this also fails the postMessage log
+// entries are the trail.
+func (b *Bot) postDeliveryFailureNotice(channel, threadTS string) {
+	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+	b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
+	noticeCancel()
+}
+
+// setStatus updates the assistant typing indicator for a thread
+// (best-effort; requires Agents & Assistants + assistant:write scope). An
+// empty status clears the indicator.
+func (b *Bot) setStatus(ctx context.Context, channel, threadTS, status string) {
 	_ = b.api.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 		ChannelID: channel,
 		ThreadTS:  threadTS,
-		Status:    "", // empty = clear
+		Status:    status,
 	})
+}
+
+// clearAssistantStatus clears the assistant typing indicator (best-effort).
+func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string) {
+	b.setStatus(ctx, channel, threadTS, "") // empty = clear
 }
 
 // postMessage sends a message to Slack with rate-limit retry. Returns
@@ -1507,51 +1557,39 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 		opts = append(opts, slack.MsgOptionTS(threadTS))
 	}
 
-	for attempt := 0; attempt <= maxRateLimitRetry; attempt++ {
-		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
-		if err == nil {
-			return true
-		}
+	// Rate-limit backoff (attempt loop, delay, injectable sleep, and the
+	// "don't sleep past the final attempt" guard that protects the 1+2+3 s
+	// chunkPostTimeout budget) lives in withRateLimitRetry. Unlike
+	// appendStream, postMessage treats every terminal outcome — exhaustion,
+	// ctx cancellation, and any non-rate-limit error — as a delivery
+	// failure (return false).
+	outcome, err := b.withRateLimitRetry(ctx, func() error {
+		_, _, e := b.api.PostMessageContext(ctx, channel, opts...)
+		return e
+	}, func(wait time.Duration) {
+		b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+	})
+	switch outcome {
+	case rlSuccess:
+		return true
+	case rlExhausted:
+		// Include err and RetryAfter so production logs can distinguish
+		// a Slack hard 429 from a slow recovery — without these the
+		// Warn is opaque.
 		var rlErr *slack.RateLimitedError
-		if errors.As(err, &rlErr) {
-			// No retries left — return immediately. Sleeping here
-			// would burn 1+ s of chunkPostTimeout for no subsequent
-			// attempt, exceeding the documented 1+2+3 s backoff
-			// chain and risking a cascade where later chunks lose
-			// their budget too.
-			if attempt == maxRateLimitRetry {
-				// Include err and RetryAfter so production logs
-				// can distinguish a Slack hard 429 from a slow
-				// recovery — without these the Warn is opaque.
-				b.logger.Warn("failed to post slack message after rate limit retries",
-					"channel", channel, "threadTS", threadTS,
-					"retryAfter", rlErr.RetryAfter, "err", err)
-				return false
-			}
-			wait := rlErr.RetryAfter
-			if wait <= 0 {
-				wait = time.Duration(attempt+1) * time.Second
-			}
-			b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
-			sleep := b.rateLimitSleep
-			if sleep == nil {
-				sleep = time.After
-			}
-			select {
-			case <-ctx.Done():
-				b.logger.Warn("slack post cancelled while waiting on rate limit",
-					"channel", channel, "threadTS", threadTS, "err", ctx.Err())
-				return false
-			case <-sleep(wait):
-				continue
-			}
-		}
-		b.logger.Warn("failed to post slack message",
+		errors.As(err, &rlErr)
+		b.logger.Warn("failed to post slack message after rate limit retries",
+			"channel", channel, "threadTS", threadTS,
+			"retryAfter", rlErr.RetryAfter, "err", err)
+		return false
+	case rlCtxDone:
+		b.logger.Warn("slack post cancelled while waiting on rate limit",
 			"channel", channel, "threadTS", threadTS, "err", err)
 		return false
 	}
-	// Unreachable: the rate-limited branch above returns on the final
-	// attempt rather than falling through. Kept to satisfy the compiler.
+	// rlOtherErr: any non-rate-limit error is a hard delivery failure.
+	b.logger.Warn("failed to post slack message",
+		"channel", channel, "threadTS", threadTS, "err", err)
 	return false
 }
 
@@ -1601,7 +1639,7 @@ func (b *Bot) resolveUserName(userID string) string {
 	}
 	b.userCacheMu.RUnlock()
 
-	user, err := b.api.GetUserInfo(userID)
+	user, err := b.api.GetUserInfoContext(context.Background(), userID)
 	if err != nil {
 		b.logger.Debug("failed to resolve slack user", "userID", userID, "err", err)
 		return userID // fallback to raw ID

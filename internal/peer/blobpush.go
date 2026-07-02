@@ -2,7 +2,6 @@ package peer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/blob"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // kojo-attach hub forwarding.
@@ -29,23 +27,23 @@ import (
 // additional indirection — the user UI fetches it through the
 // regular /api/v1/blob/... surface.
 //
-// Auth: every request is Ed25519-signed with the local peer
-// Identity, audience pinned to the hub's DeviceID. Hub-side
-// EnforceMiddleware + auth.AllowNonOwner require the peer_registry
-// row to be trusted (the user explicitly paired the peer); without
-// that the PUT returns 403.
+// Auth: no Authorization header is sent. Identity travels via
+// tsnet WhoIs on the receiving side (PairingProtocolVersion v2 —
+// NodeKey-only auth; see version.go). Hub-side EnforceMiddleware +
+// auth.AllowNonOwner require the peer_registry row to be trusted
+// (the user explicitly paired the peer); without that the PUT
+// returns 403.
 //
-// HTTP transport mirrors PullClient: keep-alives disabled so Go's
-// idempotent-request stale-conn retry can never re-send the same
-// signed nonce. See blobpull.go's NewPullClient for the full
-// rationale (the trap is identical for PUT — http.Client treats
-// PUT as idempotent and will silently re-send on a stale-conn EOF).
+// HTTP transport mirrors PullClient: keep-alives disabled. See
+// blobpull.go's NewPullClient for why the transport is still
+// configured this way even though neither client signs requests
+// anymore.
 
 // PushTarget identifies the hub a non-hub peer pushes to.
 type PushTarget struct {
-	// DeviceID is the hub peer's identity, used as the
-	// SigningInput.Audience so the signed envelope only validates
-	// against this hub.
+	// DeviceID is the hub peer's identity. Validated as part of the
+	// input contract in PushOne; the actual auth is via tsnet WhoIs
+	// on the receiving side, not a signed audience claim.
 	DeviceID string
 	// Address is the base URL of the hub (e.g.
 	// "https://hub.tail-net.ts.net:8080"). The ingest path is
@@ -57,21 +55,14 @@ type PushTarget struct {
 // transport disables keep-alives so each PushOne opens a fresh
 // TCP/TLS connection — same reasoning as PullClient.
 type PushClient struct {
-	identity *Identity
-	// store carries the dual-stack Bearer lookup for the kojo-attach
-	// hub-forwarding leg (docs/peer-simplify-plan.md step 7). When a
-	// Hub-paired Bearer is present AuthorizeOutbound uses it;
-	// otherwise SignRequest still runs so the legacy path keeps the
-	// blob ingest unblocked until a follow-up capability-URL flow
-	// lands.
-	store      *store.Store
+	identity   *Identity
 	httpClient *http.Client
 	logger     *slog.Logger
 }
 
 // NewPushClient wires the client. Pass nil for httpClient to use
 // a no-keep-alive default; tests can inject a fixture client.
-func NewPushClient(id *Identity, st *store.Store, httpClient *http.Client, logger *slog.Logger) *PushClient {
+func NewPushClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PushClient {
 	if httpClient == nil {
 		httpClient = &http.Client{
 			Transport: noKeepAliveTransport(),
@@ -80,7 +71,7 @@ func NewPushClient(id *Identity, st *store.Store, httpClient *http.Client, logge
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PushClient{identity: id, store: st, httpClient: httpClient, logger: logger}
+	return &PushClient{identity: id, httpClient: httpClient, logger: logger}
 }
 
 // PushOne uploads body to dst's ingest endpoint as (scope, path).
@@ -156,42 +147,13 @@ func (c *PushClient) PushOne(
 	return nil
 }
 
-// PushOneJSON decodes the hub's 200 response body. Used by tests
-// that want to assert echoed digest / size match what they sent.
-// Production callers (the attachment forwarder) ignore the body
-// and check err alone.
-func (c *PushClient) PushOneJSON(
-	ctx context.Context,
-	dst PushTarget,
-	scope blob.Scope,
-	blobPath string,
-	expectedSHA256 string,
-	body io.Reader,
-	size int64,
-	out any,
-) error {
-	if err := c.PushOne(ctx, dst, scope, blobPath, expectedSHA256, body, size); err != nil {
-		return err
-	}
-	if out == nil {
-		return nil
-	}
-	// PushOne drains the body for connection reuse, so this
-	// variant can't actually read it back. The helper is
-	// retained for future use; callers that need the response
-	// JSON should refactor PushOne to expose it. Returning
-	// nil here keeps the test surface honest about the
-	// limitation.
-	_ = json.Unmarshal(nil, out)
-	return nil
-}
-
 // buildPeerBlobIngestURL composes the canonical ingest URL.
 // Mirrors buildPeerBlobURL's anti-redirect posture: a path that
 // contains "//" would trigger Go's ServeMux to issue a 301
-// path-clean, and http.Client would re-send the SAME signed nonce
-// to the cleaned target → 401 replayed nonce. We refuse such
-// inputs up front rather than discover it at runtime.
+// path-clean, and PushOne's request body (an io.Reader streamed
+// once) can't be safely replayed if http.Client followed that
+// redirect. We refuse such inputs up front rather than discover it
+// at runtime.
 func buildPeerBlobIngestURL(base string, scope blob.Scope, blobPath string) (string, error) {
 	u, err := url.Parse(base)
 	if err != nil {

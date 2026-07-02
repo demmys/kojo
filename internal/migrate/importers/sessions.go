@@ -28,7 +28,9 @@ import (
 // be able to tell which peer originally launched a given session.
 type sessionsImporter struct{}
 
-func (sessionsImporter) Domain() string { return "sessions" }
+const sessionsDomain = "sessions"
+
+func (sessionsImporter) Domain() string { return sessionsDomain }
 
 // v0SessionInfo decodes one entry from sessions.json. Only the
 // fields that map onto v1 columns are decoded; everything else
@@ -61,123 +63,117 @@ type v0SessionInfo struct {
 }
 
 func (sessionsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "sessions"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "sessions")
-
-	srcPaths, err := collectSessionsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum sessions sources: %w", err)
-	}
-
-	path := filepath.Join(opts.V0Dir, "sessions.json")
-	data, err := readV0(opts.V0Dir, path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return markImported(ctx, st, "sessions", 0, checksum)
+	return runDomain(ctx, st, sessionsDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectSessionsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		return err
-	}
-	if len(data) == 0 {
-		return markImported(ctx, st, "sessions", 0, checksum)
-	}
-
-	var infos []v0SessionInfo
-	if err := json.Unmarshal(data, &infos); err != nil {
-		// Malformed file is not fatal — log and mark imported with 0
-		// rows so a subsequent run doesn't re-attempt the same parse.
-		logger.Warn("sessions: skipping malformed file",
-			"path", path, "err", err)
-		return markImported(ctx, st, "sessions", 0, checksum)
-	}
-	if len(infos) == 0 {
-		return markImported(ctx, st, "sessions", 0, checksum)
-	}
-
-	mtime := fileMTimeMillis(path)
-	recs := make([]*store.SessionRecord, 0, len(infos))
-	for i, s := range infos {
-		if s.ID == "" {
-			logger.Warn("sessions: skipping entry without id",
-				"index", i)
-			continue
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum sessions sources: %w", err)
 		}
 
-		created := parseRFC3339Millis(s.CreatedAt)
-		if created == 0 {
-			created = mtime
+		path := filepath.Join(opts.V0Dir, "sessions.json")
+		data, err := readV0(opts.V0Dir, path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, checksum, nil
+			}
+			return 0, "", err
 		}
-		if created == 0 {
-			created = store.NowMillis()
-		}
-
-		// Build the launch command snapshot. v0 doesn't preserve the
-		// full argv vector (Args is the *post-launch* args slice the
-		// session manager fed to the PTY); joining with spaces gives
-		// a debug-readable cmd column without claiming this is shell-
-		// safe to re-execute.
-		cmd := s.Tool
-		if len(s.Args) > 0 {
-			cmd = s.Tool + " " + strings.Join(s.Args, " ")
+		if len(data) == 0 {
+			return 0, checksum, nil
 		}
 
-		// stopped_at: the v0 file only records CreatedAt; the row was
-		// last written when the session became stopped/archived. mtime
-		// is the closest signal we have for "when did this session
-		// actually stop". Fall back to created_at when mtime is
-		// unreliable (zero / older than created_at) — every imported
-		// row is forced to status='archived', so a missing stopped_at
-		// would let downstream consumers ("when did this end?") see
-		// NULL on a definitively-stopped row, which is misleading.
-		stoppedAt := created
-		if mtime > 0 && mtime >= created {
-			stoppedAt = mtime
+		var infos []v0SessionInfo
+		if err := json.Unmarshal(data, &infos); err != nil {
+			// Malformed file is not fatal — log and mark imported with 0
+			// rows so a subsequent run doesn't re-attempt the same parse.
+			logger.Warn("sessions: skipping malformed file",
+				"path", path, "err", err)
+			return 0, checksum, nil
 		}
-		// updated_at reflects the last modification of the row on
-		// disk; for an archived import that's stopped_at, not the
-		// session's birth time. Without this, the etag canonical
-		// record would treat an old archived session as if it had
-		// just been stamped.
-		updated := stoppedAt
-
-		var exit *int64
-		if s.ExitCode != nil {
-			v := int64(*s.ExitCode)
-			exit = &v
+		if len(infos) == 0 {
+			return 0, checksum, nil
 		}
 
-		recs = append(recs, &store.SessionRecord{
-			ID:        s.ID,
-			AgentID:   nil, // v0 SessionInfo does not carry agent_id
-			Status:    "archived",
-			PID:       nil, // PTY died with v0; PID is meaningless
-			Cmd:       cmd,
-			WorkDir:   s.WorkDir,
-			StartedAt: &created,
-			StoppedAt: &stoppedAt,
-			ExitCode:  exit,
-			CreatedAt: created,
-			UpdatedAt: updated,
-		})
-	}
+		mtime := fileMTimeMillis(path)
+		recs := make([]*store.SessionRecord, 0, len(infos))
+		for i, s := range infos {
+			if s.ID == "" {
+				logger.Warn("sessions: skipping entry without id",
+					"index", i)
+				continue
+			}
 
-	if len(recs) == 0 {
-		return markImported(ctx, st, "sessions", 0, checksum)
-	}
+			created := parseRFC3339Millis(s.CreatedAt)
+			if created == 0 {
+				created = mtime
+			}
+			if created == 0 {
+				created = store.NowMillis()
+			}
 
-	n, err := st.BulkInsertSessions(ctx, recs, store.SessionInsertOptions{PeerID: opts.HomePeer})
-	if err != nil {
-		return fmt.Errorf("bulk insert sessions: %w", err)
-	}
-	return markImported(ctx, st, "sessions", n, checksum)
+			// Build the launch command snapshot. v0 doesn't preserve the
+			// full argv vector (Args is the *post-launch* args slice the
+			// session manager fed to the PTY); joining with spaces gives
+			// a debug-readable cmd column without claiming this is shell-
+			// safe to re-execute.
+			cmd := s.Tool
+			if len(s.Args) > 0 {
+				cmd = s.Tool + " " + strings.Join(s.Args, " ")
+			}
+
+			// stopped_at: the v0 file only records CreatedAt; the row was
+			// last written when the session became stopped/archived. mtime
+			// is the closest signal we have for "when did this session
+			// actually stop". Fall back to created_at when mtime is
+			// unreliable (zero / older than created_at) — every imported
+			// row is forced to status='archived', so a missing stopped_at
+			// would let downstream consumers ("when did this end?") see
+			// NULL on a definitively-stopped row, which is misleading.
+			stoppedAt := created
+			if mtime > 0 && mtime >= created {
+				stoppedAt = mtime
+			}
+			// updated_at reflects the last modification of the row on
+			// disk; for an archived import that's stopped_at, not the
+			// session's birth time. Without this, the etag canonical
+			// record would treat an old archived session as if it had
+			// just been stamped.
+			updated := stoppedAt
+
+			var exit *int64
+			if s.ExitCode != nil {
+				v := int64(*s.ExitCode)
+				exit = &v
+			}
+
+			recs = append(recs, &store.SessionRecord{
+				ID:        s.ID,
+				AgentID:   nil, // v0 SessionInfo does not carry agent_id
+				Status:    "archived",
+				PID:       nil, // PTY died with v0; PID is meaningless
+				Cmd:       cmd,
+				WorkDir:   s.WorkDir,
+				StartedAt: &created,
+				StoppedAt: &stoppedAt,
+				ExitCode:  exit,
+				CreatedAt: created,
+				UpdatedAt: updated,
+			})
+		}
+
+		if len(recs) == 0 {
+			return 0, checksum, nil
+		}
+
+		n, err := st.BulkInsertSessions(ctx, recs, store.SessionInsertOptions{PeerID: opts.HomePeer})
+		if err != nil {
+			return 0, "", fmt.Errorf("bulk insert sessions: %w", err)
+		}
+		return n, checksum, nil
+	})
 }
 
 // collectSessionsSourcePaths returns the deterministic set of v0 files

@@ -59,4 +59,3 @@ func ValidateName(name string) error {
 	}
 	return nil
 }
-

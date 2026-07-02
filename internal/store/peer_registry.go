@@ -211,7 +211,6 @@ UPDATE peer_registry
 	return nil
 }
 
-
 // ClearPeerNodeKey sets the node_key column to NULL for the given
 // device_id. Used on Hub-mode startup to drop a stale value left by
 // a previous binary that wrote tsnet.Server's NodeKey into the

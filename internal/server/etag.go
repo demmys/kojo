@@ -112,6 +112,50 @@ func hasIfNoneMatchWildcard(r *http.Request) bool {
 	return strings.TrimSpace(vals[0]) == "*"
 }
 
+// parseIfMatchStrict is the shared preamble for mutating handlers that
+// reject the If-Match wildcard. It chains the three steps every such
+// handler used to spell out inline:
+//
+//  1. extractDomainIfMatch — malformed header → 400 "invalid If-Match
+//     header",
+//  2. enforceIfMatchPresence — strict-mode 428 gate (docs §3.5),
+//  3. reject `*` — written with the caller-supplied wildcardStatus and
+//     wildcardMsg, because the wording (and, for the task handlers,
+//     the status: 412 instead of 400) is endpoint-specific.
+//
+// The error code mirrors the status: 412 → "precondition_failed",
+// anything else → "bad_request" (matching the pre-refactor per-site
+// literals).
+//
+// Returns ok=false after writing the error response; the caller must
+// return immediately. On ok=true, ifMatch is either "" (header absent,
+// legacy best-effort path) or a single well-formed strong etag —
+// never "*".
+//
+// Handlers that ACCEPT the wildcard (kv PUT create-or-replace, the
+// group-DM rename / member-settings PATCH paths) MUST NOT call this;
+// they keep calling extractDomainIfMatch + enforceIfMatchPresence
+// directly.
+func (s *Server) parseIfMatchStrict(w http.ResponseWriter, r *http.Request, wildcardStatus int, wildcardMsg string) (ifMatch string, ifMatchPresent bool, ok bool) {
+	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
+		return "", false, false
+	}
+	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
+		return "", false, false
+	}
+	if ifMatchPresent && ifMatch == "*" {
+		code := "bad_request"
+		if wildcardStatus == http.StatusPreconditionFailed {
+			code = "precondition_failed"
+		}
+		writeError(w, wildcardStatus, code, wildcardMsg)
+		return "", false, false
+	}
+	return ifMatch, ifMatchPresent, true
+}
+
 // extractDomainIfMatch parses the (zero or one) If-Match header for a
 // domain-table mutation.
 //

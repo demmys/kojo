@@ -42,7 +42,7 @@ func tmuxSessionName(id string) string {
 }
 
 // shellQuote wraps a string in single quotes, escaping any embedded single quotes.
-// e.g. "it's" → "'it'\''s'"
+// e.g. "it's" → "'it'\”s'"
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

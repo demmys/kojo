@@ -413,21 +413,10 @@ var grokSessionTransferMaxTotalBytes int64 = 256 << 20
 // by agentID, entries are never deleted so identity stays stable
 // across the agent's lifetime, and the map itself is guarded by
 // grokSessionTransferMapMu.
-var (
-	grokSessionTransferMapMu sync.Mutex
-	grokSessionTransferMu    = map[string]*sync.Mutex{}
-)
+var grokSessionTransferLocks keyedMutex
 
 func lockGrokSessionTransfer(agentID string) func() {
-	grokSessionTransferMapMu.Lock()
-	mu, ok := grokSessionTransferMu[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		grokSessionTransferMu[agentID] = mu
-	}
-	grokSessionTransferMapMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return grokSessionTransferLocks.Lock(agentID)
 }
 
 // StageGrokSession materialises the source-captured grok session

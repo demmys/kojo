@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,12 +40,12 @@ const chunkedSyncBudgetBytes = 64 << 20
 // sweeper. abort is best-effort — a missing entry on target is a
 // 200, matching the single-shot drop semantics. The original error is
 // returned to the caller unchanged.
-func (s *Server) dispatchPeerAgentSyncChunked(ctx context.Context, targetAddr, targetDeviceID string, payload *peerAgentSyncRequest) error {
+func (s *Server) dispatchPeerAgentSyncChunked(ctx context.Context, targetAddr string, payload *peerAgentSyncRequest) error {
 	if payload == nil {
-		return fmt.Errorf("nil payload")
+		return errors.New("nil payload")
 	}
 	if payload.OpID == "" {
-		return fmt.Errorf("op_id required")
+		return errors.New("op_id required")
 	}
 
 	// Split into begin + N chunks. Singletons go to begin; data
@@ -229,10 +230,10 @@ func (s *Server) bestEffortChunkedAbort(_ context.Context, targetAddr, opID stri
 //     of looping abort/retry against target's 413.
 func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (begin *peerAgentSyncChunkedBeginRequest, chunks []*peerAgentSyncChunkedChunkRequest, err error) {
 	if payload == nil {
-		return nil, nil, fmt.Errorf("nil payload")
+		return nil, nil, errors.New("nil payload")
 	}
 	if budgetBytes <= 0 {
-		return nil, nil, fmt.Errorf("budget must be > 0")
+		return nil, nil, errors.New("budget must be > 0")
 	}
 
 	begin = &peerAgentSyncChunkedBeginRequest{
@@ -414,7 +415,7 @@ func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (b
 // the full singleton blob during the routing decision.
 func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 	if payload == nil {
-		return 0, fmt.Errorf("nil payload")
+		return 0, errors.New("nil payload")
 	}
 	// Singletons WITHOUT the bulky-but-flat GrokSession.Files —
 	// those are walked separately below. The grokSessionWire

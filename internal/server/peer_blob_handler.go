@@ -44,15 +44,10 @@ func (s *Server) handlePeerBlobGet(w http.ResponseWriter, r *http.Request) {
 			"blob store not configured")
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"store backing peer-blob handoff not configured")
+	if _, ok := s.requireAgentStore(w, "store backing peer-blob handoff not configured"); !ok {
 		return
 	}
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	if _, ok := requirePeerOrOwner(w, r); !ok {
 		return
 	}
 
@@ -273,11 +268,8 @@ func (s *Server) relayPeerBlob(w http.ResponseWriter, r *http.Request, sourceDev
 	defer resp.Body.Close()
 	// Preserve the digest + size headers so the caller's sha256
 	// check still works.
-	for _, h := range []string{"Content-Type", "ETag", "X-Kojo-Blob-SHA256", "Content-Length", "Cache-Control"} {
-		if v := resp.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
+	copyResponseHeaders(w.Header(), resp.Header,
+		"Content-Type", "ETag", "X-Kojo-Blob-SHA256", "Content-Length", "Cache-Control")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -92,10 +91,8 @@ type peerPullResponse struct {
 }
 
 func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
 	if s.blob == nil {
@@ -108,9 +105,7 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 			"local peer identity not configured")
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"peer_registry store not configured")
+	if _, ok := s.requireAgentStore(w, "peer_registry store not configured"); !ok {
 		return
 	}
 
@@ -219,7 +214,7 @@ func (s *Server) handlePeerPull(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	client := peer.NewPullClient(s.peerID, s.agents.Store(), nil, s.logger)
+	client := peer.NewPullClient(s.peerID, nil, s.logger)
 	src := peer.PullSource{DeviceID: req.SourceDeviceID, Address: srcAddr, RelayVia: relayVia}
 
 	// No batch timeout: large blob handoffs (multi-GiB) over slow

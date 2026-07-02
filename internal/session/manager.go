@@ -69,15 +69,6 @@ func isAllowedTool(name string) bool {
 	return userTools[name] || internalTools[name]
 }
 
-func hasArg(args []string, name string) bool {
-	for _, a := range args {
-		if a == name || strings.HasPrefix(a, name+"=") {
-			return true
-		}
-	}
-	return false
-}
-
 type Manager struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -98,13 +89,6 @@ func (m *Manager) SetCustomBaseURL(baseURL string) {
 	m.mu.Lock()
 	m.customBaseURL = baseURL
 	m.mu.Unlock()
-}
-
-// GetCustomBaseURL returns the custom API base URL (empty if not configured).
-func (m *Manager) GetCustomBaseURL() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.customBaseURL
 }
 
 // ManagerOptions tunes Manager construction. Zero-value is the
@@ -200,6 +184,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		done:            make(chan struct{}),
 		readDone:        make(chan struct{}),
 		attachments:     make(map[string]*Attachment),
+		logger:          m.logger,
 	}
 
 	m.mu.Lock()
@@ -263,7 +248,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 
 	if !isAllowedTool(tool) {
 		clearRestarting()
-		return nil, fmt.Errorf("unsupported tool: %s", tool)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
 
 	customResult := m.resolveCustomAPI(tool, args)
@@ -368,6 +353,33 @@ func (m *Manager) findChildSessions(parentID, tool string) []*Session {
 		}
 	}
 	return result
+}
+
+// stopRunningChildren stops every running child terminal session of the given
+// parent. The child tool name is the platform terminal tool (tmux on unix,
+// shell on windows) via ShellToolName().
+func (m *Manager) stopRunningChildren(parentID string) {
+	for _, child := range m.findChildSessions(parentID, ShellToolName()) {
+		child.mu.Lock()
+		childStatus := child.Status
+		child.mu.Unlock()
+		if childStatus == StatusRunning {
+			_ = m.Stop(child.ID)
+		}
+	}
+}
+
+// insertRestoredSessions builds a Session for each persisted info, registers it
+// in the session map, and logs the restore count. Called during platformInit
+// before concurrent access, so no lock is held.
+func (m *Manager) insertRestoredSessions(infos []SessionInfo) {
+	for _, info := range infos {
+		s := m.restoreSession(info)
+		m.sessions[info.ID] = s
+	}
+	if len(infos) > 0 {
+		m.logger.Info("restored persisted sessions", "count", len(infos))
+	}
 }
 
 // Remove removes an exited session and its internal children from memory and persists the change.
@@ -540,10 +552,7 @@ func (m *Manager) waitLoop(s *Session) {
 
 	// close PTY so readLoop drains remaining data and exits
 	s.mu.Lock()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
+	s.closePTYLocked()
 	s.mu.Unlock()
 
 	// wait for readLoop to finish draining
@@ -586,15 +595,7 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 	m.save()
 
 	// Stop child sessions when parent exits
-	shellTool := ShellToolName()
-	for _, child := range m.findChildSessions(s.ID, shellTool) {
-		child.mu.Lock()
-		childStatus := child.Status
-		child.mu.Unlock()
-		if childStatus == StatusRunning {
-			_ = m.Stop(child.ID)
-		}
-	}
+	m.stopRunningChildren(s.ID)
 
 	m.logger.Info("session exited", "id", s.ID, "exitCode", s.ExitCode)
 

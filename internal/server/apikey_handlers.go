@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -224,6 +224,6 @@ func fetchGeminiEmbeddingModels(ctx context.Context, apiKey string) ([]string, e
 		}
 	}
 
-	sort.Strings(models)
+	slices.Sort(models)
 	return models, nil
 }

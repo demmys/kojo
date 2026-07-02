@@ -19,7 +19,9 @@ import (
 // agents importer running first because group members are FK-validated.
 type groupdmsImporter struct{}
 
-func (groupdmsImporter) Domain() string { return "groupdms" }
+const groupdmsDomain = "groupdms"
+
+func (groupdmsImporter) Domain() string { return groupdmsDomain }
 
 // v0Group decodes one entry in v0's groupdms/groups.json.
 type v0Group struct {
@@ -53,63 +55,57 @@ type v0GroupMessage struct {
 }
 
 func (groupdmsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "groupdms"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "groupdms")
-
-	srcPaths, err := collectGroupDMsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum groupdms sources: %w", err)
-	}
-
-	manifest, err := readV0(opts.V0Dir, filepath.Join(groupsDir(opts.V0Dir), "groups.json"))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return markImported(ctx, st, "groupdms", 0, checksum)
+	return runDomain(ctx, st, groupdmsDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectGroupDMsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		return fmt.Errorf("read groups.json: %w", err)
-	}
-
-	var groups []v0Group
-	if err := json.Unmarshal(manifest, &groups); err != nil {
-		return fmt.Errorf("decode groups.json: %w", err)
-	}
-
-	// Pre-build a set of live agent ids so we can drop members that
-	// reference agents that disappeared from agents.json — InsertGroupDM
-	// rejects unknown member ids and we'd otherwise abort the entire
-	// import on a single stale row. A ListAgents error is fatal: we'd
-	// otherwise mark every member dead and silently strand transcripts.
-	as, err := st.ListAgents(ctx)
-	if err != nil {
-		return fmt.Errorf("list agents: %w", err)
-	}
-	liveAgents := make(map[string]bool, len(as))
-	for _, a := range as {
-		liveAgents[a.ID] = true
-	}
-
-	count := 0
-	for i := range groups {
-		g := &groups[i]
-		if g.ID == "" || g.Name == "" {
-			logger.Warn("skipping group: missing id or name", "id", g.ID)
-			continue
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum groupdms sources: %w", err)
 		}
-		if err := importOneGroup(ctx, st, opts.V0Dir, g, liveAgents, logger); err != nil {
-			return fmt.Errorf("group %s: %w", g.ID, err)
+
+		manifest, err := readV0(opts.V0Dir, filepath.Join(groupsDir(opts.V0Dir), "groups.json"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, checksum, nil
+			}
+			return 0, "", fmt.Errorf("read groups.json: %w", err)
 		}
-		count++
-	}
-	return markImported(ctx, st, "groupdms", count, checksum)
+
+		var groups []v0Group
+		if err := json.Unmarshal(manifest, &groups); err != nil {
+			return 0, "", fmt.Errorf("decode groups.json: %w", err)
+		}
+
+		// Pre-build a set of live agent ids so we can drop members that
+		// reference agents that disappeared from agents.json — InsertGroupDM
+		// rejects unknown member ids and we'd otherwise abort the entire
+		// import on a single stale row. A ListAgents error is fatal: we'd
+		// otherwise mark every member dead and silently strand transcripts.
+		as, err := st.ListAgents(ctx)
+		if err != nil {
+			return 0, "", fmt.Errorf("list agents: %w", err)
+		}
+		liveAgents := make(map[string]bool, len(as))
+		for _, a := range as {
+			liveAgents[a.ID] = true
+		}
+
+		count := 0
+		for i := range groups {
+			g := &groups[i]
+			if g.ID == "" || g.Name == "" {
+				logger.Warn("skipping group: missing id or name", "id", g.ID)
+				continue
+			}
+			if err := importOneGroup(ctx, st, opts.V0Dir, g, liveAgents, logger); err != nil {
+				return 0, "", fmt.Errorf("group %s: %w", g.ID, err)
+			}
+			count++
+		}
+		return count, checksum, nil
+	})
 }
 
 func importOneGroup(ctx context.Context, st *store.Store, v0Dir string, g *v0Group, liveAgents map[string]bool, logger *slog.Logger) error {
@@ -285,21 +281,5 @@ func groupMembers(ctx context.Context, st *store.Store, groupID string) (map[str
 // NOT NULL) because the importer's idempotency contract is "do nothing
 // when the id has been seen", regardless of subsequent soft-deletes.
 func loadExistingGroupMessageIDs(ctx context.Context, st *store.Store, groupID string) (map[string]bool, error) {
-	rows, err := st.DB().QueryContext(ctx,
-		`SELECT id FROM groupdm_messages WHERE groupdm_id = ?`, groupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out[id] = true
-	}
-	return out, rows.Err()
+	return loadIDSet(ctx, st, `SELECT id FROM groupdm_messages WHERE groupdm_id = ?`, groupID)
 }
-
-

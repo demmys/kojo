@@ -248,15 +248,10 @@ func (s *Store) AppendMessage(ctx context.Context, rec *MessageRecord, opts Mess
 
 	seq := opts.Seq
 	if seq == 0 {
-		var maxSeq sql.NullInt64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT MAX(seq) FROM agent_messages WHERE agent_id = ?`, rec.AgentID,
-		).Scan(&maxSeq); err != nil {
-			return nil, err
-		}
-		seq = 1
-		if maxSeq.Valid {
-			seq = maxSeq.Int64 + 1
+		var serr error
+		seq, serr = nextAgentSeqTx(ctx, tx, "agent_messages", rec.AgentID)
+		if serr != nil {
+			return nil, serr
 		}
 	}
 
@@ -389,15 +384,9 @@ func (s *Store) BulkAppendMessages(ctx context.Context, agentID string, recs []*
 	// MAX(seq) once per batch, not once per row. The transaction holds the
 	// writer lock so no concurrent appender can interleave between the
 	// allocation here and the inserts below.
-	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT MAX(seq) FROM agent_messages WHERE agent_id = ?`, agentID,
-	).Scan(&maxSeq); err != nil {
+	nextSeq, err := nextAgentSeqTx(ctx, tx, "agent_messages", agentID)
+	if err != nil {
 		return 0, err
-	}
-	nextSeq := int64(1)
-	if maxSeq.Valid {
-		nextSeq = maxSeq.Int64 + 1
 	}
 
 	stmt, err := tx.PrepareContext(ctx, insertMessageSQL)
@@ -882,24 +871,9 @@ func (s *Store) TruncateMessagesAfterSeq(ctx context.Context, agentID string, af
 	rows.Close()
 
 	now := NowMillis()
-	var n int64
-	for _, rec := range targets {
-		rec.Version++
-		rec.UpdatedAt = now
-		rec.DeletedAt = &now
-		newETag, err := computeMessageETag(rec)
-		if err != nil {
-			return n, err
-		}
-		res, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID)
-		if err != nil {
-			return n, err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return n, err
-		}
-		n += affected
+	n, err := tombstoneMessages(ctx, tx, targets, now)
+	if err != nil {
+		return n, err
 	}
 	if err := tx.Commit(); err != nil {
 		return n, err
@@ -948,24 +922,9 @@ func (s *Store) TruncateMessagesFromCreatedAt(ctx context.Context, agentID strin
 	rows.Close()
 
 	now := NowMillis()
-	var n int64
-	for _, rec := range targets {
-		rec.Version++
-		rec.UpdatedAt = now
-		rec.DeletedAt = &now
-		newETag, err := computeMessageETag(rec)
-		if err != nil {
-			return n, err
-		}
-		res, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID)
-		if err != nil {
-			return n, err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return n, err
-		}
-		n += affected
+	n, err := tombstoneMessages(ctx, tx, targets, now)
+	if err != nil {
+		return n, err
 	}
 	if err := tx.Commit(); err != nil {
 		return n, err
@@ -1154,6 +1113,35 @@ func (s *Store) TruncateForRegenerate(ctx context.Context, agentID, pivotID, piv
 	return tx.Commit()
 }
 
+// tombstoneMessages soft-deletes each target row: bumps version, stamps
+// updated_at/deleted_at = now, recomputes the message etag, and issues the
+// tombstone UPDATE, returning the total rows affected. Shared by
+// TruncateMessagesAfterSeq and TruncateMessagesFromCreatedAt, whose loop
+// bodies are byte-identical. (TruncateForRegenerate keeps its own loop: it
+// discards the affected-row count and returns a bare error.)
+func tombstoneMessages(ctx context.Context, tx *sql.Tx, targets []*MessageRecord, now int64) (int64, error) {
+	var n int64
+	for _, rec := range targets {
+		rec.Version++
+		rec.UpdatedAt = now
+		rec.DeletedAt = &now
+		newETag, err := computeMessageETag(rec)
+		if err != nil {
+			return n, err
+		}
+		res, err := tx.ExecContext(ctx, messageTombstoneUpdate, now, now, rec.Version, newETag, rec.ID)
+		if err != nil {
+			return n, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return n, err
+		}
+		n += affected
+	}
+	return n, nil
+}
+
 func scanMessageRow(r rowScanner) (*MessageRecord, error) {
 	var (
 		rec         MessageRecord
@@ -1199,11 +1187,4 @@ func nullJSON(b json.RawMessage) (json.RawMessage, error) {
 		return nil, errors.New("store: invalid JSON payload")
 	}
 	return b, nil
-}
-
-func nullableRaw(b json.RawMessage) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return []byte(b)
 }

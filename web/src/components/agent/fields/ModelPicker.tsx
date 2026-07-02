@@ -1,0 +1,55 @@
+import { effortLevelsForModel, type EffortLevel } from "../../../lib/toolModels";
+
+/**
+ * The "Model" field: a <select> when the backend has a known model list,
+ * otherwise a free-text <input>. Changing the model resets effort when the
+ * new model no longer supports the current effort level. `models` is the
+ * caller-resolved list (backend whitelist or fetched custom models).
+ */
+export function ModelPicker({
+  model,
+  setModel,
+  effort,
+  setEffort,
+  models,
+}: {
+  model: string;
+  setModel: (m: string) => void;
+  effort: EffortLevel | "";
+  setEffort: (e: EffortLevel | "") => void;
+  models: string[];
+}) {
+  const onChange = (m: string) => {
+    setModel(m);
+    if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
+  };
+  return (
+    <div>
+      <label className="block text-sm text-neutral-400 mb-2">Model</label>
+      {models.length > 0 ? (
+        <select
+          value={model}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+        >
+          {model && !models.includes(model) && (
+            <option value={model}>{model}</option>
+          )}
+          {models.map((m) => (
+            <option key={m} value={m}>
+              {m}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          type="text"
+          value={model}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="model name"
+          className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
+        />
+      )}
+    </div>
+  );
+}

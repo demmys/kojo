@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"mime"
@@ -150,16 +151,16 @@ type Server struct {
 	// (the same handle session.Manager gets) so the persistence
 	// path doesn't depend on an agent.Manager — tests can wire a
 	// bare *store.Store without spinning up a Manager.
-	pendingSyncDB   *store.Store
-	logger          *slog.Logger
-	mux             *http.ServeMux
-	httpSrv         *http.Server // public (Owner-trusted) listener
-	authSrv         *http.Server // agent-facing auth-required listener (lazy, loopback)
-	authTsnetSrv    *http.Server // peer-mode primary listener (lazy, tsnet+auth+tailnet identity)
-	authMu          sync.Mutex
-	devMode         bool
-	version         string
-	idempSweepOnce  sync.Once // guards StartIdempotencySweep
+	pendingSyncDB  *store.Store
+	logger         *slog.Logger
+	mux            *http.ServeMux
+	httpSrv        *http.Server // public (Owner-trusted) listener
+	authSrv        *http.Server // agent-facing auth-required listener (lazy, loopback)
+	authTsnetSrv   *http.Server // peer-mode primary listener (lazy, tsnet+auth+tailnet identity)
+	authMu         sync.Mutex
+	devMode        bool
+	version        string
+	idempSweepOnce sync.Once // guards StartIdempotencySweep
 	// nodeKeyResolver maps an HTTP request's RemoteAddr to the
 	// calling node's Tailscale NodeKey. cmd/kojo wires this from
 	// tsnet.LocalClient.WhoIs AFTER server.New returns — tsnet
@@ -322,24 +323,24 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
-		sessions:        sessMgr,
-		agents:          cfg.AgentManager,
-		groupdms:        cfg.GroupDMManager,
-		files:           filebrowser.New(logger),
-		git:             gitpkg.New(logger),
-		notify:          cfg.NotifyManager,
-		blob:            cfg.BlobStore,
-		blobMaxPutBytes: cfg.MaxBlobPutBytes,
-		events:          cfg.EventBus,
-		peerID:          cfg.PeerIdentity,
-		peerEvents:      cfg.PeerEvents,
-		peerPresence:    cfg.PeerPresence,
-		requireIfMatch:  cfg.RequireIfMatch,
-		pendingSyncKEK:  cfg.PendingSyncKEK,
-		pendingSyncDB:   cfg.Store,
-		logger:          logger,
-		devMode:         cfg.DevMode,
-		version:         cfg.Version,
+		sessions:             sessMgr,
+		agents:               cfg.AgentManager,
+		groupdms:             cfg.GroupDMManager,
+		files:                filebrowser.New(logger),
+		git:                  gitpkg.New(),
+		notify:               cfg.NotifyManager,
+		blob:                 cfg.BlobStore,
+		blobMaxPutBytes:      cfg.MaxBlobPutBytes,
+		events:               cfg.EventBus,
+		peerID:               cfg.PeerIdentity,
+		peerEvents:           cfg.PeerEvents,
+		peerPresence:         cfg.PeerPresence,
+		requireIfMatch:       cfg.RequireIfMatch,
+		pendingSyncKEK:       cfg.PendingSyncKEK,
+		pendingSyncDB:        cfg.Store,
+		logger:               logger,
+		devMode:              cfg.DevMode,
+		version:              cfg.Version,
 		unsafePeer:           cfg.Unsafe,
 		thumbPurgeDone:       make(chan struct{}),
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
@@ -1147,7 +1148,7 @@ func (s *Server) sealPendingSync(agentID, opID string, entry pendingSyncEntry) (
 // pair as a decryption failure.
 func (s *Server) openPendingSync(agentID, opID string, sealed []byte) (pendingSyncEntry, error) {
 	if len(s.pendingSyncKEK) == 0 {
-		return pendingSyncEntry{}, fmt.Errorf("openPendingSync: no KEK configured")
+		return pendingSyncEntry{}, errors.New("openPendingSync: no KEK configured")
 	}
 	plain, err := secretcrypto.Open(s.pendingSyncKEK, sealed, pendingAgentSyncAAD(agentID, opID))
 	if err != nil {
@@ -1237,7 +1238,7 @@ func (s *Server) consumePendingAgentSync(ctx context.Context, agentID, opID stri
 		return pendingSyncEntry{}, false, fmt.Errorf("consumePendingAgentSync: get kv: %w", err)
 	}
 	if !rec.Secret || len(rec.ValueEncrypted) == 0 {
-		return pendingSyncEntry{}, false, fmt.Errorf("consumePendingAgentSync: kv row not encrypted (db hand-edited?)")
+		return pendingSyncEntry{}, false, errors.New("consumePendingAgentSync: kv row not encrypted (db hand-edited?)")
 	}
 	// Defensive shape check — writes always set binary + machine.
 	// A row with a different type or scope is corruption or a
@@ -1467,7 +1468,66 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func writeJSONResponse(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		// The status line and headers are already committed, so the
+		// only recourse for a mid-body encode/write failure (client
+		// hang-up, broken pipe) is to surface it in the logs. The
+		// wire response stays exactly as before on the success path.
+		slog.Default().Error("writeJSONResponse: encode failed", "status", status, "err", err)
+	}
+}
+
+// requireAgentStore enforces the shared "agent store must be wired in"
+// precondition. On a missing manager/store it writes 503 with msg (the
+// per-site wording is kept via the parameter so no call site's error
+// body changes) and returns ok=false; callers must return immediately.
+// On success it hands back the live store so the caller can skip a
+// redundant s.agents.Store() lookup.
+func (s *Server) requireAgentStore(w http.ResponseWriter, msg string) (*store.Store, bool) {
+	if s.agents == nil || s.agents.Store() == nil {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", msg)
+		return nil, false
+	}
+	return s.agents.Store(), true
+}
+
+// copyResponseHeaders echoes the named headers from an upstream proxy
+// response (src) onto the client-facing response (dst), skipping any
+// that are empty on the source. Callers pass the per-endpoint header
+// allow-list so each surface keeps its exact set.
+func copyResponseHeaders(dst, src http.Header, keys ...string) {
+	for _, k := range keys {
+		if v := src.Get(k); v != "" {
+			dst.Set(k, v)
+		}
+	}
+}
+
+// readCappedJSON reads r.Body under a MaxBytesReader(capBytes) and
+// unmarshals it into dst. On an over-cap body it writes 413 with
+// tooLargeMsg; on any other read error it writes 400 "invalid request
+// body"; on a JSON parse failure it writes 400 with invalidJSONMsg.
+// MaxBytesReader (not io.LimitReader) is used so an oversized upload
+// fails loudly at 413 instead of silently truncating to a valid JSON
+// prefix. Returns true only when dst was populated; on false the
+// caller must return without writing further.
+func readCappedJSON(w http.ResponseWriter, r *http.Request, capBytes int64, tooLargeMsg, invalidJSONMsg string, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, capBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", tooLargeMsg)
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return false
+	}
+	if err := json.Unmarshal(body, dst); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", invalidJSONMsg)
+		return false
+	}
+	return true
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

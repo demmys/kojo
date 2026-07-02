@@ -20,6 +20,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"embed"
@@ -28,7 +29,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -346,7 +347,7 @@ func (s *Store) applyMigrations(ctx context.Context) error {
 		}
 		files = append(files, migrationFile{version: v, name: name, body: string(body)})
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].version < files[j].version })
+	slices.SortFunc(files, func(a, b migrationFile) int { return cmp.Compare(a.version, b.version) })
 
 	current, err := s.SchemaVersion(ctx)
 	if err != nil {

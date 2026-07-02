@@ -51,7 +51,9 @@ import (
 // uninstallable rows.
 type pushSubscriptionsImporter struct{}
 
-func (pushSubscriptionsImporter) Domain() string { return "push_subscriptions" }
+const pushSubscriptionsDomain = "push_subscriptions"
+
+func (pushSubscriptionsImporter) Domain() string { return pushSubscriptionsDomain }
 
 // v0WebpushSubscription mirrors webpush-go's wire shape exactly. The v0
 // notify.Manager dropped any row missing endpoint/auth/p256dh on load
@@ -71,120 +73,114 @@ type v0VAPIDKeys struct {
 }
 
 func (pushSubscriptionsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "push_subscriptions"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "push_subscriptions")
-
-	srcPaths, err := collectPushSubscriptionsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum push_subscriptions sources: %w", err)
-	}
-
-	subPath := filepath.Join(opts.V0Dir, "push_subscriptions.json")
-	data, err := readV0(opts.V0Dir, subPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return markImported(ctx, st, "push_subscriptions", 0, checksum)
+	return runDomain(ctx, st, pushSubscriptionsDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectPushSubscriptionsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		return err
-	}
-	if len(data) == 0 {
-		return markImported(ctx, st, "push_subscriptions", 0, checksum)
-	}
-
-	var subs []v0WebpushSubscription
-	if err := json.Unmarshal(data, &subs); err != nil {
-		// Malformed file: log and mark imported with 0 rows so a re-run
-		// doesn't repeatedly fail on the same parse. Matches the posture
-		// in the sessions importer — a corrupt v0 file is signalled in
-		// the migration log but doesn't block the rest of the migration.
-		// Subscriptions are recoverable by re-permitting the browser on
-		// first v1 boot.
-		logger.Warn("push_subscriptions: skipping malformed file",
-			"path", subPath, "err", err)
-		return markImported(ctx, st, "push_subscriptions", 0, checksum)
-	}
-	if len(subs) == 0 {
-		return markImported(ctx, st, "push_subscriptions", 0, checksum)
-	}
-
-	mtime := fileMTimeMillis(subPath)
-	// Filter the v0 entries first; we need to know whether any survive
-	// the malformed-entry skip BEFORE deciding to require vapid.json.
-	// A push_subscriptions.json full of garbage (every row missing at
-	// least one of endpoint / auth / p256dh) is recoverable on the
-	// browser side (re-permit re-creates the row), and demanding a
-	// well-formed vapid.json in that case would block migration on a
-	// dataset with nothing to actually migrate. v0's load-time cleanup
-	// (webpush.go:213-220) applies the same filter, so what we drop
-	// here is precisely what v0 itself ignored at boot.
-	staged := make([]v0WebpushSubscription, 0, len(subs))
-	skipped := 0
-	for i, s := range subs {
-		if s.Endpoint == "" || s.Keys.Auth == "" || s.Keys.P256dh == "" {
-			logger.Warn("push_subscriptions: skipping malformed entry",
-				"index", i,
-				"has_endpoint", s.Endpoint != "",
-				"has_auth", s.Keys.Auth != "",
-				"has_p256dh", s.Keys.P256dh != "")
-			skipped++
-			continue
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum push_subscriptions sources: %w", err)
 		}
-		staged = append(staged, s)
-	}
-	if len(staged) == 0 {
+
+		subPath := filepath.Join(opts.V0Dir, "push_subscriptions.json")
+		data, err := readV0(opts.V0Dir, subPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, checksum, nil
+			}
+			return 0, "", err
+		}
+		if len(data) == 0 {
+			return 0, checksum, nil
+		}
+
+		var subs []v0WebpushSubscription
+		if err := json.Unmarshal(data, &subs); err != nil {
+			// Malformed file: log and mark imported with 0 rows so a re-run
+			// doesn't repeatedly fail on the same parse. Matches the posture
+			// in the sessions importer — a corrupt v0 file is signalled in
+			// the migration log but doesn't block the rest of the migration.
+			// Subscriptions are recoverable by re-permitting the browser on
+			// first v1 boot.
+			logger.Warn("push_subscriptions: skipping malformed file",
+				"path", subPath, "err", err)
+			return 0, checksum, nil
+		}
+		if len(subs) == 0 {
+			return 0, checksum, nil
+		}
+
+		mtime := fileMTimeMillis(subPath)
+		// Filter the v0 entries first; we need to know whether any survive
+		// the malformed-entry skip BEFORE deciding to require vapid.json.
+		// A push_subscriptions.json full of garbage (every row missing at
+		// least one of endpoint / auth / p256dh) is recoverable on the
+		// browser side (re-permit re-creates the row), and demanding a
+		// well-formed vapid.json in that case would block migration on a
+		// dataset with nothing to actually migrate. v0's load-time cleanup
+		// (webpush.go:213-220) applies the same filter, so what we drop
+		// here is precisely what v0 itself ignored at boot.
+		staged := make([]v0WebpushSubscription, 0, len(subs))
+		skipped := 0
+		for i, s := range subs {
+			if s.Endpoint == "" || s.Keys.Auth == "" || s.Keys.P256dh == "" {
+				logger.Warn("push_subscriptions: skipping malformed entry",
+					"index", i,
+					"has_endpoint", s.Endpoint != "",
+					"has_auth", s.Keys.Auth != "",
+					"has_p256dh", s.Keys.P256dh != "")
+				skipped++
+				continue
+			}
+			staged = append(staged, s)
+		}
+		if len(staged) == 0 {
+			if skipped > 0 {
+				logger.Info("push_subscriptions: all rows skipped (malformed)",
+					"skipped", skipped)
+			}
+			return 0, checksum, nil
+		}
+
+		// Resolve VAPID public key from v0/vapid.json. Fatal on miss because
+		// the column is NOT NULL and no other v0 source carries it (the
+		// v0 webpush.Subscription struct does not include the originating
+		// public key — it's a server-side concern). Only consulted when at
+		// least one v0 row survived the malformed filter, so a deployment
+		// that legitimately has no subscriptions can migrate without ever
+		// having booted v0's VAPID generator.
+		pub, err := loadVAPIDPublicKey(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("load vapid public key: %w", err)
+		}
+
+		recs := make([]*store.PushSubscriptionRecord, 0, len(staged))
+		for _, s := range staged {
+			recs = append(recs, &store.PushSubscriptionRecord{
+				Endpoint:       s.Endpoint,
+				VAPIDPublicKey: pub,
+				P256dh:         s.Keys.P256dh,
+				Auth:           s.Keys.Auth,
+				// DeviceID / UserAgent stay nil: v0 never recorded them.
+				// ExpiredAt stays nil: v0 dropped expired rows from the file
+				// rather than tombstoning, so anything still present is
+				// considered active for migration purposes.
+				CreatedAt: mtime,
+				UpdatedAt: mtime,
+			})
+		}
+
+		n, err := st.BulkInsertPushSubscriptions(ctx, recs, store.PushSubscriptionInsertOptions{})
+		if err != nil {
+			return 0, "", fmt.Errorf("bulk insert push_subscriptions: %w", err)
+		}
 		if skipped > 0 {
-			logger.Info("push_subscriptions: all rows skipped (malformed)",
-				"skipped", skipped)
+			logger.Info("push_subscriptions: import complete with skips",
+				"inserted", n, "skipped", skipped)
 		}
-		return markImported(ctx, st, "push_subscriptions", 0, checksum)
-	}
-
-	// Resolve VAPID public key from v0/vapid.json. Fatal on miss because
-	// the column is NOT NULL and no other v0 source carries it (the
-	// v0 webpush.Subscription struct does not include the originating
-	// public key — it's a server-side concern). Only consulted when at
-	// least one v0 row survived the malformed filter, so a deployment
-	// that legitimately has no subscriptions can migrate without ever
-	// having booted v0's VAPID generator.
-	pub, err := loadVAPIDPublicKey(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("load vapid public key: %w", err)
-	}
-
-	recs := make([]*store.PushSubscriptionRecord, 0, len(staged))
-	for _, s := range staged {
-		recs = append(recs, &store.PushSubscriptionRecord{
-			Endpoint:       s.Endpoint,
-			VAPIDPublicKey: pub,
-			P256dh:         s.Keys.P256dh,
-			Auth:           s.Keys.Auth,
-			// DeviceID / UserAgent stay nil: v0 never recorded them.
-			// ExpiredAt stays nil: v0 dropped expired rows from the file
-			// rather than tombstoning, so anything still present is
-			// considered active for migration purposes.
-			CreatedAt: mtime,
-			UpdatedAt: mtime,
-		})
-	}
-
-	n, err := st.BulkInsertPushSubscriptions(ctx, recs, store.PushSubscriptionInsertOptions{})
-	if err != nil {
-		return fmt.Errorf("bulk insert push_subscriptions: %w", err)
-	}
-	if skipped > 0 {
-		logger.Info("push_subscriptions: import complete with skips",
-			"inserted", n, "skipped", skipped)
-	}
-	return markImported(ctx, st, "push_subscriptions", n, checksum)
+		return n, checksum, nil
+	})
 }
 
 // loadVAPIDPublicKey reads <v0>/vapid.json and returns the publicKey.
@@ -207,19 +203,19 @@ func loadVAPIDPublicKey(v0Dir string) (string, error) {
 	data, err := readV0(v0Dir, path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("vapid.json missing — push_subscriptions cannot migrate without it")
+			return "", errors.New("vapid.json missing — push_subscriptions cannot migrate without it")
 		}
 		return "", err
 	}
 	if len(data) == 0 {
-		return "", fmt.Errorf("vapid.json is empty")
+		return "", errors.New("vapid.json is empty")
 	}
 	var keys v0VAPIDKeys
 	if err := json.Unmarshal(data, &keys); err != nil {
 		return "", fmt.Errorf("vapid.json malformed: %w", err)
 	}
 	if keys.PublicKey == "" {
-		return "", fmt.Errorf("vapid.json has empty publicKey")
+		return "", errors.New("vapid.json has empty publicKey")
 	}
 	return keys.PublicKey, nil
 }

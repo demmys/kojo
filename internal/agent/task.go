@@ -209,6 +209,24 @@ func (m *Manager) GetTask(ctx context.Context, agentID, taskID string) (*Task, e
 	return recordToTask(rec), nil
 }
 
+// requireOwnedTask fetches taskID and verifies it belongs to agentID. A
+// missing task and one owned by a different agent both surface as
+// ErrTaskNotFound so we don't leak the existence of tasks under other
+// agents (probe-protection).
+func (m *Manager) requireOwnedTask(ctx context.Context, agentID, taskID string) error {
+	cur, err := m.store.Store().GetAgentTask(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrTaskNotFound
+		}
+		return err
+	}
+	if cur.AgentID != agentID {
+		return ErrTaskNotFound
+	}
+	return nil
+}
+
 // UpdateTask updates a task by id. ifMatchETag is the strong etag from
 // the client's If-Match header; pass "" for unconditional update.
 //
@@ -230,15 +248,8 @@ func (m *Manager) UpdateTask(ctx context.Context, agentID, taskID, ifMatchETag s
 	// belongs to a different agent must not be patched by us, and
 	// surfacing the wrong-owner case as a generic ErrTaskNotFound
 	// avoids leaking the existence of tasks under other agents.
-	cur, err := m.store.Store().GetAgentTask(ctx, taskID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, ErrTaskNotFound
-		}
+	if err := m.requireOwnedTask(ctx, agentID, taskID); err != nil {
 		return nil, err
-	}
-	if cur.AgentID != agentID {
-		return nil, ErrTaskNotFound
 	}
 
 	patch := store.AgentTaskPatch{}
@@ -286,15 +297,8 @@ func (m *Manager) DeleteTask(ctx context.Context, agentID, taskID, ifMatchETag s
 	if err := m.requireLiveAgent(agentID); err != nil {
 		return err
 	}
-	cur, err := m.store.Store().GetAgentTask(ctx, taskID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return ErrTaskNotFound
-		}
+	if err := m.requireOwnedTask(ctx, agentID, taskID); err != nil {
 		return err
-	}
-	if cur.AgentID != agentID {
-		return ErrTaskNotFound
 	}
 
 	if err := m.store.Store().SoftDeleteAgentTask(ctx, taskID, ifMatchETag); err != nil {

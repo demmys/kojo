@@ -2,11 +2,8 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -76,13 +73,12 @@ func hydrateAgentDirFromBlobs(ctx context.Context, st *store.Store, bs *blob.Sto
 				continue
 			}
 			// blob_refs.uri is built via blob.BuildURI which percent-
-			// encodes each path segment (spaces → %20, '#' → %23,
-			// non-ASCII NFC bytes, etc). The blob layer's Get and
-			// the on-disk hydrate target both expect the DECODED
-			// form. Decode segment-by-segment so a literal `/` in
-			// the encoded form still separates segments correctly.
-			rel, derr := decodeURISegments(encoded)
-			if derr != nil {
+			// encodes each path segment. CWD hydration is now handled
+			// by the typed memory/workspace reconcilers, not by the
+			// generic blob store, so we no longer materialize the blob
+			// into the CWD — we only validate the encoding so a
+			// malformed row still surfaces as an error.
+			if _, derr := decodeURISegments(encoded); derr != nil {
 				if logger != nil {
 					logger.Warn("hydrate blobs: invalid percent-encoded URI",
 						"agent", agentID, "uri", ref.URI, "err", derr)
@@ -91,36 +87,6 @@ func hydrateAgentDirFromBlobs(ctx context.Context, st *store.Store, bs *blob.Sto
 					firstErr = derr
 				}
 				continue
-			}
-			if skipBlobHydrate(rel) {
-				continue
-			}
-			target := filepath.Join(dir, filepath.FromSlash(rel))
-			if matched, err := diskMatchesSHA(target, ref.SHA256); err != nil {
-				if logger != nil {
-					logger.Warn("hydrate blobs: stat target failed",
-						"agent", agentID, "uri", ref.URI, "err", err)
-				}
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			} else if matched {
-				continue
-			}
-			if err := hydrateOneBlob(bs, s.scope, "agents/"+agentID+"/"+rel, target, ref.SHA256); err != nil {
-				if logger != nil {
-					logger.Warn("hydrate blobs: copy failed",
-						"agent", agentID, "uri", ref.URI, "err", err)
-				}
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			if logger != nil {
-				logger.Debug("hydrate blobs: materialized",
-					"agent", agentID, "uri", ref.URI, "size", ref.Size)
 			}
 		}
 	}
@@ -143,14 +109,6 @@ func decodeURISegments(encoded string) (string, error) {
 		parts[i] = dec
 	}
 	return strings.Join(parts, "/"), nil
-}
-
-// skipBlobHydrate reports whether a (scope, agents/<id>/<rel>) blob
-// should be skipped on the hydrate path. The answer is deliberately
-// yes for every blob_refs row: CWD hydration is now handled by the
-// typed memory/workspace reconcilers, not by the generic blob store.
-func skipBlobHydrate(rel string) bool {
-	return true
 }
 
 func cleanupHydratedAttachDir(dir, agentID string, logger *slog.Logger) {
@@ -180,94 +138,6 @@ func cleanupHydratedAttachDir(dir, agentID string, logger *slog.Logger) {
 		logger.Warn("hydrate blobs: remove legacy attach dir failed",
 			"agent", agentID, "path", p, "err", err)
 	}
-}
-
-// diskMatchesSHA returns true iff a regular file at path exists and
-// its sha256 hex equals expected. A non-existent file returns
-// (false, nil) so the caller proceeds to write. Any other error
-// (permission, mid-walk dir-where-file-expected) propagates so the
-// caller can log and skip rather than overwriting.
-func diskMatchesSHA(path, expected string) (bool, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	}
-	if !st.Mode().IsRegular() {
-		return false, fmt.Errorf("hydrate target %s: not a regular file", path)
-	}
-	if expected == "" {
-		// No expected sha; treat any existing file as matching to
-		// avoid pointless rewrites. Old blob_refs rows minted
-		// before sha was tracked could land here.
-		return true, nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return false, err
-	}
-	return hex.EncodeToString(h.Sum(nil)) == expected, nil
-}
-
-// hydrateOneBlob streams the blob at (scope, logicalPath) into
-// target, verifying the on-the-wire body's sha256 matches expected
-// and using a tmp+rename so a concurrent reader (the CLI process)
-// never observes a half-written file.
-func hydrateOneBlob(bs *blob.Store, scope blob.Scope, logicalPath, target, expectedSHA string) error {
-	rc, _, err := bs.Get(scope, logicalPath)
-	if err != nil {
-		return fmt.Errorf("blob.Get %s: %w", logicalPath, err)
-	}
-	defer rc.Close()
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("ensure dir %s: %w", filepath.Dir(target), err)
-	}
-	// Streaming verify-and-write: hash as we write to the tmp file
-	// so we don't need to buffer the whole body in memory. atomicfile
-	// can't be used directly because it takes []byte; replicate its
-	// CreateTemp+Rename pattern with the streamed reader.
-	dir := filepath.Dir(target)
-	base := filepath.Base(target)
-	f, err := os.CreateTemp(dir, base+".*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := f.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			os.Remove(tmpPath)
-		}
-	}()
-	h := sha256.New()
-	w := io.MultiWriter(f, h)
-	if _, err := io.Copy(w, rc); err != nil {
-		f.Close()
-		return fmt.Errorf("copy %s: %w", logicalPath, err)
-	}
-	if err := f.Chmod(0o644); err != nil {
-		f.Close()
-		return fmt.Errorf("chmod: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	got := hex.EncodeToString(h.Sum(nil))
-	if expectedSHA != "" && got != expectedSHA {
-		return fmt.Errorf("sha256 mismatch for %s: got %s want %s", logicalPath, got, expectedSHA)
-	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return fmt.Errorf("rename: %w", err)
-	}
-	cleanup = false
-	return nil
 }
 
 // hydrateAgentBlobsAtLoad runs hydrateAgentDirFromBlobs with a fresh

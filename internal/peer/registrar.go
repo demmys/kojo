@@ -44,10 +44,10 @@ type Registrar struct {
 	// where a slow retry goroutine still calls RefreshPublicName
 	// after Stop has emitted the final offline-touch — without it
 	// the post-Stop refresh would flip the row back to online.
-	publicMu     sync.RWMutex
-	publicURL    string
-	selfNodeKey  string
-	stopped      bool
+	publicMu    sync.RWMutex
+	publicURL   string
+	selfNodeKey string
+	stopped     bool
 
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -173,11 +173,7 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("peer.Registrar.RefreshPublicName: upsert: %w", err)
 	}
-	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: url,
-		Status: store.PeerStatusOnline, LastSeen: nowMs,
-		Op: StatusOpUpsert,
-	})
+	r.publishStatus(r.selfStatusEvent(url, store.PeerStatusOnline, nowMs, StatusOpUpsert))
 	if r.logger != nil {
 		r.logger.Info("peer self-row refreshed with public URL",
 			"device_id", r.id.DeviceID, "name", rec.Name, "url", rec.URL)
@@ -214,19 +210,15 @@ func (r *Registrar) Start(ctx context.Context) error {
 	}
 	nowMs := store.NowMillis()
 	if _, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
-		DeviceID:  r.id.DeviceID,
-		Name:      r.id.Name,
-		URL:       r.selfURL(),
-		LastSeen:  nowMs,
-		Status:    store.PeerStatusOnline,
+		DeviceID: r.id.DeviceID,
+		Name:     r.id.Name,
+		URL:      r.selfURL(),
+		LastSeen: nowMs,
+		Status:   store.PeerStatusOnline,
 	}); err != nil {
 		return fmt.Errorf("peer.Registrar.Start: upsert: %w", err)
 	}
-	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
-		Status: store.PeerStatusOnline, LastSeen: nowMs,
-		Op: StatusOpUpsert,
-	})
+	r.publishStatus(r.selfStatusEvent(r.selfURL(), store.PeerStatusOnline, nowMs, StatusOpUpsert))
 	if r.logger != nil {
 		r.logger.Info("peer registered", "device_id", r.id.DeviceID, "name", r.id.Name)
 	}
@@ -251,7 +243,7 @@ func (r *Registrar) Stop() {
 		// that grabs publicMu after this point sees stopped=true
 		// and bails before its DB write. Then RELEASE the lock
 		// before wg.Wait — heartbeatLoop's tickOnce calls
-		// selfName() which takes the same lock as a reader, so
+		// selfURL() which takes the same lock as a reader, so
 		// holding through wg.Wait would deadlock.
 		r.publicMu.Lock()
 		r.stopped = true
@@ -279,11 +271,7 @@ func (r *Registrar) Stop() {
 			}
 			return
 		}
-		r.publishStatus(StatusEvent{
-			DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURLLocked(),
-			Status: store.PeerStatusOffline, LastSeen: nowMs,
-			Op: StatusOpTouch,
-		})
+		r.publishStatus(r.selfStatusEvent(r.selfURLLocked(), store.PeerStatusOffline, nowMs, StatusOpTouch))
 	})
 }
 
@@ -295,6 +283,21 @@ func (r *Registrar) publishStatus(evt StatusEvent) {
 		return
 	}
 	r.events.Publish(evt)
+}
+
+// selfStatusEvent builds the StatusEvent this Registrar publishes
+// for register / heartbeat / shutdown transitions. url is passed in
+// by the caller rather than resolved here because callers differ in
+// which accessor is safe to use at their call site: Stop already
+// holds publicMu for writing when it builds its event, so it must
+// pass the pre-locked selfURLLocked() value; other callers pass the
+// RLock-taking selfURL().
+func (r *Registrar) selfStatusEvent(url, status string, lastSeen int64, op string) StatusEvent {
+	return StatusEvent{
+		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: url,
+		Status: status, LastSeen: lastSeen,
+		Op: op,
+	}
 }
 
 func (r *Registrar) heartbeatLoop() {
@@ -331,11 +334,7 @@ func (r *Registrar) tickOnce() {
 	nowMs := store.NowMillis()
 	err := r.st.TouchPeer(ctx, r.id.DeviceID, store.PeerStatusOnline, nowMs)
 	if err == nil {
-		r.publishStatus(StatusEvent{
-			DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
-			Status: store.PeerStatusOnline, LastSeen: nowMs,
-			Op: StatusOpTouch,
-		})
+		r.publishStatus(r.selfStatusEvent(r.selfURL(), store.PeerStatusOnline, nowMs, StatusOpTouch))
 		return
 	}
 	if !errors.Is(err, store.ErrNotFound) {
@@ -351,11 +350,11 @@ func (r *Registrar) tickOnce() {
 	// reappears at full identity (public_key + name + url + caps)
 	// instead of a header-only stub.
 	if _, upErr := r.st.UpsertPeer(ctx, &store.PeerRecord{
-		DeviceID:  r.id.DeviceID,
-		Name:      r.id.Name,
-		URL:       r.selfURL(),
-		LastSeen:  nowMs,
-		Status:    store.PeerStatusOnline,
+		DeviceID: r.id.DeviceID,
+		Name:     r.id.Name,
+		URL:      r.selfURL(),
+		LastSeen: nowMs,
+		Status:   store.PeerStatusOnline,
 	}); upErr != nil {
 		if r.logger != nil {
 			r.logger.Warn("peer.Registrar: heartbeat reseed failed",
@@ -363,11 +362,7 @@ func (r *Registrar) tickOnce() {
 		}
 		return
 	}
-	r.publishStatus(StatusEvent{
-		DeviceID: r.id.DeviceID, Name: r.id.Name, URL: r.selfURL(),
-		Status: store.PeerStatusOnline, LastSeen: nowMs,
-		Op: StatusOpUpsert,
-	})
+	r.publishStatus(r.selfStatusEvent(r.selfURL(), store.PeerStatusOnline, nowMs, StatusOpUpsert))
 	if r.logger != nil {
 		r.logger.Info("peer.Registrar: self-row reseeded after disappearance",
 			"device_id", r.id.DeviceID)

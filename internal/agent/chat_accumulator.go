@@ -151,4 +151,3 @@ func (a *chatAccumulator) WaitDone(ctx context.Context) *Message {
 		return nil
 	}
 }
-

@@ -37,9 +37,9 @@ import (
 // runtime acquireCronLock to unlink it (lazy cleanup — the legacy
 // file's value is NOT migrated into the kv row, only unlinked).
 const (
-	cronLockKVNamespace   = "scheduler"
-	cronLockKVKeyPrefix   = "cron_last/"
-	cronLockKVTimeout     = 2 * time.Second
+	cronLockKVNamespace = "scheduler"
+	cronLockKVKeyPrefix = "cron_last/"
+	cronLockKVTimeout   = 2 * time.Second
 )
 
 // cronLockKVKey returns the kv key used for agentID's throttle row.

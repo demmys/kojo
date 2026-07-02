@@ -12,6 +12,7 @@ import (
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
@@ -56,16 +57,7 @@ type VAPIDStore interface {
 // kv-backed VAPID store. The legacy NewManager keeps the file-only
 // path for tests.
 func NewManagerWithVAPIDStore(logger *slog.Logger, store VAPIDStore) (*Manager, error) {
-	m := &Manager{
-		logger:        logger,
-		subscriptions: make([]*webpush.Subscription, 0),
-		vapidStore:    store,
-	}
-	if err := m.loadOrGenerateVAPID(); err != nil {
-		return nil, err
-	}
-	m.loadSubscriptions()
-	return m, nil
+	return newManager(logger, store)
 }
 
 type vapidKeys struct {
@@ -74,9 +66,16 @@ type vapidKeys struct {
 }
 
 func NewManager(logger *slog.Logger) (*Manager, error) {
+	return newManager(logger, nil)
+}
+
+// newManager builds a Manager, generating or loading the VAPID key pair and
+// reading any persisted subscriptions. store may be nil (file-only path).
+func newManager(logger *slog.Logger, store VAPIDStore) (*Manager, error) {
 	m := &Manager{
 		logger:        logger,
 		subscriptions: make([]*webpush.Subscription, 0),
+		vapidStore:    store,
 	}
 	if err := m.loadOrGenerateVAPID(); err != nil {
 		return nil, err
@@ -338,13 +337,7 @@ func (m *Manager) persistSubscriptions() {
 		m.logger.Warn("failed to marshal subscriptions", "err", err)
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := atomicfile.WriteBytes(path, data, 0o600); err != nil {
 		m.logger.Warn("failed to write push subscriptions", "err", err)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		m.logger.Warn("failed to rename push subscriptions file", "err", err)
-		_ = os.Remove(tmp)
 	}
 }

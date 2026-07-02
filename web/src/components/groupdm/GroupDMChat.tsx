@@ -9,9 +9,11 @@ import {
   DEFAULT_GROUPDM_VENUE,
   type GroupMessage,
 } from "../../lib/groupdmApi";
-import { api } from "../../lib/api";
-import type { AgentMessageAttachment } from "../../lib/agentApi";
 import { useEnterSends } from "../../lib/preferences";
+import { useFileUpload } from "../../hooks/useFileUpload";
+import { useDraftInput } from "../../hooks/useDraftInput";
+import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
+import { DismissibleError, PendingAttachments, enterToSend } from "../chatComposer";
 import { AgentAvatar } from "../agent/AgentAvatar";
 import { AttachmentList, MessageContent } from "../agent/ChatMessage";
 
@@ -47,39 +49,33 @@ export function GroupDMChat() {
   const clearDialogRef = useRef<HTMLDivElement>(null);
 
   // User input
-  const [input, setInput] = useState(() =>
-    id ? sessionStorage.getItem(`groupdm-draft:${id}`) ?? "" : "",
-  );
+  const { input, setInput, clearDraft } = useDraftInput("groupdm-draft", id);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea();
   const [enterSends] = useEnterSends();
   const pollGenerationRef = useRef(0);
 
   // File attachments — uploaded to /api/v1/blobs, attached to the user
   // message on send, then cleared on success.
-  const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const {
+    pendingFiles,
+    setPendingFiles,
+    uploading,
+    uploadError,
+    setUploadError,
+    fileInputRef,
+    handleFileSelect,
+    removePendingFile,
+  } = useFileUpload();
 
-  // Restore draft / reset textarea height when id changes
+  // Reset send-error + textarea height when id changes. The draft text
+  // itself is restored by useDraftInput.
   useEffect(() => {
-    if (!id) {
-      setInput("");
-      return;
-    }
-    const draft = sessionStorage.getItem(`groupdm-draft:${id}`) ?? "";
-    setInput(draft);
+    if (!id) return;
     setSendError(null);
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-        textareaRef.current.style.height =
-          Math.min(textareaRef.current.scrollHeight, 150) + "px";
-      }
-    });
-  }, [id]);
+    requestAnimationFrame(handleTextareaInput);
+  }, [id, handleTextareaInput]);
 
   useEffect(() => {
     if (editingName) {
@@ -196,41 +192,6 @@ export function GroupDMChat() {
     }
   }, [id, hasMore, messages]);
 
-  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    setUploading(true);
-    setUploadError(null);
-    try {
-      const results = await Promise.allSettled(
-        Array.from(files).map((file) => api.upload(file)),
-      );
-      const uploaded: AgentMessageAttachment[] = [];
-      const failed: string[] = [];
-      for (let i = 0; i < results.length; i++) {
-        const r = results[i];
-        if (r.status === "fulfilled") {
-          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime });
-        } else {
-          failed.push(Array.from(files)[i].name);
-        }
-      }
-      if (uploaded.length > 0) {
-        setPendingFiles((prev) => [...prev, ...uploaded]);
-      }
-      if (failed.length > 0) {
-        setUploadError(`Upload failed: ${failed.join(", ")}`);
-      }
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  }, []);
-
-  const removePendingFile = useCallback((index: number) => {
-    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
-  }, []);
-
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || sending || !id) return;
@@ -243,10 +204,9 @@ export function GroupDMChat() {
         pendingFiles.length > 0 ? pendingFiles : undefined,
       );
       // Clear input + draft on success
-      setInput("");
+      clearDraft();
       setPendingFiles([]);
       setUploadError(null);
-      sessionStorage.removeItem(`groupdm-draft:${id}`);
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
       }
@@ -260,27 +220,12 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [id, input, pendingFiles, sending]);
+  }, [id, input, pendingFiles, sending, clearDraft, setPendingFiles, setUploadError, textareaRef]);
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-        if (enterSends ? !e.shiftKey : e.shiftKey) {
-          e.preventDefault();
-          void handleSend();
-        }
-      }
-    },
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => enterToSend(e, enterSends, () => void handleSend()),
     [enterSends, handleSend],
   );
-
-  const handleTextareaInput = useCallback(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height =
-        Math.min(textareaRef.current.scrollHeight, 150) + "px";
-    }
-  }, []);
 
   // Conditional renders MUST live below every hook above. Moving them up
   // would change the hook count between renders (notFound flips after the
@@ -602,60 +547,9 @@ export function GroupDMChat() {
 
       {/* Input */}
       <div className="border-t border-neutral-800 px-4 py-3 shrink-0">
-        {sendError && (
-          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
-            <span className="flex-1">{sendError}</span>
-            <button
-              onClick={() => setSendError(null)}
-              className="text-red-400 hover:text-red-200"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
-              </svg>
-            </button>
-          </div>
-        )}
-        {uploadError && (
-          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
-            <span className="flex-1">{uploadError}</span>
-            <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-200">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
-              </svg>
-            </button>
-          </div>
-        )}
-        {pendingFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2">
-            {pendingFiles.map((file, i) => (
-              <div
-                key={file.path}
-                className="flex items-center gap-1.5 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded-lg text-xs text-neutral-300"
-              >
-                {file.mime.startsWith("image/") ? (
-                  <img
-                    src={api.files.rawUrl(file.path)}
-                    alt={file.name}
-                    className="w-6 h-6 rounded object-cover"
-                  />
-                ) : (
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
-                    <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
-                  </svg>
-                )}
-                <span className="max-w-[120px] truncate">{file.name}</span>
-                <button
-                  onClick={() => removePendingFile(i)}
-                  className="text-neutral-500 hover:text-neutral-300 ml-0.5"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                    <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
-                  </svg>
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+        {sendError && <DismissibleError message={sendError} onDismiss={() => setSendError(null)} />}
+        {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
+        <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb={false} />
         <div className="flex items-end gap-2">
           <input
             ref={fileInputRef}
@@ -684,10 +578,7 @@ export function GroupDMChat() {
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={(e) => {
-              setInput(e.target.value);
-              if (id) sessionStorage.setItem(`groupdm-draft:${id}`, e.target.value);
-            }}
+            onChange={(e) => setInput(e.target.value)}
             onInput={handleTextareaInput}
             onKeyDown={handleKeyDown}
             placeholder="Message the group..."

@@ -186,8 +186,8 @@ func TestModeledAgentKeys_CoversSilentHoursAndFriends(t *testing.T) {
 func TestAgentToSettings_ReservedOnlyKeysDoNotResurrect(t *testing.T) {
 	a := &Agent{ID: "ag", Name: "n"}
 	prior := map[string]any{
-		"notifySources": map[string]any{"gmail": map[string]any{"enabled": true}},
-		"NotifySources": "legacy stringified form",
+		"notifySources":   map[string]any{"gmail": map[string]any{"enabled": true}},
+		"NotifySources":   "legacy stringified form",
 		"intervalMinutes": float64(30), // legacy reserved key
 		"futureField":     "keep me",
 	}

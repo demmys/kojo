@@ -22,21 +22,23 @@ import (
 // daemon is also running.
 //
 // Output columns:
-//   device_id (8-byte prefix for compactness)
-//   name
-//   status (online/offline)
-//   last_seen (relative — "5s ago", "2m ago", "—" for never)
-//   self ("*" for the local binary's row, blank otherwise)
+//
+//	device_id (8-byte prefix for compactness)
+//	name
+//	status (online/offline)
+//	last_seen (relative — "5s ago", "2m ago", "—" for never)
+//	self ("*" for the local binary's row, blank otherwise)
 //
 // Exit codes:
-//   0 — success (even with zero rows; first-ever boot is legitimate)
-//   1 — store open / list failure
+//
+//	0 — success (even with zero rows; first-ever boot is legitimate)
+//	1 — store open / list failure
 //
 // The local peer's row is identified by reading the same kv namespace
 // that peer.LoadOrCreate writes; if the kv lookup fails we still
 // print the table without the self marker — degraded but useful.
 func runPeerListCommand(logger *slog.Logger, configDir string) int {
-	st, closeFn, err := openStoreReadOnly(logger, configDir)
+	st, closeFn, err := openPeerStore(configDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peer-list: %v\n", err)
 		return 1
@@ -102,17 +104,23 @@ func readSelfDeviceID(ctx context.Context, st *store.Store) string {
 	return rec.Value
 }
 
-// openStoreReadOnly opens a *store.Store handle pointing at the
-// kojo.db under configDir without acquiring the configdir lock.
-// Mirrors runSnapshotCommand's approach — multiple readers on
-// kojo.db are safe under SQLite WAL mode, so co-existing with the
-// running daemon is OK. Note that the readOnly bit is more about
-// "skip migrations" than literal mode-O_RDONLY: --peer-add and
-// --peer-remove DO write rows, so the store must be opened RW.
+// openStore opens the kojo.db under configDir in the given mode. It
+// standardizes on the ConfigDir option, which resolves <configDir>/kojo.db —
+// the identical path store.Open derives from Options{Path}. The open timeout
+// is the caller's ctx; the caller must Close the returned store.
+func openStore(ctx context.Context, configDir string, readOnly bool) (*store.Store, error) {
+	return store.Open(ctx, store.Options{ConfigDir: configDir, ReadOnly: readOnly})
+}
+
+// openPeerStore opens a *store.Store handle pointing at the kojo.db under
+// configDir without acquiring the configdir lock. Mirrors
+// runSnapshotCommand's approach — multiple readers on kojo.db are safe under
+// SQLite WAL mode, so co-existing with the running daemon is OK. The store is
+// opened read-write (NOT read-only): --peer-add and --peer-remove DO write
+// rows.
 //
-// Caller MUST invoke the returned closer to release the SQLite
-// handle.
-func openStoreReadOnly(logger *slog.Logger, configDir string) (*store.Store, func(), error) {
+// Caller MUST invoke the returned closer to release the SQLite handle.
+func openPeerStore(configDir string) (*store.Store, func(), error) {
 	dbPath := filepath.Join(configDir, "kojo.db")
 	if _, err := os.Stat(dbPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -122,11 +130,10 @@ func openStoreReadOnly(logger *slog.Logger, configDir string) (*store.Store, fun
 	}
 	openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	st, err := store.Open(openCtx, store.Options{Path: dbPath})
+	st, err := openStore(openCtx, configDir, false)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open store: %w", err)
 	}
-	_ = logger // reserved for future log lines on open path
 	return st, func() { _ = st.Close() }, nil
 }
 
@@ -170,7 +177,7 @@ func relativeTime(deltaMillis int64) string {
 // to "online" on the first successful inbound heartbeat from that
 // peer.
 func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
-	st, closeFn, err := openStoreReadOnly(logger, configDir)
+	st, closeFn, err := openPeerStore(configDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peer-add: %v\n", err)
 		return 1
@@ -227,7 +234,7 @@ func runPeerAddCommand(logger *slog.Logger, configDir, spec string) int {
 // the device_id but peer_registry doesn't, breaking the home_peer
 // → name lookup that some Phase 4 surfaces depend on).
 func runPeerRemoveCommand(logger *slog.Logger, configDir, deviceID string) int {
-	st, closeFn, err := openStoreReadOnly(logger, configDir)
+	st, closeFn, err := openPeerStore(configDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "peer-remove: %v\n", err)
 		return 1

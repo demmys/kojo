@@ -141,9 +141,7 @@ type switchDeviceResponse struct {
 }
 
 func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request) {
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"handoff requires agent store")
+	if _, ok := s.requireAgentStore(w, "handoff requires agent store"); !ok {
 		return
 	}
 	if s.peerID == nil {
@@ -608,17 +606,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// kojo.db has the agent row + state by the time the blob
 	// pull lands. Any failure here aborts the switch (target
 	// can't host the agent without metadata).
-	//
-	// agentSyncAttempted is set BEFORE the dispatch so a
-	// network failure that left target with a committed
-	// pending entry still triggers drop on abort — without
-	// the flag, a lost response would strand the pending
-	// entry on target until the next sync overwrites it.
-	agentSyncAttempted := true
-	_ = agentSyncAttempted // referenced below in orchestrateAbort path
 	var syncErr error
 	if useChunked {
-		syncErr = s.dispatchPeerAgentSyncChunked(ctx, targetAddr, req.TargetPeerID, syncReq)
+		syncErr = s.dispatchPeerAgentSyncChunked(ctx, targetAddr, syncReq)
 	} else {
 		syncErr = s.dispatchPeerAgentSync(ctx, targetAddr, req.TargetPeerID, syncWireBody)
 	}

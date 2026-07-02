@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // docs/multi-device-storage.md §3.7 step 4 — target-side blob pull.
@@ -26,10 +25,11 @@ import (
 // invoked between a successful `handoff/begin` and the matching
 // `handoff/complete` on the Hub.
 //
-// Auth: every outbound request is signed with the local peer
-// Identity (Ed25519) so the source's AuthMiddleware authenticates
-// us as RolePeer. The audience header pins the request to the
-// source's DeviceID, closing cross-peer signature replay.
+// Auth: no Authorization header is sent. Identity travels via
+// tsnet WhoIs on the receiving side (PairingProtocolVersion v2 —
+// NodeKey-only auth; see version.go), so the source resolves the
+// caller's DeviceID from the WireGuard tunnel rather than from a
+// signed header.
 //
 // SHA256 verification: the body is streamed through
 // blob.Store.Put with PutOptions.ExpectedSHA256 set to the digest
@@ -40,20 +40,21 @@ import (
 // PullSource identifies the peer to fetch from.
 type PullSource struct {
 	// DeviceID is the logical source peer's identity. When RelayVia
-	// is nil, used as the AuthorizeOutbound target; otherwise it
-	// rides in the `?relay_from=` query so the relayer (typically
-	// the Hub) knows which third peer to forward to.
+	// is nil, the request dials this peer directly; otherwise
+	// DeviceID rides in the `?relay_from=` query so the relayer
+	// (typically the Hub) knows which third peer to forward to.
 	DeviceID string
 	// Address is the base URL of whoever this client should dial.
 	// Direct mode: source's URL. Relay mode: relayer's URL (Hub).
 	Address string
 	// RelayVia, when non-nil, makes PullOne dial RelayVia.Address
-	// with `?relay_from=<DeviceID>` appended, and authenticate as
-	// the Bearer paired with RelayVia.DeviceID (Hub↔peer). This is
-	// the Bearer-only-auth replacement for direct peer↔peer pulls
-	// (docs/peer-simplify-plan.md Codex P1-2): each peer carries
-	// only Hub↔peer credentials, so peer-to-peer blob transfers
-	// pass through the Hub as a streaming proxy.
+	// with `?relay_from=<DeviceID>` appended instead of dialing the
+	// source directly. No Authorization header travels either way —
+	// identity is established via tsnet WhoIs on the receiving side
+	// (PairingProtocolVersion v2) — so relay mode exists to route
+	// around network reachability, not to swap credentials. The Hub
+	// side (peer_blob_handler.go relayPeerBlob) strips the query and
+	// re-issues the upstream GET to the real source.
 	RelayVia *PullSource
 }
 
@@ -89,15 +90,7 @@ type PullResult struct {
 // the same signed nonce; see NewPullClient for the full
 // rationale.
 type PullClient struct {
-	identity *Identity
-	// store is consulted by AuthorizeOutbound during the dual-stack
-	// window (docs/peer-simplify-plan.md step 7): when a Bearer for
-	// the source peer is present it's used for the GET, otherwise
-	// the legacy SignRequest path runs. peer↔peer Bearers do NOT
-	// exist after the simplification's first wave (Hub mints only
-	// Hub↔peer pairs), so this fallback is the load-bearing branch
-	// until a follow-up capability-URL flow lands.
-	store      *store.Store
+	identity   *Identity
 	httpClient *http.Client
 	logger     *slog.Logger
 }
@@ -105,18 +98,18 @@ type PullClient struct {
 // NewPullClient wires the client. Pass nil for httpClient to use a
 // default with a sane timeout; tests can inject a fixture client.
 //
-// The default transport DISABLES connection keep-alive. Each
-// signed request carries a unique nonce stamped into the
-// Authorization headers; if Go's transport silently retries an
-// idempotent GET on a stale-connection error (RST / EOF on a
-// reused idle conn before any response bytes arrive), the SAME
-// nonce reaches the source twice and the peer auth middleware
-// rejects the retry with HTTP 401 "replayed nonce". Disabling
-// keep-alives forces a fresh TCP/TLS handshake per request so
-// the stale-conn retry path never fires. Cost: a few extra
-// handshakes per switch — negligible against the blob payload
-// sizes — vs the 401 that aborts the whole switch.
-func NewPullClient(id *Identity, st *store.Store, httpClient *http.Client, logger *slog.Logger) *PullClient {
+// The default transport DISABLES connection keep-alive, forcing a
+// fresh TCP/TLS handshake per request. Historically this guarded
+// against Go's transport silently retrying an idempotent GET on a
+// stale-connection error and replaying the signed nonce that the
+// now-retired Ed25519/Bearer auth schemes stamped into the
+// Authorization header (see version.go's PairingProtocolVersion
+// history). PullOne sends no Authorization header today — identity
+// travels via tsnet WhoIs on the receiving side — so that hazard no
+// longer applies, but the no-keep-alive transport itself is
+// unchanged. Cost: a few extra handshakes per switch — negligible
+// against the blob payload sizes.
+func NewPullClient(id *Identity, httpClient *http.Client, logger *slog.Logger) *PullClient {
 	if httpClient == nil {
 		// No per-blob HTTP ceiling: a multi-GiB blob over a slow
 		// Tailscale link easily exceeds any fixed timeout, and the
@@ -129,7 +122,7 @@ func NewPullClient(id *Identity, st *store.Store, httpClient *http.Client, logge
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &PullClient{identity: id, store: st, httpClient: httpClient, logger: logger}
+	return &PullClient{identity: id, httpClient: httpClient, logger: logger}
 }
 
 // noKeepAliveTransport returns an http.Transport with idle-
@@ -143,13 +136,14 @@ func noKeepAliveTransport() *http.Transport {
 }
 
 // NoKeepAliveHTTPClient returns an *http.Client with the same
-// stale-conn-retry mitigation NewPullClient uses internally,
-// configured with the caller's timeout. Every peer-signed
-// outbound request (Ed25519-signed Authorization headers carry
-// a single-use nonce) should use this client — Go's default
-// transport will silently retry an idempotent request on a
-// stale-conn EOF, resending the SAME nonce and triggering a
-// 401 "replayed nonce" at the recipient.
+// no-keep-alive transport NewPullClient uses internally, configured
+// with the caller's timeout. This client predates
+// PairingProtocolVersion v2: it was meant for every peer-signed
+// outbound request, whose Ed25519/Bearer Authorization header
+// carried a single-use nonce that a stale-conn retry could replay.
+// Current callers (PullClient, Subscriber) send no Authorization
+// header at all — identity travels via tsnet WhoIs — but they still
+// use this client for its no-keep-alive transport.
 func NoKeepAliveHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
@@ -205,12 +199,13 @@ func (c *PullClient) PullOne(ctx context.Context, src PullSource, item PullItem,
 		return res, nil
 	}
 
-	// Direct mode: dial source, authenticate as source's Bearer.
-	// Relay mode: dial RelayVia (Hub), authenticate as Hub's Bearer,
-	// append `?relay_from=<source_device_id>` so the Hub knows whom
-	// to forward to. The Hub side (peer_blob_handler.go relayPeerBlob)
-	// strips the query and re-issues the upstream GET with its own
-	// Hub→source Bearer.
+	// Direct mode: dial source directly. Relay mode: dial
+	// RelayVia (Hub) instead, appending
+	// `?relay_from=<source_device_id>` so the Hub knows whom to
+	// forward to. Neither mode sends an Authorization header —
+	// identity travels via tsnet WhoIs on the receiving side. The
+	// Hub side (peer_blob_handler.go relayPeerBlob) strips the
+	// query and re-issues the upstream GET to the real source.
 	dialBase := src.Address
 	relayFrom := ""
 	if src.RelayVia != nil {
@@ -360,12 +355,11 @@ func (c *PullClient) PullMany(ctx context.Context, src PullSource, items []PullI
 //
 // The kojo:// prefix is STRIPPED before embedding — the "://"
 // contains a double-slash that Go's ServeMux path-cleans into a
-// single slash, triggering a 301 redirect. Go's http.Client
-// follows the redirect, re-sending the SAME signed headers
-// (including the single-use nonce) to the cleaned URL; the auth
-// middleware sees the nonce a second time and returns 401
-// "replayed nonce". Stripping the prefix produces a clean path
-// like /api/v1/peers/blobs/global/agents/… with no double-slash.
+// single slash, triggering a 301 redirect that PullOne would then
+// have to follow as a second round trip. Stripping the prefix
+// produces a clean path like
+// /api/v1/peers/blobs/global/agents/… with no double-slash, so
+// the request lands on the first try.
 //
 // The source-side handler (peer_blob_handler.go) already accepts
 // the prefix-less form: it prepends "kojo://" when the path tail
@@ -380,7 +374,7 @@ func buildPeerBlobURL(base, blobURI string) (string, error) {
 		return "", fmt.Errorf("base URL missing scheme/host: %q", base)
 	}
 	// Strip kojo:// so the path never contains "//" which would
-	// cause a ServeMux redirect → nonce replay.
+	// cause a ServeMux redirect.
 	tail := strings.TrimPrefix(blobURI, "kojo://")
 	if strings.Contains(tail, "//") {
 		return "", fmt.Errorf("blob URI tail contains double-slash after prefix strip: %q", tail)
@@ -392,4 +386,3 @@ func buildPeerBlobURL(base, blobURI string) (string, error) {
 	u.RawQuery = ""
 	return u.String(), nil
 }
-

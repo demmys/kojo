@@ -91,16 +91,16 @@ func (m *Manager) Abort(agentID string) {
 // Drains:
 //   - busy:       in-flight Chat / ChatOneShot
 //   - preparing:  a Chat between prepareChat entry and busy
-//                 entry insert (disk side effects still landing)
+//     entry insert (disk side effects still landing)
 //   - editing:    Regenerate / transcript edit holding the
-//                 acquireTranscriptEdit guard
+//     acquireTranscriptEdit guard
 //   - resetting:  ResetData / Fork / Archive / ResetSession
-//                 holding the acquireResetGuard
+//     holding the acquireResetGuard
 //   - mutating:   non-chat state writers (persona / settings /
-//                 task / credential / avatar / slack tokens)
-//                 holding AcquireMutation
+//     task / credential / avatar / slack tokens)
+//     holding AcquireMutation
 //   - oneShotCancels: Slack / group-DM one-shot chats
-//                 cancelled by switch_device_handler's Abort
+//     cancelled by switch_device_handler's Abort
 //
 // Without all six checks the §3.7 quiesce window would race a
 // Slack / cron / persona-edit write that landed mid-handoff.
@@ -333,26 +333,6 @@ func (m *Manager) AcquireMutation(agentID string) (func(), error) {
 			delete(m.mutating, agentID)
 		}
 	}, nil
-}
-
-// CheckNotSwitching is the deprecated pre-check shim. New
-// code should call AcquireMutation + defer release so the
-// switch orchestrator's WaitChatIdle observes the mutation
-// in flight. Existing callers stay on this helper until
-// they're migrated; the behavior is equivalent at the moment
-// of the check.
-//
-// Threadsafe; nil-safe for hand-rolled test fixtures.
-func (m *Manager) CheckNotSwitching(agentID string) error {
-	if m == nil {
-		return nil
-	}
-	m.busyMu.Lock()
-	defer m.busyMu.Unlock()
-	if m.switching != nil && m.switching[agentID] {
-		return fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
-	}
-	return nil
 }
 
 // acquireResetGuard marks the agent as resetting, cancels any active chat,

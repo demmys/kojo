@@ -37,6 +37,8 @@ import (
 	"golang.org/x/image/draw"
 	"golang.org/x/image/webp"
 	"golang.org/x/sync/singleflight"
+
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
 // ErrUnsupportedFormat is returned when the source can't be decoded as an
@@ -111,7 +113,7 @@ func Generate(srcPath string, size int) (string, error) {
 	// access-control layer; FIFOs / devices in a temp dir would block
 	// the decoder indefinitely.
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("not a regular file")
+		return "", errors.New("not a regular file")
 	}
 	if info.Size() > maxFileBytes {
 		return "", ErrSourceTooLarge
@@ -131,7 +133,7 @@ func Generate(srcPath string, size int) (string, error) {
 
 	// singleflight: dedupe concurrent generation for the same key. The
 	// internal map drops the entry as soon as Do returns.
-	v, err, _ := gen.Do(key, func() (interface{}, error) {
+	v, err, _ := gen.Do(key, func() (any, error) {
 		// Re-check after coalescing — another goroutine may have already
 		// written the file before we got the slot.
 		if st, err := os.Stat(cachePath); err == nil && st.Size() > 0 {
@@ -140,7 +142,7 @@ func Generate(srcPath string, size int) (string, error) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return "", fmt.Errorf("thumb cache mkdir: %w", err)
 		}
-		if err := generateOnce(srcPath, cachePath, dir, size); err != nil {
+		if err := generateOnce(srcPath, cachePath, size); err != nil {
 			return "", err
 		}
 		return cachePath, nil
@@ -151,32 +153,20 @@ func Generate(srcPath string, size int) (string, error) {
 	return v.(string), nil
 }
 
-func generateOnce(srcPath, cachePath, dir string, size int) error {
+func generateOnce(srcPath, cachePath string, size int) error {
 	src, err := decodeImage(srcPath)
 	if err != nil {
 		return err
 	}
 	dst := resize(src, size)
 
-	// Write to a tmp file in the same dir then rename, so concurrent
-	// readers never see a partially-written JPEG.
-	tmp, err := os.CreateTemp(dir, "thumb-*.jpg.tmp")
-	if err != nil {
-		return fmt.Errorf("thumb tmpfile: %w", err)
-	}
-	tmpName := tmp.Name()
-	if err := jpeg.Encode(tmp, dst, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("thumb encode: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("thumb close: %w", err)
-	}
-	if err := os.Rename(tmpName, cachePath); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("thumb rename: %w", err)
+	// Write to a unique tmp file in the same dir then rename, so concurrent
+	// readers never see a partially-written JPEG. Perm 0600 matches the
+	// prior os.CreateTemp default.
+	if err := atomicfile.WriteWith(cachePath, 0o600, func(w io.Writer) error {
+		return jpeg.Encode(w, dst, &jpeg.Options{Quality: jpegQuality})
+	}); err != nil {
+		return fmt.Errorf("thumb write: %w", err)
 	}
 	return nil
 }
@@ -207,8 +197,8 @@ func decodeImage(path string) (image.Image, error) {
 		return nil, fmt.Errorf("seek: %w", err)
 	}
 	var (
-		img    image.Image
-		derr   error
+		img  image.Image
+		derr error
 	)
 	switch format {
 	case "png":
@@ -293,30 +283,15 @@ func IsSupportedExt(ext string) bool {
 	return false
 }
 
-// ServeHTTP generates (or serves from cache) a JPEG thumbnail of the
-// image at srcPath and writes it to w with appropriate cache headers.
-// Callers provide the raw HTTP request so http.ServeFile can handle
-// If-None-Match → 304.
-//
-// On success the response carries:
-//   - Content-Type: image/jpeg
-//   - Cache-Control: private, max-age=86400
-//   - ETag: <sha256 cache key>
-//
-// Returns nil on success; callers should map non-nil errors to the
-// appropriate HTTP status (ErrUnsupportedFormat → 415,
-// ErrSourceTooLarge → 413, os.IsNotExist → 404, else 500).
-// ServeHTTPCacheable is the cached variant: private, max-age=86400.
-// Use for sources whose URL changes when the content changes (e.g.
-// file-browser thumbs with a ?v=<modtime> query).
-func ServeHTTPCacheable(w http.ResponseWriter, r *http.Request, srcPath string, size int) error {
-	return serveHTTP(w, r, srcPath, size, "private, max-age=86400")
-}
-
 // ServeHTTP serves a thumbnail with Cache-Control: no-cache so the
 // browser stores the body but revalidates via ETag on every request
 // (→ 304 when unchanged). Use for sources whose URL is stable across
 // content changes (avatars, blob thumbs without a version query).
+//
+// Callers provide the raw HTTP request so http.ServeFile can handle
+// If-None-Match → 304. Returns nil on success; callers should map
+// non-nil errors to the appropriate HTTP status (ErrUnsupportedFormat →
+// 415, ErrSourceTooLarge → 413, os.IsNotExist → 404, else 500).
 func ServeHTTP(w http.ResponseWriter, r *http.Request, srcPath string, size int) error {
 	return serveHTTP(w, r, srcPath, size, "no-cache")
 }
@@ -385,4 +360,3 @@ func StartPurger(done <-chan struct{}) {
 		}
 	}()
 }
-

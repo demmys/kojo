@@ -115,41 +115,14 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []string, erro
 	return out, skipped, nil
 }
 
-// WriteClaudeSessionFiles materialises the source-captured JSONLs
+// StageClaudeSessionFiles materialises the source-captured JSONLs
 // into target's claude project dir, computed from target's own
 // AgentDir. The encoded path differs from source's (AgentDir is
 // machine-local) but the per-file session_id is preserved so
 // `claude --continue` finds the conversation it was running on
 // the source peer.
 //
-// Existing files are overwritten — the assumption is that a
-// device switch is the authoritative state transfer. Files from
-// previous (now-stale) switches sitting in the same dir DO get
-// clobbered if they share a session_id; otherwise they remain
-// untouched.
-//
-// agentID is used to resolve target's AgentDir; the per-host
-// $HOME and platform-specific AppData layout are handled by the
-// kojo runtime so the same call works on macOS, Linux, and
-// Windows. The target AgentDir is created (with parents) before
-// the JSONL files are written so a fresh post-handoff agent on
-// target doesn't fail with ENOENT.
-func WriteClaudeSessionFiles(agentID string, files []ClaudeSessionFile) error {
-	commit, rollback, err := StageClaudeSessionFiles(agentID, files)
-	if err != nil {
-		return err
-	}
-	if commit == nil {
-		// No-op (empty file set). rollback is also nil.
-		return nil
-	}
-	commit()
-	_ = rollback
-	return nil
-}
-
-// StageClaudeSessionFiles is the two-phase variant of
-// WriteClaudeSessionFiles. It writes the JSONLs to their final
+// It is a two-phase (stage/commit) operation: it writes the JSONLs to their final
 // paths (with backups of any pre-existing files held aside) and
 // returns commit/rollback callbacks. commit() drops the backups
 // — the new content is the canonical state. rollback() restores

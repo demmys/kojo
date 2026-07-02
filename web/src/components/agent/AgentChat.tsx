@@ -1,11 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
 import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent } from "../../lib/agentApi";
-import { api, isThumbSupported } from "../../lib/api";
-import { localRFC3339 } from "../../lib/utils";
+import { errMsg, localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
+import { useFileUpload } from "../../hooks/useFileUpload";
+import { useDraftInput } from "../../hooks/useDraftInput";
+import { useAutoGrowTextarea } from "../../hooks/useAutoGrowTextarea";
+import { DismissibleError, PendingAttachments, enterToSend } from "../chatComposer";
 import { ChatMessage, StreamingMessage } from "./ChatMessage";
 import { AgentAvatar } from "./AgentAvatar";
 import {
@@ -14,6 +17,7 @@ import {
   applyDoneMessage,
   applyToolResult,
   newToolFromEvent,
+  type StreamingTool,
 } from "./chatEventReducer";
 
 const PAGE_SIZE = 30;
@@ -30,23 +34,29 @@ export function AgentChat() {
   navigateRef.current = navigate;
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
-  const [input, setInput] = useState(() => sessionStorage.getItem(`agent-draft:${id}`) ?? "");
+  const { input, setInput } = useDraftInput("agent-draft", id);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState("");
   const [streamThinking, setStreamThinking] = useState("");
-  const [streamTools, setStreamTools] = useState<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
+  const [streamTools, setStreamTools] = useState<StreamingTool[]>([]);
   const [streamStatus, setStreamStatus] = useState("");
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [streamViewMode, setStreamViewMode] = useState<"markdown" | "plain">("markdown");
   const [streamAttachments, setStreamAttachments] = useState<AgentMessageAttachment[]>([]);
   const [hasMore, setHasMore] = useState(false);
-  const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const {
+    pendingFiles,
+    setPendingFiles,
+    uploading,
+    uploadError,
+    setUploadError,
+    fileInputRef,
+    handleFileSelect,
+    removePendingFile,
+  } = useFileUpload();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea();
   const loadingMoreRef = useRef(false);
   const suppressAutoScrollRef = useRef(false);
   const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
@@ -58,7 +68,7 @@ export function AgentChat() {
   // so handleAbort always snapshots the latest data (React state lags).
   const liveStreamTextRef = useRef("");
   const liveStreamThinkingRef = useRef("");
-  const liveStreamToolsRef = useRef<Array<{ id: string; name: string; input: string; output: string | null }>>([]);
+  const liveStreamToolsRef = useRef<StreamingTool[]>([]);
   const liveStreamAttachmentsRef = useRef<AgentMessageAttachment[]>([]);
 
   // TTS — auto-play toggle (per agent, persisted in localStorage) and
@@ -88,18 +98,11 @@ export function AgentChat() {
     ttsPlayRef.current = tts.play;
   }, [tts.play]);
 
-  // Restore draft and textarea height on mount / id change
+  // Restore textarea height on mount / id change. The draft text itself is
+  // restored by useDraftInput; here we only re-fit the textarea to it.
   useEffect(() => {
-    const draft = sessionStorage.getItem(`agent-draft:${id}`) ?? "";
-    setInput(draft);
-    requestAnimationFrame(() => {
-      if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
-        textareaRef.current.style.height =
-          Math.min(textareaRef.current.scrollHeight, 150) + "px";
-      }
-    });
-  }, [id]);
+    requestAnimationFrame(handleTextareaInput);
+  }, [id, handleTextareaInput]);
 
   // Load agent and initial messages
   useEffect(() => {
@@ -445,42 +448,6 @@ export function AgentChat() {
     abort();
   }, [abort, resetStream]);
 
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-
-    setUploading(true);
-    setUploadError(null);
-    try {
-      const results = await Promise.allSettled(
-        Array.from(files).map((file) => api.upload(file)),
-      );
-      const uploaded: AgentMessageAttachment[] = [];
-      const failed: string[] = [];
-      for (let i = 0; i < results.length; i++) {
-        const r = results[i];
-        if (r.status === "fulfilled") {
-          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime });
-        } else {
-          failed.push(Array.from(files)[i].name);
-        }
-      }
-      if (uploaded.length > 0) {
-        setPendingFiles((prev) => [...prev, ...uploaded]);
-      }
-      if (failed.length > 0) {
-        setUploadError(`Upload failed: ${failed.join(", ")}`);
-      }
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  };
-
-  const removePendingFile = (index: number) => {
-    setPendingFiles((prev) => prev.filter((_, i) => i !== index));
-  };
-
   const handleSend = () => {
     const text = input.trim();
     if ((!text && pendingFiles.length === 0) || streaming || !connected) return;
@@ -500,7 +467,6 @@ export function AgentChat() {
     };
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
-    if (id) sessionStorage.setItem(`agent-draft:${id}`, "");
     setStreaming(true);
     setStreamText("");
     setStreamThinking("");
@@ -519,22 +485,7 @@ export function AgentChat() {
 
   const [enterSends] = useEnterSends();
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-      if (enterSends ? !e.shiftKey : e.shiftKey) {
-        e.preventDefault();
-        handleSend();
-      }
-    }
-  };
-
-  const handleTextareaInput = () => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height =
-        Math.min(textareaRef.current.scrollHeight, 150) + "px";
-    }
-  };
+  const handleKeyDown = (e: React.KeyboardEvent) => enterToSend(e, enterSends, handleSend);
 
   if (!agent) return null;
 
@@ -851,7 +802,7 @@ export function AgentChat() {
                             }
                             return;
                           }
-                          const errorContent = `⚠️ Error: ${e instanceof Error ? e.message : String(e)}`;
+                          const errorContent = `⚠️ Error: ${errMsg(e)}`;
                           setMessages([
                             ...snapshot,
                             {
@@ -907,54 +858,9 @@ export function AgentChat() {
           </div>
         )}
         {/* Upload error */}
-        {uploadError && (
-          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-300">
-            <span className="flex-1">{uploadError}</span>
-            <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-red-200">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
-              </svg>
-            </button>
-          </div>
-        )}
+        {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
         {/* Pending file attachments */}
-        {pendingFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2 mb-2">
-            {pendingFiles.map((file, i) => (
-              <div
-                key={file.path}
-                className="flex items-center gap-1.5 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded-lg text-xs text-neutral-300"
-              >
-                {file.mime.startsWith("image/") ? (
-                  <img
-                    src={
-                      isThumbSupported(file.path)
-                        ? api.files.thumbUrl(file.path, 64)
-                        : api.files.rawUrl(file.path)
-                    }
-                    alt={file.name}
-                    className="w-6 h-6 rounded object-cover"
-                    loading="lazy"
-                    decoding="async"
-                  />
-                ) : (
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-neutral-500">
-                    <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />
-                  </svg>
-                )}
-                <span className="max-w-[120px] truncate">{file.name}</span>
-                <button
-                  onClick={() => removePendingFile(i)}
-                  className="text-neutral-500 hover:text-neutral-300 ml-0.5"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3">
-                    <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
-                  </svg>
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+        <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb />
         <div className="flex items-end gap-2">
           <input
             ref={fileInputRef}
@@ -983,10 +889,7 @@ export function AgentChat() {
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={(e) => {
-              setInput(e.target.value);
-              if (id) sessionStorage.setItem(`agent-draft:${id}`, e.target.value);
-            }}
+            onChange={(e) => setInput(e.target.value)}
             onInput={handleTextareaInput}
             onKeyDown={handleKeyDown}
             placeholder="Message..."

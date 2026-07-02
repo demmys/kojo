@@ -193,13 +193,8 @@ SELECT body, body_sha256, seq, version, etag, created_at, updated_at, deleted_at
 		}
 	}
 
-	switch {
-	case ifMatchETag != "":
-		if !liveExists || prev.ETag != ifMatchETag {
-			return nil, ErrETagMismatch
-		}
-	case liveExists && !opts.AllowOverwrite:
-		return nil, ErrETagMismatch
+	if err := checkSingletonUpsertPrecondition(liveExists, prev.ETag, ifMatchETag, opts.AllowOverwrite); err != nil {
+		return nil, err
 	}
 
 	rec := AgentWorkspaceFileRecord{

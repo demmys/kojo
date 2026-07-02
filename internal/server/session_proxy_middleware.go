@@ -67,28 +67,12 @@ func isPeerProxyPath(p string) bool {
 	return false
 }
 
-// isRawProxyPath returns true when the request reads bulk body
-// data (raw file, view, download). Kept around so callers that
-// want to distinguish "API ping" from "stream a body" still can,
-// but every proxied request now uses the no-timeout HTTP client
-// — a multi-GiB upload over a slow tailnet can't fit in any
-// sensible fixed budget, and the caller's request context
-// already cancels the dispatch.
-func isRawProxyPath(p string) bool {
-	switch p {
-	case "/api/v1/files/raw", "/api/v1/files/view":
-		return true
-	}
-	return false
-}
-
 func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, peerID string) {
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"peer routing not available on this host")
+	st, ok := s.requireAgentStore(w, "peer routing not available on this host")
+	if !ok {
 		return
 	}
-	rec, err := s.agents.Store().GetPeer(r.Context(), peerID)
+	rec, err := st.GetPeer(r.Context(), peerID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "bad_gateway",
 			"target peer not in registry: "+err.Error())
@@ -158,15 +142,11 @@ func (s *Server) proxySessionRequest(w http.ResponseWriter, r *http.Request, pee
 	// existing Content-Type / ETag entries stay for JSON
 	// responses. Stream the body instead of buffering it so big
 	// downloads aren't silently truncated at an arbitrary cap.
-	for _, k := range []string{
+	copyResponseHeaders(w.Header(), resp.Header,
 		"Content-Type", "ETag",
 		"Content-Disposition", "Content-Length",
 		"Last-Modified", "Cache-Control",
-	} {
-		if v := resp.Header.Get(k); v != "" {
-			w.Header().Set(k, v)
-		}
-	}
+	)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

@@ -103,14 +103,7 @@ func (m *Manager) platformStop(s *Session, id string) error {
 	}
 
 	// Also stop any child sessions (e.g. tmux terminal tab)
-	for _, child := range m.findChildSessions(id, "tmux") {
-		child.mu.Lock()
-		childStatus := child.Status
-		child.mu.Unlock()
-		if childStatus == StatusRunning {
-			_ = m.Stop(child.ID)
-		}
-	}
+	m.stopRunningChildren(id)
 
 	if cmd != nil && cmd.Process != nil {
 		_ = sendTermSignal(cmd.Process)
@@ -170,10 +163,7 @@ func (m *Manager) platformStopAll() {
 		if s.Cmd != nil && s.Cmd.Process != nil {
 			_ = s.Cmd.Process.Kill()
 		}
-		if s.PTY != nil {
-			s.PTY.Close()
-			s.PTY = nil
-		}
+		s.closePTYLocked()
 		s.mu.Unlock()
 	}
 }
@@ -215,9 +205,6 @@ func (s *Session) cleanupPipePane() {
 	s.rawPipePath = ""
 }
 
-// NeedsTmuxCheck returns whether the platform requires a tmux check at startup.
-func NeedsTmuxCheck() bool { return true }
-
 // platformPrepareRestart cleans up old session resources before restart.
 func (m *Manager) platformPrepareRestart(s *Session) {
 	s.mu.Lock()
@@ -236,4 +223,3 @@ func buildInternalToolRestartArgs(origArgs []string, toolSessionID string) []str
 	}
 	return origArgs
 }
-

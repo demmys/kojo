@@ -183,7 +183,7 @@ func scaleImage(img image.Image, targetSize int) image.Image {
 
 // tryDecodeQR attempts QR decoding with multiple binarizer/inversion strategies.
 func tryDecodeQR(img image.Image) ([]*OTPEntry, error) {
-	hints := map[gozxing.DecodeHintType]interface{}{
+	hints := map[gozxing.DecodeHintType]any{
 		gozxing.DecodeHintType_TRY_HARDER: true,
 	}
 

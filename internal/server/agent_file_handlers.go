@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"fmt"
 	"mime"
 	"net/http"
@@ -12,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/agent"
-	"github.com/loppo-llc/kojo/internal/filebrowser"
 )
 
 // --- Agent-scoped file browser handlers ---
@@ -129,13 +127,7 @@ func (s *Server) handleViewAgentFile(w http.ResponseWriter, r *http.Request) {
 	}
 	view, err := s.files.View(abs)
 	if err != nil {
-		if errors.Is(err, filebrowser.ErrUnsupportedFile) {
-			writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", err.Error())
-		} else if errors.Is(err, filebrowser.ErrFileTooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", err.Error())
-		} else {
-			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
-		}
+		writeFileViewError(w, err)
 		return
 	}
 	// Replace absolute paths with relative ones in the response.

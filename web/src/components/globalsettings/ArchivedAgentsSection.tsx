@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "../agent/AgentAvatar";
+import { errMsg } from "../../lib/utils";
 
 interface Props {
   setError: (msg: string) => void;
@@ -24,7 +25,7 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
       .listArchived()
       .then(setAgents)
       .catch((e) => {
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errMsg(e));
         setAgents([]);
       });
   };
@@ -41,7 +42,7 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
       setAgents((prev) => (prev ?? []).filter((x) => x.id !== a.id));
       flashSuccess();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errMsg(e));
     } finally {
       setAgentBusy(a.id, undefined);
     }
@@ -61,7 +62,7 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
       setAgents((prev) => (prev ?? []).filter((x) => x.id !== a.id));
       flashSuccess();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errMsg(e));
     } finally {
       setAgentBusy(a.id, undefined);
     }

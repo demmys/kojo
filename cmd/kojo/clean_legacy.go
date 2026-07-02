@@ -362,10 +362,7 @@ func walkAgentTokens(ctx context.Context, kv *store.Store, plan *legacyCleanPlan
 // operator. Pending entries carry per-kind reason strings so a stuck
 // migration is visible without grepping logs.
 func printLegacyCleanPlan(plan *legacyCleanPlan, apply bool) {
-	verb := "would remove"
-	if apply {
-		verb = "removing"
-	}
+	verb := cleanVerb(apply)
 	if n := len(plan.Redundant); n > 0 {
 		fmt.Fprintf(os.Stderr, "%s %d redundant legacy file(s) (kv mirror exists and validates):\n", verb, n)
 		for _, e := range plan.Redundant {
@@ -413,7 +410,7 @@ func applyLegacyCleanPlan(plan *legacyCleanPlan, kv *store.Store) []error {
 			fmt.Fprintf(os.Stderr, "skipping %s at apply: kv row no longer valid: %v\n", e.Path, vErr)
 			continue
 		}
-		if err := os.Remove(e.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := removeIfExists(e.Path); err != nil {
 			errs = append(errs, fmt.Errorf("remove %s: %w", e.Path, err))
 		}
 	}

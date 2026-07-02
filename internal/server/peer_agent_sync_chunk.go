@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
-	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -165,15 +164,11 @@ type peerAgentSyncChunkedResponse struct {
 // on success; 409 if the op_id is already reserved by a still-pending
 // upload (a retry with the same op_id should call /abort first).
 func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not configured")
+	if _, ok := s.requireAgentStore(w, "agent store not configured"); !ok {
 		return
 	}
 
@@ -254,15 +249,11 @@ func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.
 // handler does not auto-commit, leaving the commit step explicit so a
 // commit-time auth failure can't strand the apply).
 func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not configured")
+	if _, ok := s.requireAgentStore(w, "agent store not configured"); !ok {
 		return
 	}
 
@@ -312,7 +303,7 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 			"commit is in progress; refusing further chunks")
 		return
 	}
-	if p.IsPeer() && p.PeerID != preflightEntry.sourceDeviceID {
+	if !verifySignerIsSource(p, preflightEntry.sourceDeviceID) {
 		s.chunkedSyncMu.Unlock()
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match the begin source_device_id")
@@ -402,7 +393,7 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 			"commit started between preflight and append; refusing further chunks")
 		return
 	}
-	if p.IsPeer() && p.PeerID != entry.sourceDeviceID {
+	if !verifySignerIsSource(p, entry.sourceDeviceID) {
 		s.chunkedSyncMu.Unlock()
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match the begin source_device_id (re-acquire)")
@@ -469,15 +460,11 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 // pendingAgentSyncs already keys finalize / drop off (agent_id,
 // op_id)).
 func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not configured")
+	if _, ok := s.requireAgentStore(w, "agent store not configured"); !ok {
 		return
 	}
 
@@ -496,7 +483,7 @@ func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http
 			"no pending chunked upload for op_id")
 		return
 	}
-	if p.IsPeer() && p.PeerID != entry.sourceDeviceID {
+	if !verifySignerIsSource(p, entry.sourceDeviceID) {
 		s.chunkedSyncMu.Unlock()
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match the begin source_device_id")
@@ -552,10 +539,8 @@ func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http
 // anyway. Used by the orchestrator on switch abort to free target
 // memory without waiting for TTL.
 func (s *Server) handlePeerAgentSyncChunkedAbort(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
 	opID := r.URL.Query().Get("op_id")
@@ -573,7 +558,7 @@ func (s *Server) handlePeerAgentSyncChunkedAbort(w http.ResponseWriter, r *http.
 		writeJSONResponse(w, http.StatusOK, peerAgentSyncChunkedResponse{OpID: opID})
 		return
 	}
-	if p.IsPeer() && p.PeerID != entry.sourceDeviceID {
+	if !verifySignerIsSource(p, entry.sourceDeviceID) {
 		s.chunkedSyncMu.Unlock()
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match the begin source_device_id")

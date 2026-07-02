@@ -1,9 +1,7 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 
@@ -295,20 +293,8 @@ func (s *Server) handleCreateAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, memoryEntryRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
 	var req memoryEntryCreateRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, memoryEntryRequestCap, "request body exceeds cap", "invalid JSON", &req) {
 		return
 	}
 
@@ -338,19 +324,11 @@ func (s *Server) handleUpdateAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
 	// `*` doesn't compose with the file-and-DB write trio (we'd
 	// silently overwrite a value the user didn't see). Mirror the
 	// MEMORY.md handler's policy.
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported")
+	if !ok {
 		return
 	}
 	if _, ok := s.agents.Get(id); !ok {
@@ -358,20 +336,8 @@ func (s *Server) handleUpdateAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, memoryEntryRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
 	var req memoryEntryPatchRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, memoryEntryRequestCap, "request body exceeds cap", "invalid JSON", &req) {
 		return
 	}
 
@@ -405,16 +371,8 @@ func (s *Server) handleDeleteAgentMemoryEntry(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported")
+	if !ok {
 		return
 	}
 	if _, ok := s.agents.Get(id); !ok {

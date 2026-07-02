@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -53,11 +53,11 @@ func init() {
 	for ext := range mediaExts {
 		exts = append(exts, ext)
 	}
-	sort.Slice(exts, func(i, j int) bool {
-		if len(exts[i]) != len(exts[j]) {
-			return len(exts[i]) > len(exts[j])
+	slices.SortFunc(exts, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(b) - len(a)
 		}
-		return exts[i] < exts[j]
+		return strings.Compare(a, b)
 	})
 	quoted := make([]string, len(exts))
 	for i, ext := range exts {
@@ -80,10 +80,7 @@ var (
 // and returns newly detected attachments. Caller should broadcast the result.
 func (s *Session) CheckAttachments(data []byte) []*Attachment {
 	s.mu.Lock()
-	s.attachTail = append(s.attachTail, data...)
-	if len(s.attachTail) > attachTailSize {
-		s.attachTail = s.attachTail[len(s.attachTail)-attachTailSize:]
-	}
+	s.attachTail = capTail(s.attachTail, data, attachTailSize)
 	tail := make([]byte, len(s.attachTail))
 	copy(tail, s.attachTail)
 	workDir := s.WorkDir

@@ -216,6 +216,7 @@ func TestSyncAgentMemoryToDB_MissingDiskMissingDBNoop(t *testing.T) {
 //   - projects/foo.md         → kind=project
 //   - people/bob.md           → kind=people
 //   - unknown/dir/x.md        → kind=topic, name=unknown/dir/x
+//
 // And verifies the tombstone phase: removing a file from disk soft-
 // deletes the corresponding DB row.
 func TestSyncMemoryEntriesToDB_InsertUpdateAndTombstone(t *testing.T) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
 import { api, type SessionInfo, type GitStatus, type GitLogEntry } from "../lib/api";
-import { timeAgo } from "../lib/utils";
+import { errMsg, timeAgo } from "../lib/utils";
 
 type Tab = "status" | "log" | "diff";
 
@@ -95,7 +95,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
       setPrevTab(tab);
       setTab("diff");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errMsg(e));
     }
   };
 
@@ -113,7 +113,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
       setCmdInput("");
       refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errMsg(e));
     } finally {
       setCmdRunning(false);
     }
@@ -133,7 +133,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
       });
       setHasMore(r.hasMore);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errMsg(e));
     } finally {
       setLoadingMore(false);
     }

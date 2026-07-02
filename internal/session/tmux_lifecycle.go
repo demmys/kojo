@@ -3,7 +3,6 @@
 package session
 
 import (
-	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,50 +22,14 @@ func (m *Manager) loadPersistedSessions() bool {
 		m.logger.Error("failed to load persisted sessions, skipping orphan cleanup", "err", err)
 		return false
 	}
-	for _, info := range infos {
-		s := m.restoreSession(info)
-		m.sessions[info.ID] = s
-	}
-	if len(infos) > 0 {
-		m.logger.Info("restored persisted sessions", "count", len(infos))
-	}
+	m.insertRestoredSessions(infos)
 	return true
 }
 
 // restoreSession creates a Session from persisted info, reattaching to a live tmux session if possible.
 func (m *Manager) restoreSession(info SessionInfo) *Session {
-	t, _ := time.Parse(time.RFC3339, info.CreatedAt)
-	var lastOutput []byte
-	if info.LastOutput != "" {
-		lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
-	}
-	s := &Session{
-		ID:              info.ID,
-		Tool:            info.Tool,
-		WorkDir:         info.WorkDir,
-		Args:            info.Args,
-		CreatedAt:       t,
-		Status:          StatusExited,
-		ExitCode:        info.ExitCode,
-		YoloMode:        info.YoloMode,
-		Internal:        info.Internal || internalTools[info.Tool],
-		ToolSessionID:   info.ToolSessionID,
-		ParentID:        info.ParentID,
-		TmuxSessionName: info.TmuxSessionName,
-		lastCols:        info.LastCols,
-		lastRows:        info.LastRows,
-		scrollback:      NewRingBuffer(defaultRingSize),
-		subscribers:     make(map[chan []byte]struct{}),
-		done:            make(chan struct{}),
-		lastOutput:      lastOutput,
-		attachments:     make(map[string]*Attachment, len(info.Attachments)),
-	}
-	for _, att := range info.Attachments {
-		if att == nil || att.Path == "" {
-			continue
-		}
-		s.attachments[att.Path] = att
-	}
+	s := newRestoredSession(info)
+	s.logger = m.logger
 
 	restored := false
 	if info.TmuxSessionName != "" && tmuxHasSession(info.TmuxSessionName) {
@@ -228,7 +191,7 @@ func (m *Manager) tmuxWaitLoop(s *Session) {
 type pollAction int
 
 const (
-	pollOK    pollAction = iota
+	pollOK pollAction = iota
 	pollDone
 	pollRetry
 )
@@ -302,10 +265,7 @@ func (m *Manager) handleAttachExit(s *Session) (chan struct{}, bool) {
 	}
 
 	s.mu.Lock()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
+	s.closePTYLocked()
 	tmuxName := s.TmuxSessionName
 	hasRawPipe := s.rawPipe != nil
 	s.mu.Unlock()
@@ -386,10 +346,7 @@ func (m *Manager) finalizeTmuxSession(s *Session, exitCode int, attachExited <-c
 
 	s.mu.Lock()
 	s.cleanupPipePane()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
+	s.closePTYLocked()
 	s.mu.Unlock()
 
 	m.awaitReadDone(s)

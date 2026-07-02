@@ -55,7 +55,7 @@ func (s *Store) PurgeAgentRuntimeStateForRetry(ctx context.Context, agentID stri
 	}
 
 	blobPrefix := "kojo://global/agents/" + agentID + "/"
-	blobPrefixEnd := blobPrefix[:len(blobPrefix)-1] + string([]byte{'/' + 1})
+	blobPrefixEnd, _ := nextPrefix(blobPrefix)
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE blob_refs SET handoff_pending = 0 WHERE uri >= ? AND uri < ? AND handoff_pending = 1`,
 		blobPrefix, blobPrefixEnd,
@@ -66,7 +66,7 @@ func (s *Store) PurgeAgentRuntimeStateForRetry(ctx context.Context, agentID stri
 	releasedKey := "released/" + agentID
 	arrivedKey := "arrived/" + agentID
 	pendingPrefix := "pending/" + agentID + "/"
-	pendingPrefixEnd := pendingPrefix[:len(pendingPrefix)-1] + string([]byte{'/' + 1})
+	pendingPrefixEnd, _ := nextPrefix(pendingPrefix)
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM kv
 		  WHERE namespace = 'handoff'
@@ -99,13 +99,13 @@ func (s *Store) PurgeAgentRuntimeStateForRetry(ctx context.Context, agentID stri
 //     next device-switch attempt would 409 wrong_source because
 //     blob_refs still claims the agent lives elsewhere.
 //   - kv namespace="handoff":
-//     - `released/<id>` marker deleted (otherwise startup eviction
-//       throws the just-reclaimed runtime away).
-//     - `arrived/<id>` marker deleted (stale arrival from prior
-//       half-finished switch would mask the next legitimate one).
-//     - `pending/<id>/*` sealed agent-sync tokens deleted (a
-//       stranded sync entry would let a retry of the prior
-//       orchestrator step double-commit).
+//   - `released/<id>` marker deleted (otherwise startup eviction
+//     throws the just-reclaimed runtime away).
+//   - `arrived/<id>` marker deleted (stale arrival from prior
+//     half-finished switch would mask the next legitimate one).
+//   - `pending/<id>/*` sealed agent-sync tokens deleted (a
+//     stranded sync entry would let a retry of the prior
+//     orchestrator step double-commit).
 //
 // Caller MUST refresh the in-memory cache + side channels after
 // this call returns; the store has no view into the runtime layer.
@@ -165,7 +165,7 @@ UPDATE blob_refs
 	// case-folding probe. The high bound below replaces the
 	// trailing slash with the next ASCII codepoint, which is
 	// past any legitimate kojo URI tail.
-	blobPrefixEnd := blobPrefix[:len(blobPrefix)-1] + string([]byte{'/' + 1})
+	blobPrefixEnd, _ := nextPrefix(blobPrefix)
 	if _, err := tx.ExecContext(ctx, blobUpd,
 		localPeerID, now, blobPrefix, blobPrefixEnd,
 	); err != nil {
@@ -184,7 +184,7 @@ DELETE FROM kv
 	releasedKey := "released/" + agentID
 	arrivedKey := "arrived/" + agentID
 	pendingPrefix := "pending/" + agentID + "/"
-	pendingPrefixEnd := pendingPrefix[:len(pendingPrefix)-1] + string([]byte{'/' + 1})
+	pendingPrefixEnd, _ := nextPrefix(pendingPrefix)
 	if _, err := tx.ExecContext(ctx, kvDel,
 		releasedKey, arrivedKey, pendingPrefix, pendingPrefixEnd,
 	); err != nil {

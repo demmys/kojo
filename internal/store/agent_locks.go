@@ -327,61 +327,6 @@ UPDATE agent_locks
 	return rec, nil
 }
 
-// Deprecated: use ForceReclaimAgentToLocal in
-// internal/store/force_reclaim.go. ForceReclaimAgentLock only
-// rewrites agent_locks; callers also had to chase down
-// blob_refs.home_peer and handoff kv markers by hand, which is
-// exactly the breakage ag_f71bf5e00c0ba30c hit on production.
-// Retained for the test suite while callers migrate.
-func (s *Store) ForceReclaimAgentLock(ctx context.Context, agentID, peer string, now, leaseDurationMs int64) (*AgentLockRecord, error) {
-	if agentID == "" {
-		return nil, errors.New("store.ForceReclaimAgentLock: agent_id required")
-	}
-	if peer == "" {
-		return nil, errors.New("store.ForceReclaimAgentLock: peer required")
-	}
-	if leaseDurationMs <= 0 {
-		return nil, errors.New("store.ForceReclaimAgentLock: lease duration must be > 0")
-	}
-	if now == 0 {
-		now = NowMillis()
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("store.ForceReclaimAgentLock: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	token, err := nextFencingToken(ctx, tx, agentID)
-	if err != nil {
-		return nil, fmt.Errorf("store.ForceReclaimAgentLock: %w", err)
-	}
-	expires := now + leaseDurationMs
-	const upsert = `
-INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(agent_id) DO UPDATE SET
-  holder_peer        = excluded.holder_peer,
-  fencing_token      = excluded.fencing_token,
-  lease_expires_at   = excluded.lease_expires_at,
-  acquired_at        = excluded.acquired_at,
-  allowed_proxy_peer = excluded.allowed_proxy_peer`
-	if _, err := tx.ExecContext(ctx, upsert, agentID, peer, token, expires, now, peer); err != nil {
-		return nil, fmt.Errorf("store.ForceReclaimAgentLock: upsert: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("store.ForceReclaimAgentLock: commit: %w", err)
-	}
-	return &AgentLockRecord{
-		AgentID:          agentID,
-		HolderPeer:       peer,
-		FencingToken:     token,
-		LeaseExpiresAt:   expires,
-		AcquiredAt:       now,
-		AllowedProxyPeer: peer,
-	}, nil
-}
-
 // TransferAgentLock atomically moves the lock from currentPeer to
 // newPeer, bumping the fencing_token via the per-agent counter so
 // a delayed write from currentPeer with the prior token fails

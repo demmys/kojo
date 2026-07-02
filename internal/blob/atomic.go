@@ -7,31 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-)
 
-// atomicWrite is the legacy single-call form: stage + commit + fsync
-// the parent dir in one go. Kept for the simple "write and publish"
-// callers that don't have any inter-step gating to run.
-//
-// New code that needs to validate state between the stage and the
-// rename (e.g. the blob.Store.Put preflight against an evolving
-// blob_refs.handoff_pending flag) should use atomicStage +
-// atomicCommit / atomicRollback so a refused row update doesn't
-// rename a half-orphan body into place.
-func atomicWrite(dst string, src io.Reader, mode os.FileMode, expectedSHA256 string) (size int64, hexDigest string, err error) {
-	tmp, n, digest, err := atomicStage(dst, src, mode, expectedSHA256)
-	if err != nil {
-		return 0, "", err
-	}
-	renamed, cerr := atomicCommit(tmp, dst)
-	if cerr != nil {
-		if !renamed {
-			atomicRollback(tmp)
-		}
-		return 0, "", cerr
-	}
-	return n, digest, nil
-}
+	"github.com/loppo-llc/kojo/internal/fsyncdir"
+)
 
 // atomicStage streams src into a temp file alongside dst, verifying
 // the digest against expectedSHA256 (when non-empty) before any
@@ -113,7 +91,7 @@ func atomicCommit(tmp, dst string) (renamed bool, err error) {
 	if err := os.Rename(tmp, dst); err != nil {
 		return false, fmt.Errorf("blob: rename: %w", err)
 	}
-	if err := fsyncDir(filepath.Dir(dst)); err != nil {
+	if err := fsyncdir.Dir(filepath.Dir(dst)); err != nil {
 		// The rename SUCCEEDED; the new body is at dst. The
 		// only thing missing is the directory metadata
 		// commit. Surface the error but tell the caller not
@@ -133,25 +111,4 @@ func atomicRollback(tmp string) {
 		return
 	}
 	_ = os.Remove(tmp)
-}
-
-// fsyncDir opens the directory in O_RDONLY and calls Sync. On Windows
-// the syscall is a no-op (directories are not sync'able), so we simply
-// return nil there to avoid sprinkling build tags through callers.
-func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		// Some platforms (Windows, certain network filesystems) refuse
-		// fsync on directories. Treat that as a non-fatal best-effort
-		// rather than abort an otherwise-successful publish.
-		if isUnsupported(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
 }

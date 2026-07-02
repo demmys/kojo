@@ -1,13 +1,14 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 	if st == nil {
 		return nil, errors.New("store handle is required")
 	}
-	cutoff := store.NowMillis() - int64(maxAgeDays)*24*60*60*1000
+	cutoff := cutoffMillis(maxAgeDays)
 	refs, err := st.ListBlobRefs(ctx, store.ListBlobRefsOptions{IncludeMarkedForGC: true})
 	if err != nil {
 		return nil, err
@@ -95,7 +96,7 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 		}); err != nil {
 			return nil, err
 		}
-		sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+		slices.SortFunc(dirs, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 		for _, dir := range dirs {
 			if counts[dir] != 0 {
 				continue
@@ -131,18 +132,15 @@ func planBlobCleanup(ctx context.Context, st *store.Store, root string, maxAgeDa
 			Path: filepath.Join(root, string(scope), filepath.FromSlash(rel)),
 		})
 	}
-	sort.Strings(p.OrphanFiles)
-	sort.Slice(p.GCRefs, func(i, j int) bool { return p.GCRefs[i].URI < p.GCRefs[j].URI })
-	sort.Slice(p.ExpiredAttachments, func(i, j int) bool { return p.ExpiredAttachments[i].URI < p.ExpiredAttachments[j].URI })
-	sort.Strings(p.EmptyDirs)
+	slices.Sort(p.OrphanFiles)
+	slices.SortFunc(p.GCRefs, func(a, b blobGCEntry) int { return cmp.Compare(a.URI, b.URI) })
+	slices.SortFunc(p.ExpiredAttachments, func(a, b blobGCEntry) int { return cmp.Compare(a.URI, b.URI) })
+	slices.Sort(p.EmptyDirs)
 	return p, nil
 }
 
 func printBlobCleanPlan(p *blobCleanPlan, apply bool) {
-	mode := "would remove"
-	if apply {
-		mode = "removing"
-	}
+	mode := cleanVerb(apply)
 	if p == nil || (len(p.OrphanFiles) == 0 && len(p.GCRefs) == 0 && len(p.ExpiredAttachments) == 0 && len(p.EmptyDirs) == 0) {
 		fmt.Fprintln(os.Stderr, "kojo: clean blobs: nothing to remove")
 		return
@@ -169,12 +167,12 @@ func applyBlobCleanPlan(ctx context.Context, p *blobCleanPlan, st *store.Store) 
 	}
 	var errs []error
 	for _, path := range p.OrphanFiles {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeIfExists(path); err != nil {
 			errs = append(errs, fmt.Errorf("remove orphan blob %s: %w", path, err))
 		}
 	}
 	for _, ref := range p.GCRefs {
-		if err := os.Remove(ref.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeIfExists(ref.Path); err != nil {
 			errs = append(errs, fmt.Errorf("remove GC blob %s: %w", ref.Path, err))
 			continue
 		}
@@ -183,7 +181,7 @@ func applyBlobCleanPlan(ctx context.Context, p *blobCleanPlan, st *store.Store) 
 		}
 	}
 	for _, ref := range p.ExpiredAttachments {
-		if err := os.Remove(ref.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeIfExists(ref.Path); err != nil {
 			errs = append(errs, fmt.Errorf("remove expired attachment %s: %w", ref.Path, err))
 			continue
 		}
@@ -191,9 +189,9 @@ func applyBlobCleanPlan(ctx context.Context, p *blobCleanPlan, st *store.Store) 
 			errs = append(errs, fmt.Errorf("delete expired attachment ref %s: %w", ref.URI, err))
 		}
 	}
-	sort.Slice(p.EmptyDirs, func(i, j int) bool { return len(p.EmptyDirs[i]) > len(p.EmptyDirs[j]) })
+	slices.SortFunc(p.EmptyDirs, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 	for _, dir := range p.EmptyDirs {
-		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeIfExists(dir); err != nil {
 			errs = append(errs, fmt.Errorf("remove empty blob dir %s: %w", dir, err))
 		}
 	}
@@ -225,7 +223,7 @@ type agentCleanPlan struct {
 }
 
 func planAgentCleanup(ctx context.Context, st *store.Store, maxAgeDays int) (*agentCleanPlan, error) {
-	cutoff := store.NowMillis() - int64(maxAgeDays)*24*60*60*1000
+	cutoff := cutoffMillis(maxAgeDays)
 	rows, err := st.DB().QueryContext(ctx, `
 SELECT id, name, deleted_at
   FROM agents
@@ -277,7 +275,7 @@ type eventCleanPlan struct {
 }
 
 func planEventCleanup(ctx context.Context, st *store.Store, maxAgeDays int) (*eventCleanPlan, error) {
-	cutoff := store.NowMillis() - int64(maxAgeDays)*24*60*60*1000
+	cutoff := cutoffMillis(maxAgeDays)
 	p := &eventCleanPlan{Cutoff: cutoff}
 	var maxSeq sql.NullInt64
 	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*), MAX(seq) FROM events WHERE ts < ?`, cutoff).Scan(&p.EventRows, &maxSeq); err != nil {

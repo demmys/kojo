@@ -50,39 +50,35 @@ import (
 // register.go reshuffle.
 type compactionsImporter struct{}
 
-func (compactionsImporter) Domain() string { return "compactions" }
+const compactionsDomain = "compactions"
+
+func (compactionsImporter) Domain() string { return compactionsDomain }
 
 func (compactionsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "compactions"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
+	return runDomain(ctx, st, compactionsDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectCompactionsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect compactions source paths: %w", err)
+		}
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum compactions sources: %w", err)
+		}
 
-	logger := slog.Default().With("importer", "compactions")
+		// Warn on every non-empty leaf under <v0>/compactions/. Any content
+		// here is unexpected (no v0 writer); the operator should see it
+		// surfaced rather than have it silently swept past. The bytes ARE
+		// read once (by domainChecksum above, O_RDONLY via openV0) for the
+		// fingerprint, but never parsed or imported — the file format is
+		// undefined and a future v1 reader would have nothing to do with
+		// them.
+		for _, rel := range srcPaths {
+			logger.Warn("compactions: unexpected file under <v0>/compactions/ left untouched (no v0 writer / no v1 importer for this format)",
+				"path", rel)
+		}
 
-	srcPaths, err := collectCompactionsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect compactions source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum compactions sources: %w", err)
-	}
-
-	// Warn on every non-empty leaf under <v0>/compactions/. Any content
-	// here is unexpected (no v0 writer); the operator should see it
-	// surfaced rather than have it silently swept past. The bytes ARE
-	// read once (by domainChecksum above, O_RDONLY via openV0) for the
-	// fingerprint, but never parsed or imported — the file format is
-	// undefined and a future v1 reader would have nothing to do with
-	// them.
-	for _, rel := range srcPaths {
-		logger.Warn("compactions: unexpected file under <v0>/compactions/ left untouched (no v0 writer / no v1 importer for this format)",
-			"path", rel)
-	}
-
-	return markImported(ctx, st, "compactions", 0, checksum)
+		return 0, checksum, nil
+	})
 }
 
 // collectCompactionsSourcePaths enumerates every regular file under

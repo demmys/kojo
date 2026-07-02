@@ -19,9 +19,8 @@ type StatusEvent struct {
 	LastSeen int64  `json:"last_seen,omitempty"` // unix millis
 	// Op is "upsert" for register / first-touch, "touch" for
 	// heartbeat status refreshes, "expire" for sweeper-driven
-	// stale flips, "delete" for explicit deregistration. Lets a
-	// subscriber gate on which mutations matter without re-deriving
-	// from before/after rows.
+	// stale flips. Lets a subscriber gate on which mutations matter
+	// without re-deriving from before/after rows.
 	Op string `json:"op"`
 }
 
@@ -32,7 +31,6 @@ const (
 	StatusOpUpsert = "upsert"
 	StatusOpTouch  = "touch"
 	StatusOpExpire = "expire"
-	StatusOpDelete = "delete"
 )
 
 // EventBus is the in-memory pub/sub for peer_registry status
@@ -51,9 +49,9 @@ const (
 // peer-status feed isolated from the domain-events feed.
 //
 // Concurrency: Publish is non-blocking — if a subscriber's channel
-// is full, the event is DROPPED for that subscriber and a counter
-// (Dropped) is bumped. A subscriber that drops too many events is
-// expected to drop its subscription and re-fetch the full
+// is full, its subscription is cancelled immediately (see Publish)
+// rather than silently dropping the event. The subscriber's next
+// read observes the closed channel and re-fetches the full
 // peer_registry. This trades best-effort delivery for guaranteed
 // publisher progress — a stalled HTTP client can't pin the
 // heartbeat loop.
@@ -64,10 +62,9 @@ type EventBus struct {
 }
 
 type statusSub struct {
-	ch      chan StatusEvent
-	ctx     context.Context
-	cancel  context.CancelFunc
-	dropped int
+	ch     chan StatusEvent
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewEventBus returns a fresh bus with no subscribers.
@@ -98,9 +95,7 @@ func (b *EventBus) Publish(evt StatusEvent) {
 			// goroutine in Subscribe removes the entry from
 			// b.subs and closes the channel, so the receiver's
 			// next read returns !ok and the handler emits its
-			// close-code. We bump dropped for telemetry; the
-			// counter is observable via tests.
-			s.dropped++
+			// close-code.
 			s.cancel()
 			delete(b.subs, id)
 		}

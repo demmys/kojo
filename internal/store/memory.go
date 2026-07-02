@@ -140,15 +140,10 @@ func (s *Store) InsertMemoryEntry(ctx context.Context, rec *MemoryEntryRecord, o
 
 	seq := opts.Seq
 	if seq == 0 {
-		var maxSeq sql.NullInt64
-		if err := tx.QueryRowContext(ctx,
-			`SELECT MAX(seq) FROM memory_entries WHERE agent_id = ?`, rec.AgentID,
-		).Scan(&maxSeq); err != nil {
-			return nil, err
-		}
-		seq = 1
-		if maxSeq.Valid {
-			seq = maxSeq.Int64 + 1
+		var serr error
+		seq, serr = nextAgentSeqTx(ctx, tx, "memory_entries", rec.AgentID)
+		if serr != nil {
+			return nil, serr
 		}
 	}
 
@@ -749,13 +744,8 @@ SELECT body, body_sha256, last_tx_id, seq, version, etag, created_at, updated_at
 		}
 	}
 
-	switch {
-	case ifMatchETag != "":
-		if !liveExists || prev.ETag != ifMatchETag {
-			return nil, ErrETagMismatch
-		}
-	case liveExists && !opts.AllowOverwrite:
-		return nil, ErrETagMismatch
+	if err := checkSingletonUpsertPrecondition(liveExists, prev.ETag, ifMatchETag, opts.AllowOverwrite); err != nil {
+		return nil, err
 	}
 
 	// Normalize LastTxID: a non-nil pointer to "" would hash as a present
@@ -807,7 +797,7 @@ UPDATE agent_memory SET
   version = ?, etag = ?, updated_at = ?, peer_id = ?
 WHERE agent_id = ? AND deleted_at IS NULL`
 		if _, err := tx.ExecContext(ctx, upd,
-			rec.Body, rec.BodySHA256, nullableTxID(rec.LastTxID),
+			rec.Body, rec.BodySHA256, nullableTextPtr(rec.LastTxID),
 			rec.Version, rec.ETag, rec.UpdatedAt, nullableText(rec.PeerID), agentID,
 		); err != nil {
 			return nil, err
@@ -826,7 +816,7 @@ INSERT INTO agent_memory (
   seq, version, etag, created_at, updated_at, deleted_at, peer_id
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 		if _, err := tx.ExecContext(ctx, ins,
-			rec.AgentID, rec.Body, rec.BodySHA256, nullableTxID(rec.LastTxID),
+			rec.AgentID, rec.Body, rec.BodySHA256, nullableTextPtr(rec.LastTxID),
 			rec.Seq, rec.Version, rec.ETag, rec.CreatedAt, rec.UpdatedAt, nullableText(rec.PeerID),
 		); err != nil {
 			return nil, err
@@ -918,13 +908,6 @@ SELECT m.body, m.body_sha256, m.last_tx_id, m.seq, m.version, m.etag,
 		rec.DeletedAt = &v
 	}
 	return &rec, nil
-}
-
-func nullableTxID(p *string) any {
-	if p == nil || *p == "" {
-		return nil
-	}
-	return *p
 }
 
 // SoftDeleteAgentMemory tombstones the agent_memory row for agentID.

@@ -16,15 +16,17 @@ package importers
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -209,11 +211,109 @@ func alreadyImported(ctx context.Context, st *store.Store, domain string) (bool,
 	return false, nil
 }
 
-// hasPathSep reports whether s contains either OS path separator. memory_entries
-// names must not span directory boundaries; the importer maps subdirs into
-// canonical kinds before stripping path components.
-func hasPathSep(s string) bool {
-	return strings.ContainsRune(s, filepath.Separator) || strings.ContainsRune(s, '/')
+// runDomain owns the prologue/epilogue every per-domain importer shares:
+// the alreadyImported short-circuit, the per-importer slog logger, and
+// the terminal markImported. body performs the domain's own collect →
+// domainChecksum → row copy and returns (count, checksum) — the same
+// pair every importer previously threaded into markImported by hand.
+// runDomain then stamps migration_status exactly once with that pair.
+//
+// The collect/checksum steps stay inside body because their signatures
+// and error-wrap text differ per importer (blobs derives its checksum
+// from a (ctx, st)-scoped mapping walk; the string-collect importers use
+// distinct "collect …: %w" prefixes). Keeping them in body preserves
+// each importer's error text verbatim.
+//
+// Missing-file conventions are unchanged: a whole-domain importer whose
+// top-level v0 file is absent returns (0, checksum, nil) so runDomain
+// stamps markImported(0); per-agent importers leave their leaf helpers
+// (which return 0,nil for an absent per-agent file) untouched and mark
+// the domain with the running total at the end.
+func runDomain(ctx context.Context, st *store.Store, domain string, body func(logger *slog.Logger) (count int, checksum string, err error)) error {
+	if done, err := alreadyImported(ctx, st, domain); err != nil {
+		return err
+	} else if done {
+		return nil
+	}
+
+	logger := slog.Default().With("importer", domain)
+
+	count, checksum, err := body(logger)
+	if err != nil {
+		return err
+	}
+	return markImported(ctx, st, domain, count, checksum)
+}
+
+// loadIDSet runs a query that SELECTs a single string column and returns
+// the values as a set. Used by the importers' id-preload paths (per-agent
+// dedup and cross-agent collision detection). The map is unsized because
+// the row count isn't known up front.
+func loadIDSet(ctx context.Context, st *store.Store, query string, args ...any) (map[string]bool, error) {
+	rows, err := st.DB().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// generateFreshID returns a "<prefix><16hex>" identifier guaranteed not to
+// collide with any id in taken at call time. 64 random bits + the in-memory
+// taken-set check make a runtime collision astronomically unlikely. The
+// caller must mark the returned id in taken before generating the next one.
+// Falls back with a clean error if crypto/rand can't produce entropy or a
+// long retry loop exhausts plausible ids (a safety bound, not a realistic
+// outcome).
+func generateFreshID(prefix string, taken map[string]bool) (string, error) {
+	var buf [8]byte
+	for tries := 0; tries < 32; tries++ {
+		if _, err := rand.Read(buf[:]); err != nil {
+			return "", fmt.Errorf("rand: %w", err)
+		}
+		id := prefix + hex.EncodeToString(buf[:])
+		if !taken[id] {
+			return id, nil
+		}
+	}
+	return "", errors.New("could not generate non-colliding id after 32 tries")
+}
+
+// collectPerAgentLeaf enumerates one named leaf file (e.g. messages.jsonl,
+// tasks.json) under each v0 agent dir, in V0Dir-relative forward-slash
+// form. Same scan-vs-import caveat as collectAgentsSourcePaths: an orphan
+// agent dir on disk contributes to the checksum even when the importer's
+// row-copy loop skips it (because ListAgents won't return its id).
+func collectPerAgentLeaf(v0Dir, filename string) ([]string, error) {
+	var paths []string
+	base := agentsBaseDir(v0Dir)
+	entries, err := readDirV0(v0Dir, base)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return paths, nil
+		}
+		return nil, fmt.Errorf("readdir agents: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "groupdms" {
+			continue
+		}
+		p := filepath.Join(base, e.Name(), filename)
+		updated, err := addLeafIfRegular(v0Dir, p, paths)
+		if err != nil {
+			return nil, err
+		}
+		paths = updated
+	}
+	return paths, nil
 }
 
 // readDirV0 lists path with the same root-escape protection as openV0.
@@ -295,7 +395,7 @@ func walkDirV0(v0Root, root string, fn fs.WalkDirFunc) error {
 // outside V0Dir even if the caller's path collection is sloppy.
 func domainChecksum(v0Dir string, relPaths []string) (string, error) {
 	paths := append([]string(nil), relPaths...)
-	sort.Strings(paths)
+	slices.Sort(paths)
 
 	h := sha256.New()
 	var row strings.Builder
@@ -509,27 +609,7 @@ func collectAgentsSourcePaths(v0Dir string) ([]string, error) {
 // agent dir on disk contributes to the checksum even when the messages
 // importer skips it (because ListAgents won't return its id).
 func collectMessagesSourcePaths(v0Dir string) ([]string, error) {
-	var paths []string
-	base := agentsBaseDir(v0Dir)
-	entries, err := readDirV0(v0Dir, base)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return paths, nil
-		}
-		return nil, fmt.Errorf("readdir agents: %w", err)
-	}
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "groupdms" {
-			continue
-		}
-		p := filepath.Join(base, e.Name(), "messages.jsonl")
-		updated, err := addLeafIfRegular(v0Dir, p, paths)
-		if err != nil {
-			return nil, err
-		}
-		paths = updated
-	}
-	return paths, nil
+	return collectPerAgentLeaf(v0Dir, "messages.jsonl")
 }
 
 // collectGroupDMsSourcePaths enumerates groups.json plus per-group

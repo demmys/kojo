@@ -2,6 +2,7 @@ package atomicfile
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -28,6 +29,19 @@ func WriteJSON(path string, data any, perm os.FileMode) error {
 // before rename so the final inode lands with the requested perm
 // regardless of the OS's umask handling.
 func WriteBytes(path string, data []byte, perm os.FileMode) error {
+	return WriteWith(path, perm, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// WriteWith atomically writes to path by invoking write against a unique
+// temp file in the same directory, then rename. It shares the temp+rename
+// core with WriteBytes: the write callback streams the payload (avoiding a
+// full in-memory buffer for large encoders), perm is applied via Chmod
+// before rename, and any failure removes the temp file. See WriteBytes for
+// the concurrency guarantees.
+func WriteWith(path string, perm os.FileMode, write func(io.Writer) error) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	f, err := os.CreateTemp(dir, base+".*.tmp")
@@ -41,7 +55,7 @@ func WriteBytes(path string, data []byte, perm os.FileMode) error {
 			os.Remove(tmpPath)
 		}
 	}()
-	if _, err := f.Write(data); err != nil {
+	if err := write(f); err != nil {
 		f.Close()
 		return err
 	}

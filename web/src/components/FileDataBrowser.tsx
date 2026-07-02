@@ -1,12 +1,21 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
-import type { DirEntry, FileView } from "../lib/api";
-import { formatSize, timeAgo } from "../lib/utils";
+import { isThumbSupported, type DirEntry, type FileView } from "../lib/api";
+import { errMsg, formatSize, timeAgo } from "../lib/utils";
+import {
+  basename,
+  buildBreadcrumbs,
+  joinBrowserPath,
+  normalizePath,
+  parentBrowserPath,
+  samePath,
+  type PathMode,
+} from "../lib/browserPath";
+import { fileKind, FileGlyph, FolderIcon, isImage, KIND_STYLES } from "./fileIcons";
 import { MarkdownRenderer } from "./agent/MarkdownRenderer";
 
 type SortKey = "name" | "size" | "modified";
 type SortDir = "asc" | "desc";
-type PathMode = "relative" | "absolute";
 type HistoryKind = "dir" | "view";
 
 interface FileDataSource {
@@ -34,8 +43,6 @@ interface FileDataBrowserProps {
   onExit: () => void;
 }
 
-type FileKind = "image" | "video" | "audio" | "markdown" | "code" | "data" | "archive" | "pdf" | "text";
-
 interface ViewerState {
   path: string;
   name: string;
@@ -44,177 +51,12 @@ interface ViewerState {
   loading: boolean;
 }
 
-const SEP = "/";
 const VIEW_PARAM = "view";
 // Directory and preview navigation both live in URL search params. These
 // history markers let the back button pop viewer-local entries instead of
 // leaving stale file-browser routes behind the chat screen.
 const HISTORY_STATE_KEY = "kojoFileBrowser";
 const HISTORY_DEPTH_KEY = "kojoFileBrowserDepth";
-
-const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico"]);
-const VIDEO_EXTS = new Set(["mp4", "webm", "mov", "avi", "mkv", "m4v"]);
-const AUDIO_EXTS = new Set(["mp3", "wav", "ogg", "flac", "m4a", "aac"]);
-const CODE_EXTS = new Set([
-  "js", "jsx", "ts", "tsx", "go", "rs", "py", "rb", "java", "c", "cpp", "h",
-  "hpp", "swift", "kt", "sh", "bash", "zsh", "sql", "css", "scss", "html",
-  "mod", "sum", "lua", "php", "cs", "dart", "vue", "svelte",
-]);
-const DATA_EXTS = new Set(["json", "yaml", "yml", "toml", "xml", "jsonl", "csv", "tsv", "ini", "env", "conf"]);
-const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
-const ARCHIVE_EXTS = new Set(["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]);
-const PDF_EXTS = new Set(["pdf"]);
-
-const KIND_STYLES: Record<FileKind, { bg: string; icon: string }> = {
-  image:    { bg: "bg-emerald-500/10",  icon: "text-emerald-400" },
-  video:    { bg: "bg-rose-500/10",     icon: "text-rose-400" },
-  audio:    { bg: "bg-pink-500/10",     icon: "text-pink-400" },
-  markdown: { bg: "bg-sky-500/10",      icon: "text-sky-400" },
-  code:     { bg: "bg-violet-500/10",   icon: "text-violet-400" },
-  data:     { bg: "bg-amber-500/10",    icon: "text-amber-400" },
-  archive:  { bg: "bg-orange-500/10",   icon: "text-orange-400" },
-  pdf:      { bg: "bg-red-500/10",      icon: "text-red-400" },
-  text:     { bg: "bg-neutral-700/40",  icon: "text-neutral-300" },
-};
-
-function fileKind(name: string): FileKind {
-  const dot = name.lastIndexOf(".");
-  if (dot < 0) return "text";
-  const ext = name.slice(dot + 1).toLowerCase();
-  if (IMAGE_EXTS.has(ext)) return "image";
-  if (VIDEO_EXTS.has(ext)) return "video";
-  if (AUDIO_EXTS.has(ext)) return "audio";
-  if (MARKDOWN_EXTS.has(ext)) return "markdown";
-  if (CODE_EXTS.has(ext)) return "code";
-  if (DATA_EXTS.has(ext)) return "data";
-  if (ARCHIVE_EXTS.has(ext)) return "archive";
-  if (PDF_EXTS.has(ext)) return "pdf";
-  return "text";
-}
-
-function isImage(name: string): boolean {
-  return fileKind(name) === "image";
-}
-
-function sanitizeRelativePath(raw: string): string {
-  return raw
-    .split(/[/\\]+/)
-    .filter((s) => s && s !== "." && s !== "..")
-    .join(SEP);
-}
-
-function normalizePath(raw: string, mode: PathMode): string {
-  if (mode === "relative") return sanitizeRelativePath(raw);
-  return raw;
-}
-
-function pathSep(path: string): string {
-  return path.includes("\\") && !path.includes("/") ? "\\" : "/";
-}
-
-function joinBrowserPath(parent: string, name: string, mode: PathMode): string {
-  if (mode === "relative") return sanitizeRelativePath([parent, name].filter(Boolean).join(SEP));
-  if (!parent) return name;
-  const sep = pathSep(parent);
-  return parent.endsWith("/") || parent.endsWith("\\") ? `${parent}${name}` : `${parent}${sep}${name}`;
-}
-
-function trimTrailingSep(path: string): string {
-  if (!path) return "";
-  if (path === "/" || /^[A-Za-z]:[\\/]?$/.test(path)) return path;
-  return path.replace(/[/\\]+$/, "");
-}
-
-function unifiedPath(path: string): string {
-  const unified = trimTrailingSep(path).replace(/\\/g, "/");
-  return unified === "" && path.startsWith("/") ? "/" : unified;
-}
-
-function samePath(a: string, b: string): boolean {
-  const ua = unifiedPath(a);
-  const ub = unifiedPath(b);
-  if (/^[A-Za-z]:/.test(ua) || /^[A-Za-z]:/.test(ub)) return ua.toLowerCase() === ub.toLowerCase();
-  return ua === ub;
-}
-
-function pathWithin(path: string, root: string): boolean {
-  const p = unifiedPath(path);
-  const r = unifiedPath(root);
-  if (samePath(p, r)) return true;
-  const prefix = r.endsWith("/") ? r : `${r}/`;
-  return p.startsWith(prefix);
-}
-
-function parentBrowserPath(path: string, mode: PathMode): string {
-  if (mode === "relative") {
-    const parts = sanitizeRelativePath(path).split(SEP).filter(Boolean);
-    parts.pop();
-    return parts.join(SEP);
-  }
-
-  const trimmed = trimTrailingSep(path);
-  if (!trimmed || trimmed === "/" || /^[A-Za-z]:[\\/]?$/.test(trimmed)) return trimmed;
-  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-  if (slash < 0) return "";
-  if (slash === 0) return "/";
-  const parent = trimmed.slice(0, slash);
-  return /^[A-Za-z]:$/.test(parent) ? `${parent}${pathSep(trimmed)}` : parent;
-}
-
-function basename(path: string): string {
-  const trimmed = trimTrailingSep(path);
-  return trimmed.split(/[/\\]+/).filter(Boolean).pop() || trimmed || path;
-}
-
-function splitPath(path: string): string[] {
-  return unifiedPath(path).split("/").filter(Boolean);
-}
-
-function fsRoot(path: string): string {
-  const drive = path.match(/^[A-Za-z]:[\\/]?/);
-  if (drive) return drive[0].endsWith("\\") || drive[0].endsWith("/") ? drive[0] : `${drive[0]}\\`;
-  return path.startsWith("/") ? "/" : "";
-}
-
-function relativeSegments(path: string, root: string): string[] {
-  if (!root || !pathWithin(path, root)) return splitPath(path);
-  const p = unifiedPath(path);
-  const r = unifiedPath(root);
-  const rel = p.slice(r.length).replace(/^\/+/, "");
-  return rel ? rel.split("/").filter(Boolean) : [];
-}
-
-function buildBreadcrumbs(path: string, mode: PathMode, rootLabel: string, rootPath?: string) {
-  if (mode === "relative") {
-    const parts = sanitizeRelativePath(path).split(SEP).filter(Boolean);
-    const crumbs: { label: string; path: string; isRoot?: boolean }[] = [
-      { label: rootLabel, path: "", isRoot: true },
-    ];
-    let acc = "";
-    for (const p of parts) {
-      acc = acc ? `${acc}${SEP}${p}` : p;
-      crumbs.push({ label: p, path: acc });
-    }
-    return crumbs;
-  }
-
-  const root = rootPath || fsRoot(path);
-  const rootCrumbPath = root || path;
-  const crumbs: { label: string; path: string; isRoot?: boolean }[] = [
-    { label: rootLabel, path: rootCrumbPath, isRoot: true },
-  ];
-  const segments = root ? relativeSegments(path, root) : splitPath(path);
-  let acc = rootCrumbPath;
-  for (const segment of segments) {
-    if (!root && /^[A-Za-z]:$/.test(segment)) {
-      acc = `${segment}\\`;
-      continue;
-    }
-    acc = joinBrowserPath(acc, segment, "absolute");
-    crumbs.push({ label: segment, path: acc });
-  }
-  return crumbs;
-}
 
 function getHistoryKind(state: unknown): HistoryKind | null {
   if (!state || typeof state !== "object") return null;
@@ -235,87 +77,6 @@ function withHistoryKind(state: unknown, kind: HistoryKind, depth: number | null
   };
   if (depth !== null) next[HISTORY_DEPTH_KEY] = depth;
   return next;
-}
-
-function FolderIcon({ className = "" }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" fill="currentColor" className={className}>
-      <path d="M3 6.75A2.25 2.25 0 015.25 4.5h3.19a2.25 2.25 0 011.59.66L11.56 6.56a.75.75 0 00.53.22h6.66A2.25 2.25 0 0121 9.03v8.72a2.25 2.25 0 01-2.25 2.25H5.25A2.25 2.25 0 013 17.75V6.75z" />
-    </svg>
-  );
-}
-
-function FileGlyph({ kind, className = "" }: { kind: FileKind; className?: string }) {
-  switch (kind) {
-    case "image":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <rect x="3" y="4.5" width="18" height="15" rx="2" />
-          <circle cx="8.5" cy="10" r="1.5" fill="currentColor" />
-          <path d="M21 16.5l-5-5-9 9" />
-        </svg>
-      );
-    case "video":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <rect x="3" y="5" width="14" height="14" rx="2" />
-          <path d="M17 10l4-2v8l-4-2" fill="currentColor" stroke="none" />
-        </svg>
-      );
-    case "audio":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <path d="M9 18V6l10-2v12" />
-          <circle cx="7" cy="18" r="2" fill="currentColor" />
-          <circle cx="17" cy="16" r="2" fill="currentColor" />
-        </svg>
-      );
-    case "markdown":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <rect x="3" y="5" width="18" height="14" rx="2" />
-          <path d="M7 15V9l2.5 3L12 9v6" />
-          <path d="M16 9v6l2-2M18 15l2-2" />
-        </svg>
-      );
-    case "code":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <path d="M9 8l-4 4 4 4M15 8l4 4-4 4" />
-        </svg>
-      );
-    case "data":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <ellipse cx="12" cy="6" rx="8" ry="2.5" />
-          <path d="M4 6v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5V6" />
-          <path d="M4 12v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-6" />
-        </svg>
-      );
-    case "archive":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <rect x="4" y="4" width="16" height="16" rx="2" />
-          <path d="M12 4v4M12 10v2M12 14v2" />
-        </svg>
-      );
-    case "pdf":
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z" />
-          <path d="M14 3v5h5" />
-          <path d="M9 14h1.5a1.5 1.5 0 010 3H9v-3zM13 14v3M16 14h2M16 15.5h1.5" />
-        </svg>
-      );
-    default:
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className={className}>
-          <path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8z" />
-          <path d="M14 3v5h5" />
-          <path d="M8 13h8M8 17h5" />
-        </svg>
-      );
-  }
 }
 
 export function FileDataBrowser({
@@ -428,7 +189,7 @@ export function FileDataBrowser({
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        setError(errMsg(e));
         setEntries([]);
         setListedPath("");
         setCopyFolderPath("");
@@ -459,7 +220,7 @@ export function FileDataBrowser({
           setViewer({
             path: viewPath,
             name,
-            error: err instanceof Error ? err.message : String(err),
+            error: errMsg(err),
             loading: false,
           });
         }
@@ -741,9 +502,7 @@ function EntryRow({
   // The thumb endpoint only handles png/jpeg/gif/webp. svg/bmp/avif/ico
   // skip the thumb and load the raw directly — usually small anyway,
   // and the resize would only marginally help.
-  const ext = entry.name.toLowerCase().split(".").pop() ?? "";
-  const thumbSupported = ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp";
-  const thumbSrc = showThumb && thumbSupported && dataSource.thumbUrl
+  const thumbSrc = showThumb && isThumbSupported(entry.name) && dataSource.thumbUrl
     ? dataSource.thumbUrl(path, 96, entry.modTime)
     : dataSource.rawUrl(path);
   const meta =

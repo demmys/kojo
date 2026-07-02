@@ -28,6 +28,7 @@ import {
   type PeerInfo,
   type PeerPendingInfo,
 } from "../../lib/peerApi";
+import { errMsg } from "../../lib/utils";
 
 interface Props {
   setError: (msg: string) => void;
@@ -113,7 +114,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
           // else as an error banner so the Approve / Reject UI
           // doesn't silently disappear on a real failure.
           peersApi.pending().catch((e: unknown) => {
-            const msg = (e as Error).message ?? "";
+            const msg = errMsg(e);
             if (!/^404:|^503:/.test(msg) && !silent) {
               setError(`Failed to load pending peers: ${msg}`);
             }
@@ -130,7 +131,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       } catch (e) {
         if (!mounted.current) return;
         if (myseq !== requestSeq.current) return;
-        const msg = (e as Error).message;
+        const msg = errMsg(e);
         // Detect "registry not registered on this server". The
         // server returns 404 (route not registered) when peerIdentity
         // is nil and 503 (registry not initialized) when the
@@ -203,7 +204,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     try {
       parsed = parsePairingSpec(pairingSpec);
     } catch (e) {
-      setParseError((e as Error).message);
+      setParseError(errMsg(e));
       return;
     }
     setBusy(true);
@@ -213,7 +214,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Register failed: ${(e as Error).message}`);
+      setError(`Register failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -243,7 +244,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Edit failed: ${(e as Error).message}`);
+      setError(`Edit failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -256,7 +257,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Approve failed: ${(e as Error).message}`);
+      setError(`Approve failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -270,7 +271,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Reject failed: ${(e as Error).message}`);
+      setError(`Reject failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }
@@ -284,7 +285,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Delete failed: ${(e as Error).message}`);
+      setError(`Delete failed: ${errMsg(e)}`);
     } finally {
       setBusy(false);
     }

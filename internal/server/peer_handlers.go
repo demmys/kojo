@@ -40,6 +40,29 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
+// requirePeerOrOwner extracts the request principal and enforces the
+// peer-or-owner authorization gate shared by the /api/v1/peers/* sync,
+// pull, blob, and events handlers. On rejection it writes the
+// canonical 403 body and returns ok=false; callers must return
+// immediately without writing further.
+func requirePeerOrOwner(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	p := auth.FromContext(r.Context())
+	if !p.IsPeer() && !p.IsOwner() {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"peer or owner principal required")
+		return p, false
+	}
+	return p, true
+}
+
+// verifySignerIsSource reports whether principal p is authorized to
+// act on behalf of sourceDeviceID. Owner principals always pass; a
+// peer principal must be the named source device. Callers write their
+// own 403 so per-site wording and any lock cleanup stay local.
+func verifySignerIsSource(p auth.Principal, sourceDeviceID string) bool {
+	return !p.IsPeer() || p.PeerID == sourceDeviceID
+}
+
 // peerResponse is the wire shape for one peer_registry row.
 type peerResponse struct {
 	DeviceID string `json:"deviceId"`
@@ -170,7 +193,6 @@ func validatePeerURL(rawURL string) error {
 	}
 	return nil
 }
-
 
 // handleListPeers returns every row in peer_registry. The local row
 // is included — UIs are expected to render it differently using the

@@ -61,7 +61,9 @@ var errSkipInvalidPath = errors.New("blobs: v1 path validation refused leaf")
 // surviving the migration is harmless cruft.
 type blobsImporter struct{}
 
-func (blobsImporter) Domain() string { return "blobs" }
+const blobsDomain = "blobs"
+
+func (blobsImporter) Domain() string { return blobsDomain }
 
 // blobMapping captures one (v0 leaf → v1 blob URI) edge. relPath is the
 // V0Dir-relative form used for the source-path checksum; absPath is
@@ -75,98 +77,92 @@ type blobMapping struct {
 }
 
 func (blobsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "blobs"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "blobs")
-
-	// Scan v0 first. The checksum (and the per-leaf op list) are both
-	// derived from the same walk so source_checksum can never claim a
-	// file the importer didn't actually consider. Pulls the known-agent
-	// set from the v1 store rather than re-parsing agents.json so the
-	// filter inherits whatever skip policy the agents importer applied
-	// (empty name, schema-rejection rows, etc.).
-	mappings, err := collectBlobMappings(ctx, st, opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect blob mappings: %w", err)
-	}
-	relPaths := make([]string, 0, len(mappings))
-	for _, m := range mappings {
-		relPaths = append(relPaths, m.relPath)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, relPaths)
-	if err != nil {
-		return fmt.Errorf("checksum blobs sources: %w", err)
-	}
-
-	if len(mappings) == 0 {
-		// Empty v0 dir / no agents — still record the domain so a re-run
-		// can early-exit via alreadyImported.
-		return markImported(ctx, st, "blobs", 0, checksum)
-	}
-
-	// Build a Store for the v1 blob tree. We construct it locally rather
-	// than threading a *blob.Store through migrate.Options so internal/
-	// migrate stays free of an internal/blob import; the importer is
-	// the only consumer that cares.
-	homePeer := opts.HomePeer
-	if homePeer == "" {
-		h, _ := os.Hostname()
-		if h == "" {
-			h = "kojo-local"
+	return runDomain(ctx, st, blobsDomain, func(logger *slog.Logger) (int, string, error) {
+		// Scan v0 first. The checksum (and the per-leaf op list) are both
+		// derived from the same walk so source_checksum can never claim a
+		// file the importer didn't actually consider. Pulls the known-agent
+		// set from the v1 store rather than re-parsing agents.json so the
+		// filter inherits whatever skip policy the agents importer applied
+		// (empty name, schema-rejection rows, etc.).
+		mappings, err := collectBlobMappings(ctx, st, opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect blob mappings: %w", err)
 		}
-		homePeer = h
-	}
-	bs := blob.New(opts.V1Dir,
-		blob.WithRefs(blob.NewStoreRefs(st, homePeer)),
-		blob.WithHomePeer(homePeer),
-	)
-
-	imported := 0
-	skipped := 0
-	skippedInvalid := 0
-	for _, m := range mappings {
-		// Resume decision: skip iff (a) the blob_refs row is present
-		// AND (b) the on-disk body matches what the row claims AND
-		// (c) the body matches the v0 source. Any divergence — row
-		// missing, row ↔ fs drift, fs ↔ src drift — re-publishes so
-		// the partial-run hole closes.
-		decision, err := blobResumeDecision(opts.V0Dir, bs, m, logger)
-		switch {
-		case errors.Is(err, errSkipInvalidPath):
-			logger.Warn("skipping v0 blob with v1-invalid path",
-				"v0_path", m.absPath, "logical", m.path, "err", err)
-			skippedInvalid++
-			continue
-		case err != nil:
-			return err
-		case decision == decisionSkipFresh:
-			skipped++
-			continue
+		relPaths := make([]string, 0, len(mappings))
+		for _, m := range mappings {
+			relPaths = append(relPaths, m.relPath)
+		}
+		checksum, err := domainChecksum(opts.V0Dir, relPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum blobs sources: %w", err)
 		}
 
-		if err := publishBlob(opts.V0Dir, bs, m); err != nil {
-			if errors.Is(err, errSkipInvalidPath) {
+		if len(mappings) == 0 {
+			// Empty v0 dir / no agents — still record the domain so a re-run
+			// can early-exit via alreadyImported.
+			return 0, checksum, nil
+		}
+
+		// Build a Store for the v1 blob tree. We construct it locally rather
+		// than threading a *blob.Store through migrate.Options so internal/
+		// migrate stays free of an internal/blob import; the importer is
+		// the only consumer that cares.
+		homePeer := opts.HomePeer
+		if homePeer == "" {
+			h, _ := os.Hostname()
+			if h == "" {
+				h = "kojo-local"
+			}
+			homePeer = h
+		}
+		bs := blob.New(opts.V1Dir,
+			blob.WithRefs(blob.NewStoreRefs(st, homePeer)),
+			blob.WithHomePeer(homePeer),
+		)
+
+		imported := 0
+		skipped := 0
+		skippedInvalid := 0
+		for _, m := range mappings {
+			// Resume decision: skip iff (a) the blob_refs row is present
+			// AND (b) the on-disk body matches what the row claims AND
+			// (c) the body matches the v0 source. Any divergence — row
+			// missing, row ↔ fs drift, fs ↔ src drift — re-publishes so
+			// the partial-run hole closes.
+			decision, err := blobResumeDecision(opts.V0Dir, bs, m, logger)
+			switch {
+			case errors.Is(err, errSkipInvalidPath):
 				logger.Warn("skipping v0 blob with v1-invalid path",
 					"v0_path", m.absPath, "logical", m.path, "err", err)
 				skippedInvalid++
 				continue
+			case err != nil:
+				return 0, "", err
+			case decision == decisionSkipFresh:
+				skipped++
+				continue
 			}
-			return fmt.Errorf("publish %s: %w", m.path, err)
-		}
-		imported++
-	}
 
-	if skipped > 0 || skippedInvalid > 0 {
-		logger.Info("blobs partial-run resume",
-			"imported", imported,
-			"skipped_already_published", skipped,
-			"skipped_invalid_path", skippedInvalid)
-	}
-	return markImported(ctx, st, "blobs", imported, checksum)
+			if err := publishBlob(opts.V0Dir, bs, m); err != nil {
+				if errors.Is(err, errSkipInvalidPath) {
+					logger.Warn("skipping v0 blob with v1-invalid path",
+						"v0_path", m.absPath, "logical", m.path, "err", err)
+					skippedInvalid++
+					continue
+				}
+				return 0, "", fmt.Errorf("publish %s: %w", m.path, err)
+			}
+			imported++
+		}
+
+		if skipped > 0 || skippedInvalid > 0 {
+			logger.Info("blobs partial-run resume",
+				"imported", imported,
+				"skipped_already_published", skipped,
+				"skipped_invalid_path", skippedInvalid)
+		}
+		return imported, checksum, nil
+	})
 }
 
 // blobResumeDecision encapsulates the resume policy for one mapping.

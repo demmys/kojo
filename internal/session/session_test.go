@@ -29,11 +29,11 @@ func TestCheckYolo_LongPromptWithANSI(t *testing.T) {
 	// push the prompt out of a 512-byte buffer but fits in 4096.
 	var b strings.Builder
 	for i := 0; i < 100; i++ {
-		b.WriteString("\x1b[1;32m")  // SGR bold green
-		b.WriteString("\x1b[?25l")   // DEC hide cursor
+		b.WriteString("\x1b[1;32m") // SGR bold green
+		b.WriteString("\x1b[?25l")  // DEC hide cursor
 		b.WriteString("some output line\r\n")
-		b.WriteString("\x1b[0m")     // SGR reset
-		b.WriteString("\x1b[?25h")   // DEC show cursor
+		b.WriteString("\x1b[0m")   // SGR reset
+		b.WriteString("\x1b[?25h") // DEC show cursor
 	}
 	b.WriteString("Do you want to proceed? ❯ 1. Yes")
 	data := []byte(b.String())

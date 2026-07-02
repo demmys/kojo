@@ -174,8 +174,7 @@ type Manager struct {
 	// coordination is the store-level optimistic-concurrency layer's
 	// job (see store.UpdateAgent's ifMatchETag parameter, which a
 	// future cutover slice will thread through Manager.Update).
-	patchMusMu sync.Mutex
-	patchMus   map[string]*sync.Mutex
+	patchMus keyedMutex
 
 	// startSchedulersOnce guards StartSchedulers from double-firing
 	// the cron boot. schedulersStarted gates Shutdown so it
@@ -342,7 +341,6 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		memIndexes:     make(map[string]*MemoryIndex),
 		chatWatchers:   make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels: make(map[string]map[int64]context.CancelFunc),
-		patchMus:       make(map[string]*sync.Mutex),
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -1670,7 +1668,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	agentCopy := *a
 	m.mu.Unlock()
 
-	backend, err := m.resolveBackend(agentID, &agentCopy)
+	backend, err := m.resolveBackend(&agentCopy)
 	if err != nil {
 		return nil, err
 	}
@@ -2374,7 +2372,7 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 }
 
 // resolveBackend selects the ChatBackend for the agent's tool.
-func (m *Manager) resolveBackend(agentID string, agentCopy *Agent) (ChatBackend, error) {
+func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 	backend, ok := m.backends[agentCopy.Tool]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
@@ -3247,15 +3245,7 @@ func (m *Manager) save() {
 // the bookkeeping complexity of "which mutex is currently unheld and
 // safe to drop".
 func (m *Manager) LockPatch(id string) (release func()) {
-	m.patchMusMu.Lock()
-	mu, ok := m.patchMus[id]
-	if !ok {
-		mu = &sync.Mutex{}
-		m.patchMus[id] = mu
-	}
-	m.patchMusMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return m.patchMus.Lock(id)
 }
 
 // copyAgent returns a deep copy of an Agent, including pointer fields.

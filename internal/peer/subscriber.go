@@ -38,30 +38,21 @@ import (
 // SubscriberTarget identifies one peer the Subscriber should
 // connect to. Address is the base URL (e.g.
 // "https://peer-b.tail-net.ts.net:8443") and DeviceID is the
-// remote peer's identity (used to verify the peer_registry row's
-// public_key matches what the Hub knows).
+// remote peer's identity, keyed against the peer_registry row the
+// Hub knows about.
 type SubscriberTarget struct {
 	DeviceID string
 	Address  string
 }
 
 // Subscriber maintains one connect-and-reconnect loop per target
-// peer. Local Identity (DeviceID + PrivateKey) signs every
-// outbound WS upgrade so the remote peer's AuthMiddleware
-// authenticates us as RolePeer.
+// peer. No Authorization header is sent on the WS upgrade; the
+// remote peer authenticates the caller via tsnet WhoIs on the
+// receiving side (PairingProtocolVersion v2).
 type Subscriber struct {
 	id     *Identity
 	store  *store.Store
 	logger *slog.Logger
-	// bus is the LOCAL pub/sub the Subscriber would forward
-	// remote events into. In v1 we keep it wired but NEVER
-	// re-publish remote events here — A↔B mutual subscriptions
-	// would otherwise reflect the same status_event back and
-	// forth forever (no origin/hop field to suppress the loop).
-	// In-process consumers consult Subscriber.LiveStatus
-	// instead; the bus is retained on the struct for future
-	// origin-tagging.
-	bus *EventBus
 
 	mu      sync.RWMutex
 	live    map[string]map[string]StatusEvent // target → (deviceID → event)
@@ -73,10 +64,10 @@ type Subscriber struct {
 	stopOnce sync.Once
 
 	// httpClient is used for the WS upgrade. Production
-	// NewSubscriber wires NoKeepAliveHTTPClient(10s) so each
-	// signed upgrade GET runs over a fresh TCP/TLS handshake —
-	// see NewSubscriber for the stale-conn-retry-replays-nonce
-	// rationale. Tests can overwrite the field with their own
+	// NewSubscriber wires NoKeepAliveHTTPClient(10s); the upgrade
+	// GET carries no Authorization header (identity travels via
+	// tsnet WhoIs on the receiving side, PairingProtocolVersion v2).
+	// Tests can overwrite the field with their own
 	// transport-injecting client.
 	httpClient *http.Client
 }
@@ -90,30 +81,27 @@ type subTarget struct {
 	cancel  context.CancelFunc
 }
 
-// NewSubscriber wires the deps. The local EventBus (optional) lets
-// the in-process Hub-side handler re-broadcast events the
-// Subscriber observes — useful in multi-peer setups where a peer
-// learning of a status change should propagate it back through
-// its own /api/v1/peers/events WS to other subscribers.
-func NewSubscriber(id *Identity, st *store.Store, bus *EventBus, logger *slog.Logger) *Subscriber {
+// NewSubscriber wires the deps. The Subscriber deliberately never
+// re-publishes remote events onto the local EventBus (see handleFrame)
+// — A↔B mutual subscriptions would otherwise reflect the same
+// status_event back and forth forever (no origin/hop field to suppress
+// the loop). In-process consumers consult Subscriber.LiveStatus
+// instead.
+func NewSubscriber(id *Identity, st *store.Store, logger *slog.Logger) *Subscriber {
 	return &Subscriber{
 		id:      id,
 		store:   st,
 		logger:  logger,
-		bus:     bus,
 		live:    make(map[string]map[string]StatusEvent),
 		targets: make(map[string]*subTarget),
 		stopCh:  make(chan struct{}),
-		// Disable keep-alives on the WS upgrade GET. The
-		// upgrade carries an Ed25519-signed Authorization
-		// header with a single-use nonce; Go's http.Transport
-		// will silently retry an idempotent GET when a reused
-		// idle connection EOFs before any response bytes,
-		// resending the SAME nonce → the recipient's peer auth
-		// middleware rejects the retry with HTTP 401 "replayed
-		// nonce". Each WS dial gets a fresh TCP/TLS handshake;
-		// the WS connection itself is then long-lived as
-		// usual.
+		// Disable keep-alives on the WS upgrade GET (same
+		// no-keep-alive transport as NewPullClient; see
+		// blobpull.go for why it's still configured this way
+		// even though the upgrade carries no Authorization
+		// header today). Each WS dial gets a fresh TCP/TLS
+		// handshake; the WS connection itself is then
+		// long-lived as usual.
 		//
 		// 10s upgrade ceiling — generous enough for tsnet's
 		// LetsEncrypt cert fetch on first contact, tight
@@ -384,9 +372,6 @@ func (s *Subscriber) handleFrame(target string, data []byte) {
 		}
 		s.live[target] = fresh
 		s.mu.Unlock()
-		for _, evt := range f.Peers {
-			s.republish(evt)
-		}
 	case "event":
 		var f struct {
 			Event StatusEvent `json:"event"`
@@ -402,26 +387,7 @@ func (s *Subscriber) handleFrame(target string, data []byte) {
 		}
 		perTarget[f.Event.DeviceID] = f.Event
 		s.mu.Unlock()
-		s.republish(f.Event)
 	}
-}
-
-// republish is intentionally a NO-OP in v1.
-//
-// An earlier iteration forwarded observed events into s.bus so
-// in-process consumers (e.g. a deconflict layer with
-// OfflineSweeper) could see remote-observed status changes
-// alongside locally-generated ones. With mutual subscriptions
-// (A subscribed to B, B subscribed to A) that creates a
-// reflection loop: A's bus emits → B's subscriber picks it up
-// → B's bus emits → A's subscriber picks it up → A's bus emits
-// the same event again, ad infinitum. The status_event payload
-// has no origin / event_id / hop field to break the loop.
-//
-// In-process consumers query Subscriber.LiveStatus instead; republish is a
-// deliberate no-op to avoid reflection loops.
-func (s *Subscriber) republish(evt StatusEvent) {
-	_ = evt
 }
 
 // jitter applies ±25% to d. Helps avoid synchronised reconnect

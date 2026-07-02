@@ -117,14 +117,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		defer close(ch)
 
 		// send is a helper that respects context cancellation to avoid goroutine leaks.
-		send := func(e ChatEvent) bool {
-			select {
-			case ch <- e:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
+		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
 		result := parseClaudeStream(stdout, b.logger, send)
 
@@ -188,11 +181,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			send(ChatEvent{Type: "text", Delta: finalText})
 		}
 
-		msg := newAssistantMessage()
-		msg.Content = finalText
-		msg.Thinking = result.thinking
-		msg.ToolUses = result.toolUses
-		msg.Usage = result.usage
+		msg := assembleAssistantMessage(finalText, result.thinking, result.toolUses, result.usage)
 
 		// Cache-hit telemetry. Logged on every turn so we can see whether
 		// the system-prompt / volatile-context split is actually keeping
@@ -556,13 +545,7 @@ type claudeStreamEvent struct {
 
 	// "result" event
 	Result    string `json:"result,omitempty"`
-	Duration  int    `json:"duration_ms,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
-
-	// "tool_use" / "tool_result" events
-	Name    string `json:"name,omitempty"`
-	Input   string `json:"input,omitempty"`
-	Content string `json:"content,omitempty"`
 }
 
 // claudeContentBlock represents a content block in a Claude message.
@@ -770,6 +753,11 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 // that persona / system-prompt instructions to "write to MEMORY.md" are not
 // reliable, so the reset path writes a summary regardless.
 func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool, agentID string, idleThreshold time.Duration, logger *slog.Logger) bool {
+	if logger == nil {
+		// Preserve the pre-DI behavior (logging went to the package
+		// default) for callers — chiefly tests — that pass no logger.
+		logger = slog.Default()
+	}
 	absDir, err := filepath.Abs(agentDir)
 	if err != nil {
 		return false
@@ -784,7 +772,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 			// Same rationale as the threshold branch below — a file we
 			// can't delete but also can't --resume (empty) is best left
 			// alone; next chat will retry.
-			slog.Warn("empty session remove failed, keeping as --resume fallback",
+			logger.Warn("empty session remove failed, keeping as --resume fallback",
 				"path", path, "err", err)
 			return true
 		}
@@ -805,7 +793,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 			threshold = sessionResetMinIdleDuration
 		}
 		if idle := time.Since(info.ModTime()); idle < threshold {
-			slog.Debug("claude session over threshold but recently active, keeping",
+			logger.Debug("claude session over threshold but recently active, keeping",
 				"path", path, "contextTokens", ctx,
 				"idle", idle, "idleThreshold", threshold)
 			return true
@@ -819,13 +807,13 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 	// carrying a slightly-over-threshold session for one more turn.
 	if agentID != "" {
 		if err := preResetSummarize(agentID, "claude", logger); err != nil {
-			slog.Warn("pre-reset summary failed, keeping session to avoid context loss",
+			logger.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
 			return true
 		}
 	}
 
-	slog.Info("claude session context over threshold, resetting",
+	logger.Info("claude session context over threshold, resetting",
 		"path", path, "contextTokens", ctx,
 		"threshold", sessionResetThresholdTokens,
 		"automatedTrigger", automatedTrigger)
@@ -835,7 +823,7 @@ func sessionFileUsable(agentDir string, sessionID string, automatedTrigger bool,
 		// --session-id <id> invocation would either resurrect the existing
 		// session or fail, neither of which is what we want. Keep using
 		// --resume; the next run will retry the reset.
-		slog.Warn("session reset: remove failed, keeping session",
+		logger.Warn("session reset: remove failed, keeping session",
 			"path", path, "err", err)
 		return true
 	}
@@ -1081,26 +1069,26 @@ func findSessionFile(projectDir string, sessionID string) string {
 
 // clearClaudeSession removes Claude session JSONL files from the global
 // config store for the given agent, forcing the next chat to start fresh.
-func clearClaudeSession(agentID string) {
+func clearClaudeSession(agentID string, logger *slog.Logger) {
 	dir := agentDir(agentID)
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		slog.Warn("clearClaudeSession: Abs failed", "agent", agentID, "err", err)
+		logger.Warn("clearClaudeSession: Abs failed", "agent", agentID, "err", err)
 		return
 	}
 	projectDir := claudeProjectDir(absDir)
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
-		slog.Info("clearClaudeSession: no project dir", "agent", agentID, "dir", projectDir)
+		logger.Info("clearClaudeSession: no project dir", "agent", agentID, "dir", projectDir)
 		return
 	}
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
 			path := filepath.Join(projectDir, e.Name())
 			if err := os.Remove(path); err != nil {
-				slog.Warn("clearClaudeSession: remove failed", "path", path, "err", err)
+				logger.Warn("clearClaudeSession: remove failed", "path", path, "err", err)
 			} else {
-				slog.Info("clearClaudeSession: removed", "path", path)
+				logger.Info("clearClaudeSession: removed", "path", path)
 			}
 		}
 	}

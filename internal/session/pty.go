@@ -3,7 +3,6 @@
 package session
 
 import (
-	"log/slog"
 	"os"
 
 	"github.com/creack/pty/v2"
@@ -50,7 +49,7 @@ func (s *Session) Resize(cols, rows uint16) error {
 	if tmuxName != "" && (cols != prevCols || rows != prevRows) {
 		if err := tmuxResizePane(tmuxName, cols, rows); err != nil {
 			// Don't update dedup state so the resize is retried next time
-			slog.Debug("tmux resize failed", "session", tmuxName, "err", err)
+			s.log().Debug("tmux resize failed", "session", tmuxName, "err", err)
 			return nil
 		}
 	}

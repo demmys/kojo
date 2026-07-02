@@ -40,29 +40,10 @@ const personaIODBTimeout = 30 * time.Second
 //
 // Map entries leak by design — same pattern as memorySyncMu /
 // Manager.LockPatch (agent IDs bounded, unheld mutex is small).
-var personaSyncMu struct {
-	mu sync.Mutex
-	m  map[string]*sync.Mutex
-}
-
-func personaSyncLockFor(agentID string) *sync.Mutex {
-	personaSyncMu.mu.Lock()
-	defer personaSyncMu.mu.Unlock()
-	if personaSyncMu.m == nil {
-		personaSyncMu.m = make(map[string]*sync.Mutex)
-	}
-	mu, ok := personaSyncMu.m[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		personaSyncMu.m[agentID] = mu
-	}
-	return mu
-}
+var personaSyncLocks keyedMutex
 
 func lockPersonaSync(agentID string) func() {
-	mu := personaSyncLockFor(agentID)
-	mu.Lock()
-	return mu.Unlock
+	return personaSyncLocks.Lock(agentID)
 }
 
 // GetAgentPersona returns the v1 store's view of persona.md for

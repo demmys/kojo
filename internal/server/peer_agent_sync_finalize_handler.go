@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -85,10 +84,8 @@ type peerAgentSyncFinalizeResponse struct {
 }
 
 func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
 	// Body cap raised to 16 MiB to admit an optional TailMessage —
@@ -115,7 +112,7 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"source_device_id, agent_id, and op_id required")
 		return
 	}
-	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
+	if !verifySignerIsSource(p, req.SourceDeviceID) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return
@@ -319,7 +316,7 @@ func (s *Server) applyFinalizeTailMessage(ctx context.Context, agentID string, r
 		return nil
 	}
 	if rec.ID == "" {
-		return fmt.Errorf("tail message: id required")
+		return errors.New("tail message: id required")
 	}
 	if rec.AgentID != "" && rec.AgentID != agentID {
 		return fmt.Errorf("tail message: agent_id mismatch (got %q, want %q)", rec.AgentID, agentID)
@@ -414,10 +411,8 @@ type peerAgentSyncDropRequest struct {
 }
 
 func (s *Server) handlePeerAgentSyncDrop(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
@@ -439,7 +434,7 @@ func (s *Server) handlePeerAgentSyncDrop(w http.ResponseWriter, r *http.Request)
 			"agent_id and op_id required")
 		return
 	}
-	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
+	if !verifySignerIsSource(p, req.SourceDeviceID) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return

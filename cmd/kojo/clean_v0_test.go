@@ -21,8 +21,8 @@ func v0CleanLogger() *slog.Logger {
 func v0TestEnv(t *testing.T) (string, string) {
 	t.Helper()
 	root := t.TempDir()
-	v0 := filepath.Join(root, "kojo")     // v0
-	v1 := filepath.Join(root, "kojo-v1")  // v1
+	v0 := filepath.Join(root, "kojo")    // v0
+	v1 := filepath.Join(root, "kojo-v1") // v1
 	if err := os.MkdirAll(filepath.Join(v0, "agents"), 0o755); err != nil {
 		t.Fatalf("mkdir v0: %v", err)
 	}

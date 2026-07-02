@@ -55,7 +55,7 @@ func (m *Manager) ResetData(id string) error {
 	// clear touches memory/* nor MEMORY.md, so moving it outside the
 	// memorySyncMu region is safe for the half-reset-visibility
 	// invariant the lock protects.
-	clearClaudeSession(id)
+	clearClaudeSession(id, m.logger)
 	clearGrokSession(id)
 	clearCodexSession(id)
 
@@ -2039,9 +2039,9 @@ func (m *Manager) ResetSession(agentID string) error {
 
 	switch tool {
 	case "claude":
-		clearClaudeSession(agentID)
+		clearClaudeSession(agentID, m.logger)
 	case "custom":
-		clearClaudeSession(agentID)
+		clearClaudeSession(agentID, m.logger)
 	case "grok":
 		// Use the counted variant so permission / IO failures
 		// surface in the log instead of being silently swallowed.

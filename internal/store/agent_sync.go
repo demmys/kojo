@@ -3,22 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
-
-// nullableJSON converts an empty / nil json.RawMessage to a SQL NULL.
-// Mirrors nullableText for raw-JSON columns (tool_uses, attachments,
-// usage on agent_messages) so a missing field round-trips as NULL
-// instead of the literal string "null" — distinguishing "no row data"
-// from "explicit JSON null" is part of the canonical etag contract.
-func nullableJSON(v json.RawMessage) any {
-	if len(v) == 0 {
-		return nil
-	}
-	return string(v)
-}
 
 // AgentSyncPayload is the bundle of rows a §3.7 device-switch
 // pushes from source to target so the agent's runtime can continue
@@ -59,6 +46,77 @@ type AgentSyncPayload struct {
 	// negligible, and an updated_at cursor would risk silently
 	// dropping edits across peer clock skew. syncWorkspaceFilesTx
 	// always runs the DELETE-then-INSERT full-replace path.
+}
+
+// errSyncSeqRequired is the sentinel resolveSyncMeta returns when a
+// fatal-seq table (messages / memory_entries / tasks) is handed a
+// record with seq <= 0. Callers translate it into their own indexed
+// "seq must be > 0" error so the surfaced message stays byte-identical.
+var errSyncSeqRequired = errors.New("store: sync record seq must be > 0")
+
+// syncRowMeta is the resolved version/seq/updated/created/etag tuple
+// shared by the per-row sync*Tx helpers.
+type syncRowMeta struct {
+	version int
+	seq     int64
+	updated int64
+	created int64
+	etag    string
+}
+
+// resolveSyncMeta applies the version/seq/updated/created/etag defaulting
+// common to the seven sync*Tx helpers.
+//
+//   - version: <=0 becomes 1.
+//   - seq: <=0 becomes NextGlobalSeq() when autoSeq (agent / persona /
+//     memory / workspace_files); otherwise errSyncSeqRequired is returned
+//     (messages / memory_entries / tasks ship explicit source seqs).
+//   - updated/created: createdLeads mirrors syncAgentRowTx, which defaults
+//     created from NowMillis() first and derives updated from created;
+//     every other table defaults updated first and derives created from it.
+//   - etag: recomputed via etagFn only when the source omitted it. etagFn's
+//     error is returned verbatim so the caller can wrap it with the same
+//     context string (and index) as before.
+func resolveSyncMeta(
+	version int,
+	seq, updated, created int64,
+	etag string,
+	autoSeq, createdLeads bool,
+	etagFn func(version int, seq, updated int64) (string, error),
+) (syncRowMeta, error) {
+	m := syncRowMeta{version: version, seq: seq, updated: updated, created: created, etag: etag}
+	if m.version <= 0 {
+		m.version = 1
+	}
+	if m.seq <= 0 {
+		if !autoSeq {
+			return syncRowMeta{}, errSyncSeqRequired
+		}
+		m.seq = NextGlobalSeq()
+	}
+	if createdLeads {
+		if m.created <= 0 {
+			m.created = NowMillis()
+		}
+		if m.updated <= 0 {
+			m.updated = m.created
+		}
+	} else {
+		if m.updated <= 0 {
+			m.updated = NowMillis()
+		}
+		if m.created <= 0 {
+			m.created = m.updated
+		}
+	}
+	if m.etag == "" {
+		computed, err := etagFn(m.version, m.seq, m.updated)
+		if err != nil {
+			return syncRowMeta{}, err
+		}
+		m.etag = computed
+	}
+	return m, nil
 }
 
 // SyncAgentFromPeer overwrites the target's local copy of one
@@ -158,34 +216,21 @@ INSERT INTO agent_tasks (
 		if !validTaskStatuses[t.Status] {
 			return fmt.Errorf("syncAgentTasksTx: index %d: invalid status %q", i, t.Status)
 		}
-		version := t.Version
-		if version <= 0 {
-			version = 1
-		}
-		seq := t.Seq
-		if seq <= 0 {
-			return fmt.Errorf("syncAgentTasksTx: index %d: seq must be > 0", i)
-		}
-		now := t.UpdatedAt
-		if now <= 0 {
-			now = NowMillis()
-		}
-		created := t.CreatedAt
-		if created <= 0 {
-			created = now
-		}
-		etag := t.ETag
-		if etag == "" {
-			copy := *t
-			copy.Version = version
-			copy.Seq = seq
-			copy.UpdatedAt = now
-			computed, cerr := computeAgentTaskETag(&copy)
-			if cerr != nil {
-				return fmt.Errorf("syncAgentTasksTx: index %d: etag: %w", i, cerr)
+		meta, merr := resolveSyncMeta(t.Version, t.Seq, t.UpdatedAt, t.CreatedAt, t.ETag, false, false,
+			func(version int, seq, updated int64) (string, error) {
+				rec2 := *t
+				rec2.Version = version
+				rec2.Seq = seq
+				rec2.UpdatedAt = updated
+				return computeAgentTaskETag(&rec2)
+			})
+		if merr != nil {
+			if errors.Is(merr, errSyncSeqRequired) {
+				return fmt.Errorf("syncAgentTasksTx: index %d: seq must be > 0", i)
 			}
-			etag = computed
+			return fmt.Errorf("syncAgentTasksTx: index %d: etag: %w", i, merr)
 		}
+		version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 		var deletedAt sql.NullInt64
 		if t.DeletedAt != nil {
 			deletedAt = sql.NullInt64{Int64: *t.DeletedAt, Valid: true}
@@ -220,35 +265,19 @@ func syncAgentRowTx(ctx context.Context, tx *sql.Tx, rec *AgentRecord) error {
 	if workspaceID == "" {
 		workspaceID = rec.ID
 	}
-	version := rec.Version
-	if version <= 0 {
-		version = 1
+	meta, merr := resolveSyncMeta(rec.Version, rec.Seq, rec.UpdatedAt, rec.CreatedAt, rec.ETag, true, true,
+		func(version int, seq, updated int64) (string, error) {
+			rec2 := *rec
+			rec2.Version = version
+			rec2.PersonaRef = personaRef
+			rec2.WorkspaceID = workspaceID
+			rec2.UpdatedAt = updated
+			return computeAgentETag(&rec2)
+		})
+	if merr != nil {
+		return fmt.Errorf("syncAgentRowTx: etag: %w", merr)
 	}
-	seq := rec.Seq
-	if seq <= 0 {
-		seq = NextGlobalSeq()
-	}
-	created := rec.CreatedAt
-	if created <= 0 {
-		created = NowMillis()
-	}
-	updated := rec.UpdatedAt
-	if updated <= 0 {
-		updated = created
-	}
-	etag := rec.ETag
-	if etag == "" {
-		copy := *rec
-		copy.Version = version
-		copy.PersonaRef = personaRef
-		copy.WorkspaceID = workspaceID
-		copy.UpdatedAt = updated
-		computed, cerr := computeAgentETag(&copy)
-		if cerr != nil {
-			return fmt.Errorf("syncAgentRowTx: etag: %w", cerr)
-		}
-		etag = computed
-	}
+	version, seq, created, updated, etag := meta.version, meta.seq, meta.created, meta.updated, meta.etag
 	const q = `
 INSERT INTO agents (
   id, name, persona_ref, settings_json, workspace_id,
@@ -291,33 +320,17 @@ func syncAgentPersonaTx(ctx context.Context, tx *sql.Tx, agentID string, rec *Ag
 		}
 		return nil
 	}
-	version := rec.Version
-	if version <= 0 {
-		version = 1
+	meta, merr := resolveSyncMeta(rec.Version, rec.Seq, rec.UpdatedAt, rec.CreatedAt, rec.ETag, true, false,
+		func(version int, seq, updated int64) (string, error) {
+			rec2 := *rec
+			rec2.Version = version
+			rec2.UpdatedAt = updated
+			return computeAgentPersonaETag(&rec2)
+		})
+	if merr != nil {
+		return fmt.Errorf("syncAgentPersonaTx: etag: %w", merr)
 	}
-	seq := rec.Seq
-	if seq <= 0 {
-		seq = NextGlobalSeq()
-	}
-	now := rec.UpdatedAt
-	if now <= 0 {
-		now = NowMillis()
-	}
-	created := rec.CreatedAt
-	if created <= 0 {
-		created = now
-	}
-	etag := rec.ETag
-	if etag == "" {
-		copy := *rec
-		copy.Version = version
-		copy.UpdatedAt = now
-		computed, cerr := computeAgentPersonaETag(&copy)
-		if cerr != nil {
-			return fmt.Errorf("syncAgentPersonaTx: etag: %w", cerr)
-		}
-		etag = computed
-	}
+	version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 	const q = `
 INSERT INTO agent_persona (
   agent_id, body, body_sha256,
@@ -357,33 +370,17 @@ func syncAgentMemoryTx(ctx context.Context, tx *sql.Tx, agentID string, rec *Age
 		}
 		return nil
 	}
-	version := rec.Version
-	if version <= 0 {
-		version = 1
+	meta, merr := resolveSyncMeta(rec.Version, rec.Seq, rec.UpdatedAt, rec.CreatedAt, rec.ETag, true, false,
+		func(version int, seq, updated int64) (string, error) {
+			rec2 := *rec
+			rec2.Version = version
+			rec2.UpdatedAt = updated
+			return computeAgentMemoryETag(&rec2)
+		})
+	if merr != nil {
+		return fmt.Errorf("syncAgentMemoryTx: etag: %w", merr)
 	}
-	seq := rec.Seq
-	if seq <= 0 {
-		seq = NextGlobalSeq()
-	}
-	now := rec.UpdatedAt
-	if now <= 0 {
-		now = NowMillis()
-	}
-	created := rec.CreatedAt
-	if created <= 0 {
-		created = now
-	}
-	etag := rec.ETag
-	if etag == "" {
-		copy := *rec
-		copy.Version = version
-		copy.UpdatedAt = now
-		computed, cerr := computeAgentMemoryETag(&copy)
-		if cerr != nil {
-			return fmt.Errorf("syncAgentMemoryTx: etag: %w", cerr)
-		}
-		etag = computed
-	}
+	version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 	const q = `
 INSERT INTO agent_memory (
   agent_id, body, body_sha256, last_tx_id,
@@ -477,34 +474,21 @@ ON CONFLICT(id) DO UPDATE SET
 		if !validRoles[m.Role] {
 			return fmt.Errorf("syncMessagesTx: index %d: invalid role %q", i, m.Role)
 		}
-		version := m.Version
-		if version <= 0 {
-			version = 1
-		}
-		seq := m.Seq
-		if seq <= 0 {
-			return fmt.Errorf("syncMessagesTx: index %d: seq must be > 0 (source rows have explicit seq)", i)
-		}
-		now := m.UpdatedAt
-		if now <= 0 {
-			now = NowMillis()
-		}
-		created := m.CreatedAt
-		if created <= 0 {
-			created = now
-		}
-		etag := m.ETag
-		if etag == "" {
-			copy := *m
-			copy.Version = version
-			copy.Seq = seq
-			copy.UpdatedAt = now
-			computed, cerr := computeMessageETag(&copy)
-			if cerr != nil {
-				return fmt.Errorf("syncMessagesTx: index %d: etag: %w", i, cerr)
+		meta, merr := resolveSyncMeta(m.Version, m.Seq, m.UpdatedAt, m.CreatedAt, m.ETag, false, false,
+			func(version int, seq, updated int64) (string, error) {
+				rec2 := *m
+				rec2.Version = version
+				rec2.Seq = seq
+				rec2.UpdatedAt = updated
+				return computeMessageETag(&rec2)
+			})
+		if merr != nil {
+			if errors.Is(merr, errSyncSeqRequired) {
+				return fmt.Errorf("syncMessagesTx: index %d: seq must be > 0 (source rows have explicit seq)", i)
 			}
-			etag = computed
+			return fmt.Errorf("syncMessagesTx: index %d: etag: %w", i, merr)
 		}
+		version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 		var deletedAt sql.NullInt64
 		if m.DeletedAt != nil {
 			deletedAt = sql.NullInt64{Int64: *m.DeletedAt, Valid: true}
@@ -563,34 +547,21 @@ ON CONFLICT(id) DO UPDATE SET
 			return fmt.Errorf("syncMemoryEntriesTx: index %d: agent_id mismatch (%q vs %q)",
 				i, m.AgentID, agentID)
 		}
-		version := m.Version
-		if version <= 0 {
-			version = 1
-		}
-		seq := m.Seq
-		if seq <= 0 {
-			return fmt.Errorf("syncMemoryEntriesTx: index %d: seq must be > 0", i)
-		}
-		now := m.UpdatedAt
-		if now <= 0 {
-			now = NowMillis()
-		}
-		created := m.CreatedAt
-		if created <= 0 {
-			created = now
-		}
-		etag := m.ETag
-		if etag == "" {
-			copy := *m
-			copy.Version = version
-			copy.Seq = seq
-			copy.UpdatedAt = now
-			computed, cerr := computeMemoryEntryETag(&copy)
-			if cerr != nil {
-				return fmt.Errorf("syncMemoryEntriesTx: index %d: etag: %w", i, cerr)
+		meta, merr := resolveSyncMeta(m.Version, m.Seq, m.UpdatedAt, m.CreatedAt, m.ETag, false, false,
+			func(version int, seq, updated int64) (string, error) {
+				rec2 := *m
+				rec2.Version = version
+				rec2.Seq = seq
+				rec2.UpdatedAt = updated
+				return computeMemoryEntryETag(&rec2)
+			})
+		if merr != nil {
+			if errors.Is(merr, errSyncSeqRequired) {
+				return fmt.Errorf("syncMemoryEntriesTx: index %d: seq must be > 0", i)
 			}
-			etag = computed
+			return fmt.Errorf("syncMemoryEntriesTx: index %d: etag: %w", i, merr)
 		}
+		version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 		var deletedAt sql.NullInt64
 		if m.DeletedAt != nil {
 			deletedAt = sql.NullInt64{Int64: *m.DeletedAt, Valid: true}
@@ -665,33 +636,17 @@ ON CONFLICT(agent_id, kind) DO UPDATE SET
 		if !IsValidWorkspaceFileKind(w.Kind) {
 			return fmt.Errorf("syncWorkspaceFilesTx: index %d: invalid kind %q", i, string(w.Kind))
 		}
-		version := w.Version
-		if version <= 0 {
-			version = 1
+		meta, merr := resolveSyncMeta(w.Version, w.Seq, w.UpdatedAt, w.CreatedAt, w.ETag, true, false,
+			func(version int, seq, updated int64) (string, error) {
+				rec2 := *w
+				rec2.Version = version
+				rec2.UpdatedAt = updated
+				return computeAgentWorkspaceFileETag(&rec2)
+			})
+		if merr != nil {
+			return fmt.Errorf("syncWorkspaceFilesTx: index %d: etag: %w", i, merr)
 		}
-		seq := w.Seq
-		if seq <= 0 {
-			seq = NextGlobalSeq()
-		}
-		now := w.UpdatedAt
-		if now <= 0 {
-			now = NowMillis()
-		}
-		created := w.CreatedAt
-		if created <= 0 {
-			created = now
-		}
-		etag := w.ETag
-		if etag == "" {
-			copy := *w
-			copy.Version = version
-			copy.UpdatedAt = now
-			computed, cerr := computeAgentWorkspaceFileETag(&copy)
-			if cerr != nil {
-				return fmt.Errorf("syncWorkspaceFilesTx: index %d: etag: %w", i, cerr)
-			}
-			etag = computed
-		}
+		version, seq, now, created, etag := meta.version, meta.seq, meta.updated, meta.created, meta.etag
 		var deletedAt sql.NullInt64
 		if w.DeletedAt != nil {
 			deletedAt = sql.NullInt64{Int64: *w.DeletedAt, Valid: true}

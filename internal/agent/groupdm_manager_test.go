@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -87,7 +86,6 @@ func newTestManager(t *testing.T) *Manager {
 		editing:    make(map[string]bool),
 		profileGen: make(map[string]bool),
 		memIndexes: make(map[string]*MemoryIndex),
-		patchMus:   make(map[string]*sync.Mutex),
 	}
 	_ = tmp // tmp is captured by t.Setenv via configdir.Path() resolution
 	return m

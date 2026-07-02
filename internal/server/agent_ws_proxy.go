@@ -114,14 +114,7 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			"target address unparseable: "+err.Error())
 		return
 	}
-	switch targetURL.Scheme {
-	case "http":
-		targetURL.Scheme = "ws"
-	case "https":
-		targetURL.Scheme = "wss"
-	default:
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target scheme not http(s): "+targetURL.Scheme)
+	if !rewriteHTTPSchemeToWS(w, targetURL) {
 		return
 	}
 	targetURL.Path = "/api/v1/agents/" + agentID + "/ws"

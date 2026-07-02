@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { agentApi } from "../../lib/agentApi";
+import { errMsg } from "../../lib/utils";
 
 /**
  * useEmbeddingModel owns the "currently selected embedding model" + the
@@ -66,7 +67,7 @@ export function useEmbeddingModel(
         setModel(next);
         onSuccess();
       } catch (err) {
-        onError(err instanceof Error ? err.message : String(err));
+        onError(errMsg(err));
       } finally {
         setSaving(false);
       }

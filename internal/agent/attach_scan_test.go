@@ -31,7 +31,7 @@ func TestSanitizeAttachBasename(t *testing.T) {
 		{"", "", false, false},
 		{".", "", false, false},
 		{"..", "", false, false},
-		{".env", "", false, false},  // dotfile rejected
+		{".env", "", false, false},    // dotfile rejected
 		{".bashrc", "", false, false}, // dotfile rejected
 		{"with\x00nul.txt", "", false, false},
 		{"with\nnewline.txt", "", false, false},

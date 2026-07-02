@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/fsyncdir"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -103,19 +104,12 @@ var diaryAnyHeading = regexp.MustCompile(`^#{1,6}\s`)
 // markdown parsers that treat `\t` as <=4 spaces.
 var diaryFenceLine = regexp.MustCompile("^[ \t]{0,3}(```+|~~~+)")
 
-// syncDir fsyncs a directory inode so unlink/rename ops survive a crash.
-// Mirrors internal/oplog.fsyncDir — Windows / some network FSes refuse
-// fsync on dirs and we swallow that as non-fatal.
+// syncDir delegates to fsyncdir.DirLenient: open failures propagate, Sync
+// errors are deliberately swallowed (the historical best-effort policy).
+// Tightening it to surface fsync failures is a pending proposal, not this
+// refactor.
 func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
-		return nil
-	}
-	return nil
+	return fsyncdir.DirLenient(dir)
 }
 
 // TruncateMemoryFromMessage truncates the agent's memory using the message

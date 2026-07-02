@@ -6,7 +6,8 @@ import { groupdmApi, type GroupDMInfo } from "../lib/groupdmApi";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { usePushNotifications } from "../hooks/usePushNotifications";
-import { timeAgo } from "../lib/utils";
+import { useCollapsedSet } from "../hooks/useCollapsedSet";
+import { errMsg, timeAgo } from "../lib/utils";
 
 interface SessionGroup {
   key: string;
@@ -75,18 +76,8 @@ export function Dashboard() {
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [createGroupError, setCreateGroupError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(() => {
-    try {
-      const saved = localStorage.getItem("kojo:collapsed-agents");
-      return saved ? new Set(JSON.parse(saved)) : new Set();
-    } catch { return new Set(); }
-  });
-  const [collapsedGroupDMs, setCollapsedGroupDMs] = useState<Set<string>>(() => {
-    try {
-      const saved = localStorage.getItem("kojo:collapsed-groupdms");
-      return saved ? new Set(JSON.parse(saved)) : new Set();
-    } catch { return new Set(); }
-  });
+  const [collapsedAgents, toggleCollapseAgent] = useCollapsedSet("kojo:collapsed-agents");
+  const [collapsedGroupDMs, toggleCollapseGroupDM] = useCollapsedSet("kojo:collapsed-groupdms");
   const navigate = useNavigate();
   const { state: pushState, loading: pushLoading, subscribe: pushSubscribe } = usePushNotifications();
   const createGroupDialogRef = useRef<HTMLDivElement>(null);
@@ -345,34 +336,6 @@ export function Dashboard() {
     });
   };
 
-  useEffect(() => {
-    try { localStorage.setItem("kojo:collapsed-agents", JSON.stringify([...collapsedAgents])); } catch { /* quota / private mode */ }
-  }, [collapsedAgents]);
-
-  useEffect(() => {
-    try { localStorage.setItem("kojo:collapsed-groupdms", JSON.stringify([...collapsedGroupDMs])); } catch { /* quota / private mode */ }
-  }, [collapsedGroupDMs]);
-
-  const toggleCollapseAgent = (agentId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setCollapsedAgents((prev) => {
-      const next = new Set(prev);
-      if (next.has(agentId)) next.delete(agentId);
-      else next.add(agentId);
-      return next;
-    });
-  };
-
-  const toggleCollapseGroupDM = (groupId: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setCollapsedGroupDMs((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupId)) next.delete(groupId);
-      else next.add(groupId);
-      return next;
-    });
-  };
-
   // sessionHref preserves the session's home peer so a click on a
   // peer-routed entry lands on the right host. Empty peer → local.
   const sessionHref = (s: SessionInfo) =>
@@ -523,7 +486,7 @@ export function Dashboard() {
                             setAgents(fresh);
                           } catch (err) {
                             console.error("force-reclaim failed", err);
-                            window.alert(`Force-reclaim failed: ${(err as Error).message}`);
+                            window.alert(`Force-reclaim failed: ${errMsg(err)}`);
                           }
                         }}
                         className="px-2 py-1 mr-1 bg-amber-900/60 hover:bg-amber-900 text-amber-200 rounded text-[10px] shrink-0"

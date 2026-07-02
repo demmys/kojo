@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
@@ -480,21 +479,10 @@ Outcome catalog:
 // claude). map keyed by agent_id; entries are NEVER deleted so the
 // mutex identity is stable across the agent's lifetime. The map
 // itself is guarded by deviceSwitchSkillMapMu.
-var (
-	deviceSwitchSkillMapMu sync.Mutex
-	deviceSwitchSkillMu    = map[string]*sync.Mutex{}
-)
+var deviceSwitchSkillLocks keyedMutex
 
 func lockDeviceSwitchSkill(agentID string) func() {
-	deviceSwitchSkillMapMu.Lock()
-	mu, ok := deviceSwitchSkillMu[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		deviceSwitchSkillMu[agentID] = mu
-	}
-	deviceSwitchSkillMapMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return deviceSwitchSkillLocks.Lock(agentID)
 }
 
 // SyncDeviceSwitchSkill writes or removes the kojo-switch-device

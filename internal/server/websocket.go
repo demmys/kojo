@@ -314,6 +314,24 @@ func isPeerWS(r *http.Request) bool {
 	return auth.FromContext(r.Context()).IsPeer()
 }
 
+// rewriteHTTPSchemeToWS flips targetURL's http/https scheme to the
+// ws/wss equivalent in place for a WebSocket upgrade dial. On an
+// unexpected scheme it writes the 502 body and returns false; the
+// caller must return without dialing.
+func rewriteHTTPSchemeToWS(w http.ResponseWriter, targetURL *url.URL) bool {
+	switch targetURL.Scheme {
+	case "http":
+		targetURL.Scheme = "ws"
+	case "https":
+		targetURL.Scheme = "wss"
+	default:
+		writeError(w, http.StatusBadGateway, "bad_gateway",
+			"target scheme not http(s): "+targetURL.Scheme)
+		return false
+	}
+	return true
+}
+
 // proxySessionWebSocket dials the target peer's
 // `/api/v1/ws?session=<id>` over tsnet (target's ServeAuthTsnet
 // stamps RolePeer from the WhoIs-resolved peer_registry row, so no
@@ -345,14 +363,7 @@ func (s *Server) proxySessionWebSocket(w http.ResponseWriter, r *http.Request, s
 			"target address unparseable: "+err.Error())
 		return
 	}
-	switch targetURL.Scheme {
-	case "http":
-		targetURL.Scheme = "ws"
-	case "https":
-		targetURL.Scheme = "wss"
-	default:
-		writeError(w, http.StatusBadGateway, "bad_gateway",
-			"target scheme not http(s): "+targetURL.Scheme)
+	if !rewriteHTTPSchemeToWS(w, targetURL) {
 		return
 	}
 	targetURL.Path = "/api/v1/ws"

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/migrate/externalcli"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // applyExternalCLIForward wires the v0 → v1 external-CLI continuity layer
@@ -32,10 +31,7 @@ import (
 func applyExternalCLIForward(ctx context.Context, v0Path, v1Path string, logger *slog.Logger) []string {
 	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	st, err := store.Open(openCtx, store.Options{
-		ConfigDir: v1Path,
-		ReadOnly:  true,
-	})
+	st, err := openStore(openCtx, v1Path, true)
 	if err != nil {
 		return []string{"external-cli forward: open v1 store: " + err.Error()}
 	}

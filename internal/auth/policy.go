@@ -89,14 +89,14 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //
 // The intent is "default deny". Routes are grouped into three buckets:
 //
-//   1. Public reads — info, directory, agent list/get, avatar.
-//   2. Self-scoped reads/writes — files, messages, tasks, credentials,
-//      memory, slackbot config, notify sources, group memberships,
-//      avatar upload, persona / metadata patch, MCP, PreCompact hook.
-//      Permitted only when the path's {id} matches the principal.
-//   3. Privileged-cross-agent — delete / reset / checkin / unarchive /
-//      reset-session. Permitted for self by Agent, or for any target by
-//      PrivAgent.
+//  1. Public reads — info, directory, agent list/get, avatar.
+//  2. Self-scoped reads/writes — files, messages, tasks, credentials,
+//     memory, slackbot config, notify sources, group memberships,
+//     avatar upload, persona / metadata patch, MCP, PreCompact hook.
+//     Permitted only when the path's {id} matches the principal.
+//  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
+//     reset-session. Permitted for self by Agent, or for any target by
+//     PrivAgent.
 //
 // Owner-only routes (sessions, git, files browser, embedding,
 // push, custom-models, group DM mutate-as-owner, fork, /privilege,
@@ -242,7 +242,7 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/agents" {
 		return true
 	}
-	if method == http.MethodGet && matchAgentSubpath(path, "") {
+	if method == http.MethodGet && matchAgentSubpath(path) {
 		return true
 	}
 
@@ -410,13 +410,13 @@ func SplitAgentIDPath(path string) (id, sub string, ok bool) {
 	return rest[:slash], rest[slash:], true
 }
 
-// matchAgentSubpath checks /api/v1/agents/{id}{sub} where sub is the
-// expected suffix ("" for the bare GET /agents/{id}). Used in the
-// allowlist for read-only endpoints exposed to Agent principals.
-func matchAgentSubpath(path, expectedSub string) bool {
+// matchAgentSubpath reports whether path is the bare GET /api/v1/agents/{id}
+// route (no trailing sub-segment). Used in the allowlist for read-only
+// endpoints exposed to Agent principals.
+func matchAgentSubpath(path string) bool {
 	_, sub, ok := SplitAgentIDPath(path)
 	if !ok {
 		return false
 	}
-	return sub == expectedSub
+	return sub == ""
 }

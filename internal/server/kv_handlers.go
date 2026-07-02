@@ -1,17 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/store"
 )
-
-var _ = strings.HasPrefix // keep strings import for path-segment validator
 
 // kvResponse is the wire shape for one kv row. Secret rows expose
 // metadata only — the encrypted blob never leaves the daemon. Type /
@@ -244,20 +240,8 @@ func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 		storeIfMatch = store.IfMatchAny
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, kvRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 1 MiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
 	var req kvPutRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, kvRequestCap, "request body exceeds 1 MiB cap", "invalid JSON", &req) {
 		return
 	}
 	if req.Secret {

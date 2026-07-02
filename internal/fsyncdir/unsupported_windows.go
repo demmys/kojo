@@ -1,6 +1,6 @@
 //go:build windows
 
-package blob
+package fsyncdir
 
 // isUnsupported on Windows always returns true: the OS does not provide
 // fsync semantics on directory handles, so any error from a

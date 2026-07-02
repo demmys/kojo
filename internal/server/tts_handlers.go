@@ -34,6 +34,37 @@ func (s *Server) ensureTTSService() *tts.Service {
 	return ttsService
 }
 
+// resolveTTSFormat applies the shared synthesize/preview format
+// policy: empty defaults to "opus"; anything outside the opus / mp3 /
+// wav whitelist is refused with 400 "invalid format". Returns ok=false
+// after writing the error; the caller must return immediately.
+func resolveTTSFormat(w http.ResponseWriter, format string) (string, bool) {
+	if format == "" {
+		format = "opus"
+	}
+	switch format {
+	case "opus", "mp3", "wav":
+	default:
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid format")
+		return "", false
+	}
+	return format, true
+}
+
+// acquireTTSSlot blocks on the shared ttsConcurrency gate. Uses the
+// request context so a navigation away cancels the wait (408 "synthesis
+// queue timed out"). On ok=true the caller MUST defer release() to
+// return the slot; on ok=false the error response has been written.
+func acquireTTSSlot(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+	select {
+	case ttsConcurrency <- struct{}{}:
+		return func() { <-ttsConcurrency }, true
+	case <-r.Context().Done():
+		writeError(w, http.StatusRequestTimeout, "timeout", "synthesis queue timed out")
+		return nil, false
+	}
+}
+
 // ttsSynthesizeRequest is the POST body for /api/v1/agents/{id}/tts/synthesize.
 type ttsSynthesizeRequest struct {
 	Text   string `json:"text"`
@@ -82,25 +113,16 @@ func (s *Server) handleTTSSynthesize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "empty text")
 		return
 	}
-	format := body.Format
-	if format == "" {
-		format = "opus"
-	}
-	switch format {
-	case "opus", "mp3", "wav":
-	default:
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid format")
+	format, ok := resolveTTSFormat(w, body.Format)
+	if !ok {
 		return
 	}
 
-	// Concurrency gate. Use ctx so a navigation away cancels the wait.
-	select {
-	case ttsConcurrency <- struct{}{}:
-		defer func() { <-ttsConcurrency }()
-	case <-r.Context().Done():
-		writeError(w, http.StatusRequestTimeout, "timeout", "synthesis queue timed out")
+	release, ok := acquireTTSSlot(w, r)
+	if !ok {
 		return
 	}
+	defer release()
 
 	svc := s.ensureTTSService()
 	res, err := svc.Synthesize(r.Context(), tts.SynthesizeRequest{
@@ -164,24 +186,16 @@ func (s *Server) handleTTSPreview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid voice")
 		return
 	}
-	format := body.Format
-	if format == "" {
-		format = "opus"
-	}
-	switch format {
-	case "opus", "mp3", "wav":
-	default:
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid format")
+	format, ok := resolveTTSFormat(w, body.Format)
+	if !ok {
 		return
 	}
 
-	select {
-	case ttsConcurrency <- struct{}{}:
-		defer func() { <-ttsConcurrency }()
-	case <-r.Context().Done():
-		writeError(w, http.StatusRequestTimeout, "timeout", "synthesis queue timed out")
+	release, ok := acquireTTSSlot(w, r)
+	if !ok {
 		return
 	}
+	defer release()
 
 	svc := s.ensureTTSService()
 	res, err := svc.Synthesize(r.Context(), tts.SynthesizeRequest{

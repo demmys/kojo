@@ -121,21 +121,6 @@ func TestBuildLocalPath(t *testing.T) {
 	})
 }
 
-func TestSanitizeFilename(t *testing.T) {
-	cases := map[string]string{
-		"simple.txt":              "simple.txt",
-		"../etc/passwd":           "passwd",
-		"dir/sub/file.png":        "file.png",
-		"weird\x00name.jpg":       "weird_name.jpg",
-		`back\slash.png`:          "back_slash.png",
-	}
-	for in, want := range cases {
-		if got := sanitizeFilename(in); got != want {
-			t.Errorf("sanitizeFilename(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestDownloadSlackFilesSuccess(t *testing.T) {
 	dir := withTempUploadDir(t)
 	_ = dir

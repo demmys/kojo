@@ -222,7 +222,7 @@ func (s *Store) InsertOrReplaceBlobRef(ctx context.Context, rec *BlobRefRecord, 
 			// idempotent path is admitted by the WHERE itself.
 			return nil, ErrHandoffPending
 		}
-		return nil, fmt.Errorf("store.InsertOrReplaceBlobRef: RETURNING produced no row")
+		return nil, errors.New("store.InsertOrReplaceBlobRef: RETURNING produced no row")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store.InsertOrReplaceBlobRef: %w", err)
@@ -607,8 +607,8 @@ func (s *Store) MarkBlobRefForGC(ctx context.Context, uri string) error {
 // every SELECT in this file.
 func scanBlobRefRow(r rowScanner) (*BlobRefRecord, error) {
 	var (
-		rec      BlobRefRecord
-		handoff  int
+		rec     BlobRefRecord
+		handoff int
 	)
 	if err := r.Scan(
 		&rec.URI, &rec.Scope, &rec.HomePeer, &rec.Size, &rec.SHA256, &rec.Refcount,
@@ -619,16 +619,6 @@ func scanBlobRefRow(r rowScanner) (*BlobRefRecord, error) {
 	}
 	rec.HandoffPending = handoff != 0
 	return &rec, nil
-}
-
-// nullableInt64 returns sql.NullInt64{} for zero so the column stores
-// NULL rather than 0 — preserves the schema's "missing" semantic for
-// last_seen_ok / marked_for_gc_at.
-func nullableInt64(v int64) any {
-	if v == 0 {
-		return nil
-	}
-	return v
 }
 
 // nextPrefix returns the lexicographically smallest byte string that

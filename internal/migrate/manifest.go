@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -8,7 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -90,7 +91,7 @@ func ManifestSHA256(root string) (string, error) {
 		return "", fmt.Errorf("manifest: walk %s: %w", root, err)
 	}
 
-	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+	slices.SortFunc(files, func(a, b entry) int { return cmp.Compare(a.rel, b.rel) })
 
 	hash := sha256.New()
 	var rowBuf strings.Builder

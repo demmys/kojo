@@ -155,15 +155,9 @@ func (s *Store) CreateAgentTask(ctx context.Context, rec *AgentTaskRecord, opts 
 		return nil, err
 	}
 
-	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT MAX(seq) FROM agent_tasks WHERE agent_id = ?`, rec.AgentID,
-	).Scan(&maxSeq); err != nil {
+	seq, err := nextAgentSeqTx(ctx, tx, "agent_tasks", rec.AgentID)
+	if err != nil {
 		return nil, err
-	}
-	seq := int64(1)
-	if maxSeq.Valid {
-		seq = maxSeq.Int64 + 1
 	}
 
 	out := *rec
@@ -287,15 +281,9 @@ func (s *Store) BulkInsertAgentTasks(ctx context.Context, agentID string, recs [
 	// claim seq values we're about to use. SQLite serializes writers, so
 	// MAX(seq) read here is the post-commit value once we hold the write
 	// lock for the upcoming INSERTs.
-	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT MAX(seq) FROM agent_tasks WHERE agent_id = ?`, agentID,
-	).Scan(&maxSeq); err != nil {
+	nextSeq, err := nextAgentSeqTx(ctx, tx, "agent_tasks", agentID)
+	if err != nil {
 		return 0, err
-	}
-	nextSeq := int64(1)
-	if maxSeq.Valid {
-		nextSeq = maxSeq.Int64 + 1
 	}
 
 	const q = `
@@ -516,11 +504,11 @@ SELECT t.id, t.agent_id, t.seq, t.title, COALESCE(t.body,'') AS body, t.status, 
 // clear DueAt, set ClearDueAt=true (a nil DueAt is otherwise read as
 // "leave alone" — Go has no tri-state pointer-of-pointer convention here).
 type AgentTaskPatch struct {
-	Title       *string
-	Body        *string
-	Status      *string
-	DueAt       *int64
-	ClearDueAt  bool
+	Title      *string
+	Body       *string
+	Status     *string
+	DueAt      *int64
+	ClearDueAt bool
 }
 
 // UpdateAgentTask applies patch to the task identified by id with optional
@@ -718,14 +706,4 @@ func scanAgentTaskRow(r rowScanner) (*AgentTaskRecord, error) {
 		rec.DeletedAt = &v
 	}
 	return &rec, nil
-}
-
-// nullableInt64Ptr converts an optional *int64 into the form database/sql
-// understands. Returns sql.NullInt64{Valid:false} when the pointer is nil
-// so the column is written as SQL NULL rather than 0.
-func nullableInt64Ptr(p *int64) any {
-	if p == nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: *p, Valid: true}
 }

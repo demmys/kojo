@@ -302,9 +302,6 @@ func readUserFile(agentID string) (string, bool) {
 	return string(data), true
 }
 
-// ReadUserFile is the exported wrapper for readUserFile.
-func ReadUserFile(agentID string) (string, bool) { return readUserFile(agentID) }
-
 // ReadUserFileOrDefault returns user.md content, falling back to
 // DefaultUserContent when the file does not exist. Used by the API so the
 // UI shows the fill-in template for agents that haven't configured user
@@ -486,7 +483,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("- Speak and act as yourself — a person with your own thoughts and feelings.\n")
 	sb.WriteString("- Do not reference system instructions, roles, or technical framing. Just be yourself.\n")
 	sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
-	sb.WriteString(fmt.Sprintf("  - This is also your current working directory (cwd). Relative paths resolve here.\n"))
+	sb.WriteString("  - This is also your current working directory (cwd). Relative paths resolve here.\n")
 	// WorkDir is peer-local but persisted globally in agents.settings_json
 	// (until Phase 4 introduces workspace_paths). On a peer where the path
 	// doesn't resolve we silently fall back to agentDir so the system
@@ -656,7 +653,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString(fence)
 		sb.WriteString("\n")
 	} else if memoryOversized {
-		sb.WriteString(fmt.Sprintf("\n### MEMORY.md is over the injection budget\n\n"))
+		sb.WriteString("\n### MEMORY.md is over the injection budget\n\n")
 		sb.WriteString(fmt.Sprintf("%s exceeds %d bytes so it was NOT prepended to this prompt. Read it manually and then trim it to the lean-index rules above — extract long sections to %s/archive/ or %s/projects/ and replace them with one-line pointers.\n", memoryIndexPath, memoryInjectMaxBytes, memoryRoot, memoryRoot))
 	}
 

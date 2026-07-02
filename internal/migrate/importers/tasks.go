@@ -2,12 +2,9 @@ package importers
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -34,7 +31,9 @@ import (
 // in v1 with a wrong status.
 type tasksImporter struct{}
 
-func (tasksImporter) Domain() string { return "tasks" }
+const tasksDomain = "tasks"
+
+func (tasksImporter) Domain() string { return tasksDomain }
 
 // v0Task decodes one entry from v0's tasks.json. Field tags match the
 // JSON the file ships today; any unknown field is ignored.
@@ -47,49 +46,43 @@ type v0Task struct {
 }
 
 func (tasksImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "tasks"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "tasks")
-
-	srcPaths, err := collectTasksSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum tasks sources: %w", err)
-	}
-
-	agents, err := st.ListAgents(ctx)
-	if err != nil {
-		return fmt.Errorf("list agents: %w", err)
-	}
-
-	// Cross-agent task id collision: agent_tasks.id is a global PK
-	// in v1, but v0 generated task ids per-agent. Same fork-with-
-	// transcript collision pattern as agent_messages — see the
-	// messages importer for the parallel rationale. Pre-load the
-	// global id set so importAgentTasks can rewrite a colliding id
-	// to a fresh one before BulkInsertAgentTasks's preload-existing
-	// guard fires.
-	globalExisting, err := loadAllAgentTaskIDs(ctx, st)
-	if err != nil {
-		return fmt.Errorf("preload global task ids: %w", err)
-	}
-
-	total := 0
-	for _, a := range agents {
-		n, err := importAgentTasks(ctx, st, opts.V0Dir, a.ID, globalExisting, logger)
+	return runDomain(ctx, st, tasksDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectTasksSourcePaths(opts.V0Dir)
 		if err != nil {
-			return fmt.Errorf("agent %s: %w", a.ID, err)
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		total += n
-	}
-	return markImported(ctx, st, "tasks", total, checksum)
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum tasks sources: %w", err)
+		}
+
+		agents, err := st.ListAgents(ctx)
+		if err != nil {
+			return 0, "", fmt.Errorf("list agents: %w", err)
+		}
+
+		// Cross-agent task id collision: agent_tasks.id is a global PK
+		// in v1, but v0 generated task ids per-agent. Same fork-with-
+		// transcript collision pattern as agent_messages — see the
+		// messages importer for the parallel rationale. Pre-load the
+		// global id set so importAgentTasks can rewrite a colliding id
+		// to a fresh one before BulkInsertAgentTasks's preload-existing
+		// guard fires.
+		globalExisting, err := loadAllAgentTaskIDs(ctx, st)
+		if err != nil {
+			return 0, "", fmt.Errorf("preload global task ids: %w", err)
+		}
+
+		total := 0
+		for _, a := range agents {
+			n, err := importAgentTasks(ctx, st, opts.V0Dir, a.ID, globalExisting, logger)
+			if err != nil {
+				return 0, "", fmt.Errorf("agent %s: %w", a.ID, err)
+			}
+			total += n
+		}
+		return total, checksum, nil
+	})
 }
 
 // importAgentTasks reads tasks.json for one agent (if present) and inserts
@@ -227,27 +220,7 @@ func mapV0TaskStatus(s string) (string, bool) {
 // scan-vs-import caveat as collectMessagesSourcePaths: orphan agent
 // dirs contribute to the checksum even when ListAgents skips them.
 func collectTasksSourcePaths(v0Dir string) ([]string, error) {
-	var paths []string
-	base := agentsBaseDir(v0Dir)
-	entries, err := readDirV0(v0Dir, base)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return paths, nil
-		}
-		return nil, fmt.Errorf("readdir agents: %w", err)
-	}
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "groupdms" {
-			continue
-		}
-		p := filepath.Join(base, e.Name(), "tasks.json")
-		updated, err := addLeafIfRegular(v0Dir, p, paths)
-		if err != nil {
-			return nil, err
-		}
-		paths = updated
-	}
-	return paths, nil
+	return collectPerAgentLeaf(v0Dir, "tasks.json")
 }
 
 // loadAllAgentTaskIDs returns every agent_tasks id currently in the
@@ -255,20 +228,7 @@ func collectTasksSourcePaths(v0Dir string) ([]string, error) {
 // in tasksImporter.Run; see the messages importer's
 // loadAllMessageIDs for the parallel design.
 func loadAllAgentTaskIDs(ctx context.Context, st *store.Store) (map[string]bool, error) {
-	rows, err := st.DB().QueryContext(ctx, `SELECT id FROM agent_tasks`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out[id] = true
-	}
-	return out, rows.Err()
+	return loadIDSet(ctx, st, `SELECT id FROM agent_tasks`)
 }
 
 // taskIDOwnedBy returns true iff agent_tasks contains a row with
@@ -292,15 +252,5 @@ func taskIDOwnedBy(ctx context.Context, st *store.Store, id, agentID string) boo
 // guaranteed not to collide with any id in `taken` at call time.
 // Mirrors generateFreshMessageID in the messages importer.
 func generateFreshTaskID(taken map[string]bool) (string, error) {
-	var buf [8]byte
-	for tries := 0; tries < 32; tries++ {
-		if _, err := rand.Read(buf[:]); err != nil {
-			return "", fmt.Errorf("rand: %w", err)
-		}
-		id := "task_" + hex.EncodeToString(buf[:])
-		if !taken[id] {
-			return id, nil
-		}
-	}
-	return "", errors.New("could not generate non-colliding task id after 32 tries")
+	return generateFreshID("task_", taken)
 }

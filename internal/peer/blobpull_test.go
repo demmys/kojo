@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/loppo-llc/kojo/internal/blob"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // fixedSourceFixture mounts an httptest server that pretends to
@@ -49,21 +48,6 @@ func newTestIdentity(t *testing.T) *Identity {
 	}
 }
 
-// newBlobTestStore opens a temp store. With docs/peer-tsnet-identity.md
-// the outbound Bearer plumbing is gone — identity travels via tsnet
-// WhoIs on the receiving side — so the store is empty.
-func newBlobTestStore(t *testing.T, sourceDeviceID string) *store.Store {
-	t.Helper()
-	_ = sourceDeviceID
-	dir := t.TempDir()
-	st, err := store.Open(context.Background(), store.Options{ConfigDir: dir})
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st
-}
-
 func newTestBlobStore(t *testing.T) *blob.Store {
 	t.Helper()
 	return blob.New(t.TempDir())
@@ -84,8 +68,7 @@ func TestPullOne_HappyPath(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	uri := "kojo://global/agents/ag_x/transcript"
@@ -125,8 +108,7 @@ func TestPullOne_SHA256Mismatch(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// No orchestrator-supplied digest: only the response header
@@ -156,8 +138,7 @@ func TestPullOne_HTTPNon200(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -183,8 +164,7 @@ func TestPullOne_MissingSHAHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	// Pass an empty ExpectedSHA256 so the helper has nothing to
@@ -214,8 +194,7 @@ func TestPullOne_OrchestratorDigestOverridesHeader(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	res, err := client.PullOne(context.Background(),
@@ -244,8 +223,7 @@ func TestPullMany_StopsOnLocalFatal(t *testing.T) {
 
 	id := newTestIdentity(t)
 	dst := newTestBlobStore(t)
-	st := newBlobTestStore(t, "source-device-fedcba9876543210")
-	client := NewPullClient(id, st, nil, nil)
+	client := NewPullClient(id, nil, nil)
 	src := PullSource{DeviceID: "source-device-fedcba9876543210", Address: srv.URL}
 
 	ctx, cancel := context.WithCancel(context.Background())

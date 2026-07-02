@@ -1,20 +1,18 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/snapshot"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // cleanFlags carries the parsed `--clean*` flag values from main.go.
@@ -132,122 +130,93 @@ func runCleanCommand(f cleanFlags) int {
 	runAgents := f.target == "agents"
 	runEvents := f.target == "events"
 
-	var snapshotPlan *cleanPlan
+	// Build the seven targets behind a common interface. Each wraps
+	// its subsystem's plan/print/apply triad; see clean_targets.go.
+	// The shared env owns the lazily-opened sqlite handles (read-only
+	// for the scan phase, read-write for apply) plus the deferred
+	// cleanups, replacing the hand-managed defers the inline dispatch
+	// used to carry.
+	//
+	// The legacy target opens its kv handle read-only (SQLite WAL admits
+	// multiple readers alongside a live writer; ReadOnly also skips
+	// migrations so clean never silently bumps the schema version) and
+	// holds it across scan+apply so apply-time re-validation sees the
+	// same connection.
+	env := &cleanEnv{f: f}
+	defer env.closeAll()
+
+	var (
+		snapT    *snapshotTarget
+		legacyT  *legacyTarget
+		v0TrashT *v0TrashTarget
+		v0T      *v0Target
+		blobT    *blobTarget
+		agentT   *agentTarget
+		eventT   *eventTarget
+	)
 	if runSnapshots {
-		p, err := planSnapshotCleanup(f)
-		if err != nil {
-			f.logger.Error("clean: snapshot scan failed", "err", err)
-			return 1
-		}
-		snapshotPlan = p
-		printCleanPlan(snapshotPlan, f.apply)
+		snapT = &snapshotTarget{f: f}
 	}
-
-	var (
-		legacyPlan *legacyCleanPlan
-		legacyKV   *store.Store
-	)
 	if runLegacy {
-		// The legacy target needs a kv handle. Open kojo.db read-only:
-		// SQLite WAL admits multiple readers alongside a live writer,
-		// so this co-exists with a running kojo. ReadOnly skips
-		// migrations as well — clean must never silently bump the
-		// schema version. The handle is held across both scan and
-		// apply so apply-time re-validation sees the same connection.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		st, err := store.Open(ctx, store.Options{ConfigDir: f.configDirPath, ReadOnly: true})
-		if err != nil {
-			f.logger.Error("clean: open kv store (read-only) failed", "err", err)
-			return 1
-		}
-		defer st.Close()
-		legacyKV = st
-		p, err := planLegacyCleanup(ctx, st, f.configDirPath)
-		if err != nil {
-			f.logger.Error("clean: legacy scan failed", "err", err)
-			return 1
-		}
-		legacyPlan = p
-		printLegacyCleanPlan(legacyPlan, f.apply)
+		legacyT = &legacyTarget{f: f, env: env}
 	}
-
-	var v0TrashPlan *v0TrashCleanPlan
 	if runV0Trash {
-		p, err := planV0TrashCleanup(f.minAgeDays, f.logger)
-		if err != nil {
-			f.logger.Error("clean: v0-trash scan failed", "err", err)
-			return 1
-		}
-		v0TrashPlan = p
-		printV0TrashCleanPlan(v0TrashPlan, f.apply)
+		v0TrashT = &v0TrashTarget{f: f}
 	}
-
-	var v0Plan *v0CleanPlan
 	if runV0 {
-		p, err := planV0Cleanup(f.configDirPath, f.logger)
-		if err != nil {
-			f.logger.Error("clean: v0 scan failed", "err", err)
-			return 1
-		}
-		// --clean-force only matters when the plan flagged a
-		// ForceableReason (currently only manifest divergence is
-		// overridable; every other PartialReason — non-dir,
-		// symlink, lock held, missing/mismatched complete file —
-		// fails closed regardless of --force; trash-path
-		// collision is a separate apply-time error, not a
-		// PartialReason). Recording ForceUsed here keeps the
-		// dry-run printout honest.
-		if p != nil && f.force {
-			p.ForceUsed = true
-		}
-		v0Plan = p
-		printV0CleanPlan(v0Plan, f.apply)
-	}
-
-	var (
-		blobPlan  *blobCleanPlan
-		agentPlan *agentCleanPlan
-		eventPlan *eventCleanPlan
-		storePlan *store.Store
-	)
-	if runBlobs || runAgents || runEvents {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		st, err := store.Open(ctx, store.Options{ConfigDir: f.configDirPath, ReadOnly: true})
-		if err != nil {
-			f.logger.Error("clean: open store (read-only) failed", "err", err)
-			return 1
-		}
-		defer st.Close()
-		storePlan = st
+		v0T = &v0Target{f: f}
 	}
 	if runBlobs {
-		p, err := planBlobCleanup(context.Background(), storePlan, f.configDirPath, f.maxAgeDays)
-		if err != nil {
-			f.logger.Error("clean: blob scan failed", "err", err)
-			return 1
-		}
-		blobPlan = p
-		printBlobCleanPlan(blobPlan, f.apply)
+		blobT = &blobTarget{f: f, env: env}
 	}
 	if runAgents {
-		p, err := planAgentCleanup(context.Background(), storePlan, f.maxAgeDays)
-		if err != nil {
-			f.logger.Error("clean: agent scan failed", "err", err)
-			return 1
-		}
-		agentPlan = p
-		printAgentCleanPlan(agentPlan, f.apply)
+		agentT = &agentTarget{f: f, env: env}
 	}
 	if runEvents {
-		p, err := planEventCleanup(context.Background(), storePlan, f.maxAgeDays)
-		if err != nil {
-			f.logger.Error("clean: event scan failed", "err", err)
+		eventT = &eventTarget{f: f, env: env}
+	}
+
+	// addTarget appends only constructed (non-nil) concrete pointers,
+	// sidestepping the typed-nil-in-interface trap (a nil *snapshotTarget
+	// boxed into a cleanTarget is itself non-nil).
+	scanTargets := make([]cleanTarget, 0, 7)
+	addScan := func(t cleanTarget, set bool) {
+		if set {
+			scanTargets = append(scanTargets, t)
+		}
+	}
+	applyTargets := make([]cleanTarget, 0, 7)
+	addApply := func(t cleanTarget, set bool) {
+		if set {
+			applyTargets = append(applyTargets, t)
+		}
+	}
+
+	// Scan order — identical to the original inline sequence:
+	// snapshots, legacy, v0-trash, v0, blobs, agents, events.
+	addScan(snapT, snapT != nil)
+	addScan(legacyT, legacyT != nil)
+	addScan(v0TrashT, v0TrashT != nil)
+	addScan(v0T, v0T != nil)
+	addScan(blobT, blobT != nil)
+	addScan(agentT, agentT != nil)
+	addScan(eventT, eventT != nil)
+
+	// Apply order differs from scan order: v0 is applied BEFORE v0-trash
+	// (the soft-delete rename precedes physical trash removal).
+	addApply(snapT, snapT != nil)
+	addApply(legacyT, legacyT != nil)
+	addApply(v0T, v0T != nil)
+	addApply(v0TrashT, v0TrashT != nil)
+	addApply(blobT, blobT != nil)
+	addApply(agentT, agentT != nil)
+	addApply(eventT, eventT != nil)
+
+	for _, t := range scanTargets {
+		if err := t.scan(); err != nil {
 			return 1
 		}
-		eventPlan = p
-		printEventCleanPlan(eventPlan, f.apply)
+		t.print(f.apply)
 	}
 
 	if !f.apply {
@@ -256,64 +225,18 @@ func runCleanCommand(f cleanFlags) int {
 	}
 
 	rc := 0
-	if snapshotPlan != nil {
-		if errs := applyCleanPlan(snapshotPlan); len(errs) > 0 {
+	for _, t := range applyTargets {
+		if t.needsRWStore() {
+			if err := env.ensureRWStore(); err != nil {
+				f.logger.Error("clean: open store (read-write) failed", "err", err)
+				return 1
+			}
+		}
+		if errs := t.apply(); len(errs) > 0 {
 			for _, e := range errs {
-				f.logger.Error("clean: remove snapshot failed", "err", e)
+				f.logger.Error(t.applyErrMsg(), "err", e)
 			}
 			rc = 1
-		}
-	}
-	if legacyPlan != nil {
-		if errs := applyLegacyCleanPlan(legacyPlan, legacyKV); len(errs) > 0 {
-			for _, e := range errs {
-				f.logger.Error("clean: remove legacy file failed", "err", e)
-			}
-			rc = 1
-		}
-	}
-	if v0Plan != nil {
-		if err := applyV0CleanPlan(v0Plan, f.logger); err != nil {
-			f.logger.Error("clean: v0 soft-delete failed", "err", err)
-			rc = 1
-		}
-	}
-	if v0TrashPlan != nil {
-		if errs := applyV0TrashCleanPlan(v0TrashPlan, f.logger); len(errs) > 0 {
-			for _, e := range errs {
-				f.logger.Error("clean: remove v0 trash dir failed", "err", e)
-			}
-			rc = 1
-		}
-	}
-	if blobPlan != nil || agentPlan != nil || eventPlan != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		st, err := store.Open(ctx, store.Options{ConfigDir: f.configDirPath})
-		if err != nil {
-			f.logger.Error("clean: open store (read-write) failed", "err", err)
-			return 1
-		}
-		defer st.Close()
-		if blobPlan != nil {
-			if errs := applyBlobCleanPlan(ctx, blobPlan, st); len(errs) > 0 {
-				for _, e := range errs {
-					f.logger.Error("clean: remove blob entry failed", "err", e)
-				}
-				rc = 1
-			}
-		}
-		if agentPlan != nil {
-			if err := applyAgentCleanPlan(ctx, agentPlan, st); err != nil {
-				f.logger.Error("clean: hard-delete agents failed", "err", err)
-				rc = 1
-			}
-		}
-		if eventPlan != nil {
-			if err := applyEventCleanPlan(ctx, eventPlan, st); err != nil {
-				f.logger.Error("clean: prune event rows failed", "err", err)
-				rc = 1
-			}
 		}
 	}
 	return rc
@@ -369,10 +292,10 @@ func planSnapshotCleanup(f cleanFlags) (*cleanPlan, error) {
 	}
 
 	// Sort newest-first so the keep-latest cut is easy.
-	sort.Slice(all, func(i, j int) bool { return all[i].ModTime.After(all[j].ModTime) })
+	slices.SortFunc(all, func(a, b snapshotEntry) int { return b.ModTime.Compare(a.ModTime) })
 
 	plan := &cleanPlan{}
-	cutoff := time.Now().Add(-time.Duration(f.maxAgeDays) * 24 * time.Hour)
+	cutoff := cutoffTime(f.maxAgeDays)
 
 	for i, e := range all {
 		switch {
@@ -393,10 +316,7 @@ func planSnapshotCleanup(f cleanFlags) (*cleanPlan, error) {
 }
 
 func printCleanPlan(plan *cleanPlan, apply bool) {
-	verb := "would remove"
-	if apply {
-		verb = "removing"
-	}
+	verb := cleanVerb(apply)
 	if n := len(plan.PartialSnapshots); n > 0 {
 		fmt.Fprintf(os.Stderr, "%s %d partial snapshot dir(s):\n", verb, n)
 		for _, e := range plan.PartialSnapshots {

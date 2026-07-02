@@ -536,13 +536,6 @@ func TestRemoveGrokSessionDir_RejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestHasGrokSession_FalseWhenMissing(t *testing.T) {
-	// A path that almost certainly has no grok session.
-	if hasGrokSession("/tmp/this-does-not-exist-kojo-test-" + randomSuffix()) {
-		t.Error("hasGrokSession returned true for nonexistent cwd")
-	}
-}
-
 func randomSuffix() string {
 	// Cheap unique-enough suffix; collisions would only weaken the
 	// test, not break it.

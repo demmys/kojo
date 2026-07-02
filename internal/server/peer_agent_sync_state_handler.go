@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -52,15 +51,11 @@ type peerAgentSyncStateRequest struct {
 const peerAgentSyncStateMaxBody = 4 << 10 // 4 KiB; body is two short strings.
 
 func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not configured")
+	if _, ok := s.requireAgentStore(w, "agent store not configured"); !ok {
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, peerAgentSyncStateMaxBody))
@@ -90,7 +85,7 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 				"source_device_id required for peer principal")
 			return
 		}
-		if p.PeerID != req.SourceDeviceID {
+		if !verifySignerIsSource(p, req.SourceDeviceID) {
 			writeError(w, http.StatusForbidden, "forbidden",
 				"signer peer device_id does not match source_device_id")
 			return
@@ -121,7 +116,6 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			// caller is trusted; the prior `kojo --peer-trust`
 			// guard would always pass now. Keep the comment for
 			// audit-trail context but skip the runtime check.
-			_ = p
 			s.logger.Warn("state probe: purging stale agent runtime state on target",
 				"agent", req.AgentID, "source", req.SourceDeviceID,
 				"stale_holder", lock.HolderPeer,

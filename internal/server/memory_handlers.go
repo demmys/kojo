@@ -1,9 +1,7 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -83,20 +81,12 @@ func (s *Server) handlePutAgentMemory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
 	// `*` is meaningful for create-or-replace, but for MEMORY.md
 	// "any current state is acceptable" doesn't compose well with
 	// the file-and-DB write trio (we'd silently overwrite a value
 	// the user didn't see). Refuse rather than silently accept.
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported for MEMORY.md")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for MEMORY.md")
+	if !ok {
 		return
 	}
 
@@ -105,25 +95,8 @@ func (s *Server) handlePutAgentMemory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MaxBytesReader (NOT LimitReader): a 4MiB+1 body returns an
-	// error from ReadAll, mapped to 413. LimitReader silently
-	// truncates which would let a malformed but valid-prefix JSON
-	// land successfully — the wrong failure mode for an oversized
-	// upload.
-	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "MEMORY.md body exceeds 4 MiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
 	var req memoryPutRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, 4<<20, "MEMORY.md body exceeds 4 MiB cap", "invalid JSON", &req) {
 		return
 	}
 
@@ -164,16 +137,8 @@ func (s *Server) handleDeleteAgentMemory(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own memory")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported for MEMORY.md")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for MEMORY.md")
+	if !ok {
 		return
 	}
 	if _, ok := s.agents.Get(id); !ok {

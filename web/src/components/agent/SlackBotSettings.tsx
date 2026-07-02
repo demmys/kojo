@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { agentApi, type SlackBotStatus } from "../../lib/agentApi";
+import { errMsg } from "../../lib/utils";
 
 export function SlackBotSettings({ agentId }: { agentId: string }) {
   const [status, setStatus] = useState<SlackBotStatus | null>(null);
@@ -44,7 +45,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
       const s = await agentApi.slackBot.get(agentId);
       setStatus(s);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setSaving(false);
     }
@@ -61,7 +62,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
       });
       setTestResult(`Connected: team=${res.team}, bot=${res.botUser}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setTesting(false);
     }
@@ -80,7 +81,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
       setBotToken("");
       setTestResult("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setSaving(false);
     }

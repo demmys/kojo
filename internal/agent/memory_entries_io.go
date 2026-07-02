@@ -297,7 +297,7 @@ func (m *Manager) refuseIfResetting(agentID string) error {
 // the post-reset sync lands.
 func (m *Manager) ListAgentMemoryEntries(ctx context.Context, agentID string, opts MemoryEntryListOptions) ([]*MemoryEntryRecord, error) {
 	if agentID == "" {
-		return nil, fmt.Errorf("ListAgentMemoryEntries: agentID required")
+		return nil, fmt.Errorf("listAgentMemoryEntries: agentID required")
 	}
 	if opts.Kind != "" {
 		if err := validateMemoryEntryKind(opts.Kind); err != nil {
@@ -339,7 +339,7 @@ func (m *Manager) ListAgentMemoryEntries(ctx context.Context, agentID string, op
 // pending DB.
 func (m *Manager) GetAgentMemoryEntry(ctx context.Context, agentID, entryID string) (*MemoryEntryRecord, error) {
 	if agentID == "" || entryID == "" {
-		return nil, fmt.Errorf("GetAgentMemoryEntry: agentID and entryID required")
+		return nil, fmt.Errorf("getAgentMemoryEntry: agentID and entryID required")
 	}
 	st := m.Store()
 	if st == nil {
@@ -374,7 +374,7 @@ func (m *Manager) GetAgentMemoryEntry(ctx context.Context, agentID, entryID stri
 // surfaces as a conflict rather than a silent overwrite.
 func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, name, body string) (*MemoryEntryRecord, error) {
 	if agentID == "" {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: agentID required")
+		return nil, fmt.Errorf("createAgentMemoryEntry: agentID required")
 	}
 	if err := validateMemoryEntryKind(kind); err != nil {
 		return nil, err
@@ -408,14 +408,14 @@ func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, nam
 	// on stat, INSERT, and then sync would notice both files (ours +
 	// the pre-existing one) and resurrect a duplicate.
 	if err := syncMemoryEntriesToDB(dbCtx, st, agentID, m.logger); err != nil {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: pre-sync: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: pre-sync: %w", err)
 	}
 
 	// Refuse if a live row already exists under (kind, name).
 	if existing, err := st.FindMemoryEntryByName(dbCtx, agentID, kind, name); err == nil && existing != nil {
 		return nil, fmt.Errorf("%w: %s/%s", ErrMemoryEntryExists, kind, name)
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: dedup check: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: dedup check: %w", err)
 	}
 
 	path, err := memoryEntryCanonicalPath(agentID, kind, name)
@@ -423,7 +423,7 @@ func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, nam
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: ensure dir: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: ensure dir: %w", err)
 	}
 	// Refuse if the canonical file already exists on disk — would
 	// mean the DB lookup above missed something the next sync will
@@ -431,10 +431,10 @@ func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, nam
 	if _, err := os.Stat(path); err == nil {
 		return nil, fmt.Errorf("%w: %s/%s", ErrMemoryEntryExists, kind, name)
 	} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: stat existing: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: stat existing: %w", err)
 	}
 	if err := writeFileAtomic(path, []byte(body)); err != nil {
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: write file: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: write file: %w", err)
 	}
 
 	rec, err := st.InsertMemoryEntry(dbCtx, &store.MemoryEntryRecord{
@@ -447,7 +447,7 @@ func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, nam
 	if err != nil {
 		// Rollback the file write so disk and DB stay in sync.
 		_ = os.Remove(path)
-		return nil, fmt.Errorf("CreateAgentMemoryEntry: insert: %w", err)
+		return nil, fmt.Errorf("createAgentMemoryEntry: insert: %w", err)
 	}
 	return toMemoryEntryRecord(rec), nil
 }
@@ -462,7 +462,7 @@ func (m *Manager) CreateAgentMemoryEntry(ctx context.Context, agentID, kind, nam
 // inside the store TX (defense in depth).
 func (m *Manager) UpdateAgentMemoryEntry(ctx context.Context, agentID, entryID, ifMatchETag string, patch MemoryEntryPatch) (*MemoryEntryRecord, error) {
 	if agentID == "" || entryID == "" {
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: agentID and entryID required")
+		return nil, fmt.Errorf("updateAgentMemoryEntry: agentID and entryID required")
 	}
 	if patch.Kind != nil || patch.Name != nil {
 		return nil, ErrMemoryEntryRenameUnsupported
@@ -497,7 +497,7 @@ func (m *Manager) UpdateAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 	defer cancel()
 
 	if err := syncMemoryEntriesToDB(dbCtx, st, agentID, m.logger); err != nil {
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: pre-sync: %w", err)
+		return nil, fmt.Errorf("updateAgentMemoryEntry: pre-sync: %w", err)
 	}
 
 	cur, err := st.GetMemoryEntry(dbCtx, entryID)
@@ -558,7 +558,7 @@ func (m *Manager) UpdateAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 	// walk in Update is the price of correctness.
 	existingPaths, scanErr := m.findExistingEntryFiles(agentID, cur.Kind, cur.Name)
 	if scanErr != nil {
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: scan disk: %w", scanErr)
+		return nil, fmt.Errorf("updateAgentMemoryEntry: scan disk: %w", scanErr)
 	}
 
 	switch {
@@ -615,7 +615,7 @@ func (m *Manager) UpdateAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 			return m.finishUpdateMemoryEntry(dbCtx, st, cur, entryID, ifMatchETag,
 				*patch.Body, canonicalPath, "" /* no prior body */, false /* hadFile */, agentID)
 		default:
-			return nil, fmt.Errorf("UpdateAgentMemoryEntry: pre-write read: %w", readErr)
+			return nil, fmt.Errorf("updateAgentMemoryEntry: pre-write read: %w", readErr)
 		}
 	}
 	// Unreachable. Belt-and-suspenders to satisfy the compiler.
@@ -633,10 +633,10 @@ func (m *Manager) UpdateAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 func (m *Manager) finishUpdateMemoryEntry(dbCtx context.Context, st *store.Store, cur *store.MemoryEntryRecord, entryID, ifMatchETag, body, path, priorBody string, hadFile bool, agentID string) (*MemoryEntryRecord, error) {
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: ensure dir: %w", err)
+		return nil, fmt.Errorf("updateAgentMemoryEntry: ensure dir: %w", err)
 	}
 	if err := writeFileAtomic(path, []byte(body)); err != nil {
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: write file: %w", err)
+		return nil, fmt.Errorf("updateAgentMemoryEntry: write file: %w", err)
 	}
 
 	storePatch := store.MemoryEntryPatch{Body: &body}
@@ -665,7 +665,7 @@ func (m *Manager) finishUpdateMemoryEntry(dbCtx context.Context, st *store.Store
 				"agent", agentID, "entry", entryID, "path", path,
 				"hadFile", hadFile, "err", rbErr)
 		}
-		return nil, fmt.Errorf("UpdateAgentMemoryEntry: update: %w", err)
+		return nil, fmt.Errorf("updateAgentMemoryEntry: update: %w", err)
 	}
 	return toMemoryEntryRecord(rec), nil
 }
@@ -677,7 +677,7 @@ func (m *Manager) finishUpdateMemoryEntry(dbCtx context.Context, st *store.Store
 // refetch.
 func (m *Manager) DeleteAgentMemoryEntry(ctx context.Context, agentID, entryID, ifMatchETag string) error {
 	if agentID == "" || entryID == "" {
-		return fmt.Errorf("DeleteAgentMemoryEntry: agentID and entryID required")
+		return fmt.Errorf("deleteAgentMemoryEntry: agentID and entryID required")
 	}
 	st := m.Store()
 	if st == nil {
@@ -698,7 +698,7 @@ func (m *Manager) DeleteAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 	defer cancel()
 
 	if err := syncMemoryEntriesToDB(dbCtx, st, agentID, m.logger); err != nil {
-		return fmt.Errorf("DeleteAgentMemoryEntry: pre-sync: %w", err)
+		return fmt.Errorf("deleteAgentMemoryEntry: pre-sync: %w", err)
 	}
 
 	cur, err := st.GetMemoryEntry(dbCtx, entryID)
@@ -737,7 +737,7 @@ func (m *Manager) DeleteAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 	// can't resurrect a missed orphan.
 	paths, scanErr := m.findExistingEntryFiles(agentID, cur.Kind, cur.Name)
 	if scanErr != nil {
-		return fmt.Errorf("DeleteAgentMemoryEntry: scan disk: %w", scanErr)
+		return fmt.Errorf("deleteAgentMemoryEntry: scan disk: %w", scanErr)
 	}
 
 	// If scan didn't find a file but the row's kind/name validates,
@@ -800,7 +800,7 @@ func (m *Manager) DeleteAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 		if err := os.Remove(p); err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				rollback()
-				return fmt.Errorf("DeleteAgentMemoryEntry: remove file: %w", err)
+				return fmt.Errorf("deleteAgentMemoryEntry: remove file: %w", err)
 			}
 			// Vanished between snapshot and remove. Skip rollback
 			// for this path (the prior state was "doesn't exist").
@@ -816,7 +816,7 @@ func (m *Manager) DeleteAgentMemoryEntry(ctx context.Context, agentID, entryID, 
 		// gone" and tombstone the row, silently turning the failed
 		// DELETE into a successful one.
 		rollback()
-		return fmt.Errorf("DeleteAgentMemoryEntry: tombstone: %w", err)
+		return fmt.Errorf("deleteAgentMemoryEntry: tombstone: %w", err)
 	}
 	return nil
 }

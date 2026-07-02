@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -754,7 +754,7 @@ func slackListEmojiHandler(agents *agent.Manager, logger *slog.Logger) mcpserver
 		emojis := filterEmoji(emojiMap, nameFilter)
 
 		// Sort by name for deterministic output.
-		sort.Slice(emojis, func(i, j int) bool { return emojis[i].Name < emojis[j].Name })
+		slices.SortFunc(emojis, func(a, b emojiInfo) int { return strings.Compare(a.Name, b.Name) })
 
 		logger.Info("mcp tool result", "reqID", reqID, "agent", agentID, "tool", "slack_list_emoji", "emojiCount", len(emojis))
 

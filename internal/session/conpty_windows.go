@@ -29,16 +29,10 @@ func (c *conPTY) Close() error {
 	return c.cpty.Close()
 }
 
-// resizeConPTY returns a resize function for the given ConPTY.
-func resizeConPTY(cpty *conpty.ConPty) func(cols, rows uint16) error {
-	return func(cols, rows uint16) error {
-		return cpty.Resize(int(cols), int(rows))
-	}
-}
-
 // startConPTY starts a process inside a ConPTY.
-// Returns the io.ReadWriteCloser, the exec.Cmd, and a resize function.
-func startConPTY(cmdLine string, workDir string, cols, rows uint16) (io.ReadWriteCloser, *exec.Cmd, func(cols, rows uint16) error, error) {
+// Returns the io.ReadWriteCloser and the exec.Cmd. Resizing is handled via
+// Session.Resize, which type-asserts the ReadWriteCloser back to *conPTY.
+func startConPTY(cmdLine string, workDir string, cols, rows uint16) (io.ReadWriteCloser, *exec.Cmd, error) {
 	if cols == 0 {
 		cols = 120
 	}
@@ -48,7 +42,7 @@ func startConPTY(cmdLine string, workDir string, cols, rows uint16) (io.ReadWrit
 
 	cpty, err := conpty.Start(cmdLine, conpty.ConPtyDimensions(int(cols), int(rows)), conpty.ConPtyWorkDir(workDir))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("conpty start: %w", err)
+		return nil, nil, fmt.Errorf("conpty start: %w", err)
 	}
 
 	// Get the PID of the process spawned inside the ConPTY.
@@ -59,13 +53,13 @@ func startConPTY(cmdLine string, workDir string, cols, rows uint16) (io.ReadWrit
 	proc, err := findProcessByPID(pid)
 	if err != nil {
 		cpty.Close()
-		return nil, nil, nil, fmt.Errorf("conpty find process (pid %d): %w", pid, err)
+		return nil, nil, fmt.Errorf("conpty find process (pid %d): %w", pid, err)
 	}
 	cmd := &exec.Cmd{}
 	cmd.Process = proc
 
 	rwc := &conPTY{cpty: cpty}
-	return rwc, cmd, resizeConPTY(cpty), nil
+	return rwc, cmd, nil
 }
 
 // buildCmdLine constructs a Windows command line string from a tool path and arguments.

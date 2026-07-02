@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
@@ -31,24 +30,7 @@ import (
 // Map entries are never deleted: agent IDs are bounded (low thousands
 // in the worst case) and an unheld *sync.Mutex is small. The simpler
 // "leak by design" pattern matches Manager.LockPatch.
-var memorySyncMu struct {
-	mu sync.Mutex
-	m  map[string]*sync.Mutex
-}
-
-func memorySyncLockFor(agentID string) *sync.Mutex {
-	memorySyncMu.mu.Lock()
-	defer memorySyncMu.mu.Unlock()
-	if memorySyncMu.m == nil {
-		memorySyncMu.m = make(map[string]*sync.Mutex)
-	}
-	mu, ok := memorySyncMu.m[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		memorySyncMu.m[agentID] = mu
-	}
-	return mu
-}
+var memorySyncLocks keyedMutex
 
 // lockMemorySync blocks until the per-agent mutex is acquired. Used by
 // callers (Load, fork, Create, ResetData) where we MUST sync before
@@ -57,9 +39,7 @@ func memorySyncLockFor(agentID string) *sync.Mutex {
 // for the same agent, which in normal operation is short — concurrent
 // callers serialize but each individual sync runs to completion.
 func lockMemorySync(agentID string) func() {
-	mu := memorySyncLockFor(agentID)
-	mu.Lock()
-	return mu.Unlock
+	return memorySyncLocks.Lock(agentID)
 }
 
 // tryLockMemorySync is the non-blocking variant for hot paths
@@ -69,11 +49,7 @@ func lockMemorySync(agentID string) func() {
 // retries. No ctx parameter — the contract is "if busy, skip" with no
 // timeout to manage.
 func tryLockMemorySync(agentID string) (func(), bool) {
-	mu := memorySyncLockFor(agentID)
-	if !mu.TryLock() {
-		return nil, false
-	}
-	return mu.Unlock, true
+	return memorySyncLocks.TryLock(agentID)
 }
 
 // canonicalMemoryKindDirs maps a top-level memory subdirectory to its DB kind.

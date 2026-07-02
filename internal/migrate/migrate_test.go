@@ -49,13 +49,13 @@ func fakeV0Dir(t *testing.T, at time.Time) string {
 	t.Helper()
 	root := t.TempDir()
 	files := map[string]string{
-		"agents.json":                          `[]`,
-		"sessions.json":                        `[]`,
-		"agents/ag_1/persona.md":               "I am Hana.\n",
-		"agents/ag_1/MEMORY.md":                "# Memory\n",
-		"agents/ag_1/messages.jsonl":           ``,
-		"agents/groupdms/groups.json":          `[]`,
-		"vapid.json":                           `{}`,
+		"agents.json":                 `[]`,
+		"sessions.json":               `[]`,
+		"agents/ag_1/persona.md":      "I am Hana.\n",
+		"agents/ag_1/MEMORY.md":       "# Memory\n",
+		"agents/ag_1/messages.jsonl":  ``,
+		"agents/groupdms/groups.json": `[]`,
+		"vapid.json":                  `{}`,
 	}
 	for rel, body := range files {
 		abs := filepath.Join(root, rel)

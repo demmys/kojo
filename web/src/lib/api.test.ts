@@ -12,7 +12,6 @@ vi.mock("./auth", () => ({
     url.includes("?") ? `${url}&token=tok` : `${url}?token=tok`,
   ),
   bootstrapTokenFromURL: vi.fn(),
-  clearOwnerToken: vi.fn(),
 }));
 
 import { api } from "./api";

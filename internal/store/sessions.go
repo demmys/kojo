@@ -351,15 +351,3 @@ func scanSessionRow(r rowScanner) (*SessionRecord, error) {
 	}
 	return &rec, nil
 }
-
-// nullableTextPtr converts *string to a database/sql NULL-aware value.
-// Distinct from nullableText (which takes a plain string and emits NULL
-// for ""): a session with AgentID=nil legitimately means "detached",
-// while a session with AgentID=&"" would be a malformed row that we
-// surface as NULL too rather than persisting an empty-string FK target.
-func nullableTextPtr(p *string) any {
-	if p == nil || *p == "" {
-		return sql.NullString{}
-	}
-	return sql.NullString{String: *p, Valid: true}
-}

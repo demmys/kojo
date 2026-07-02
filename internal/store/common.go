@@ -1,15 +1,34 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
-	"sync"
+	"slices"
 	"sync/atomic"
 	"time"
 )
+
+// nextAgentSeqTx allocates the next per-agent seq for table as MAX(seq)+1
+// (1 when the agent has no rows yet). table MUST be a trusted constant
+// (agent_tasks / memory_entries / agent_messages) — it is interpolated into
+// the SQL. Callers hold the write tx so SQLite's writer serialization makes
+// the returned value stable until their INSERT lands.
+func nextAgentSeqTx(ctx context.Context, tx *sql.Tx, table, agentID string) (int64, error) {
+	var maxSeq sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT MAX(seq) FROM `+table+` WHERE agent_id = ?`, agentID,
+	).Scan(&maxSeq); err != nil {
+		return 0, err
+	}
+	if maxSeq.Valid {
+		return maxSeq.Int64 + 1, nil
+	}
+	return 1, nil
+}
 
 // NowMillis returns the current UTC time in epoch milliseconds. All timestamps
 // in kojo's structured store use this representation (3.2 in the design doc).
@@ -98,7 +117,7 @@ func marshalSorted(v any) ([]byte, error) {
 		for k := range x {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		slices.Sort(keys)
 		var b []byte
 		b = append(b, '{')
 		for i, k := range keys {
@@ -144,16 +163,4 @@ func marshalSorted(v any) ([]byte, error) {
 func SHA256Hex(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
-}
-
-// onceErr is a tiny utility wrapping sync.Once that propagates an error.
-// Useful for one-shot initializers (e.g. lazy prepared-statement caches).
-type onceErr struct {
-	once sync.Once
-	err  error
-}
-
-func (o *onceErr) Do(f func() error) error {
-	o.once.Do(func() { o.err = f() })
-	return o.err
 }

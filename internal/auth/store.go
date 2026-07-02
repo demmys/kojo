@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -156,11 +157,11 @@ func NewTokenStore(base string, kv *store.Store, overrideOwner string) (*TokenSt
 //
 // Lookup order:
 //
-//   1. kv row (auth/owner.token)
-//   2. legacy disk file (<base>/owner.token), with disk → kv
-//      mirror via IfMatchAny on success
-//   3. fresh-generate, persist to kv (or disk fallback when kv is
-//      unavailable)
+//  1. kv row (auth/owner.token)
+//  2. legacy disk file (<base>/owner.token), with disk → kv
+//     mirror via IfMatchAny on success
+//  3. fresh-generate, persist to kv (or disk fallback when kv is
+//     unavailable)
 //
 // The opportunistic "kv-hit drops a stale legacy file" branch
 // matches the cron_paused / autosummary_marker pattern: the disk
@@ -482,13 +483,6 @@ func (s *TokenStore) EnsureAgentToken(agentID string) error {
 		return nil
 	}
 	return err
-}
-
-// VerifyAgent returns the agent ID if presented matches a stored
-// agent token hash. Distinct from LookupAgent only by name; both do
-// constant-time hash comparison via the map lookup.
-func (s *TokenStore) VerifyAgent(presented string) (string, bool) {
-	return s.LookupAgent(presented)
 }
 
 // RemoveAgentToken deletes the kv row, in-memory entries, and any
@@ -884,14 +878,9 @@ func writeHashFile(path, hash string) error {
 	if !isHex64(hash) {
 		return fmt.Errorf("auth: refusing to write malformed hash to %s", path)
 	}
-	tmp := path + ".tmp"
 	body := hashedTokenPrefix + hash + "\n"
-	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+	if err := atomicfile.WriteBytes(path, []byte(body), 0o600); err != nil {
 		return fmt.Errorf("auth: write %s: %w", path, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("auth: rename %s: %w", path, err)
 	}
 	return nil
 }

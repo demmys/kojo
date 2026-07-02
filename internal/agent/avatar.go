@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/blob"
@@ -69,32 +68,14 @@ var avatarExtProbe = []string{".png", ".jpg", ".jpeg", ".webp", ".svg"}
 // invariant. The leak is bounded by total agent ids ever created
 // (one *sync.RWMutex per id, ~24 bytes), matching the same pattern
 // used by Manager.patchMus.
-var (
-	avatarMuMu sync.Mutex
-	avatarMu   = map[string]*sync.RWMutex{}
-)
-
-func avatarLockFor(agentID string) *sync.RWMutex {
-	avatarMuMu.Lock()
-	mu, ok := avatarMu[agentID]
-	if !ok {
-		mu = &sync.RWMutex{}
-		avatarMu[agentID] = mu
-	}
-	avatarMuMu.Unlock()
-	return mu
-}
+var avatarLocks keyedRWMutex
 
 func acquireAvatarLock(agentID string) func() {
-	mu := avatarLockFor(agentID)
-	mu.Lock()
-	return mu.Unlock
+	return avatarLocks.Lock(agentID)
 }
 
 func acquireAvatarRLock(agentID string) func() {
-	mu := avatarLockFor(agentID)
-	mu.RLock()
-	return mu.RUnlock
+	return avatarLocks.RLock(agentID)
 }
 
 // IsAllowedImageExt returns true if ext (case-insensitive) is an accepted avatar image extension.
@@ -615,7 +596,7 @@ func generateSVGAvatar(name string) string {
 	hash := md5.Sum([]byte(name))
 
 	// Generate two colors from hash for gradient
-	h1 := int(hash[0])%360
+	h1 := int(hash[0]) % 360
 	h2 := (h1 + 60 + int(hash[1])%120) % 360
 
 	// Get initials (first letter of first two words, or first two letters)

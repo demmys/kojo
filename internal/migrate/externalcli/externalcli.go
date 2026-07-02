@@ -23,13 +23,14 @@
 package externalcli
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 )
 
 // ManifestFileName is the on-disk record of forward operations,
@@ -168,7 +169,7 @@ func PlanSymlinks(specs []CLISpec, agents []PlanInput) []Op {
 		}
 	}
 	// Stable order so manifest diffs are reviewable.
-	sort.Slice(ops, func(i, j int) bool { return ops[i].Path < ops[j].Path })
+	slices.SortFunc(ops, func(a, b Op) int { return cmp.Compare(a.Path, b.Path) })
 	return ops
 }
 

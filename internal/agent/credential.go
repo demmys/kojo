@@ -28,8 +28,8 @@ type Credential struct {
 	Password      string `json:"password"`
 	TOTPSecret    string `json:"totpSecret,omitempty"`
 	TOTPAlgorithm string `json:"totpAlgorithm,omitempty"` // SHA1 (default), SHA256, SHA512
-	TOTPDigits    int    `json:"totpDigits,omitempty"`     // 6 (default) or 8
-	TOTPPeriod    int    `json:"totpPeriod,omitempty"`     // 30 (default)
+	TOTPDigits    int    `json:"totpDigits,omitempty"`    // 6 (default) or 8
+	TOTPPeriod    int    `json:"totpPeriod,omitempty"`    // 30 (default)
 	CreatedAt     string `json:"createdAt"`
 	UpdatedAt     string `json:"updatedAt"`
 }
@@ -540,7 +540,7 @@ func (s *CredentialStore) getCredentialLocked(agentID, credID string) (*Credenti
 		 FROM credentials WHERE agent_id=? AND id=?`,
 		agentID, credID,
 	)
-	c, err := s.scanCredentialRow(row)
+	c, err := s.scanAndDecrypt(row)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("%w: %s", ErrCredentialNotFound, credID)
 	}
@@ -562,10 +562,6 @@ func scanCredentialColumns(sc scannable) (*Credential, string, string, error) {
 		return nil, "", "", err
 	}
 	return &c, pwEnc, totpEnc, nil
-}
-
-func (s *CredentialStore) scanCredentialRow(row *sql.Row) (*Credential, error) {
-	return s.scanAndDecrypt(row)
 }
 
 func (s *CredentialStore) scanAndDecrypt(sc scannable) (*Credential, error) {

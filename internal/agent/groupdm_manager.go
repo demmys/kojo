@@ -135,8 +135,7 @@ type GroupDMManager struct {
 	// Map entries are never deleted: group IDs are bounded and
 	// an unheld *sync.Mutex is small. Same trade-off as
 	// Manager.patchMus.
-	patchMusMu sync.Mutex
-	patchMus   map[string]*sync.Mutex
+	patchMus keyedMutex
 }
 
 // NewGroupDMManager creates a new GroupDMManager.
@@ -149,7 +148,6 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		latestMsgID: make(map[string]string),
 		deleting:    make(map[string]bool),
 		persistGen:  make(map[string]int64),
-		patchMus:    make(map[string]*sync.Mutex),
 	}
 	m.load()
 	return m
@@ -167,15 +165,7 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 // Cross-process / cross-device write coordination is the store layer's
 // concern; LockPatch only serializes within one daemon process.
 func (m *GroupDMManager) LockPatch(groupID string) (release func()) {
-	m.patchMusMu.Lock()
-	mu, ok := m.patchMus[groupID]
-	if !ok {
-		mu = &sync.Mutex{}
-		m.patchMus[groupID] = mu
-	}
-	m.patchMusMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return m.patchMus.Lock(groupID)
 }
 
 // SetAPIBase sets the base URL for agent-facing API docs in system prompts.
@@ -392,29 +382,11 @@ func (m *GroupDMManager) Rename(id, name, callerAgentID string) (*GroupDM, error
 		return nil, err
 	}
 
-	// Verify caller is a member
-	if callerAgentID != "" {
-		isMember := false
-		for _, mem := range g.Members {
-			if mem.AgentID == callerAgentID {
-				isMember = true
-				break
-			}
-		}
-		if !isMember {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
-		}
-		// Re-check archived under the lock — Archive can flip the flag in
-		// the window between requireActiveCaller (outside the lock) and
-		// here.
-		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
-		} else if c.Archived {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
-		}
+	// Verify caller is an active member (membership + archived re-check
+	// under the lock).
+	if err := m.verifyActiveMemberLocked(g, callerAgentID); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 
 	oldName := g.Name
@@ -943,28 +915,10 @@ func (m *GroupDMManager) SetMemberNotifyMode(groupID, agentID string, mode Notif
 		m.mu.Unlock()
 		return nil, err
 	}
-	// Verify caller membership inside the lock.
-	if callerAgentID != "" {
-		callerOK := false
-		for _, mem := range g.Members {
-			if mem.AgentID == callerAgentID {
-				callerOK = true
-				break
-			}
-		}
-		if !callerOK {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, groupID)
-		}
-		// Re-check archived/deleted under the lock — Archive can flip the
-		// flag in the window between requireActiveCaller and here.
-		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
-		} else if c.Archived {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
-		}
+	// Verify caller membership + active state inside the lock.
+	if err := m.verifyActiveMemberLocked(g, callerAgentID); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 	found := false
 	for i := range g.Members {
@@ -1202,25 +1156,9 @@ func (m *GroupDMManager) SetStyle(id string, style GroupDMStyle, callerAgentID s
 		m.mu.Unlock()
 		return nil, err
 	}
-	if callerAgentID != "" {
-		found := false
-		for _, mem := range g.Members {
-			if mem.AgentID == callerAgentID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
-		}
-		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
-		} else if c.Archived {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
-		}
+	if err := m.verifyActiveMemberLocked(g, callerAgentID); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 	g.Style = style
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
@@ -1251,25 +1189,9 @@ func (m *GroupDMManager) SetVenue(id string, venue GroupDMVenue, callerAgentID s
 		m.mu.Unlock()
 		return nil, err
 	}
-	if callerAgentID != "" {
-		found := false
-		for _, mem := range g.Members {
-			if mem.AgentID == callerAgentID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, id)
-		}
-		if c, ok := m.agentMgr.Get(callerAgentID); !ok {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, callerAgentID)
-		} else if c.Archived {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
-		}
+	if err := m.verifyActiveMemberLocked(g, callerAgentID); err != nil {
+		m.mu.Unlock()
+		return nil, err
 	}
 	g.Venue = venue
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
@@ -1858,6 +1780,34 @@ func (m *GroupDMManager) requireActiveCaller(callerAgentID string) error {
 		return fmt.Errorf("%w: %s", ErrAgentArchived, callerAgentID)
 	}
 	return nil
+}
+
+// verifyActiveMemberLocked checks that callerAgentID is a current member
+// of g and is still active (exists, not archived). Empty callerAgentID is
+// the trusted admin/UI path and always passes. The active re-check runs
+// under m.mu — closing the TOCTOU window against requireActiveCaller,
+// which the mutation endpoints call before taking the lock (a concurrent
+// Archive could flip the flag in between).
+//
+// Contract: callers MUST hold m.mu. On a non-nil error they should unlock
+// and propagate it verbatim — the error values match the previous inline
+// checks per site (ErrGroupNotMember carries g.ID, matching the group id
+// the caller passed to liveGroupLocked).
+func (m *GroupDMManager) verifyActiveMemberLocked(g *GroupDM, callerAgentID string) error {
+	if callerAgentID == "" {
+		return nil
+	}
+	isMember := false
+	for _, mem := range g.Members {
+		if mem.AgentID == callerAgentID {
+			isMember = true
+			break
+		}
+	}
+	if !isMember {
+		return fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, callerAgentID, g.ID)
+	}
+	return m.requireActiveCaller(callerAgentID)
 }
 
 // resolveMembers validates member IDs and resolves their names.

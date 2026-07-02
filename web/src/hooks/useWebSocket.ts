@@ -3,7 +3,7 @@ import { toBase64, base64ToBytes, wsUrl } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import type { Attachment } from "../lib/api";
 
-interface WSMessage {
+export interface WSMessage {
   type: string;
   data?: string;
   exitCode?: number;

@@ -49,7 +49,9 @@ func setGlobalStore(s *store.Store) { globalStore.Store(s) }
 const cronPausedFile = "cron_paused"
 
 // cron_paused is now backed by the kv table per design doc §2.3
-//   namespace = "scheduler", key = "paused", scope = global, type = string
+//
+//	namespace = "scheduler", key = "paused", scope = global, type = string
+//
 // Value is the literal "true" / "false". A missing row means "not paused"
 // (cron defaults to running). Global scope so a deliberate pause
 // propagates across peers — the v0 marker file was implicitly per-device
@@ -85,15 +87,15 @@ var cronPausedMigrationTestHook func()
 //   - lastMessage             → runtime cache (would churn etag on every msg)
 //   - intervalMinutes,
 //     activeStart,activeEnd   → legacy fields stripped on Save (already
-//                               migrated into cronExpr / silentStart on Load)
+//     migrated into cronExpr / silentStart on Load)
 //   - cronMessage             → moved to agent_workspace_files (kind=checkin).
-//                               Must be stripped on Save so a cleared
-//                               legacy field doesn't survive via the
-//                               prior-merge path below (omitempty drops
-//                               the field from m, so without this stripping
-//                               the prior settings_json's cronMessage would
-//                               leak back in and resurrect the migration on
-//                               every subsequent Load).
+//     Must be stripped on Save so a cleared
+//     legacy field doesn't survive via the
+//     prior-merge path below (omitempty drops
+//     the field from m, so without this stripping
+//     the prior settings_json's cronMessage would
+//     leak back in and resurrect the migration on
+//     every subsequent Load).
 //
 // cronExpr is intentionally NOT reserved — it's the canonical persisted
 // field for schedules in v1, and stripping it from settings_json would

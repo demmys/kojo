@@ -7,7 +7,6 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -74,10 +73,8 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 			"peer events bus not configured")
 		return
 	}
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
 

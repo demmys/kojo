@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/chathistory"
@@ -97,29 +96,13 @@ const (
 // turns; without a per-agent lock two concurrent calls would both run the
 // LLM, both append to today's diary, and race on recent.md / marker
 // writes — multiplying the very cost the rate limiter is meant to avoid.
-var (
-	preCompactMu       sync.Mutex
-	preCompactAgentMus = map[string]*sync.Mutex{}
-)
-
-func agentPreCompactLock(agentID string) *sync.Mutex {
-	preCompactMu.Lock()
-	defer preCompactMu.Unlock()
-	mu, ok := preCompactAgentMus[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		preCompactAgentMus[agentID] = mu
-	}
-	return mu
-}
+var preCompactLocks keyedMutex
 
 // dropAgentPreCompactLock releases the per-agent lock entry for an
 // agent that's being deleted, so the map doesn't grow without bound
 // over the lifetime of the process. Safe to call on an unknown ID.
 func dropAgentPreCompactLock(agentID string) {
-	preCompactMu.Lock()
-	defer preCompactMu.Unlock()
-	delete(preCompactAgentMus, agentID)
+	preCompactLocks.Drop(agentID)
 }
 
 // validateTranscriptPath ensures a transcript path is safe to open.
@@ -583,8 +566,8 @@ func copyMarker(srcID, dstID string, logger *slog.Logger) error {
 //   - (zero, nil)    — no marker exists (kv ErrNotFound + no legacy file)
 //   - (marker, nil)  — marker found and valid
 //   - (zero, err)    — kv read failure, row-shape mismatch, or corrupt
-//                     JSON in BOTH kv and the legacy fallback. The
-//                     caller decides whether to abort or continue.
+//     JSON in BOTH kv and the legacy fallback. The
+//     caller decides whether to abort or continue.
 func readMarkerErr(agentID string) (autoSummaryMarker, error) {
 	logger := slog.Default()
 	st := getGlobalStore()
@@ -726,7 +709,7 @@ func messagesFingerprint(msgs []*Message) string {
 //     not time-based: under PreCompact storms each fire usually carries
 //     new tool_use / tool_result content, and a time-only skip would
 //     lose exactly the short-term context we're trying to preserve.
-//     Per-agent serialisation (agentPreCompactLock) is what actually
+//     Per-agent serialisation (preCompactLocks) is what actually
 //     collapses concurrent fires.
 //
 // Successful summaries update the marker, append to the daily diary, and
@@ -735,9 +718,7 @@ func messagesFingerprint(msgs []*Message) string {
 // per-agent lock to prevent concurrent fires from racing on the marker
 // or the recent.md tempfile.
 func PreCompactSummarize(agentID string, tool string, transcriptPath string, logger *slog.Logger) error {
-	mu := agentPreCompactLock(agentID)
-	mu.Lock()
-	defer mu.Unlock()
+	defer preCompactLocks.Lock(agentID)()
 
 	// Validate the hook-supplied transcript path before opening. An
 	// invalid path is treated as "no hint, fall back to discovery" — we

@@ -13,7 +13,7 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-const cronTimeout = 10 * time.Minute // default timeout; per-agent override via TimeoutMinutes
+const cronTimeout = 10 * time.Minute     // default timeout; per-agent override via TimeoutMinutes
 const cronMinInterval = 50 * time.Second // minimum interval between runs for same agent
 
 // cronLockFile is the legacy v0 throttle marker filename. Kept as

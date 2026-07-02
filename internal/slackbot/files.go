@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/slack-go/slack"
+
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
-// uploadDir matches the WebUI upload directory (file_handlers.go).
-var uploadDir = filepath.Join(os.TempDir(), "kojo", "upload")
+// uploadDir matches the WebUI upload directory. Kept as a package var so
+// tests can redirect it; overridden in files_test.go.
+var uploadDir = uploadpath.Dir()
 
 // maxFileSize is the maximum file size the bot will download from
 // Slack. Slack itself caps uploads at 1 GiB on most workspaces, so
@@ -48,7 +51,7 @@ func preflightSlackFile(f slack.File) error {
 // buildLocalPath returns the destination path for a Slack attachment using
 // the WebUI upload convention {unixnano}_{sanitized_original_name}. Pure.
 func buildLocalPath(dir string, now time.Time, originalName string) string {
-	return filepath.Join(dir, fmt.Sprintf("%d_%s", now.UnixNano(), sanitizeFilename(originalName)))
+	return filepath.Join(dir, fmt.Sprintf("%d_%s", now.UnixNano(), uploadpath.SanitizeName(originalName)))
 }
 
 // downloadedFile holds metadata about a successfully downloaded Slack file.
@@ -195,12 +198,4 @@ func appendFileInfo(text string, files []downloadedFile, errs []fileError) strin
 		}
 	}
 	return sb.String()
-}
-
-// sanitizeFilename removes path separators and other problematic characters.
-func sanitizeFilename(name string) string {
-	name = filepath.Base(name) // strip any directory components
-	// Replace problematic characters with underscore.
-	replacer := strings.NewReplacer("/", "_", "\\", "_", "\x00", "_")
-	return replacer.Replace(name)
 }

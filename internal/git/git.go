@@ -1,19 +1,17 @@
 package git
 
 import (
+	"errors"
 	"fmt"
-	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
 )
 
-type Manager struct {
-	logger *slog.Logger
-}
+type Manager struct{}
 
-func New(logger *slog.Logger) *Manager {
-	return &Manager{logger: logger}
+func New() *Manager {
+	return &Manager{}
 }
 
 type StatusResult struct {
@@ -27,7 +25,7 @@ type StatusResult struct {
 
 func (m *Manager) Status(workDir string) (*StatusResult, error) {
 	if workDir == "" {
-		return nil, fmt.Errorf("workDir is required")
+		return nil, errors.New("workDir is required")
 	}
 
 	result := &StatusResult{
@@ -96,7 +94,7 @@ type LogResult struct {
 
 func (m *Manager) Log(workDir string, limit, skip int) (*LogResult, error) {
 	if workDir == "" {
-		return nil, fmt.Errorf("workDir is required")
+		return nil, errors.New("workDir is required")
 	}
 	if limit < 1 {
 		limit = 1
@@ -139,7 +137,7 @@ type DiffResult struct {
 
 func (m *Manager) Diff(workDir, ref string) (*DiffResult, error) {
 	if workDir == "" {
-		return nil, fmt.Errorf("workDir is required")
+		return nil, errors.New("workDir is required")
 	}
 
 	if ref != "" && strings.HasPrefix(ref, "-") {
@@ -187,10 +185,10 @@ type ExecResult struct {
 
 func (m *Manager) Exec(workDir string, args []string) (*ExecResult, error) {
 	if workDir == "" {
-		return nil, fmt.Errorf("workDir is required")
+		return nil, errors.New("workDir is required")
 	}
 	if len(args) == 0 {
-		return nil, fmt.Errorf("args is required")
+		return nil, errors.New("args is required")
 	}
 
 	cmd := exec.Command("git", args...)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -31,7 +32,7 @@ type Session struct {
 	ExitCode        *int
 	YoloMode        bool
 	Internal        bool   // internal session (e.g. tmux), not user-facing
-	ToolSessionID string // tool-specific session ID for resume
+	ToolSessionID   string // tool-specific session ID for resume
 	ParentID        string // parent session ID (e.g. tmux child of a CLI session)
 	TmuxSessionName string // tmux session name (kojo_<id>) for tmux-backed sessions
 	restarting      bool   // true while Restart is in progress, prevents concurrent Stop
@@ -73,12 +74,81 @@ type Session struct {
 
 	// readDone is closed when readLoop exits
 	readDone chan struct{}
+
+	// logger routes session-scoped diagnostics; nil falls back to slog.Default().
+	logger *slog.Logger
+}
+
+// log returns the session logger, falling back to the process default when unset
+// (e.g. sessions constructed directly in tests).
+func (s *Session) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
+}
+
+// closePTYLocked closes the PTY and clears the field. Caller must hold s.mu.
+func (s *Session) closePTYLocked() {
+	if s.PTY != nil {
+		s.PTY.Close()
+		s.PTY = nil
+	}
+}
+
+// capTail appends data to buf and caps the result to the last limit bytes,
+// reusing buf's backing array (identical to the inline append/reslice idiom).
+func capTail(buf, data []byte, limit int) []byte {
+	buf = append(buf, data...)
+	if len(buf) > limit {
+		buf = buf[len(buf)-limit:]
+	}
+	return buf
+}
+
+// newRestoredSession builds a Session from persisted info with the fields common
+// to every platform populated (status exited, scrollback, subscribers, done
+// channel, attachments). Platform restoreSession wrappers add platform-specific
+// reattach/finalization on top (and are responsible for closing done).
+func newRestoredSession(info SessionInfo) *Session {
+	t, _ := time.Parse(time.RFC3339, info.CreatedAt)
+	var lastOutput []byte
+	if info.LastOutput != "" {
+		lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
+	}
+	s := &Session{
+		ID:              info.ID,
+		Tool:            info.Tool,
+		WorkDir:         info.WorkDir,
+		Args:            info.Args,
+		CreatedAt:       t,
+		Status:          StatusExited,
+		ExitCode:        info.ExitCode,
+		YoloMode:        info.YoloMode,
+		Internal:        info.Internal || internalTools[info.Tool],
+		ToolSessionID:   info.ToolSessionID,
+		ParentID:        info.ParentID,
+		TmuxSessionName: info.TmuxSessionName,
+		lastCols:        info.LastCols,
+		lastRows:        info.LastRows,
+		scrollback:      NewRingBuffer(defaultRingSize),
+		subscribers:     make(map[chan []byte]struct{}),
+		done:            make(chan struct{}),
+		lastOutput:      lastOutput,
+		attachments:     make(map[string]*Attachment, len(info.Attachments)),
+	}
+	for _, att := range info.Attachments {
+		if att == nil || att.Path == "" {
+			continue
+		}
+		s.attachments[att.Path] = att
+	}
+	return s
 }
 
 // YoloApproval is broadcast when yolo auto-approves a prompt.
 type YoloApproval struct {
-	Matched  string `json:"matched"`
-	Response string `json:"response"`
+	Matched string `json:"matched"`
 }
 
 // yoloTailSize is the trailing output buffer size for yolo pattern detection.
@@ -95,17 +165,17 @@ var yoloPattern = regexp.MustCompile(`(?i)Do you \S[^\n]*\?[\s\S]{0,200}?1\.\s*Y
 var codexSessionIDRe = regexp.MustCompile(`(?i)session id: ([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`)
 
 type SessionInfo struct {
-	ID              string   `json:"id"`
-	Tool            string   `json:"tool"`
-	WorkDir         string   `json:"workDir"`
-	Args            []string `json:"args,omitempty"`
-	Status          Status   `json:"status"`
-	ExitCode        *int     `json:"exitCode,omitempty"`
-	YoloMode        bool     `json:"yoloMode"`
-	Internal        bool     `json:"internal,omitempty"`
-	CreatedAt       string   `json:"createdAt"`
-	ToolSessionID string   `json:"toolSessionId,omitempty"`
-	ParentID        string   `json:"parentId,omitempty"`
+	ID              string        `json:"id"`
+	Tool            string        `json:"tool"`
+	WorkDir         string        `json:"workDir"`
+	Args            []string      `json:"args,omitempty"`
+	Status          Status        `json:"status"`
+	ExitCode        *int          `json:"exitCode,omitempty"`
+	YoloMode        bool          `json:"yoloMode"`
+	Internal        bool          `json:"internal,omitempty"`
+	CreatedAt       string        `json:"createdAt"`
+	ToolSessionID   string        `json:"toolSessionId,omitempty"`
+	ParentID        string        `json:"parentId,omitempty"`
 	TmuxSessionName string        `json:"tmuxSessionName,omitempty"`
 	LastOutput      string        `json:"lastOutput,omitempty"`
 	LastCols        uint16        `json:"lastCols,omitempty"`
@@ -126,7 +196,7 @@ func (s *Session) Info() SessionInfo {
 		YoloMode:        s.YoloMode,
 		Internal:        s.Internal,
 		CreatedAt:       s.CreatedAt.Local().Format(time.RFC3339),
-		ToolSessionID: s.ToolSessionID,
+		ToolSessionID:   s.ToolSessionID,
 		ParentID:        s.ParentID,
 		TmuxSessionName: s.TmuxSessionName,
 	}
@@ -275,10 +345,7 @@ func (s *Session) CaptureToolSessionID(data []byte) {
 		return
 	}
 	// accumulate data, keep last 256 bytes
-	s.codexCaptureBuf = append(s.codexCaptureBuf, data...)
-	if len(s.codexCaptureBuf) > 256 {
-		s.codexCaptureBuf = s.codexCaptureBuf[len(s.codexCaptureBuf)-256:]
-	}
+	s.codexCaptureBuf = capTail(s.codexCaptureBuf, data, 256)
 	buf := make([]byte, len(s.codexCaptureBuf))
 	copy(buf, s.codexCaptureBuf)
 	s.mu.Unlock()
@@ -317,10 +384,7 @@ func (s *Session) CheckYolo(data []byte) (*YoloApproval, string) {
 	}
 
 	// append to tail, keep last yoloTailSize bytes
-	s.yoloTail = append(s.yoloTail, data...)
-	if len(s.yoloTail) > yoloTailSize {
-		s.yoloTail = s.yoloTail[len(s.yoloTail)-yoloTailSize:]
-	}
+	s.yoloTail = capTail(s.yoloTail, data, yoloTailSize)
 	tail := make([]byte, len(s.yoloTail))
 	copy(tail, s.yoloTail)
 	s.mu.Unlock()
@@ -345,7 +409,6 @@ func (s *Session) CheckYolo(data []byte) (*YoloApproval, string) {
 	s.mu.Unlock()
 
 	return &YoloApproval{
-		Matched:  matched,
-		Response: "",
+		Matched: matched,
 	}, cleanStr
 }

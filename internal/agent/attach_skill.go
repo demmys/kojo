@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
@@ -126,21 +125,10 @@ description: Send a file (image, audio, video, PDF, archive, anything) to the us
 // Manager.Update callers must not race a RemoveAll against a
 // mid-write. Map keyed by agent_id; entries are never deleted so
 // the mutex identity stays stable across the agent's lifetime.
-var (
-	attachSkillMapMu sync.Mutex
-	attachSkillMu    = map[string]*sync.Mutex{}
-)
+var attachSkillLocks keyedMutex
 
 func lockAttachSkill(agentID string) func() {
-	attachSkillMapMu.Lock()
-	mu, ok := attachSkillMu[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		attachSkillMu[agentID] = mu
-	}
-	attachSkillMapMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return attachSkillLocks.Lock(agentID)
 }
 
 // SyncAttachSkill writes or removes the kojo-attach SKILL.md based

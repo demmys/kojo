@@ -10,7 +10,6 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/snapshot"
-	"github.com/loppo-llc/kojo/internal/store"
 )
 
 // runSnapshotCommand executes one snapshot and exits. Used by
@@ -31,7 +30,7 @@ func runSnapshotCommand(logger *slog.Logger, configDirPath string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	st, err := store.Open(ctx, store.Options{ConfigDir: configDirPath})
+	st, err := openStore(ctx, configDirPath, false)
 	if err != nil {
 		logger.Error("snapshot: open store failed", "err", err)
 		return 1

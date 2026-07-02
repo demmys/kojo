@@ -6,6 +6,18 @@ import (
 	"strings"
 )
 
+// ctxSend delivers e on ch, returning false without blocking further if
+// ctx is cancelled before the send completes. Backends wrap it in a local
+// send closure and use the false return to stop stream parsing on cancel.
+func ctxSend(ctx context.Context, ch chan<- ChatEvent, e ChatEvent) bool {
+	select {
+	case ch <- e:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // ErrMsgTimeout is the error message attached to a "done" event when
 // the backend process is terminated due to a context timeout.
 const ErrMsgTimeout = "timeout: process was terminated"

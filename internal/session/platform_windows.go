@@ -3,7 +3,7 @@
 package session
 
 import (
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -27,49 +27,13 @@ func (m *Manager) loadPersistedSessions() {
 		m.logger.Error("failed to load persisted sessions", "err", err)
 		return
 	}
-	for _, info := range infos {
-		s := m.restoreSession(info)
-		m.sessions[info.ID] = s
-	}
-	if len(infos) > 0 {
-		m.logger.Info("restored persisted sessions", "count", len(infos))
-	}
+	m.insertRestoredSessions(infos)
 }
 
 // restoreSession creates a Session from persisted info, always exited on Windows.
 func (m *Manager) restoreSession(info SessionInfo) *Session {
-	t, _ := time.Parse(time.RFC3339, info.CreatedAt)
-	var lastOutput []byte
-	if info.LastOutput != "" {
-		lastOutput, _ = base64.StdEncoding.DecodeString(info.LastOutput)
-	}
-	s := &Session{
-		ID:              info.ID,
-		Tool:            info.Tool,
-		WorkDir:         info.WorkDir,
-		Args:            info.Args,
-		CreatedAt:       t,
-		Status:          StatusExited,
-		ExitCode:        info.ExitCode,
-		YoloMode:        info.YoloMode,
-		Internal:        info.Internal || internalTools[info.Tool],
-		ToolSessionID:   info.ToolSessionID,
-		ParentID:        info.ParentID,
-		TmuxSessionName: info.TmuxSessionName,
-		lastCols:        info.LastCols,
-		lastRows:        info.LastRows,
-		scrollback:      NewRingBuffer(defaultRingSize),
-		subscribers:     make(map[chan []byte]struct{}),
-		done:            make(chan struct{}),
-		lastOutput:      lastOutput,
-		attachments:     make(map[string]*Attachment, len(info.Attachments)),
-	}
-	for _, att := range info.Attachments {
-		if att == nil || att.Path == "" {
-			continue
-		}
-		s.attachments[att.Path] = att
-	}
+	s := newRestoredSession(info)
+	s.logger = m.logger
 	close(s.done)
 	return s
 }
@@ -77,14 +41,13 @@ func (m *Manager) restoreSession(info SessionInfo) *Session {
 // platformStartUserTool starts a user-facing tool directly via ConPTY (no tmux on Windows).
 func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []string, cols, rows uint16, envVars []string) (*startResult, error) {
 	if len(envVars) > 0 {
-		return nil, fmt.Errorf("environment variable injection is not supported on Windows (custom API sessions require Unix)")
+		return nil, errors.New("environment variable injection is not supported on Windows (custom API sessions require Unix)")
 	}
 	cmdLine := buildCmdLine(toolPath, args)
-	rwc, cmd, resizeFn, err := startConPTY(cmdLine, workDir, cols, rows)
+	rwc, cmd, err := startConPTY(cmdLine, workDir, cols, rows)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start conpty: %w", err)
 	}
-	_ = resizeFn // stored in session via Resize method
 	return &startResult{
 		pty: rwc,
 		cmd: cmd,
@@ -95,7 +58,7 @@ func (m *Manager) platformStartUserTool(id, workDir, toolPath string, args []str
 func (m *Manager) platformStartInternalTool(id, tool, toolPath, workDir string, args []string, toolSessionID string) (*startResult, error) {
 	shell := defaultShell()
 	cmdLine := buildCmdLine(shell, nil)
-	rwc, cmd, _, err := startConPTY(cmdLine, workDir, 0, 0)
+	rwc, cmd, err := startConPTY(cmdLine, workDir, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shell: %w", err)
 	}
@@ -119,14 +82,7 @@ func (m *Manager) platformStop(s *Session, id string) error {
 	s.mu.Unlock()
 
 	// Also stop any child sessions
-	for _, child := range m.findChildSessions(id, "shell") {
-		child.mu.Lock()
-		childStatus := child.Status
-		child.mu.Unlock()
-		if childStatus == StatusRunning {
-			_ = m.Stop(child.ID)
-		}
-	}
+	m.stopRunningChildren(id)
 
 	if cmd != nil && cmd.Process != nil {
 		_ = sendTermSignal(cmd.Process)
@@ -134,10 +90,7 @@ func (m *Manager) platformStop(s *Session, id string) error {
 
 	// Close the PTY to ensure readLoop exits
 	s.mu.Lock()
-	if s.PTY != nil {
-		s.PTY.Close()
-		s.PTY = nil
-	}
+	s.closePTYLocked()
 	s.mu.Unlock()
 
 	return nil
@@ -192,9 +145,6 @@ func platformBuildInternalToolArgs(id, tool, workDir string, args []string) (run
 // cleanupPipePane is a no-op on Windows (no pipe-pane).
 func (s *Session) cleanupPipePane() {}
 
-// NeedsTmuxCheck returns whether the platform requires a tmux check at startup.
-func NeedsTmuxCheck() bool { return false }
-
 // platformPrepareRestart is a no-op on Windows (no tmux cleanup).
 func (m *Manager) platformPrepareRestart(s *Session) {}
 
@@ -205,5 +155,5 @@ func buildInternalToolRestartArgs(origArgs []string, toolSessionID string) []str
 
 // tmuxRunAction is not available on Windows.
 func tmuxRunAction(sessionName, action string) error {
-	return fmt.Errorf("tmux actions are not supported on Windows")
+	return errors.New("tmux actions are not supported on Windows")
 }

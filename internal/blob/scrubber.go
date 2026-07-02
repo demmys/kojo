@@ -384,7 +384,7 @@ func (s *Scrubber) quarantine(orig, uri string) (string, error) {
 	}
 	root := s.blobs.BaseDir()
 	if root == "" {
-		return "", fmt.Errorf("blob.scrubber.quarantine: store root unset")
+		return "", errors.New("blob.scrubber.quarantine: store root unset")
 	}
 	suffix := fmt.Sprintf(".corrupt.%d", store.NowMillis())
 	target := filepath.Join(root, ".quarantine", string(scope), path+suffix)
@@ -423,7 +423,7 @@ func parseBlobURI(uri string) (Scope, string, error) {
 	rest := uri[len(scheme):]
 	slash := strings.IndexByte(rest, '/')
 	if slash < 0 {
-		return "", "", fmt.Errorf("missing path component")
+		return "", "", errors.New("missing path component")
 	}
 	sc := Scope(rest[:slash])
 	if !sc.Valid() {
@@ -431,7 +431,7 @@ func parseBlobURI(uri string) (Scope, string, error) {
 	}
 	encPath := rest[slash+1:]
 	if encPath == "" {
-		return "", "", fmt.Errorf("empty path")
+		return "", "", errors.New("empty path")
 	}
 	parts := strings.Split(encPath, "/")
 	for i, p := range parts {

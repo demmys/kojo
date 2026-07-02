@@ -207,7 +207,6 @@ func (s *Server) idempotencyMiddleware(next http.Handler) http.Handler {
 		// we can capture the response, then save it.
 		bw := newBufferingWriter(w, idempotencyResponseBodyCap)
 		next.ServeHTTP(bw, r)
-		bw.flushHeader()
 
 		// Save (or skip if we exceeded the cap / handler never wrote
 		// a status). Use a fresh background context with a short
@@ -686,17 +685,6 @@ func (bw *bufferingWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return n, err
-}
-
-// flushHeader is a no-op when WriteHeader was already called; kept
-// here so the middleware can guarantee status capture even for
-// handlers that never wrote a status (which we treat as "did
-// nothing" and abandon the claim).
-func (bw *bufferingWriter) flushHeader() {
-	if !bw.headerSent {
-		// Don't flush — leave bw.status == 0 so the persist step
-		// abandons the claim.
-	}
 }
 
 // Flush propagates to the inner writer if it supports flushing —

@@ -40,6 +40,20 @@ import (
 
 var version = "0.102.0"
 
+// newCLILogger builds the stderr text logger used by every subcommand and
+// the main boot path, at the given level.
+func newCLILogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
+
+// applyConfigDirFlag applies the --config-dir override when set. A no-op for
+// the empty default so configdir keeps its platform-default resolution.
+func applyConfigDirFlag(configDir string) {
+	if configDir != "" {
+		configdir.Set(configDir)
+	}
+}
+
 func main() {
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
 	dev := flag.Bool("dev", false, "enable dev mode (proxy to Vite)")
@@ -89,10 +103,8 @@ func main() {
 	// to query the registry. Each opens its own short-lived
 	// *store.Store and exits.
 	if *peerList || *peerAdd != "" || *peerRemove != "" {
-		if *configDir != "" {
-			configdir.Set(*configDir)
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		applyConfigDirFlag(*configDir)
+		logger := newCLILogger(slog.LevelInfo)
 		switch {
 		case *peerList:
 			os.Exit(runPeerListCommand(logger, configdir.Path()))
@@ -108,10 +120,8 @@ func main() {
 		// the main path. Snapshot takes its own short-lived store
 		// connection; do NOT acquire the long-running configdir lock,
 		// the snapshot path co-exists with a running kojo.
-		if *configDir != "" {
-			configdir.Set(*configDir)
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		applyConfigDirFlag(*configDir)
+		logger := newCLILogger(slog.LevelInfo)
 		os.Exit(runSnapshotCommand(logger, configdir.Path()))
 	}
 
@@ -122,18 +132,14 @@ func main() {
 		// surfaces a friendly error otherwise). KEK / per-peer
 		// credentials are NOT restored; the operator supplies those
 		// out-of-band per docs/snapshot-restore.md.
-		if *configDir != "" {
-			configdir.Set(*configDir)
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		applyConfigDirFlag(*configDir)
+		logger := newCLILogger(slog.LevelInfo)
 		os.Exit(runRestoreCommand(logger, *doRestore, configdir.Path(), *restoreForce))
 	}
 
 	if *doClean != "" {
-		if *configDir != "" {
-			configdir.Set(*configDir)
-		}
-		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		applyConfigDirFlag(*configDir)
+		logger := newCLILogger(slog.LevelInfo)
 		os.Exit(runCleanCommand(cleanFlags{
 			target:        *doClean,
 			apply:         *cleanApply,
@@ -167,9 +173,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "kojo: ignoring invalid KOJO_LOG_LEVEL=%q (valid: debug|info|warn|warning|error)\n", lvl)
 		}
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: logLevel,
-	}))
+	logger := newCLILogger(logLevel)
 
 	// --peer mode mutual exclusion. The Hub-side network shape
 	// (tsnet listener, Owner-trusted UI proxy) and the peer-side
@@ -608,7 +612,7 @@ func main() {
 			// no targets and the subscriber's goroutine pool is
 			// empty.
 			if peerRegistrar != nil {
-				peerSubscriber = peer.NewSubscriber(peerIdentity, st, peerEvents, logger)
+				peerSubscriber = peer.NewSubscriber(peerIdentity, st, logger)
 				peerSubscriberTargetsCtx, peerSubscriberTargetsCancel = context.WithCancel(context.Background())
 				go peerSubscriberTargetsLoop(peerSubscriberTargetsCtx, st, peerIdentity, peerSubscriber, logger)
 			}
@@ -2040,13 +2044,6 @@ func peerSubscriberTargetsLoop(ctx context.Context, st *store.Store, self *peer.
 	}
 }
 
-// tsAddrForURL formats a Tailscale IP + port as a URL host string,
-// wrapping IPv6 addresses in brackets.
-//
-// (Note: peer_registry.name → dial URL normalization moved to
-// peer.NormalizeAddress so the switch-device orchestrator + the
-// blob-pull client can share the same logic.)
-
 // peerBindAndAdvertise resolves the Tailscale IPv4 the OS tailscaled
 // reports for this host. The returned bindHost is the address to pass
 // to listenWithFallback (Tailscale IP when known, 0.0.0.0 as the
@@ -2086,10 +2083,6 @@ func peerBindAndAdvertise(parent context.Context, logger *slog.Logger) (bindHost
 		return "0.0.0.0", ""
 	}
 	return ip, ip
-}
-
-func tsAddrForURL(ip netip.Addr, port int) string {
-	return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 }
 
 func listenWithFallback(host string, startPort, maxAttempts int, logger *slog.Logger) (net.Listener, error) {

@@ -71,12 +71,6 @@ func Path() string {
 	return defaultPath(v1DirName)
 }
 
-// DefaultPath returns the v1 platform-default config directory, ignoring any
-// override. Exposed so callers (e.g. --dev mode) can derive a sibling dir.
-func DefaultPath() string {
-	return defaultPath(v1DirName)
-}
-
 // V0Path returns the v0 configuration directory (the legacy `kojo` dir),
 // honoring XDG_CONFIG_HOME / APPDATA the same way v0 itself did. This is the
 // only entry point migration tooling (and the v0-dir cleanup target

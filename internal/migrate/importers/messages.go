@@ -3,8 +3,6 @@ package importers
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +19,9 @@ import (
 // Depends on the agents importer having run first (FK on agent_id).
 type messagesImporter struct{}
 
-func (messagesImporter) Domain() string { return "messages" }
+const messagesDomain = "messages"
+
+func (messagesImporter) Domain() string { return messagesDomain }
 
 // v0Message decodes one line of v0's messages.jsonl. Tool/attachment/usage
 // fields are kept as raw JSON so the v1 store can persist them verbatim
@@ -38,52 +38,46 @@ type v0Message struct {
 }
 
 func (messagesImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "messages"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "messages")
-
-	srcPaths, err := collectMessagesSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum messages sources: %w", err)
-	}
-
-	agents, err := st.ListAgents(ctx)
-	if err != nil {
-		return fmt.Errorf("list agents: %w", err)
-	}
-
-	// Cross-agent id collision detection: agent_messages.id is a
-	// global PRIMARY KEY in v1, but v0 only enforced uniqueness
-	// within each agent. The most common collision source is `Fork
-	// --include-transcript` in v0, which copies messages.jsonl
-	// line-for-line preserving every id. Pre-load the set of all
-	// already-imported ids so importAgentMessages can rewrite a
-	// colliding id to a fresh one before the bulk insert lands the
-	// PK conflict. The set grows as we import each agent (the per-
-	// agent helper updates it in place) so the second occurrence of
-	// a forked id sees it as already-in-use.
-	globalExisting, err := loadAllMessageIDs(ctx, st)
-	if err != nil {
-		return fmt.Errorf("preload global ids: %w", err)
-	}
-
-	total := 0
-	for _, a := range agents {
-		n, err := importAgentMessages(ctx, st, opts.V0Dir, a.ID, globalExisting, logger)
+	return runDomain(ctx, st, messagesDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectMessagesSourcePaths(opts.V0Dir)
 		if err != nil {
-			return fmt.Errorf("agent %s: %w", a.ID, err)
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		total += n
-	}
-	return markImported(ctx, st, "messages", total, checksum)
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum messages sources: %w", err)
+		}
+
+		agents, err := st.ListAgents(ctx)
+		if err != nil {
+			return 0, "", fmt.Errorf("list agents: %w", err)
+		}
+
+		// Cross-agent id collision detection: agent_messages.id is a
+		// global PRIMARY KEY in v1, but v0 only enforced uniqueness
+		// within each agent. The most common collision source is `Fork
+		// --include-transcript` in v0, which copies messages.jsonl
+		// line-for-line preserving every id. Pre-load the set of all
+		// already-imported ids so importAgentMessages can rewrite a
+		// colliding id to a fresh one before the bulk insert lands the
+		// PK conflict. The set grows as we import each agent (the per-
+		// agent helper updates it in place) so the second occurrence of
+		// a forked id sees it as already-in-use.
+		globalExisting, err := loadAllMessageIDs(ctx, st)
+		if err != nil {
+			return 0, "", fmt.Errorf("preload global ids: %w", err)
+		}
+
+		total := 0
+		for _, a := range agents {
+			n, err := importAgentMessages(ctx, st, opts.V0Dir, a.ID, globalExisting, logger)
+			if err != nil {
+				return 0, "", fmt.Errorf("agent %s: %w", a.ID, err)
+			}
+			total += n
+		}
+		return total, checksum, nil
+	})
 }
 
 // importBatchSize bounds the per-flush slice for streaming messages.jsonl
@@ -272,21 +266,7 @@ func importAgentMessages(ctx context.Context, st *store.Store, v0Dir, agentID st
 // (agent_id, seq) index that backs ListMessages, so it stays O(rows)
 // even when many other agents are present.
 func loadExistingMessageIDs(ctx context.Context, st *store.Store, agentID string) (map[string]bool, error) {
-	rows, err := st.DB().QueryContext(ctx,
-		`SELECT id FROM agent_messages WHERE agent_id = ?`, agentID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out[id] = true
-	}
-	return out, rows.Err()
+	return loadIDSet(ctx, st, `SELECT id FROM agent_messages WHERE agent_id = ?`, agentID)
 }
 
 // loadAllMessageIDs returns the set of every agent_messages id
@@ -296,20 +276,7 @@ func loadExistingMessageIDs(ctx context.Context, st *store.Store, agentID string
 // the same shape as loadExistingMessageIDs but without the agent
 // filter.
 func loadAllMessageIDs(ctx context.Context, st *store.Store) (map[string]bool, error) {
-	rows, err := st.DB().QueryContext(ctx, `SELECT id FROM agent_messages`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out[id] = true
-	}
-	return out, rows.Err()
+	return loadIDSet(ctx, st, `SELECT id FROM agent_messages`)
 }
 
 // generateFreshMessageID returns a v0-shape "m_<16hex>" identifier
@@ -324,17 +291,7 @@ func loadAllMessageIDs(ctx context.Context, st *store.Store) (map[string]bool, e
 // entropy or if a long retry loop somehow exhausts plausible ids
 // (the latter is a safety bound, not a realistic outcome).
 func generateFreshMessageID(taken map[string]bool) (string, error) {
-	var buf [8]byte
-	for tries := 0; tries < 32; tries++ {
-		if _, err := rand.Read(buf[:]); err != nil {
-			return "", fmt.Errorf("rand: %w", err)
-		}
-		id := "m_" + hex.EncodeToString(buf[:])
-		if !taken[id] {
-			return id, nil
-		}
-	}
-	return "", errors.New("could not generate non-colliding message id after 32 tries")
+	return generateFreshID("m_", taken)
 }
 
 // validRole mirrors the store's CHECK constraint set ("user", "assistant",
@@ -347,4 +304,3 @@ func validRole(r string) bool {
 	}
 	return false
 }
-

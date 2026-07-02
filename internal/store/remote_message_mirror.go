@@ -61,7 +61,7 @@ func (s *Store) UpsertRemoteMirrorMessages(ctx context.Context, agentID, holderP
 // (または lock 行が消えている) ときは upsert を skip し、エラーは返さない。
 func (s *Store) UpsertRemoteMirrorMessagesIfHolder(ctx context.Context, agentID, expectedHolder string, msgs []RemoteMirrorMessage) error {
 	if expectedHolder == "" {
-		return errors.New("store: UpsertRemoteMirrorMessagesIfHolder: expectedHolder required")
+		return errors.New("store.UpsertRemoteMirrorMessagesIfHolder: expectedHolder required")
 	}
 	return s.upsertRemoteMirrorMessages(ctx, agentID, expectedHolder, expectedHolder, msgs)
 }
@@ -71,13 +71,13 @@ func (s *Store) UpsertRemoteMirrorMessagesIfHolder(ctx context.Context, agentID,
 // upsert を skip する。expectedHolder == "" のときは無条件 upsert。
 func (s *Store) upsertRemoteMirrorMessages(ctx context.Context, agentID, holderPeer, expectedHolder string, msgs []RemoteMirrorMessage) error {
 	if s == nil || s.db == nil {
-		return errors.New("store: UpsertRemoteMirrorMessages: store not initialised")
+		return errors.New("store.UpsertRemoteMirrorMessages: store not initialised")
 	}
 	if agentID == "" {
-		return errors.New("store: UpsertRemoteMirrorMessages: agent_id required")
+		return errors.New("store.UpsertRemoteMirrorMessages: agent_id required")
 	}
 	if holderPeer == "" {
-		return errors.New("store: UpsertRemoteMirrorMessages: holder_peer required")
+		return errors.New("store.UpsertRemoteMirrorMessages: holder_peer required")
 	}
 	if len(msgs) == 0 {
 		return nil
@@ -87,7 +87,7 @@ func (s *Store) upsertRemoteMirrorMessages(ctx context.Context, agentID, holderP
 	// race window を閉じる。
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: UpsertRemoteMirrorMessages: begin tx: %w", err)
+		return fmt.Errorf("store.UpsertRemoteMirrorMessages: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -102,7 +102,7 @@ func (s *Store) upsertRemoteMirrorMessages(ctx context.Context, agentID, holderP
 			// どちらも upsert すべきでない (stale 化する) ので skip。
 			return nil
 		case err != nil:
-			return fmt.Errorf("store: UpsertRemoteMirrorMessages: holder check: %w", err)
+			return fmt.Errorf("store.UpsertRemoteMirrorMessages: holder check: %w", err)
 		}
 		if curHolder != expectedHolder {
 			// holder rotated — proxy 先 peer は既に元 holder ではない。
@@ -114,30 +114,30 @@ func (s *Store) upsertRemoteMirrorMessages(ctx context.Context, agentID, holderP
 	now := NowMillis()
 	stmt, err := tx.PrepareContext(ctx, remoteMirrorUpsertSQL)
 	if err != nil {
-		return fmt.Errorf("store: UpsertRemoteMirrorMessages: prepare: %w", err)
+		return fmt.Errorf("store.UpsertRemoteMirrorMessages: prepare: %w", err)
 	}
 	defer stmt.Close()
 
 	for i, m := range msgs {
 		if m.ID == "" {
-			return fmt.Errorf("store: UpsertRemoteMirrorMessages: msg[%d] id required", i)
+			return fmt.Errorf("store.UpsertRemoteMirrorMessages: msg[%d] id required", i)
 		}
 		if m.Role == "" {
-			return fmt.Errorf("store: UpsertRemoteMirrorMessages: msg[%d] role required", i)
+			return fmt.Errorf("store.UpsertRemoteMirrorMessages: msg[%d] role required", i)
 		}
 		if m.Timestamp == "" {
-			return fmt.Errorf("store: UpsertRemoteMirrorMessages: msg[%d] timestamp required", i)
+			return fmt.Errorf("store.UpsertRemoteMirrorMessages: msg[%d] timestamp required", i)
 		}
 		if _, err := stmt.ExecContext(ctx,
 			agentID, m.ID, m.Role, m.Content, m.Thinking,
 			jsonOrNil(m.ToolUses), jsonOrNil(m.Attachments), jsonOrNil(m.Usage),
 			m.Timestamp, holderPeer, now,
 		); err != nil {
-			return fmt.Errorf("store: UpsertRemoteMirrorMessages: exec msg[%d] %q: %w", i, m.ID, err)
+			return fmt.Errorf("store.UpsertRemoteMirrorMessages: exec msg[%d] %q: %w", i, m.ID, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: UpsertRemoteMirrorMessages: commit: %w", err)
+		return fmt.Errorf("store.UpsertRemoteMirrorMessages: commit: %w", err)
 	}
 	return nil
 }
@@ -149,10 +149,10 @@ func (s *Store) upsertRemoteMirrorMessages(ctx context.Context, agentID, holderP
 // hasMore) を提供する。limit <= 0 は全件返却 + hasMore=false。
 func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, limit int, before string) ([]RemoteMirrorMessage, bool, error) {
 	if s == nil || s.db == nil {
-		return nil, false, errors.New("store: ListRemoteMirrorMessages: store not initialised")
+		return nil, false, errors.New("store.ListRemoteMirrorMessages: store not initialised")
 	}
 	if agentID == "" {
-		return nil, false, errors.New("store: ListRemoteMirrorMessages: agent_id required")
+		return nil, false, errors.New("store.ListRemoteMirrorMessages: agent_id required")
 	}
 
 	// before cursor: ts + message_id を引いてから WHERE (ts,id) < (refTs,refID)
@@ -167,7 +167,7 @@ func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, li
 			`SELECT timestamp, message_id FROM remote_message_mirror
 			  WHERE agent_id = ? AND message_id = ?`, agentID, before)
 		if err := row.Scan(&refTS, &refID); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, false, fmt.Errorf("store: ListRemoteMirrorMessages: resolve cursor: %w", err)
+			return nil, false, fmt.Errorf("store.ListRemoteMirrorMessages: resolve cursor: %w", err)
 		}
 	}
 
@@ -188,7 +188,7 @@ func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, li
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, false, fmt.Errorf("store: ListRemoteMirrorMessages: query: %w", err)
+		return nil, false, fmt.Errorf("store.ListRemoteMirrorMessages: query: %w", err)
 	}
 	defer rows.Close()
 
@@ -201,7 +201,7 @@ func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, li
 			&toolUses, &attachments, &usage,
 			&m.Timestamp,
 		); err != nil {
-			return nil, false, fmt.Errorf("store: ListRemoteMirrorMessages: scan: %w", err)
+			return nil, false, fmt.Errorf("store.ListRemoteMirrorMessages: scan: %w", err)
 		}
 		if toolUses.Valid {
 			m.ToolUses = []byte(toolUses.String)
@@ -215,7 +215,7 @@ func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, li
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("store: ListRemoteMirrorMessages: rows: %w", err)
+		return nil, false, fmt.Errorf("store.ListRemoteMirrorMessages: rows: %w", err)
 	}
 
 	hasMore := false
@@ -235,7 +235,7 @@ func (s *Store) ListRemoteMirrorMessages(ctx context.Context, agentID string, li
 // 判別するために使う。エラーは false + err で返す。
 func (s *Store) RemoteMirrorMessageExists(ctx context.Context, agentID, messageID string) (bool, error) {
 	if s == nil || s.db == nil {
-		return false, errors.New("store: RemoteMirrorMessageExists: store not initialised")
+		return false, errors.New("store.RemoteMirrorMessageExists: store not initialised")
 	}
 	if agentID == "" || messageID == "" {
 		return false, nil
@@ -249,7 +249,7 @@ func (s *Store) RemoteMirrorMessageExists(ctx context.Context, agentID, messageI
 	case errors.Is(err, sql.ErrNoRows):
 		return false, nil
 	case err != nil:
-		return false, fmt.Errorf("store: RemoteMirrorMessageExists: %w", err)
+		return false, fmt.Errorf("store.RemoteMirrorMessageExists: %w", err)
 	}
 	return true, nil
 }
@@ -259,26 +259,16 @@ func (s *Store) RemoteMirrorMessageExists(ctx context.Context, agentID, messageI
 // 戻り値は削除された行数。
 func (s *Store) DeleteRemoteMirrorForAgent(ctx context.Context, agentID string) (int64, error) {
 	if s == nil || s.db == nil {
-		return 0, errors.New("store: DeleteRemoteMirrorForAgent: store not initialised")
+		return 0, errors.New("store.DeleteRemoteMirrorForAgent: store not initialised")
 	}
 	if agentID == "" {
-		return 0, errors.New("store: DeleteRemoteMirrorForAgent: agent_id required")
+		return 0, errors.New("store.DeleteRemoteMirrorForAgent: agent_id required")
 	}
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM remote_message_mirror WHERE agent_id = ?`, agentID)
 	if err != nil {
-		return 0, fmt.Errorf("store: DeleteRemoteMirrorForAgent: exec: %w", err)
+		return 0, fmt.Errorf("store.DeleteRemoteMirrorForAgent: exec: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil
-}
-
-// jsonOrNil は空 / nil バイト列を SQL NULL に落とす。`{}` や `[]` 等の
-// 「空だが有効な JSON」はそのまま保存する (canonical 側と同じく
-// 「絶対に空でない」JSON は touch しない方針)。
-func jsonOrNil(b []byte) any {
-	if len(b) == 0 {
-		return nil
-	}
-	return string(b)
 }

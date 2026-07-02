@@ -121,7 +121,7 @@ func (r *StoreRefs) Restore(ctx context.Context, snap RefSnapshot, expectedCurre
 
 func (r *StoreRefs) putWith(ctx context.Context, ref *Ref, opts store.BlobRefInsertOptions) (int64, error) {
 	if ref == nil {
-		return 0, fmt.Errorf("blob.StoreRefs.Put: nil ref")
+		return 0, errors.New("blob.StoreRefs.Put: nil ref")
 	}
 	homePeer := ref.HomePeer
 	if homePeer == "" {
@@ -130,7 +130,7 @@ func (r *StoreRefs) putWith(ctx context.Context, ref *Ref, opts store.BlobRefIns
 	if homePeer == "" {
 		// Without a home_peer the row violates a NOT NULL — fail
 		// loudly so a misconfigured daemon can't silently degrade.
-		return 0, fmt.Errorf("blob.StoreRefs.Put: home_peer not configured")
+		return 0, errors.New("blob.StoreRefs.Put: home_peer not configured")
 	}
 	rec, err := r.st.InsertOrReplaceBlobRef(ctx, &store.BlobRefRecord{
 		URI:      ref.URI,
@@ -167,25 +167,4 @@ func (r *StoreRefs) Delete(ctx context.Context, uri string) error {
 // deleted=false as "leave it alone".
 func (r *StoreRefs) DeleteIfMatches(ctx context.Context, uri, sha256 string, updatedAt int64) (bool, error) {
 	return r.st.DeleteBlobRefIfMatches(ctx, uri, sha256, updatedAt)
-}
-
-func (r *StoreRefs) List(ctx context.Context, scope, uriPrefix string) ([]*Ref, error) {
-	recs, err := r.st.ListBlobRefs(ctx, store.ListBlobRefsOptions{
-		Scope:     scope,
-		URIPrefix: uriPrefix,
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*Ref, 0, len(recs))
-	for _, rec := range recs {
-		out = append(out, &Ref{
-			URI:      rec.URI,
-			Scope:    rec.Scope,
-			HomePeer: rec.HomePeer,
-			Size:     rec.Size,
-			SHA256:   rec.SHA256,
-		})
-	}
-	return out, nil
 }

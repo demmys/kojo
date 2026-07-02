@@ -241,14 +241,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		defer close(ch)
 		defer os.Remove(promptPath)
 
-		send := func(e ChatEvent) bool {
-			select {
-			case ch <- e:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
+		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
 		// Surface MCP-drop warning ahead of the model output so the
 		// caller's transcript records it. Use a Type:"message"
@@ -357,10 +350,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 			removeGrokSessionDir(dir, result.sessionID)
 		}
 
-		msg := newAssistantMessage()
-		msg.Content = result.text
-		msg.Thinking = result.thinking
-		msg.ToolUses = result.toolUses
+		msg := assembleAssistantMessage(result.text, result.thinking, result.toolUses, nil)
 
 		if result.sessionID != "" {
 			b.logger.Debug("grok session", "agent", agent.ID, "sessionId", result.sessionID, "oneShot", opts.OneShot)
@@ -1118,26 +1108,6 @@ func removeGrokSessionDir(cwd, sessionID string) {
 		return
 	}
 	_ = os.RemoveAll(target)
-}
-
-// hasGrokSession reports whether grok has at least one stored session
-// for the given cwd. Currently unused (replaced by explicit session ID
-// resume) but retained for diagnostic / future fallback use.
-func hasGrokSession(cwd string) bool {
-	dir := grokSessionDir(cwd)
-	if dir == "" {
-		return false
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			return true
-		}
-	}
-	return false
 }
 
 // clearGrokSession removes grok's stored sessions for the agent's

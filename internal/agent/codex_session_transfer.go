@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,21 +68,10 @@ const codexSessionTransferMaxThreads = 128
 
 var codexSessionTransferMaxTotalBytes int64 = 256 << 20
 
-var (
-	codexSessionTransferMapMu sync.Mutex
-	codexSessionTransferMu    = map[string]*sync.Mutex{}
-)
+var codexSessionTransferLocks keyedMutex
 
 func lockCodexSessionTransfer(agentID string) func() {
-	codexSessionTransferMapMu.Lock()
-	mu, ok := codexSessionTransferMu[agentID]
-	if !ok {
-		mu = &sync.Mutex{}
-		codexSessionTransferMu[agentID] = mu
-	}
-	codexSessionTransferMapMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return codexSessionTransferLocks.Lock(agentID)
 }
 
 func codexHome() string {
@@ -164,7 +154,7 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, err
 		}
 		return nil, nil, fmt.Errorf("agent.ReadCodexSessionFiles: readdir refs: %w", err)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 
 	root := codexHome()
 	if root == "" {
@@ -237,10 +227,10 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []string, err
 		var toolRows []CodexSQLiteRow
 		if db != nil {
 			if codexTableExists(db, "threads") {
-				threadRow, _ = queryCodexSQLiteRow(db, "SELECT * FROM threads WHERE id = ?", ref.ThreadID)
+				threadRow, _ = queryCodexSQLiteRowTx(db, "SELECT * FROM threads WHERE id = ?", ref.ThreadID)
 			}
 			if codexTableExists(db, "thread_dynamic_tools") {
-				toolRows, _ = queryCodexSQLiteRows(db, "SELECT * FROM thread_dynamic_tools WHERE thread_id = ? ORDER BY position, name", ref.ThreadID)
+				toolRows, _ = queryCodexSQLiteRowsTx(db, "SELECT * FROM thread_dynamic_tools WHERE thread_id = ? ORDER BY position, name", ref.ThreadID)
 			}
 		}
 
@@ -686,43 +676,6 @@ func lookupCodexRolloutPathFromDB(db *sql.DB, threadID string) string {
 		return ""
 	}
 	return out
-}
-
-func queryCodexSQLiteRow(db *sql.DB, query string, args ...any) (*CodexSQLiteRow, error) {
-	rows, err := queryCodexSQLiteRows(db, query, args...)
-	if err != nil || len(rows) == 0 {
-		return nil, err
-	}
-	return &rows[0], nil
-}
-
-func queryCodexSQLiteRows(db *sql.DB, query string, args ...any) ([]CodexSQLiteRow, error) {
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-	var out []CodexSQLiteRow
-	for rows.Next() {
-		raw := make([]any, len(cols))
-		dest := make([]any, len(cols))
-		for i := range raw {
-			dest[i] = &raw[i]
-		}
-		if err := rows.Scan(dest...); err != nil {
-			return nil, err
-		}
-		vals := make([]CodexSQLiteValue, len(cols))
-		for i, v := range raw {
-			vals[i] = codexSQLiteValueFromDB(v)
-		}
-		out = append(out, CodexSQLiteRow{Columns: append([]string(nil), cols...), Values: vals})
-	}
-	return out, rows.Err()
 }
 
 func codexSQLiteValueFromDB(v any) CodexSQLiteValue {

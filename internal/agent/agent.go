@@ -91,9 +91,6 @@ func ValidSilentHours(start, end string) error {
 	return nil
 }
 
-// ValidActiveHours is a compatibility alias for ValidSilentHours.
-func ValidActiveHours(start, end string) error { return ValidSilentHours(start, end) }
-
 // IsInSilentHours checks if the current local time is within the silent window.
 // Returns false if no restriction is set (both empty = never silent).
 // Supports overnight ranges (e.g., 23:00-09:00).
@@ -152,7 +149,7 @@ var xhighModels = map[string]bool{
 	// web/src/lib/toolModels.ts xhighModels.
 	"grok-build":             true,
 	"grok-composer-2.5-fast": true,
-	"gpt-5.5":    true, "gpt-5.4": true, "gpt-5.4-mini": true,
+	"gpt-5.5":                true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 

@@ -25,13 +25,13 @@ type OplogAppliedRecord struct {
 //
 //  1. Probes oplog_applied(OpID) inside its tx.
 //     - hit + fingerprint match: returns the saved etag without
-//       re-running the write.
+//     re-running the write.
 //     - hit + fingerprint MISMATCH: returns ErrOplogOpIDReused
-//       (a peer-side bug — the same op_id was used for two
-//       different (table, op, body) tuples).
+//     (a peer-side bug — the same op_id was used for two
+//     different (table, op, body) tuples).
 //     - hit + agent_id mismatch: returns ErrOplogOpIDReused for
-//       the same reason — the ledger is keyed on op_id, and the
-//       claimed agent must match the ledger row.
+//     the same reason — the ledger is keyed on op_id, and the
+//     claimed agent must match the ledger row.
 //  2. Runs the write.
 //  3. Records oplog_applied(OpID, agent_id, fingerprint, etag) in
 //     the same tx so a crash between dispatch commit and ledger

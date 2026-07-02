@@ -3,6 +3,7 @@ package tts
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,10 +44,10 @@ func cacheDir() (string, error) {
 // already constrained to [0-9a-f].
 func cachePath(hash, format string) (string, error) {
 	if !isHexHash(hash) {
-		return "", fmt.Errorf("invalid hash")
+		return "", errors.New("invalid hash")
 	}
 	if Extension(format) == "bin" {
-		return "", fmt.Errorf("invalid format")
+		return "", errors.New("invalid format")
 	}
 	dir, err := cacheDir()
 	if err != nil {

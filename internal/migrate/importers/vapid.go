@@ -47,7 +47,9 @@ import (
 // returns ErrETagMismatch, which we treat as benign.
 type vapidImporter struct{}
 
-func (vapidImporter) Domain() string { return "vapid" }
+const vapidDomain = "vapid"
+
+func (vapidImporter) Domain() string { return vapidDomain }
 
 // kv layout — pinned to internal/notify so the importer and runtime
 // share a single source of truth on namespace / key / AAD. Drift would
@@ -73,200 +75,194 @@ type v0VAPIDFile struct {
 }
 
 func (vapidImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "vapid"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
+	return runDomain(ctx, st, vapidDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectVAPIDSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
+		}
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum vapid sources: %w", err)
+		}
 
-	logger := slog.Default().With("importer", "vapid")
+		vapidPath := filepath.Join(opts.V0Dir, "vapid.json")
+		data, err := readV0(opts.V0Dir, vapidPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// No v0 VAPID. push_subscriptions importer's own fatal-
+				// on-missing-vapid rule guards the case where there ARE
+				// well-formed rows that need a key, so this importer is
+				// free to mark imported(0) — runtime regenerates on first
+				// notify use, harmless when no rows reference the prior
+				// pair. The cross-check below is unnecessary here because
+				// push_subscriptions runs after this importer and would
+				// already abort the migration on the same vapid.json
+				// missing condition with live rows.
+				return 0, checksum, nil
+			}
+			return 0, "", err
+		}
+		if len(data) == 0 {
+			// Zero-byte file is a truncation signal. Same cross-check as
+			// the malformed/half-key branches: with live subscriptions,
+			// silently regenerating on next boot would orphan every row's
+			// vapid_public_key. Without live subscriptions, the empty file
+			// is recoverable and we mark imported(0).
+			if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
+				return 0, "", fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
+			} else if hasSubs {
+				return 0, "", errors.New("vapid.json is empty but push_subscriptions has live rows: refusing to migrate")
+			}
+			logger.Warn("vapid.json is empty; treating as no v0 VAPID configured", "path", vapidPath)
+			return 0, checksum, nil
+		}
 
-	srcPaths, err := collectVAPIDSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum vapid sources: %w", err)
-	}
+		var keys v0VAPIDFile
+		if err := json.Unmarshal(data, &keys); err != nil {
+			// Malformed JSON: cross-check whether push_subscriptions has any
+			// well-formed row that would lose its VAPID anchor on a runtime
+			// regenerate. If so, fail loudly — silently markImported(0)
+			// here would let the migration finish with subscriptions whose
+			// vapid_public_key column points at a key the runtime can no
+			// longer reproduce. With no live subscriptions, the regenerate
+			// path is harmless and we mark imported(0) so the rerun loop
+			// converges. Matches the posture push_subscriptions itself
+			// applies to malformed v0 input.
+			if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
+				return 0, "", fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
+			} else if hasSubs {
+				return 0, "", fmt.Errorf("vapid.json malformed but push_subscriptions has live rows that would orphan: %w", err)
+			}
+			logger.Warn("vapid.json malformed; skipping (no live push subscriptions)", "path", vapidPath, "err", err)
+			return 0, checksum, nil
+		}
+		if keys.PublicKey == "" || keys.PrivateKey == "" {
+			// Half-installed v0 state. v0's loadOrGenerateVAPID always
+			// materializes a full pair at first boot, so reaching this
+			// branch means the file was hand-edited or partially written.
+			// Same orphan-protection cross-check as the malformed branch:
+			// if push_subscriptions has live rows, we cannot silently leave
+			// kv unset (the runtime would regenerate a new pair and orphan
+			// every subscription's vapid_public_key column).
+			if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
+				return 0, "", fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
+			} else if hasSubs {
+				return 0, "", fmt.Errorf("vapid.json missing publicKey or privateKey but push_subscriptions has live rows: refusing to migrate (has_public=%t has_private=%t)",
+					keys.PublicKey != "", keys.PrivateKey != "")
+			}
+			logger.Warn("vapid.json missing publicKey or privateKey; skipping (no live push subscriptions)",
+				"path", vapidPath,
+				"has_public", keys.PublicKey != "",
+				"has_private", keys.PrivateKey != "")
+			return 0, checksum, nil
+		}
 
-	vapidPath := filepath.Join(opts.V0Dir, "vapid.json")
-	data, err := readV0(opts.V0Dir, vapidPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// No v0 VAPID. push_subscriptions importer's own fatal-
-			// on-missing-vapid rule guards the case where there ARE
-			// well-formed rows that need a key, so this importer is
-			// free to mark imported(0) — runtime regenerates on first
-			// notify use, harmless when no rows reference the prior
-			// pair. The cross-check below is unnecessary here because
-			// push_subscriptions runs after this importer and would
-			// already abort the migration on the same vapid.json
-			// missing condition with live rows.
-			return markImported(ctx, st, "vapid", 0, checksum)
+		// KEK is host-bound and lives in <v1>/auth/kek.bin. We materialize
+		// it here (LoadOrCreateKEK creates a fresh 32-byte key with mode
+		// 0600 if absent) so the importer is self-contained — no Options
+		// plumbing required. The runtime cmd/kojo/vapid_kv.go path also
+		// calls LoadOrCreateKEK with the same auth dir, so the secret row
+		// we seal here round-trips cleanly on the next boot.
+		//
+		// On --migrate-restart the wipeIncompleteV1 allowlist removes the
+		// auth/ tree alongside kojo.db (see migrate.go), so the next
+		// run starts with a fresh KEK paired with a fresh kojo.db — no
+		// orphaned ciphertext.
+		authDir := filepath.Join(opts.V1Dir, "auth")
+		kek, err := secretcrypto.LoadOrCreateKEK(authDir)
+		if err != nil {
+			return 0, "", fmt.Errorf("load/create KEK: %w", err)
 		}
-		return err
-	}
-	if len(data) == 0 {
-		// Zero-byte file is a truncation signal. Same cross-check as
-		// the malformed/half-key branches: with live subscriptions,
-		// silently regenerating on next boot would orphan every row's
-		// vapid_public_key. Without live subscriptions, the empty file
-		// is recoverable and we mark imported(0).
-		if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
-			return fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
-		} else if hasSubs {
-			return fmt.Errorf("vapid.json is empty but push_subscriptions has live rows: refusing to migrate")
-		}
-		logger.Warn("vapid.json is empty; treating as no v0 VAPID configured", "path", vapidPath)
-		return markImported(ctx, st, "vapid", 0, checksum)
-	}
 
-	var keys v0VAPIDFile
-	if err := json.Unmarshal(data, &keys); err != nil {
-		// Malformed JSON: cross-check whether push_subscriptions has any
-		// well-formed row that would lose its VAPID anchor on a runtime
-		// regenerate. If so, fail loudly — silently markImported(0)
-		// here would let the migration finish with subscriptions whose
-		// vapid_public_key column points at a key the runtime can no
-		// longer reproduce. With no live subscriptions, the regenerate
-		// path is harmless and we mark imported(0) so the rerun loop
-		// converges. Matches the posture push_subscriptions itself
-		// applies to malformed v0 input.
-		if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
-			return fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
-		} else if hasSubs {
-			return fmt.Errorf("vapid.json malformed but push_subscriptions has live rows that would orphan: %w", err)
+		// Public row first, private row second. Order is documented but
+		// not load-bearing — vapidKVStore.LoadVAPID treats "public present
+		// but private missing" as a half-installed error, so a crash
+		// between the two PutKVs surfaces loudly on next boot rather than
+		// silently regenerating.
+		pubRec := &store.KVRecord{
+			Namespace: vapidKVNamespace, Key: vapidKVPublicKey,
+			Value: keys.PublicKey, Type: store.KVTypeString,
+			Scope: store.KVScopeGlobal,
 		}
-		logger.Warn("vapid.json malformed; skipping (no live push subscriptions)", "path", vapidPath, "err", err)
-		return markImported(ctx, st, "vapid", 0, checksum)
-	}
-	if keys.PublicKey == "" || keys.PrivateKey == "" {
-		// Half-installed v0 state. v0's loadOrGenerateVAPID always
-		// materializes a full pair at first boot, so reaching this
-		// branch means the file was hand-edited or partially written.
-		// Same orphan-protection cross-check as the malformed branch:
-		// if push_subscriptions has live rows, we cannot silently leave
-		// kv unset (the runtime would regenerate a new pair and orphan
-		// every subscription's vapid_public_key column).
-		if hasSubs, hsErr := hasWellFormedV0PushSubscriptions(opts.V0Dir); hsErr != nil {
-			return fmt.Errorf("probe push_subscriptions for vapid orphan check: %w", hsErr)
-		} else if hasSubs {
-			return fmt.Errorf("vapid.json missing publicKey or privateKey but push_subscriptions has live rows: refusing to migrate (has_public=%t has_private=%t)",
-				keys.PublicKey != "", keys.PrivateKey != "")
+		if _, err := st.PutKV(ctx, pubRec, store.KVPutOptions{IfMatchETag: store.IfMatchAny}); err != nil {
+			if !errors.Is(err, store.ErrETagMismatch) {
+				return 0, "", fmt.Errorf("put vapid_public: %w", err)
+			}
+			// Row already exists. alreadyImported() should have short-
+			// circuited at the top, so reaching here means a crash
+			// between PutKV and markImported on a prior run, OR a hand-
+			// bootstrapped v1 with mismatched contents. Verify the
+			// existing value matches the v0 input before treating as
+			// benign; mismatch means a different KEK or a different v0
+			// produced the row, and silently markImported(2) over it
+			// would lock in a broken pair.
+			existing, getErr := st.GetKV(ctx, vapidKVNamespace, vapidKVPublicKey)
+			if getErr != nil {
+				return 0, "", fmt.Errorf("verify existing vapid_public: %w", getErr)
+			}
+			// Compare every metadata field that defines this row's
+			// contract — value, type, scope, secret — so a row that
+			// landed via a different writer (e.g. a hand-edited DB or a
+			// future schema migration that flipped scope/secret) is
+			// surfaced loudly rather than silently overlaid as "imported".
+			if existing.Value != keys.PublicKey {
+				return 0, "", errors.New("vapid_public already present with different value: refusing to migrate (use --migrate-restart to wipe v1)")
+			}
+			if existing.Type != store.KVTypeString || existing.Scope != store.KVScopeGlobal || existing.Secret || len(existing.ValueEncrypted) > 0 {
+				return 0, "", fmt.Errorf("vapid_public already present with mismatched metadata (type=%q scope=%q secret=%t encrypted=%t): refusing to migrate",
+					existing.Type, existing.Scope, existing.Secret, len(existing.ValueEncrypted) > 0)
+			}
+			logger.Info("vapid_public row already present and matches v0; leaving untouched")
 		}
-		logger.Warn("vapid.json missing publicKey or privateKey; skipping (no live push subscriptions)",
-			"path", vapidPath,
-			"has_public", keys.PublicKey != "",
-			"has_private", keys.PrivateKey != "")
-		return markImported(ctx, st, "vapid", 0, checksum)
-	}
 
-	// KEK is host-bound and lives in <v1>/auth/kek.bin. We materialize
-	// it here (LoadOrCreateKEK creates a fresh 32-byte key with mode
-	// 0600 if absent) so the importer is self-contained — no Options
-	// plumbing required. The runtime cmd/kojo/vapid_kv.go path also
-	// calls LoadOrCreateKEK with the same auth dir, so the secret row
-	// we seal here round-trips cleanly on the next boot.
-	//
-	// On --migrate-restart the wipeIncompleteV1 allowlist removes the
-	// auth/ tree alongside kojo.db (see migrate.go), so the next
-	// run starts with a fresh KEK paired with a fresh kojo.db — no
-	// orphaned ciphertext.
-	authDir := filepath.Join(opts.V1Dir, "auth")
-	kek, err := secretcrypto.LoadOrCreateKEK(authDir)
-	if err != nil {
-		return fmt.Errorf("load/create KEK: %w", err)
-	}
+		sealed, err := secretcrypto.Seal(kek, []byte(keys.PrivateKey), vapidPrivateAAD())
+		if err != nil {
+			return 0, "", fmt.Errorf("seal vapid_private: %w", err)
+		}
+		privRec := &store.KVRecord{
+			Namespace: vapidKVNamespace, Key: vapidKVPrivateKey,
+			ValueEncrypted: sealed, Type: store.KVTypeBinary,
+			Scope: store.KVScopeMachine, Secret: true,
+		}
+		if _, err := st.PutKV(ctx, privRec, store.KVPutOptions{IfMatchETag: store.IfMatchAny}); err != nil {
+			if !errors.Is(err, store.ErrETagMismatch) {
+				return 0, "", fmt.Errorf("put vapid_private: %w", err)
+			}
+			// Existing private row — verify it decrypts to the same
+			// plaintext as keys.PrivateKey under the current KEK + AAD.
+			// A row sealed under a DIFFERENT KEK (e.g. the operator
+			// rotated kek.bin between runs) would surface as an Open
+			// error here, which is the correct fail-loud signal: the
+			// resumed migration cannot reconcile two KEKs and the
+			// operator must --migrate-restart. Same goes for a row sealed
+			// under a different private key.
+			existing, getErr := st.GetKV(ctx, vapidKVNamespace, vapidKVPrivateKey)
+			if getErr != nil {
+				return 0, "", fmt.Errorf("verify existing vapid_private: %w", getErr)
+			}
+			// Same metadata symmetry as the public row — secret rows must
+			// stay binary/secret/machine-scope, and the plaintext field
+			// must be empty (PutKV enforces the value/value_encrypted
+			// XOR but a hand-edited DB could violate it).
+			if existing.Type != store.KVTypeBinary || existing.Scope != store.KVScopeMachine || !existing.Secret || existing.Value != "" || len(existing.ValueEncrypted) == 0 {
+				return 0, "", fmt.Errorf("vapid_private already present with mismatched metadata (type=%q scope=%q secret=%t plain_len=%d encrypted_len=%d): refusing to migrate",
+					existing.Type, existing.Scope, existing.Secret, len(existing.Value), len(existing.ValueEncrypted))
+			}
+			plain, openErr := secretcrypto.Open(kek, existing.ValueEncrypted, vapidPrivateAAD())
+			if openErr != nil {
+				return 0, "", fmt.Errorf("vapid_private already present but cannot decrypt under current KEK: %w (use --migrate-restart to wipe v1)", openErr)
+			}
+			if string(plain) != keys.PrivateKey {
+				return 0, "", errors.New("vapid_private already present with different plaintext: refusing to migrate (use --migrate-restart to wipe v1)")
+			}
+			logger.Info("vapid_private row already present and matches v0; leaving untouched")
+		}
 
-	// Public row first, private row second. Order is documented but
-	// not load-bearing — vapidKVStore.LoadVAPID treats "public present
-	// but private missing" as a half-installed error, so a crash
-	// between the two PutKVs surfaces loudly on next boot rather than
-	// silently regenerating.
-	pubRec := &store.KVRecord{
-		Namespace: vapidKVNamespace, Key: vapidKVPublicKey,
-		Value: keys.PublicKey, Type: store.KVTypeString,
-		Scope: store.KVScopeGlobal,
-	}
-	if _, err := st.PutKV(ctx, pubRec, store.KVPutOptions{IfMatchETag: store.IfMatchAny}); err != nil {
-		if !errors.Is(err, store.ErrETagMismatch) {
-			return fmt.Errorf("put vapid_public: %w", err)
-		}
-		// Row already exists. alreadyImported() should have short-
-		// circuited at the top, so reaching here means a crash
-		// between PutKV and markImported on a prior run, OR a hand-
-		// bootstrapped v1 with mismatched contents. Verify the
-		// existing value matches the v0 input before treating as
-		// benign; mismatch means a different KEK or a different v0
-		// produced the row, and silently markImported(2) over it
-		// would lock in a broken pair.
-		existing, getErr := st.GetKV(ctx, vapidKVNamespace, vapidKVPublicKey)
-		if getErr != nil {
-			return fmt.Errorf("verify existing vapid_public: %w", getErr)
-		}
-		// Compare every metadata field that defines this row's
-		// contract — value, type, scope, secret — so a row that
-		// landed via a different writer (e.g. a hand-edited DB or a
-		// future schema migration that flipped scope/secret) is
-		// surfaced loudly rather than silently overlaid as "imported".
-		if existing.Value != keys.PublicKey {
-			return fmt.Errorf("vapid_public already present with different value: refusing to migrate (use --migrate-restart to wipe v1)")
-		}
-		if existing.Type != store.KVTypeString || existing.Scope != store.KVScopeGlobal || existing.Secret || len(existing.ValueEncrypted) > 0 {
-			return fmt.Errorf("vapid_public already present with mismatched metadata (type=%q scope=%q secret=%t encrypted=%t): refusing to migrate",
-				existing.Type, existing.Scope, existing.Secret, len(existing.ValueEncrypted) > 0)
-		}
-		logger.Info("vapid_public row already present and matches v0; leaving untouched")
-	}
-
-	sealed, err := secretcrypto.Seal(kek, []byte(keys.PrivateKey), vapidPrivateAAD())
-	if err != nil {
-		return fmt.Errorf("seal vapid_private: %w", err)
-	}
-	privRec := &store.KVRecord{
-		Namespace: vapidKVNamespace, Key: vapidKVPrivateKey,
-		ValueEncrypted: sealed, Type: store.KVTypeBinary,
-		Scope: store.KVScopeMachine, Secret: true,
-	}
-	if _, err := st.PutKV(ctx, privRec, store.KVPutOptions{IfMatchETag: store.IfMatchAny}); err != nil {
-		if !errors.Is(err, store.ErrETagMismatch) {
-			return fmt.Errorf("put vapid_private: %w", err)
-		}
-		// Existing private row — verify it decrypts to the same
-		// plaintext as keys.PrivateKey under the current KEK + AAD.
-		// A row sealed under a DIFFERENT KEK (e.g. the operator
-		// rotated kek.bin between runs) would surface as an Open
-		// error here, which is the correct fail-loud signal: the
-		// resumed migration cannot reconcile two KEKs and the
-		// operator must --migrate-restart. Same goes for a row sealed
-		// under a different private key.
-		existing, getErr := st.GetKV(ctx, vapidKVNamespace, vapidKVPrivateKey)
-		if getErr != nil {
-			return fmt.Errorf("verify existing vapid_private: %w", getErr)
-		}
-		// Same metadata symmetry as the public row — secret rows must
-		// stay binary/secret/machine-scope, and the plaintext field
-		// must be empty (PutKV enforces the value/value_encrypted
-		// XOR but a hand-edited DB could violate it).
-		if existing.Type != store.KVTypeBinary || existing.Scope != store.KVScopeMachine || !existing.Secret || existing.Value != "" || len(existing.ValueEncrypted) == 0 {
-			return fmt.Errorf("vapid_private already present with mismatched metadata (type=%q scope=%q secret=%t plain_len=%d encrypted_len=%d): refusing to migrate",
-				existing.Type, existing.Scope, existing.Secret, len(existing.Value), len(existing.ValueEncrypted))
-		}
-		plain, openErr := secretcrypto.Open(kek, existing.ValueEncrypted, vapidPrivateAAD())
-		if openErr != nil {
-			return fmt.Errorf("vapid_private already present but cannot decrypt under current KEK: %w (use --migrate-restart to wipe v1)", openErr)
-		}
-		if string(plain) != keys.PrivateKey {
-			return fmt.Errorf("vapid_private already present with different plaintext: refusing to migrate (use --migrate-restart to wipe v1)")
-		}
-		logger.Info("vapid_private row already present and matches v0; leaving untouched")
-	}
-
-	// imported_count = 2 reflects the two kv rows produced from one
-	// v0 file. Operators reading migration_status see "2" and can
-	// cross-check via SELECT * FROM kv WHERE namespace='notify'.
-	return markImported(ctx, st, "vapid", 2, checksum)
+		// imported_count = 2 reflects the two kv rows produced from one
+		// v0 file. Operators reading migration_status see "2" and can
+		// cross-check via SELECT * FROM kv WHERE namespace='notify'.
+		return 2, checksum, nil
+	})
 }
 
 // hasWellFormedV0PushSubscriptions returns true if v0/push_subscriptions.json

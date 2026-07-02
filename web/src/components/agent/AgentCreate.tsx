@@ -3,7 +3,14 @@ import { useNavigate } from "react-router";
 import { agentApi } from "../../lib/agentApi";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { api, type ServerInfo } from "../../lib/api";
-import { defaultModelForTool, modelsForTool, effortLevelsForModel, defaultEffortForModel, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { errMsg } from "../../lib/utils";
+import { useCustomModels } from "./fields/useCustomModels";
+import { PersonaField } from "./fields/PersonaField";
+import { ToolPicker } from "./fields/ToolPicker";
+import { ModelPicker } from "./fields/ModelPicker";
+import { EffortPicker } from "./fields/EffortPicker";
+import { WorkDirInput } from "./fields/WorkDirInput";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
@@ -13,10 +20,9 @@ export function AgentCreate() {
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
   const [model, setModel] = useState("sonnet");
-  const [effort, setEffort] = useState("");
+  const [effort, setEffort] = useState<EffortLevel | "">("");
   const [tool, setTool] = useState("claude");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
-  const [customModels, setCustomModels] = useState<string[]>([]);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   // cronExpr starts as the default "*/30 * * * *" only for ScheduleEditor's
@@ -52,23 +58,7 @@ export function AgentCreate() {
     api.info().then(setInfo).catch(console.error);
   }, []);
 
-  const needsCustomURL = tool === "custom" || tool === "llama.cpp";
-
-  // Fetch models when custom/llama.cpp tool is selected or base URL changes
-  useEffect(() => {
-    if (!needsCustomURL) return;
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      api.customModels(customBaseURL).then((models) => {
-        if (cancelled) return;
-        setCustomModels(models);
-        if (models.length > 0) {
-          setModel((prev) => models.includes(prev) ? prev : models[0]);
-        }
-      }).catch(() => { if (!cancelled) setCustomModels([]); });
-    }, 300);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [needsCustomURL, customBaseURL]);
+  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel);
 
   // Revoke blob URL on unmount
   useEffect(() => {
@@ -99,7 +89,7 @@ export function AgentCreate() {
       setPersona(result.persona);
       setPersonaPrompt("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setGenPhase("idle");
     }
@@ -120,7 +110,7 @@ export function AgentCreate() {
       setName(result.name);
       return result.name;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
       return null;
     } finally {
       setGenPhase("idle");
@@ -155,7 +145,7 @@ export function AgentCreate() {
         setAvatarPreviewUrl("");
         setAvatarFile(null);
       }
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setGenPhase("idle");
     }
@@ -179,7 +169,7 @@ export function AgentCreate() {
       generatedName = result.name;
       setName(result.name);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
       setGenPhase("idle");
       return;
     }
@@ -205,7 +195,7 @@ export function AgentCreate() {
         setAvatarPreviewUrl("");
         setAvatarFile(null);
       }
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     }
     setGenPhase("idle");
   };
@@ -265,7 +255,7 @@ export function AgentCreate() {
 
       navigate(`/agents/${agent.id}`, { replace: true });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
       setLoading(false);
     }
   };
@@ -293,44 +283,18 @@ export function AgentCreate() {
 
       <main className="p-4 space-y-5 max-w-md mx-auto">
         {/* Persona */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">
-            Persona
-          </label>
-          <textarea
-            value={persona}
-            onChange={(e) => setPersona(e.target.value)}
-            placeholder="Describe the agent's personality, speaking style, interests..."
-            rows={5}
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm resize-none focus:outline-none focus:border-neutral-500"
-          />
-          <div className="flex gap-2 mt-2">
-            <input
-              type="text"
-              value={personaPrompt}
-              onChange={(e) => setPersonaPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.nativeEvent.isComposing && !e.shiftKey && !isGenerating) {
-                  e.preventDefault();
-                  handleGeneratePersona();
-                }
-              }}
-              placeholder="e.g. ツンデレな女の子にして"
-              className="flex-1 px-3 py-1.5 bg-neutral-900 border border-neutral-700 rounded text-xs focus:outline-none focus:border-neutral-500"
-            />
-            <button
-              onClick={handleGeneratePersona}
-              disabled={isGenerating || !personaPrompt.trim()}
-              className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-xs disabled:opacity-40 flex items-center gap-1"
-            >
-              {genPhase === "persona" ? (
-                <span className="animate-spin">↻</span>
-              ) : (
-                "✨ AI"
-              )}
-            </button>
-          </div>
-        </div>
+        <PersonaField
+          persona={persona}
+          setPersona={setPersona}
+          textareaRows={5}
+          textareaPlaceholder="Describe the agent's personality, speaking style, interests..."
+          personaPrompt={personaPrompt}
+          setPersonaPrompt={setPersonaPrompt}
+          promptPlaceholder="e.g. ツンデレな女の子にして"
+          busy={isGenerating}
+          spinning={genPhase === "persona"}
+          onGenerate={handleGeneratePersona}
+        />
 
         {/* Avatar + Name + Hint */}
         <div className="flex gap-4">
@@ -457,36 +421,14 @@ export function AgentCreate() {
         </div>
 
         {/* Tool */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Tool</label>
-          <div className="flex flex-wrap gap-2">
-            {["claude", "codex", "grok", "custom", "llama.cpp"].map((t) => (
-              <button
-                key={t}
-                onClick={() => {
-                  if (t !== tool) {
-                    setTool(t);
-                    if (t === "custom" || t === "llama.cpp") {
-                      setModel("");
-                    } else {
-                      const m = defaultModelForTool(t);
-                      setModel(m);
-                      if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
-                    }
-                  }
-                }}
-                disabled={info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false}
-                className={`px-3 py-2 rounded text-sm font-mono ${
-                  tool === t
-                    ? "bg-neutral-700 border border-neutral-500"
-                    : "bg-neutral-900 border border-neutral-800"
-                } disabled:opacity-30`}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-        </div>
+        <ToolPicker
+          tool={tool}
+          setTool={setTool}
+          setModel={setModel}
+          effort={effort}
+          setEffort={setEffort}
+          isDisabled={(t) => (info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false)}
+        />
 
         {/* Custom Base URL */}
         {needsCustomURL && (
@@ -503,63 +445,16 @@ export function AgentCreate() {
         )}
 
         {/* Model */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">Model</label>
-          {(() => {
-            const models = needsCustomURL ? customModels : modelsForTool(tool);
-            return models.length > 0 ? (
-              <select
-                value={model}
-                onChange={(e) => {
-                  const m = e.target.value;
-                  setModel(m);
-                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
-                }}
-                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-              >
-                {model && !models.includes(model) && (
-                  <option value={model}>{model}</option>
-                )}
-                {models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                type="text"
-                value={model}
-                onChange={(e) => {
-                  const m = e.target.value;
-                  setModel(m);
-                  if (effort && !effortLevelsForModel(m).includes(effort as EffortLevel)) setEffort("");
-                }}
-                placeholder="model name"
-                className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-              />
-            );
-          })()}
-        </div>
+        <ModelPicker
+          model={model}
+          setModel={setModel}
+          effort={effort}
+          setEffort={setEffort}
+          models={needsCustomURL ? customModels : modelsForTool(tool)}
+        />
 
         {/* Effort */}
-        {supportsEffort(tool) && (
-          <div>
-            <label className="block text-sm text-neutral-400 mb-2">Effort</label>
-            <select
-              value={effort}
-              onChange={(e) => setEffort(e.target.value)}
-              className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm focus:outline-none focus:border-neutral-500"
-            >
-              <option value="">default ({defaultEffortForModel(model)})</option>
-              {effortLevelsForModel(model).map((e) => (
-                <option key={e} value={e}>
-                  {e}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+        <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
         {/* Thinking Mode (llama.cpp only) */}
         {tool === "llama.cpp" && (
@@ -578,17 +473,7 @@ export function AgentCreate() {
         )}
 
         {/* File Storage */}
-        <div>
-          <label className="block text-sm text-neutral-400 mb-2">File Storage</label>
-          <input
-            type="text"
-            value={workDir}
-            onChange={(e) => setWorkDir(e.target.value)}
-            placeholder="(default: agent data dir)"
-            className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm font-mono focus:outline-none focus:border-neutral-500"
-          />
-          <p className="text-xs text-neutral-600 mt-1">Generated files are saved here.</p>
-        </div>
+        <WorkDirInput workDir={workDir} setWorkDir={setWorkDir} />
 
         {/* Schedule */}
         <ScheduleEditor

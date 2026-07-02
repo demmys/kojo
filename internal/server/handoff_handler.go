@@ -142,9 +142,7 @@ func (s *Server) listHandoffBlobRefs(ctx context.Context, agentID string) ([]*st
 }
 
 func (s *Server) handleAgentHandoffOp(w http.ResponseWriter, r *http.Request, op string) {
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"handoff requires agent store")
+	if _, ok := s.requireAgentStore(w, "handoff requires agent store"); !ok {
 		return
 	}
 	if !auth.FromContext(r.Context()).IsOwner() {

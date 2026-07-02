@@ -1,9 +1,7 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -92,16 +90,8 @@ func (s *Server) handlePutAgentPersona(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only edit their own persona")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported for persona")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for persona")
+	if !ok {
 		return
 	}
 	// No s.agents.Get(id) precheck: same syncPersona-side-effect
@@ -109,20 +99,8 @@ func (s *Server) handlePutAgentPersona(w http.ResponseWriter, r *http.Request) {
 	// ErrAgentArchived / ErrAgentResetting which the switch below
 	// maps to 404 / 409.
 
-	r.Body = http.MaxBytesReader(w, r.Body, personaRequestCap)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
-		return
-	}
 	var req personaPutRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, personaRequestCap, "request body exceeds cap", "invalid JSON", &req) {
 		return
 	}
 

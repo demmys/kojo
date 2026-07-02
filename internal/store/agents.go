@@ -461,11 +461,26 @@ func cloneJSONMap(m map[string]any) map[string]any {
 	return out
 }
 
-func nullableText(s string) any {
-	if s == "" {
-		return nil
+// checkSingletonUpsertPrecondition enforces the optimistic-lock gate shared
+// by the singleton upserts (UpsertAgentPersona / UpsertAgentMemory /
+// UpsertAgentWorkspaceFile) after the prior row has been classified:
+//
+//   - ifMatchETag set: require a live row whose etag matches, else ErrETagMismatch.
+//   - ifMatchETag empty + live row present + !allowOverwrite: refuse the blind
+//     overwrite with ErrETagMismatch (importers/internal callers set
+//     allowOverwrite to replace a live row without an etag).
+//
+// Returns nil when the write may proceed.
+func checkSingletonUpsertPrecondition(liveExists bool, prevETag, ifMatchETag string, allowOverwrite bool) error {
+	switch {
+	case ifMatchETag != "":
+		if !liveExists || prevETag != ifMatchETag {
+			return ErrETagMismatch
+		}
+	case liveExists && !allowOverwrite:
+		return ErrETagMismatch
 	}
-	return s
+	return nil
 }
 
 // -- agent_persona ------------------------------------------------------
@@ -543,17 +558,8 @@ SELECT body, body_sha256, seq, version, etag, created_at, updated_at, deleted_at
 		}
 	}
 
-	switch {
-	case ifMatchETag != "":
-		// Caller asserted a prior etag.
-		if !liveExists || prev.ETag != ifMatchETag {
-			return nil, ErrETagMismatch
-		}
-	case liveExists && !opts.AllowOverwrite:
-		// No If-Match given, but a live row exists — refuse blind overwrite.
-		// Importers/internal callers that legitimately need to replace a
-		// row without an etag must set opts.AllowOverwrite.
-		return nil, ErrETagMismatch
+	if err := checkSingletonUpsertPrecondition(liveExists, prev.ETag, ifMatchETag, opts.AllowOverwrite); err != nil {
+		return nil, err
 	}
 
 	rec := AgentPersonaRecord{

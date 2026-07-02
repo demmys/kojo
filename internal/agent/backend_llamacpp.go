@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // LlamaCppBackend implements ChatBackend by talking directly to llama-server's
@@ -142,14 +141,7 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 		stripper = &thinkStripper{}
 	}
 
-	send := func(e ChatEvent) bool {
-		select {
-		case ch <- e:
-			return true
-		case <-ctx.Done():
-			return false
-		}
-	}
+	send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
 	emitText := func(text string) bool {
 		if stripper != nil {
@@ -275,11 +267,7 @@ func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, bo
 		return
 	}
 
-	msg := newAssistantMessage()
-	msg.Content = content.String()
-	msg.Thinking = thinking.String()
-	msg.Usage = usage
-	msg.Timestamp = time.Now().Format(time.RFC3339)
+	msg := assembleAssistantMessage(content.String(), thinking.String(), nil, usage)
 
 	ch <- ChatEvent{
 		Type:    "done",
@@ -480,12 +468,10 @@ type llamaCppChunk struct {
 }
 
 type llamaCppChoice struct {
-	Delta        llamaCppDelta `json:"delta"`
-	FinishReason string        `json:"finish_reason"`
+	Delta llamaCppDelta `json:"delta"`
 }
 
 type llamaCppDelta struct {
-	Role             string `json:"role,omitempty"`
 	Content          string `json:"content,omitempty"`
 	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
@@ -493,5 +479,4 @@ type llamaCppDelta struct {
 type llamaCppUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
 }

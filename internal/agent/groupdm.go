@@ -13,12 +13,9 @@ import (
 )
 
 // jsonMarshalAttachments encodes attachments as a json.RawMessage suitable
-// for store.GroupDMMessageRecord.Attachments. Returns nil RawMessage when
-// the input slice is empty so the store wraps it as SQL NULL via nullJSON.
+// for store.GroupDMMessageRecord.Attachments. Callers guard against empty
+// input, so an empty slice marshals to a JSON "[]" here.
 func jsonMarshalAttachments(atts []MessageAttachment) (json.RawMessage, error) {
-	if len(atts) == 0 {
-		return nil, nil
-	}
 	return json.Marshal(atts)
 }
 

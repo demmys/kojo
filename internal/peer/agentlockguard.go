@@ -170,20 +170,6 @@ func (g *AgentLockGuard) RemoveAgent(ctx context.Context, agentID string) {
 	}
 }
 
-// Token returns the fencing token currently held for agentID, or
-// (0, false) when the guard does not hold a lock for it. Will be
-// used by the write-fencing slice to thread CheckFencingTx into
-// agent-runtime write paths.
-func (g *AgentLockGuard) Token(agentID string) (int64, bool) {
-	if g == nil {
-		return 0, false
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	tok, ok := g.tokens[agentID]
-	return tok, ok
-}
-
 // Stop signals the refresh loop to exit and releases every held
 // lock via ReleaseAgentLockByPeer. Bounded so shutdown can't block.
 // Idempotent.

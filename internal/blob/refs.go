@@ -58,11 +58,6 @@ type RefStore interface {
 	// when the URI was never present, so implementations must NOT
 	// return ErrRefNotFound for missing rows.
 	Delete(ctx context.Context, uri string) error
-
-	// List returns rows whose URI starts with the given prefix and
-	// (optionally) belongs to the given scope. An empty scope means
-	// "any scope". Output is ordered by URI ASC.
-	List(ctx context.Context, scope, uriPrefix string) ([]*Ref, error)
 }
 
 // bypassPutter is implemented by RefStore backends that can write
@@ -138,7 +133,4 @@ func (noopRefs) Snapshot(context.Context, string) (RefSnapshot, error) {
 	return nil, ErrRefNotFound
 }
 func (noopRefs) Restore(context.Context, RefSnapshot, string, int64) error { return nil }
-func (noopRefs) Delete(context.Context, string) error       { return nil }
-func (noopRefs) List(context.Context, string, string) ([]*Ref, error) {
-	return nil, nil
-}
+func (noopRefs) Delete(context.Context, string) error                      { return nil }

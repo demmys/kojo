@@ -119,64 +119,6 @@ func TestStripBotMention(t *testing.T) {
 	}
 }
 
-func TestPlainToSlack(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "bold conversion",
-			input: "This is **bold** text",
-			want:  "This is *bold* text",
-		},
-		{
-			name:  "strikethrough conversion",
-			input: "This is ~~deleted~~ text",
-			want:  "This is ~deleted~ text",
-		},
-		{
-			name:  "markdown link conversion",
-			input: "Click [here](https://example.com) now",
-			want:  "Click <https://example.com|here> now",
-		},
-		{
-			name:  "heading conversion",
-			input: "# Main Title\n## Subtitle",
-			want:  "*Main Title*\n*Subtitle*",
-		},
-		{
-			name:  "code block preserved",
-			input: "```go\n**bold inside code**\n```",
-			want:  "```go\n**bold inside code**\n```",
-		},
-		{
-			name:  "inline code preserved",
-			input: "Use `**not bold**` here",
-			want:  "Use `**not bold**` here",
-		},
-		{
-			name:  "mixed with code blocks",
-			input: "**bold** then ```\n**code**\n``` then **more bold**",
-			want:  "*bold* then ```\n**code**\n``` then *more bold*",
-		},
-		{
-			name:  "italic unchanged",
-			input: "_italic text_",
-			want:  "_italic text_",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := PlainToSlack(tt.input)
-			if got != tt.want {
-				t.Errorf("PlainToSlack(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestSplitMessage(t *testing.T) {
 	tests := []struct {
 		name   string

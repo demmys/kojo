@@ -109,19 +109,6 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isRawAgentSubpath reports whether the agent sub-path streams
-// bulk body data (file raw / view) and therefore needs the
-// long-proxy timeout. Mirrors session_proxy_middleware's
-// isRawProxyPath; kept local so the agent-routing module owns
-// its own decision.
-func isRawAgentSubpath(sub string) bool {
-	switch sub {
-	case "/files/raw", "/files/view":
-		return true
-	}
-	return false
-}
-
 // proxyToHolderPeer forwards the HTTP request to the peer that
 // holds the agent's runtime lock. Authentication is by Tailnet
 // identity — the forward dials the target peer over tsnet and its
@@ -216,16 +203,12 @@ func (s *Server) proxyToHolderPeer(w http.ResponseWriter, r *http.Request, agent
 	// JSON / WS surfaces use Content-Type / ETag. Body is copied
 	// unbounded; a 32 MiB silent truncate would mangle big
 	// agent-side downloads.
-	for _, k := range []string{
+	copyResponseHeaders(w.Header(), resp.Header,
 		"Content-Type", "ETag",
 		"X-Kojo-No-Idempotency-Cache",
 		"Content-Disposition", "Content-Length",
 		"Last-Modified", "Cache-Control",
-	} {
-		if v := resp.Header.Get(k); v != "" {
-			w.Header().Set(k, v)
-		}
-	}
+	)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }

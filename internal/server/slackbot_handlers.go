@@ -94,17 +94,9 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	// `*` is rejected on PUT because the row must already exist (we
 	// 404'd above on missing agent); "any current version" carries no
 	// useful semantics here.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on PUT /slackbot; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on PUT /slackbot; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -248,17 +240,9 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 	// Same If-Match contract as PUT — DELETE /slackbot mutates the
 	// SlackBot field on the agent record, so the precondition checks
 	// against the agent etag. `*` is rejected for the same reason.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on DELETE /slackbot; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on DELETE /slackbot; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 

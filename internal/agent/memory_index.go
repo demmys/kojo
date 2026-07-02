@@ -1,13 +1,14 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -645,8 +646,8 @@ func mergeSearchResults(vecResults, ftsResults []SearchResult, limit int) []Sear
 	}
 
 	// Sort by score descending
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].score > merged[j].score
+	slices.SortFunc(merged, func(a, b ranked) int {
+		return cmp.Compare(b.score, a.score)
 	})
 
 	if len(merged) > limit {
@@ -700,8 +701,8 @@ func (idx *MemoryIndex) vectorSearch(queryEmb []float32, limit int) []SearchResu
 	}
 
 	// Sort by score descending
-	sort.Slice(hits, func(i, j int) bool {
-		return hits[i].score > hits[j].score
+	slices.SortFunc(hits, func(a, b hit) int {
+		return cmp.Compare(b.score, a.score)
 	})
 
 	if len(hits) > limit {

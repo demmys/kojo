@@ -9,12 +9,12 @@ import (
 func TestValidateCronExpr(t *testing.T) {
 	t.Run("accept", func(t *testing.T) {
 		valid := []string{
-			"",                  // empty = scheduling disabled
-			"*/5 * * * *",       // every 5 min
-			"0 9 * * 1-5",       // weekday 09:00
-			"0 */3 * * *",       // every 3 hours
-			"30 14 * * *",       // daily 14:30
-			"0 0 1 * *",         // monthly on the 1st
+			"",                   // empty = scheduling disabled
+			"*/5 * * * *",        // every 5 min
+			"0 9 * * 1-5",        // weekday 09:00
+			"0 */3 * * *",        // every 3 hours
+			"30 14 * * *",        // daily 14:30
+			"0 0 1 * *",          // monthly on the 1st
 			"0,15,30,45 * * * *", // explicit 15-min cadence
 		}
 		for _, expr := range valid {
@@ -28,13 +28,13 @@ func TestValidateCronExpr(t *testing.T) {
 		// 6-field (with seconds) and shortcut forms must be rejected so the
 		// strict 5-field UI editor and the runtime stay in lockstep.
 		invalid := []string{
-			"* * * * * *",   // 6 fields with seconds
-			"@every 1m",     // shortcut
-			"@hourly",       // shortcut
-			"@reboot",       // shortcut
-			"   ",           // whitespace only
-			"foo bar",       // garbage
-			"60 * * * *",    // out of range
+			"* * * * * *", // 6 fields with seconds
+			"@every 1m",   // shortcut
+			"@hourly",     // shortcut
+			"@reboot",     // shortcut
+			"   ",         // whitespace only
+			"foo bar",     // garbage
+			"60 * * * *",  // out of range
 		}
 		for _, expr := range invalid {
 			err := ValidateCronExpr(expr)

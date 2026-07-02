@@ -205,14 +205,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	go func() {
 		defer close(ch)
 
-		send := func(e ChatEvent) bool {
-			select {
-			case ch <- e:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
+		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
 		// JSON-RPC message sender (mutex-protected since stdin is shared)
 		var reqID atomic.Int64
@@ -503,12 +496,7 @@ type codexStreamResult struct {
 
 // buildMessage creates a Message from accumulated stream data.
 func (r *codexStreamResult) buildMessage() *Message {
-	msg := newAssistantMessage()
-	msg.Content = r.fullText.String()
-	msg.Thinking = r.thinking.String()
-	msg.ToolUses = r.toolUses
-	msg.Usage = r.usage
-	return msg
+	return assembleAssistantMessage(r.fullText.String(), r.thinking.String(), r.toolUses, r.usage)
 }
 
 // hasOutput returns true if the stream produced any text or tool uses.

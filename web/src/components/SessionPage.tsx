@@ -67,6 +67,22 @@ export function SessionPage() {
     navigate(target, { replace: true });
   };
 
+  const goBackOrHome = () => {
+    // React Router stores {idx, key} in history.state. idx is
+    // the stack position — stable across replace navigations
+    // (tab switches), unlike location.key which changes on
+    // every replace. NaN > 0 is false (safe for hash URLs).
+    const state = window.history.state as { idx?: number } | null;
+    const canGoBack = typeof state?.idx === "number"
+      ? state.idx > 0
+      : location.key !== "default";
+    if (canGoBack) {
+      navigate(-1);
+    } else {
+      navigate("/", { replace: true });
+    }
+  };
+
   const gotScrollbackRef = useRef(false);
 
   // Bridge refs: useTerminal and useWebSocket have a circular dependency
@@ -287,21 +303,7 @@ export function SessionPage() {
       {/* Header */}
       <header className="flex items-center gap-2 px-3 py-2 border-b border-neutral-800 shrink-0">
         <button
-          onClick={() => {
-            // React Router stores {idx, key} in history.state. idx is
-            // the stack position — stable across replace navigations
-            // (tab switches), unlike location.key which changes on
-            // every replace. NaN > 0 is false (safe for hash URLs).
-            const state = window.history.state as { idx?: number } | null;
-            const canGoBack = typeof state?.idx === "number"
-              ? state.idx > 0
-              : location.key !== "default";
-            if (canGoBack) {
-              navigate(-1);
-            } else {
-              navigate("/", { replace: true });
-            }
-          }}
+          onClick={goBackOrHome}
           className="text-neutral-400 hover:text-neutral-200"
         >
           &larr;
@@ -504,14 +506,7 @@ export function SessionPage() {
             New Session
           </button>
           <button
-            onClick={() => {
-              const state = window.history.state as { idx?: number } | null;
-              if (state && typeof state.idx === "number" && state.idx > 0) {
-                navigate(-1);
-              } else {
-                navigate("/", { replace: true });
-              }
-            }}
+            onClick={goBackOrHome}
             className="w-full py-2.5 text-sm text-neutral-500 hover:text-neutral-400"
           >
             Back

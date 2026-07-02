@@ -326,14 +326,26 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	// PATCHes without a fresh GET.
 	if etag != "" {
 		w.Header().Set("ETag", quoteETag(etag))
-	} else if st := s.agents.Store(); st != nil && result != nil {
-		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
-			w.Header().Set("ETag", quoteETag(rec.ETag))
-		}
-		cancel()
+	} else if result != nil {
+		s.echoGroupDMETag(w, r, id)
 	}
 	writeJSONResponse(w, http.StatusOK, result)
+}
+
+// echoGroupDMETag looks up the group's current ETag and stamps it on
+// the response so a caller can chain the next mutation without a fresh
+// GET. Best-effort: a missing store, a dissolved group, or a lookup
+// error simply leaves no ETag header — the mutation already committed.
+func (s *Server) echoGroupDMETag(w http.ResponseWriter, r *http.Request, id string) {
+	st := s.agents.Store()
+	if st == nil {
+		return
+	}
+	dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
+		w.Header().Set("ETag", quoteETag(rec.ETag))
+	}
 }
 
 func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
@@ -345,17 +357,9 @@ func (s *Server) handleDeleteGroupDM(w http.ResponseWriter, r *http.Request) {
 	// fan-out (notify=true), so a stale-view caller deleting a group
 	// that has just been renamed should get 412, not silently delete
 	// the renamed row. `*` rejected for the same reason as PATCH.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on DELETE /groupdms/{id}; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on DELETE /groupdms/{id}; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -562,17 +566,9 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 
 	// If-Match optional. AddMember mutates the membership list (part
 	// of the group row). `*` rejected as elsewhere.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on POST /groupdms/{id}/members; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on POST /groupdms/{id}/members; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -594,13 +590,7 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 	// Echo the new etag so the caller can chain follow-up PATCH /
 	// AddMember / LeaveGroup against the just-bumped row without an
 	// intervening GET.
-	if st := s.agents.Store(); st != nil {
-		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
-			w.Header().Set("ETag", quoteETag(rec.ETag))
-		}
-		cancel()
-	}
+	s.echoGroupDMETag(w, r, id)
 	writeJSONResponse(w, http.StatusOK, g)
 }
 
@@ -699,12 +689,8 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	if st := s.agents.Store(); st != nil && g != nil {
-		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
-			w.Header().Set("ETag", quoteETag(rec.ETag))
-		}
-		cancel()
+	if g != nil {
+		s.echoGroupDMETag(w, r, id)
 	}
 	writeJSONResponse(w, http.StatusOK, g)
 }
@@ -725,17 +711,9 @@ func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	// If-Match optional. LeaveGroup bumps the group etag (member
 	// list change). `*` rejected — the membership row must already
 	// exist (we 404 below otherwise).
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on DELETE /groupdms/{id}/members/{agentId}; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on DELETE /groupdms/{id}/members/{agentId}; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -757,13 +735,7 @@ func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	// echo the new etag for the caller's chain. If LeaveGroup
 	// dissolved the group (last member out), the row is gone and
 	// GetGroupDM returns ErrNotFound — silently skipped.
-	if st := s.agents.Store(); st != nil {
-		dbCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		if rec, err := st.GetGroupDM(dbCtx, id); err == nil {
-			w.Header().Set("ETag", quoteETag(rec.ETag))
-		}
-		cancel()
-	}
+	s.echoGroupDMETag(w, r, id)
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

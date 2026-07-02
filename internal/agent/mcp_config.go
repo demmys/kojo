@@ -61,4 +61,3 @@ func mcpConfigJSON(servers map[string]mcpServerEntry) (string, error) {
 	}
 	return string(data), nil
 }
-

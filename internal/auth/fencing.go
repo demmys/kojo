@@ -175,14 +175,14 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 //
 //   - /api/v1/agents/{p.AgentID}/...  (per-agent writes)
 //   - /api/v1/groupdms                (creation — fenced because
-//                                       the creating agent's row
-//                                       is what mutates)
+//     the creating agent's row
+//     is what mutates)
 //   - /api/v1/groupdms/{id}/...       (membership / messages —
-//                                       fenced against the
-//                                       calling agent's lock,
-//                                       since the agent's
-//                                       holder peer is what
-//                                       changes on a switch)
+//     fenced against the
+//     calling agent's lock,
+//     since the agent's
+//     holder peer is what
+//     changes on a switch)
 //
 // Anything else (cron-paused, directory, /info, /ws) passes
 // through; those either don't write or have their own auth

@@ -69,243 +69,239 @@ import (
 // design doc §2.3) but the row remembers which peer last advanced it.
 type externalChatCursorsImporter struct{}
 
-func (externalChatCursorsImporter) Domain() string { return "external_chat_cursors" }
+const externalChatCursorsDomain = "external_chat_cursors"
+
+func (externalChatCursorsImporter) Domain() string { return externalChatCursorsDomain }
 
 func (externalChatCursorsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "external_chat_cursors"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "external_chat_cursors")
-
-	srcPaths, err := collectExternalChatCursorsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum external_chat_cursors sources: %w", err)
-	}
-
-	// Build the composite-id-safe agent filter. agentsImporter itself
-	// does NOT reject ':' in agent ids today (see agents.go:108 — only
-	// id+name presence is checked), so this set can be a strict *subset*
-	// of what landed in v1's agents table. The narrower filter is on
-	// purpose: the v1 cursor primary key is composite ("<agent>:<source>:
-	// <channel>"), and accepting an agent id with ':' would let two
-	// distinct (agent, source, channel) tuples collide on the composite.
-	// Missing agents.json (os.ErrNotExist) is tolerated and returns an
-	// empty set, which downgrades every chat_history dir to "orphan agent"
-	// and yields markImported(0). Malformed JSON is fatal: we'd rather
-	// surface the corruption than silently drop every cursor.
-	validAgents, err := loadValidV0AgentIDs(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("load valid agent ids: %w", err)
-	}
-
-	base := agentsBaseDir(opts.V0Dir)
-	entries, err := readDirV0(opts.V0Dir, base)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return markImported(ctx, st, "external_chat_cursors", 0, checksum)
+	return runDomain(ctx, st, externalChatCursorsDomain, func(logger *slog.Logger) (int, string, error) {
+		srcPaths, err := collectExternalChatCursorsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		return fmt.Errorf("readdir agents: %w", err)
-	}
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum external_chat_cursors sources: %w", err)
+		}
 
-	// importBatchSize bounds memory and the size of the SQL transaction
-	// when an operator has accumulated tens of thousands of chat_history
-	// JSONL files (1 agent × N channels × M threads can balloon quickly).
-	// Each batch is its own short transaction; ON CONFLICT DO NOTHING in
-	// BulkInsertExternalChatCursors keeps the operation idempotent across
-	// batch boundaries, so a crash mid-domain converges to the same final
-	// state on the next --migrate-resume run.
-	const importBatchSize = 1000
+		// Build the composite-id-safe agent filter. agentsImporter itself
+		// does NOT reject ':' in agent ids today (see agents.go:108 — only
+		// id+name presence is checked), so this set can be a strict *subset*
+		// of what landed in v1's agents table. The narrower filter is on
+		// purpose: the v1 cursor primary key is composite ("<agent>:<source>:
+		// <channel>"), and accepting an agent id with ':' would let two
+		// distinct (agent, source, channel) tuples collide on the composite.
+		// Missing agents.json (os.ErrNotExist) is tolerated and returns an
+		// empty set, which downgrades every chat_history dir to "orphan agent"
+		// and yields markImported(0). Malformed JSON is fatal: we'd rather
+		// surface the corruption than silently drop every cursor.
+		validAgents, err := loadValidV0AgentIDs(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("load valid agent ids: %w", err)
+		}
 
-	flush := func(batch []*store.ExternalChatCursorRecord) (int, error) {
-		if len(batch) == 0 {
-			return 0, nil
-		}
-		return st.BulkInsertExternalChatCursors(ctx, batch, store.ExternalChatCursorInsertOptions{PeerID: opts.HomePeer})
-	}
-
-	var batch []*store.ExternalChatCursorRecord
-	// freshlyInserted counts rows BulkInsert reported as newly-inserted
-	// across all batches; useful for the post-run log line. importable
-	// counts every candidate that reached a batch (including those that
-	// already existed and were skipped via ON CONFLICT) — that is the
-	// "rows in v1 that this domain owns" total, which is what
-	// migration_status.imported_count should reflect even after a crash-
-	// resume cycle re-walks the v0 tree and finds every row already
-	// committed. Other single-batch importers collapse these two counts
-	// because their bulk call is atomic; this importer commits in chunks,
-	// so reporting freshlyInserted alone would under-
-	// count after a partial-progress crash.
-	freshlyInserted := 0
-	importable := 0
-	skipped := 0
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "groupdms" {
-			continue
-		}
-		agentID := e.Name()
-		if !validAgents[agentID] {
-			// Orphan agent dir on disk that agentsImporter wouldn't have
-			// inserted. Skip silently (the disk-vs-manifest mismatch is
-			// already surfaced in the agents domain checksum).
-			continue
-		}
-		chatRoot := filepath.Join(base, agentID, "chat_history")
-		if _, err := os.Lstat(chatRoot); err != nil {
-			// No chat_history dir for this agent — common case.
-			// Tolerate only os.ErrNotExist; surface EACCES / IO so a
-			// permission glitch doesn't silently drop every cursor for
-			// the affected agent.
-			if errors.Is(err, fs.ErrNotExist) {
-				continue
-			}
-			return fmt.Errorf("lstat chat_history %s: %w", chatRoot, err)
-		}
-		platforms, err := readDirV0(opts.V0Dir, chatRoot)
+		base := agentsBaseDir(opts.V0Dir)
+		entries, err := readDirV0(opts.V0Dir, base)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
-				continue
+				return 0, checksum, nil
 			}
-			return fmt.Errorf("readdir chat_history %s: %w", chatRoot, err)
+			return 0, "", fmt.Errorf("readdir agents: %w", err)
 		}
-		for _, p := range platforms {
-			if !p.IsDir() {
+
+		// importBatchSize bounds memory and the size of the SQL transaction
+		// when an operator has accumulated tens of thousands of chat_history
+		// JSONL files (1 agent × N channels × M threads can balloon quickly).
+		// Each batch is its own short transaction; ON CONFLICT DO NOTHING in
+		// BulkInsertExternalChatCursors keeps the operation idempotent across
+		// batch boundaries, so a crash mid-domain converges to the same final
+		// state on the next --migrate-resume run.
+		const importBatchSize = 1000
+
+		flush := func(batch []*store.ExternalChatCursorRecord) (int, error) {
+			if len(batch) == 0 {
+				return 0, nil
+			}
+			return st.BulkInsertExternalChatCursors(ctx, batch, store.ExternalChatCursorInsertOptions{PeerID: opts.HomePeer})
+		}
+
+		var batch []*store.ExternalChatCursorRecord
+		// freshlyInserted counts rows BulkInsert reported as newly-inserted
+		// across all batches; useful for the post-run log line. importable
+		// counts every candidate that reached a batch (including those that
+		// already existed and were skipped via ON CONFLICT) — that is the
+		// "rows in v1 that this domain owns" total, which is what
+		// migration_status.imported_count should reflect even after a crash-
+		// resume cycle re-walks the v0 tree and finds every row already
+		// committed. Other single-batch importers collapse these two counts
+		// because their bulk call is atomic; this importer commits in chunks,
+		// so reporting freshlyInserted alone would under-
+		// count after a partial-progress crash.
+		freshlyInserted := 0
+		importable := 0
+		skipped := 0
+		for _, e := range entries {
+			if !e.IsDir() || e.Name() == "groupdms" {
 				continue
 			}
-			platform := p.Name()
-			if strings.ContainsRune(platform, ':') {
-				logger.Warn("external_chat_cursors: skipping platform dir with ':' in name",
-					"agent_id", agentID, "platform", platform)
-				skipped++
+			agentID := e.Name()
+			if !validAgents[agentID] {
+				// Orphan agent dir on disk that agentsImporter wouldn't have
+				// inserted. Skip silently (the disk-vs-manifest mismatch is
+				// already surfaced in the agents domain checksum).
 				continue
 			}
-			platformDir := filepath.Join(chatRoot, platform)
-			channels, err := readDirV0(opts.V0Dir, platformDir)
+			chatRoot := filepath.Join(base, agentID, "chat_history")
+			if _, err := os.Lstat(chatRoot); err != nil {
+				// No chat_history dir for this agent — common case.
+				// Tolerate only os.ErrNotExist; surface EACCES / IO so a
+				// permission glitch doesn't silently drop every cursor for
+				// the affected agent.
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				return 0, "", fmt.Errorf("lstat chat_history %s: %w", chatRoot, err)
+			}
+			platforms, err := readDirV0(opts.V0Dir, chatRoot)
 			if err != nil {
 				if errors.Is(err, fs.ErrNotExist) {
 					continue
 				}
-				return fmt.Errorf("readdir %s: %w", platformDir, err)
+				return 0, "", fmt.Errorf("readdir chat_history %s: %w", chatRoot, err)
 			}
-			for _, c := range channels {
-				if !c.IsDir() {
+			for _, p := range platforms {
+				if !p.IsDir() {
 					continue
 				}
-				channelID := c.Name()
-				if strings.ContainsRune(channelID, ':') {
-					logger.Warn("external_chat_cursors: skipping channel dir with ':' in name",
-						"agent_id", agentID, "platform", platform, "channel", channelID)
+				platform := p.Name()
+				if strings.ContainsRune(platform, ':') {
+					logger.Warn("external_chat_cursors: skipping platform dir with ':' in name",
+						"agent_id", agentID, "platform", platform)
 					skipped++
 					continue
 				}
-				channelDir := filepath.Join(platformDir, channelID)
-				files, err := readDirV0(opts.V0Dir, channelDir)
+				platformDir := filepath.Join(chatRoot, platform)
+				channels, err := readDirV0(opts.V0Dir, platformDir)
 				if err != nil {
 					if errors.Is(err, fs.ErrNotExist) {
 						continue
 					}
-					return fmt.Errorf("readdir %s: %w", channelDir, err)
+					return 0, "", fmt.Errorf("readdir %s: %w", platformDir, err)
 				}
-				for _, f := range files {
-					if f.IsDir() {
+				for _, c := range channels {
+					if !c.IsDir() {
 						continue
 					}
-					name := f.Name()
-					if !strings.HasSuffix(name, ".jsonl") {
-						continue
-					}
-					threadID := strings.TrimSuffix(name, ".jsonl")
-					// _channel.jsonl is the channel-level rollup that v0
-					// fetches via the sliding-window FetchChannelHistory
-					// — that path overwrites the file every poll and
-					// does NOT consult LastPlatformTS as a delta cursor.
-					// Importing the file's last ts as a v1 cursor would
-					// invite a future v1 channel poll to mistake a
-					// non-cursor file for a delta-fetch starting point
-					// and silently drop messages between last-real-ts
-					// and now. Skip it: thread JSONLs (which DO use
-					// cursor-based delta fetch in v0's FetchThreadHistory)
-					// are still imported below.
-					if threadID == "_channel" {
-						continue
-					}
-					if strings.ContainsRune(threadID, ':') {
-						logger.Warn("external_chat_cursors: skipping thread file with ':' in name",
-							"agent_id", agentID, "platform", platform,
-							"channel", channelID, "thread", threadID)
+					channelID := c.Name()
+					if strings.ContainsRune(channelID, ':') {
+						logger.Warn("external_chat_cursors: skipping channel dir with ':' in name",
+							"agent_id", agentID, "platform", platform, "channel", channelID)
 						skipped++
 						continue
 					}
-					filePath := filepath.Join(channelDir, name)
-					cursor, err := lastPlatformTSFromV0(opts.V0Dir, filePath)
+					channelDir := filepath.Join(platformDir, channelID)
+					files, err := readDirV0(opts.V0Dir, channelDir)
 					if err != nil {
-						// Read failure: log and skip this file. The
-						// scan-vs-import gap note in domainChecksum
-						// applies — the file IS in the checksum, but
-						// the row doesn't get written, which is exactly
-						// what we want for unreadable inputs.
-						logger.Warn("external_chat_cursors: skipping unreadable file",
-							"path", filePath, "err", err)
-						skipped++
-						continue
-					}
-					if cursor == "" {
-						// No real platform-stamped messages — only
-						// bot/incomplete entries, or empty file. Skip:
-						// re-importing an empty cursor would still be
-						// an empty cursor, and the v1 runtime's first
-						// poll will full-fetch as if nothing was saved.
-						continue
-					}
-					mtime := fileMTimeMillis(filePath)
-
-					agentIDLocal := agentID
-					channelIDLocal := channelID
-					batch = append(batch, &store.ExternalChatCursorRecord{
-						ID:        agentID + ":" + platform + ":" + channelID + ":" + threadID,
-						Source:    platform,
-						AgentID:   &agentIDLocal,
-						ChannelID: &channelIDLocal,
-						Cursor:    cursor,
-						CreatedAt: mtime,
-						UpdatedAt: mtime,
-					})
-					importable++
-					if len(batch) >= importBatchSize {
-						n, err := flush(batch)
-						if err != nil {
-							return fmt.Errorf("bulk insert external_chat_cursors: %w", err)
+						if errors.Is(err, fs.ErrNotExist) {
+							continue
 						}
-						freshlyInserted += n
-						batch = batch[:0]
+						return 0, "", fmt.Errorf("readdir %s: %w", channelDir, err)
+					}
+					for _, f := range files {
+						if f.IsDir() {
+							continue
+						}
+						name := f.Name()
+						if !strings.HasSuffix(name, ".jsonl") {
+							continue
+						}
+						threadID := strings.TrimSuffix(name, ".jsonl")
+						// _channel.jsonl is the channel-level rollup that v0
+						// fetches via the sliding-window FetchChannelHistory
+						// — that path overwrites the file every poll and
+						// does NOT consult LastPlatformTS as a delta cursor.
+						// Importing the file's last ts as a v1 cursor would
+						// invite a future v1 channel poll to mistake a
+						// non-cursor file for a delta-fetch starting point
+						// and silently drop messages between last-real-ts
+						// and now. Skip it: thread JSONLs (which DO use
+						// cursor-based delta fetch in v0's FetchThreadHistory)
+						// are still imported below.
+						if threadID == "_channel" {
+							continue
+						}
+						if strings.ContainsRune(threadID, ':') {
+							logger.Warn("external_chat_cursors: skipping thread file with ':' in name",
+								"agent_id", agentID, "platform", platform,
+								"channel", channelID, "thread", threadID)
+							skipped++
+							continue
+						}
+						filePath := filepath.Join(channelDir, name)
+						cursor, err := lastPlatformTSFromV0(opts.V0Dir, filePath)
+						if err != nil {
+							// Read failure: log and skip this file. The
+							// scan-vs-import gap note in domainChecksum
+							// applies — the file IS in the checksum, but
+							// the row doesn't get written, which is exactly
+							// what we want for unreadable inputs.
+							logger.Warn("external_chat_cursors: skipping unreadable file",
+								"path", filePath, "err", err)
+							skipped++
+							continue
+						}
+						if cursor == "" {
+							// No real platform-stamped messages — only
+							// bot/incomplete entries, or empty file. Skip:
+							// re-importing an empty cursor would still be
+							// an empty cursor, and the v1 runtime's first
+							// poll will full-fetch as if nothing was saved.
+							continue
+						}
+						mtime := fileMTimeMillis(filePath)
+
+						agentIDLocal := agentID
+						channelIDLocal := channelID
+						batch = append(batch, &store.ExternalChatCursorRecord{
+							ID:        agentID + ":" + platform + ":" + channelID + ":" + threadID,
+							Source:    platform,
+							AgentID:   &agentIDLocal,
+							ChannelID: &channelIDLocal,
+							Cursor:    cursor,
+							CreatedAt: mtime,
+							UpdatedAt: mtime,
+						})
+						importable++
+						if len(batch) >= importBatchSize {
+							n, err := flush(batch)
+							if err != nil {
+								return 0, "", fmt.Errorf("bulk insert external_chat_cursors: %w", err)
+							}
+							freshlyInserted += n
+							batch = batch[:0]
+						}
 					}
 				}
 			}
 		}
-	}
 
-	// Final flush for any remainder. Empty batch is a no-op.
-	if len(batch) > 0 {
-		n, err := flush(batch)
-		if err != nil {
-			return fmt.Errorf("bulk insert external_chat_cursors: %w", err)
+		// Final flush for any remainder. Empty batch is a no-op.
+		if len(batch) > 0 {
+			n, err := flush(batch)
+			if err != nil {
+				return 0, "", fmt.Errorf("bulk insert external_chat_cursors: %w", err)
+			}
+			freshlyInserted += n
 		}
-		freshlyInserted += n
-	}
 
-	if skipped > 0 || freshlyInserted != importable {
-		logger.Info("external_chat_cursors: import complete",
-			"importable", importable,
-			"freshly_inserted", freshlyInserted,
-			"skipped", skipped)
-	}
-	return markImported(ctx, st, "external_chat_cursors", importable, checksum)
+		if skipped > 0 || freshlyInserted != importable {
+			logger.Info("external_chat_cursors: import complete",
+				"importable", importable,
+				"freshly_inserted", freshlyInserted,
+				"skipped", skipped)
+		}
+		return importable, checksum, nil
+	})
 }
 
 // lastPlatformTSFromV0 mirrors chathistory.LastPlatformTS but routes the
@@ -413,7 +409,7 @@ func loadValidV0AgentIDs(v0Dir string) (map[string]bool, error) {
 	if len(data) == 0 {
 		// Zero-byte agents.json on a disk that *has* the file is a
 		// truncation signal, not a v0 contract.
-		return nil, fmt.Errorf("agents.json is empty")
+		return nil, errors.New("agents.json is empty")
 	}
 	var raw []map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {

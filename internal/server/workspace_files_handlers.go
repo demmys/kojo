@@ -1,9 +1,7 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -106,37 +104,20 @@ func (s *Server) handlePutWorkspaceFile(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only PUT their own workspace file")
 		return
 	}
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request", "If-Match wildcard is not supported for workspace files")
-		return
-	}
-	// Strict-mode gate (KOJO_REQUIRE_IF_MATCH=1): reject the PUT when the
-	// caller didn't send an If-Match. Matches the persona / agent PATCH
-	// handlers — without this gate the workspace-file endpoints would
-	// silently bypass the strict-mode contract every other mutating
-	// endpoint enforces.
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, workspaceFileBodyCap)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds 1 MiB cap")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+	// Shared preamble covers both the strict-mode gate
+	// (KOJO_REQUIRE_IF_MATCH=1 — matches the persona / agent PATCH
+	// handlers; without it the workspace-file endpoints would silently
+	// bypass the strict-mode contract every other mutating endpoint
+	// enforces) and the wildcard reject. The pre-refactor code checked
+	// the wildcard before the gate; the orders are observably identical
+	// because a wildcard request always carries If-Match, which
+	// satisfies the gate.
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest, "If-Match wildcard is not supported for workspace files")
+	if !ok {
 		return
 	}
 	var req workspaceFilePutRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+	if !readCappedJSON(w, r, workspaceFileBodyCap, "request body exceeds 1 MiB cap", "invalid JSON body", &req) {
 		return
 	}
 	rec, err := agent.WriteWorkspaceFile(r.Context(), s.agents.Store(), id, kind, req.Content, ifMatch)

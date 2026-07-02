@@ -13,8 +13,8 @@ func TestValidatePath(t *testing.T) {
 	tests := []struct {
 		name      string
 		in        string
-		wantClean string  // empty when wantErr is non-nil
-		wantErr   error   // nil means "must succeed and return wantClean"
+		wantClean string // empty when wantErr is non-nil
+		wantErr   error  // nil means "must succeed and return wantClean"
 	}{
 		// Happy paths
 		{name: "single segment", in: "a", wantClean: "a"},

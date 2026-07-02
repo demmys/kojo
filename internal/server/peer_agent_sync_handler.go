@@ -78,6 +78,20 @@ func itoa(i int) string {
 	return string(buf[pos:])
 }
 
+// decodeSyncB64 decodes one base64 payload from the pre-DB decode
+// phase of applyPeerAgentSync. On malformed input it writes the shared
+// 400 "<label>[<i>]: invalid base64: <err>" body and returns ok=false
+// so the caller can bail with zero database side effects.
+func decodeSyncB64(w http.ResponseWriter, label string, i int, b64 string) ([]byte, bool) {
+	body, derr := base64.StdEncoding.DecodeString(b64)
+	if derr != nil {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			label+"["+itoa(i)+"]: invalid base64: "+derr.Error())
+		return nil, false
+	}
+	return body, true
+}
+
 // peerAgentSyncMaxBody caps the DECOMPRESSED payload size after
 // optional Content-Encoding: gzip handling. The wire size is
 // bounded separately by peerAgentSyncMaxWireBody; senders gzip
@@ -276,15 +290,11 @@ type peerAgentSyncResponse struct {
 }
 
 func (s *Server) handlePeerAgentSync(w http.ResponseWriter, r *http.Request) {
-	p := auth.FromContext(r.Context())
-	if !p.IsPeer() && !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden",
-			"peer or owner principal required")
+	p, ok := requirePeerOrOwner(w, r)
+	if !ok {
 		return
 	}
-	if s.agents == nil || s.agents.Store() == nil {
-		writeError(w, http.StatusServiceUnavailable, "unavailable",
-			"agent store not configured")
+	if _, ok := s.requireAgentStore(w, "agent store not configured"); !ok {
 		return
 	}
 
@@ -403,7 +413,7 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 			"source_device_id required")
 		return false
 	}
-	if p.IsPeer() && p.PeerID != req.SourceDeviceID {
+	if !verifySignerIsSource(p, req.SourceDeviceID) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return false
@@ -494,10 +504,8 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	if len(req.ClaudeSessions) > 0 {
 		decodedSessions = make([]agent.ClaudeSessionFile, 0, len(req.ClaudeSessions))
 		for i, cs := range req.ClaudeSessions {
-			body, derr := base64.StdEncoding.DecodeString(cs.ContentB64)
-			if derr != nil {
-				writeError(w, http.StatusBadRequest, "bad_request",
-					"claude_sessions["+itoa(i)+"]: invalid base64: "+derr.Error())
+			body, ok := decodeSyncB64(w, "claude_sessions", i, cs.ContentB64)
+			if !ok {
 				return
 			}
 			decodedSessions = append(decodedSessions, agent.ClaudeSessionFile{
@@ -516,10 +524,8 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			Files:     make([]agent.GrokSessionFile, 0, len(req.GrokSession.Files)),
 		}
 		for i, gf := range req.GrokSession.Files {
-			body, derr := base64.StdEncoding.DecodeString(gf.ContentB64)
-			if derr != nil {
-				writeError(w, http.StatusBadRequest, "bad_request",
-					"grok_session.files["+itoa(i)+"]: invalid base64: "+derr.Error())
+			body, ok := decodeSyncB64(w, "grok_session.files", i, gf.ContentB64)
+			if !ok {
 				return
 			}
 			decodedGrok.Files = append(decodedGrok.Files, agent.GrokSessionFile{
@@ -537,10 +543,8 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			Threads: make([]agent.CodexThreadTransfer, 0, len(req.CodexSession.Threads)),
 		}
 		for i, ct := range req.CodexSession.Threads {
-			body, derr := base64.StdEncoding.DecodeString(ct.RolloutContentB64)
-			if derr != nil {
-				writeError(w, http.StatusBadRequest, "bad_request",
-					"codex_session.threads["+itoa(i)+"]: invalid base64: "+derr.Error())
+			body, ok := decodeSyncB64(w, "codex_session.threads", i, ct.RolloutContentB64)
+			if !ok {
 				return
 			}
 			decodedCodex.Threads = append(decodedCodex.Threads, agent.CodexThreadTransfer{
@@ -844,6 +848,5 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		}
 	}
 
-	_ = errors.Unwrap // keep import for future error-mapping work
 	writeJSONResponse(w, http.StatusOK, peerAgentSyncResponse{AgentID: req.Agent.ID})
 }

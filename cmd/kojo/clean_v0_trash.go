@@ -65,7 +65,7 @@ func planV0TrashCleanup(minAgeDays int, logger *slog.Logger) (*v0TrashCleanPlan,
 	if minAgeDays < 0 {
 		minAgeDays = 0
 	}
-	cutoff := time.Now().UTC().Add(-time.Duration(minAgeDays) * 24 * time.Hour)
+	cutoff := cutoffTime(minAgeDays)
 
 	plan := &v0TrashCleanPlan{}
 	entries, err := os.ReadDir(parent)
@@ -133,10 +133,7 @@ func planV0TrashCleanup(minAgeDays int, logger *slog.Logger) (*v0TrashCleanPlan,
 // the snapshot/legacy/v0 targets use. apply=false produces "would
 // remove"; apply=true produces "removing".
 func printV0TrashCleanPlan(plan *v0TrashCleanPlan, apply bool) {
-	verb := "would remove"
-	if apply {
-		verb = "removing"
-	}
+	verb := cleanVerb(apply)
 	if n := len(plan.Purge); n > 0 {
 		fmt.Fprintf(os.Stderr, "%s %d v0 trash dir(s):\n", verb, n)
 		for _, e := range plan.Purge {

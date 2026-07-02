@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useNavigate } from "react-router";
 import { agentApi, type AgentInfo, type Credential, type OTPEntry } from "../../lib/agentApi";
+import { errMsg } from "../../lib/utils";
 
 function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
   const [code, setCode] = useState<string | null>(null);
@@ -105,7 +106,7 @@ function QRImportModal({
         setEntries(result);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setLoading(false);
     }
@@ -123,7 +124,7 @@ function QRImportModal({
         setEntries(result);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setLoading(false);
     }
@@ -281,7 +282,7 @@ function CredentialEdit({
       const updated = await agentApi.credentials.update(agentId, credential.id, data);
       onSave(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setSaving(false);
     }
@@ -405,7 +406,7 @@ export function AgentCredentials() {
           setCredentials(credsRes.value);
         } else {
           const err = credsRes.reason;
-          setListError(err instanceof Error ? err.message : String(err));
+          setListError(errMsg(err));
         }
         if (agentRes.status === "fulfilled") {
           setAgent(agentRes.value);
@@ -415,8 +416,7 @@ export function AgentCredentials() {
           // to enabled, which is wrong if a switch is actually running).
           const err = agentRes.reason;
           setListError(
-            "agent record fetch failed: " +
-              (err instanceof Error ? err.message : String(err)),
+            "agent record fetch failed: " + errMsg(err),
           );
         }
         setLoading(false);
@@ -502,7 +502,7 @@ export function AgentCredentials() {
       setAddTotpPeriod(0);
       setShowForm(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     } finally {
       setAdding(false);
     }
@@ -514,7 +514,7 @@ export function AgentCredentials() {
       await agentApi.credentials.delete(id, credId);
       setCredentials((prev) => prev.filter((c) => c.id !== credId));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     }
   };
 
@@ -526,7 +526,7 @@ export function AgentCredentials() {
       setCopied(credId);
       setTimeout(() => setCopied(null), 2000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(errMsg(err));
     }
   };
 

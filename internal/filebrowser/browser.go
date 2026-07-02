@@ -108,16 +108,8 @@ func (b *Browser) List(dir string, hidden bool) (*ListResult, error) {
 		dir = home
 	}
 
-	dir, err := expandHome(dir)
+	dir, err := b.resolveValidated(dir)
 	if err != nil {
-		return nil, err
-	}
-	dir, err = filepath.Abs(dir)
-	if err != nil {
-		return nil, fmt.Errorf("invalid path: %w", err)
-	}
-
-	if err := b.validatePath(dir); err != nil {
 		return nil, err
 	}
 
@@ -170,16 +162,8 @@ type FileView struct {
 }
 
 func (b *Browser) View(path string) (*FileView, error) {
-	path, err := expandHome(path)
+	path, err := b.resolveValidated(path)
 	if err != nil {
-		return nil, err
-	}
-	path, err = filepath.Abs(path)
-	if err != nil {
-		return nil, fmt.Errorf("invalid path: %w", err)
-	}
-
-	if err := b.validatePath(path); err != nil {
 		return nil, err
 	}
 
@@ -308,15 +292,28 @@ func (b *Browser) ServeThumb(w http.ResponseWriter, r *http.Request, path string
 
 // ValidatePath checks that the given path is under an allowed root directory.
 func (b *Browser) ValidatePath(path string) error {
+	_, err := b.resolveValidated(path)
+	return err
+}
+
+// resolveValidated expands a leading ~, makes the path absolute, and checks
+// it against the allowed roots (home / temp), returning the resolved
+// absolute path. It is the shared preamble for the browser's read paths;
+// validatePath (the containment check) and its error values are unchanged,
+// so callers observe identical errors to the inline form.
+func (b *Browser) resolveValidated(path string) (string, error) {
 	path, err := expandHome(path)
 	if err != nil {
-		return err
+		return "", err
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Errorf("invalid path: %w", err)
+		return "", fmt.Errorf("invalid path: %w", err)
 	}
-	return b.validatePath(absPath)
+	if err := b.validatePath(absPath); err != nil {
+		return "", err
+	}
+	return absPath, nil
 }
 
 func (b *Browser) validatePath(path string) error {

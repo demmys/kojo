@@ -7,7 +7,8 @@ package tts
 //
 // Trait source: https://ai.google.dev/gemini-api/docs/speech-generation
 // Gender source: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types
-//   (the same voice names appear under Chirp3-HD with ssmlGender annotated)
+//
+//	(the same voice names appear under Chirp3-HD with ssmlGender annotated)
 type VoiceInfo struct {
 	Name   string `json:"name"`
 	Trait  string `json:"trait"`

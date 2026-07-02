@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/configdir"
+	"github.com/loppo-llc/kojo/internal/fsyncdir"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -52,9 +53,9 @@ const (
 
 // Options configures Run.
 type Options struct {
-	V0Dir            string
-	V1Dir            string
-	MigratorVersion  string        // e.g. "v1.0.0"; written into complete.json
+	V0Dir             string
+	V1Dir             string
+	MigratorVersion   string // e.g. "v1.0.0"; written into complete.json
 	MtimeSafetyWindow time.Duration
 
 	// SkipMtimeCheck, when true, bypasses the v0 mtime safety window
@@ -129,7 +130,6 @@ type CompleteFile struct {
 type Result struct {
 	V0Manifest      string
 	DomainsImported []string
-	Skipped         []string
 	Warnings        []string
 	CompletedAt     time.Time
 }
@@ -310,7 +310,6 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		return nil, ErrNoImporters
 	}
 	imported := []string{}
-	skipped := []string{}
 	for _, im := range imp {
 		if err := im.Run(ctx, st, opts); err != nil {
 			return nil, fmt.Errorf("migrate: domain %q: %w", im.Domain(), err)
@@ -367,7 +366,6 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 	return &Result{
 		V0Manifest:      manifest,
 		DomainsImported: imported,
-		Skipped:         skipped,
 		Warnings:        warnings,
 		CompletedAt:     opts.Now(),
 	}, nil
@@ -377,17 +375,17 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 // conflict with re-running the importer. The acceptable set is:
 //   - migration_in_progress.lock  (stale state from prior crash)
 //   - kojo.lock                   (the runtime advisory lock just acquired
-//                                  by Run, or left behind by a prior Run)
+//     by Run, or left behind by a prior Run)
 //   - kojo.db / kojo.db-wal / kojo.db-shm  (partial schema/import)
 //   - .migrate-* atomic-write temp files (from a crashed atomicWrite)
 //   - global / local / machine    (blob scope subtrees published by
-//                                  the blobs importer; the importer's
-//                                  own resume logic reconciles partial
-//                                  publishes via Verify+Head)
+//     the blobs importer; the importer's
+//     own resume logic reconciles partial
+//     publishes via Verify+Head)
 //   - credentials.{db,db-wal,db-shm,key}  (encrypted user secret store
-//                                  owned by internal/agent/credential.go;
-//                                  allowed but NOT a sentinel — see the
-//                                  isCredentialFile gate below)
+//     owned by internal/agent/credential.go;
+//     allowed but NOT a sentinel — see the
+//     isCredentialFile gate below)
 //
 // Scope dirs / `auth/` / credentials.* alone (no kojo.db / no
 // migration_in_progress.lock) do NOT count as resumable — those
@@ -868,7 +866,7 @@ func atomicWrite(path string, body []byte) error {
 		os.Remove(tmpName)
 		return err
 	}
-	return fsyncDir(dir)
+	return fsyncdir.DirStrict(dir)
 }
 
 // readOnlyOpen is the only file-open primitive migration code is allowed to
@@ -877,18 +875,6 @@ func atomicWrite(path string, body []byte) error {
 // rationale.
 func readOnlyOpen(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY, 0)
-}
-
-// readAllRO reads the entire content of a v0 file under O_RDONLY. Wraps
-// readOnlyOpen so callers can stay one-liners while still going through the
-// guard.
-func readAllRO(path string) ([]byte, error) {
-	f, err := readOnlyOpen(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(f)
 }
 
 // v0Locked reports whether v0's `kojo.lock` is currently held by another
@@ -928,4 +914,3 @@ func walkRecentMtime(root string, now time.Time, window time.Duration) (bool, st
 	}
 	return false, "", err
 }
-

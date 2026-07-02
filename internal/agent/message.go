@@ -108,3 +108,15 @@ func newAssistantMessage() *Message {
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
 }
+
+// assembleAssistantMessage builds a completed assistant Message from
+// accumulated stream data. Backends pass nil for fields they never
+// populate (grok has no Usage; llama.cpp has no ToolUses).
+func assembleAssistantMessage(content, thinking string, toolUses []ToolUse, usage *Usage) *Message {
+	msg := newAssistantMessage()
+	msg.Content = content
+	msg.Thinking = thinking
+	msg.ToolUses = toolUses
+	msg.Usage = usage
+	return msg
+}

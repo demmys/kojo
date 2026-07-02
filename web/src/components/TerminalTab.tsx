@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type SessionInfo } from "../lib/api";
-import { toBase64, base64ToBytes, restoreScrollback, wsUrl } from "../lib/utils";
+import { errMsg, toBase64, base64ToBytes, restoreScrollback, wsUrl } from "../lib/utils";
 import { createOutputBuffer, type OutputBuffer } from "../lib/outputBuffer";
 import { useTerminal } from "../hooks/useTerminal";
+import type { WSMessage } from "../hooks/useWebSocket";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { SpecialKeysBar } from "./SpecialKeysBar";
 
@@ -93,7 +94,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
     const ws = new WebSocket(wsUrl(`/api/v1/ws?${qs}`));
 
     ws.onmessage = (evt) => {
-      let msg: { type: string; data?: string; exitCode?: number; live?: boolean };
+      let msg: WSMessage;
       try {
         msg = JSON.parse(evt.data);
       } catch {
@@ -213,7 +214,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
         // Only create new session on 404; other errors (network, 500) should not trigger creation
         const is404 = err instanceof Error && err.message.startsWith("404");
         if (!is404) {
-          setError(err instanceof Error ? err.message : String(err));
+          setError(errMsg(err));
           return;
         }
       }
@@ -226,7 +227,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
         connectWs(s.id);
       } catch (err) {
         if (cancelled) return;
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errMsg(err);
         if (msg.includes("tool not found")) {
           setError(
             shellTool === "tmux" || shellTool === null

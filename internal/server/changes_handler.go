@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -89,10 +88,7 @@ func (s *Server) handleChanges(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(out); err != nil {
-		s.logger.Warn("changes: encode failed", "err", err)
-	}
+	writeJSONResponse(w, http.StatusOK, out)
 }
 
 // changeStore returns the Store backing the cursor read. We pull it

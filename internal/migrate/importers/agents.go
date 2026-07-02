@@ -26,7 +26,9 @@ import (
 // key: "agents". Runs first because everything else FK's against agents.
 type agentsImporter struct{}
 
-func (agentsImporter) Domain() string { return "agents" }
+const agentsDomain = "agents"
+
+func (agentsImporter) Domain() string { return agentsDomain }
 
 // settingsKeysToStrip lists every key in agents.json that does NOT belong
 // in AgentRecord.Settings:
@@ -62,67 +64,61 @@ var settingsKeysToStrip = map[string]struct{}{
 }
 
 func (agentsImporter) Run(ctx context.Context, st *store.Store, opts migrate.Options) error {
-	if done, err := alreadyImported(ctx, st, "agents"); err != nil {
-		return err
-	} else if done {
-		return nil
-	}
-
-	logger := slog.Default().With("importer", "agents")
-
-	// Collect scanned source paths up front. The checksum records the
-	// set of v0 files this domain WALKED, not the subset it actually
-	// imported (orphan agent dirs missing from agents.json show up here
-	// even though importOneAgent skips them — see the scan-vs-import
-	// gap note in collectAgentsSourcePaths). This is intentional: the
-	// orchestrator's pre/post manifest comparison rejects post-import
-	// drift, and the per-domain checksum gives operators a finer-
-	// grained audit trail when something does change.
-	srcPaths, err := collectAgentsSourcePaths(opts.V0Dir)
-	if err != nil {
-		return fmt.Errorf("collect source paths: %w", err)
-	}
-	checksum, err := domainChecksum(opts.V0Dir, srcPaths)
-	if err != nil {
-		return fmt.Errorf("checksum agents sources: %w", err)
-	}
-
-	manifest, err := readV0(opts.V0Dir, filepath.Join(agentsBaseDir(opts.V0Dir), "agents.json"))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// No agents to migrate — perfectly valid for a fresh v0 dir.
-			return markImported(ctx, st, "agents", 0, checksum)
+	return runDomain(ctx, st, agentsDomain, func(logger *slog.Logger) (int, string, error) {
+		// Collect scanned source paths up front. The checksum records the
+		// set of v0 files this domain WALKED, not the subset it actually
+		// imported (orphan agent dirs missing from agents.json show up here
+		// even though importOneAgent skips them — see the scan-vs-import
+		// gap note in collectAgentsSourcePaths). This is intentional: the
+		// orchestrator's pre/post manifest comparison rejects post-import
+		// drift, and the per-domain checksum gives operators a finer-
+		// grained audit trail when something does change.
+		srcPaths, err := collectAgentsSourcePaths(opts.V0Dir)
+		if err != nil {
+			return 0, "", fmt.Errorf("collect source paths: %w", err)
 		}
-		return fmt.Errorf("read agents.json: %w", err)
-	}
-
-	// Decode as []map[string]any so unknown / forward-introduced keys
-	// round-trip unchanged into Settings, and zero-valued numeric/bool
-	// fields are preserved (a typed struct with omitempty would silently
-	// drop intervalMinutes:0, which v0 uses as the "schedule disabled"
-	// sentinel — losing the sentinel would resurrect the default 30-min
-	// cadence after migration).
-	var raw []map[string]any
-	if err := json.Unmarshal(manifest, &raw); err != nil {
-		return fmt.Errorf("decode agents.json: %w", err)
-	}
-
-	count := 0
-	for i := range raw {
-		agentJSON := raw[i]
-		id, _ := agentJSON["id"].(string)
-		name, _ := agentJSON["name"].(string)
-		if id == "" || name == "" {
-			logger.Warn("skipping agent: missing id or name", "id", id)
-			continue
+		checksum, err := domainChecksum(opts.V0Dir, srcPaths)
+		if err != nil {
+			return 0, "", fmt.Errorf("checksum agents sources: %w", err)
 		}
-		if err := importOneAgent(ctx, st, opts.V0Dir, opts.V1Dir, agentJSON, logger); err != nil {
-			return fmt.Errorf("agent %s: %w", id, err)
-		}
-		count++
-	}
 
-	return markImported(ctx, st, "agents", count, checksum)
+		manifest, err := readV0(opts.V0Dir, filepath.Join(agentsBaseDir(opts.V0Dir), "agents.json"))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// No agents to migrate — perfectly valid for a fresh v0 dir.
+				return 0, checksum, nil
+			}
+			return 0, "", fmt.Errorf("read agents.json: %w", err)
+		}
+
+		// Decode as []map[string]any so unknown / forward-introduced keys
+		// round-trip unchanged into Settings, and zero-valued numeric/bool
+		// fields are preserved (a typed struct with omitempty would silently
+		// drop intervalMinutes:0, which v0 uses as the "schedule disabled"
+		// sentinel — losing the sentinel would resurrect the default 30-min
+		// cadence after migration).
+		var raw []map[string]any
+		if err := json.Unmarshal(manifest, &raw); err != nil {
+			return 0, "", fmt.Errorf("decode agents.json: %w", err)
+		}
+
+		count := 0
+		for i := range raw {
+			agentJSON := raw[i]
+			id, _ := agentJSON["id"].(string)
+			name, _ := agentJSON["name"].(string)
+			if id == "" || name == "" {
+				logger.Warn("skipping agent: missing id or name", "id", id)
+				continue
+			}
+			if err := importOneAgent(ctx, st, opts.V0Dir, opts.V1Dir, agentJSON, logger); err != nil {
+				return 0, "", fmt.Errorf("agent %s: %w", id, err)
+			}
+			count++
+		}
+
+		return count, checksum, nil
+	})
 }
 
 // importOneAgent inserts the agent row, copies the v0 agent working

@@ -120,8 +120,8 @@ func ReconcileWorkspaceFilesDiskFromDBHeld(ctx context.Context, st *store.Store,
 //     never live; in steady state it catches "user removed checkin.md
 //     in the CLI" propagation.
 //   - disk file present:
-//     - DB body matches → skip
-//     - DB body differs / no row → Upsert with AllowOverwrite=true
+//   - DB body matches → skip
+//   - DB body differs / no row → Upsert with AllowOverwrite=true
 //
 // Best-effort: per-kind failures log and surface as the returned
 // firstErr but don't short-circuit other kinds.

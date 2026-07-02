@@ -1,12 +1,13 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 )
 
 // validGroupDMStyles mirrors v0's GroupDMStyle enum. "efficient" is the
@@ -96,7 +97,7 @@ func canonicalizeMembers(in []GroupDMMember) []canonicalMember {
 		}
 		out[i] = canonicalMember{AgentID: m.AgentID, NotifyMode: mode, DigestWindow: m.DigestWindow}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].AgentID < out[j].AgentID })
+	slices.SortFunc(out, func(a, b canonicalMember) int { return cmp.Compare(a.AgentID, b.AgentID) })
 	return out
 }
 

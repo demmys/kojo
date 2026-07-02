@@ -856,17 +856,9 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// applies. `*` is rejected: DELETE on a missing resource is
 	// already idempotent, and "any current version" carries no
 	// useful semantics over the row-load below.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on DELETE /agents/{id}; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on DELETE /agents/{id}; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -940,17 +932,9 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 	// (archived) row. Unarchive mutates the agent record so the same
 	// optimistic-concurrency contract as PATCH applies. `*` rejected:
 	// the row must already exist (we 404 below if it doesn't).
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on POST /agents/{id}/unarchive; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on POST /agents/{id}/unarchive; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -1604,17 +1588,9 @@ func (s *Server) handleUpdateMessage(w http.ResponseWriter, r *http.Request) {
 	// exists with any current etag", which here adds nothing over
 	// the existing row-load and would invite sloppy clients to skip
 	// real concurrency control entirely).
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on PATCH /messages/{msgId}; send a specific etag")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on PATCH /messages/{msgId}; send a specific etag")
+	if !ok {
 		return
 	}
 
@@ -1663,17 +1639,9 @@ func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	// callers that want strict idempotence should not rely on the
 	// historical store-level "missing row → ok" path through this
 	// handler.
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on DELETE /messages/{msgId}; send a specific etag or omit the header")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on DELETE /messages/{msgId}; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -1700,17 +1668,9 @@ func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request)
 	// rejected for the same reason as PATCH/DELETE: regenerate is per-
 	// row and a wildcard precondition adds nothing over the existing
 	// row-load. Empty If-Match disables the check (legacy behaviour).
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on POST /messages/{msgId}/regenerate; send a specific etag or omit the header")
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on POST /messages/{msgId}/regenerate; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -2285,20 +2245,13 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	taskID := r.PathValue("taskId")
 
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
 	// `*` is rejected on PATCH because the row must already exist —
 	// "any current version" carries no meaning when the only valid
-	// shape of "current" is "live row with some etag".
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
-			"If-Match: * is not supported on PATCH /tasks/{taskId}; send a specific etag or omit the header")
+	// shape of "current" is "live row with some etag". Task handlers
+	// reject the wildcard with 412 (not 400) — preserved here.
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusPreconditionFailed,
+		"If-Match: * is not supported on PATCH /tasks/{taskId}; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 
@@ -2322,17 +2275,11 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	taskID := r.PathValue("taskId")
 
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusPreconditionFailed, "precondition_failed",
-			"If-Match: * is not supported on DELETE /tasks/{taskId}")
+	// Wildcard rejected with 412 (not 400) — same contract as PATCH
+	// /tasks/{taskId}; preserved through the shared preamble.
+	ifMatch, _, ok := s.parseIfMatchStrict(w, r, http.StatusPreconditionFailed,
+		"If-Match: * is not supported on DELETE /tasks/{taskId}")
+	if !ok {
 		return
 	}
 
@@ -2460,17 +2407,9 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 	// privilege flips are admin-class mutations of the agent record;
 	// same If-Match contract as PATCH applies. `*` rejected — the row
 	// must already exist (we 404 below if it doesn't).
-	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid If-Match header")
-		return
-	}
-	if !s.enforceIfMatchPresence(w, r, ifMatchPresent) {
-		return
-	}
-	if ifMatchPresent && ifMatch == "*" {
-		writeError(w, http.StatusBadRequest, "bad_request",
-			"If-Match: * is not supported on POST /agents/{id}/privilege; send a specific etag or omit the header")
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r, http.StatusBadRequest,
+		"If-Match: * is not supported on POST /agents/{id}/privilege; send a specific etag or omit the header")
+	if !ok {
 		return
 	}
 

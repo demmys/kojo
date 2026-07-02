@@ -514,7 +514,9 @@ func TestParseAuthKVValue_RowShapeGate(t *testing.T) {
 		{"wrong scope machine", func(r *store.KVRecord) { r.Scope = store.KVScopeMachine }},
 		{"secret flag set", func(r *store.KVRecord) { r.Secret = true }},
 		{"missing prefix", func(r *store.KVRecord) { r.Value = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }},
-		{"non-hex hash", func(r *store.KVRecord) { r.Value = hashedTokenPrefix + "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-" }},
+		{"non-hex hash", func(r *store.KVRecord) {
+			r.Value = hashedTokenPrefix + "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-"
+		}},
 		{"truncated hash", func(r *store.KVRecord) { r.Value = hashedTokenPrefix + "ff" }},
 	}
 	for _, c := range cases {

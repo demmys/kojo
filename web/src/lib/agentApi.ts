@@ -243,7 +243,6 @@ export interface ChatEvent {
   toolOutput?: string;
   message?: AgentMessage;
   attachments?: AgentMessageAttachment[]; // streamed kojo-attach files
-  usage?: { inputTokens: number; outputTokens: number };
   errorMessage?: string;
   startedAt?: string; // RFC3339 timestamp of when processing started
 }

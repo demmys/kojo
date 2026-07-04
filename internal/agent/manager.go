@@ -1880,9 +1880,38 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 
 		m.updatePostChatIndex(agentID)
+		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
 	}()
 
 	return callerCh, nil
+}
+
+// turnSummarizeAsync fires the post-turn incremental summarization
+// (TurnSummarize) in the background. Runs OUTSIDE the busy window — the
+// caller invokes it after processChatEvents returns, and the goroutine
+// detaches so clearBusy isn't held up by an LLM call. Best-effort: a
+// failure only defers the summary to the next turn or to the
+// pre-compaction fire, both of which resume from the same cursor.
+//
+// The goroutine is not tracked or cancelled: an agent delete/reset that
+// lands mid-summary can leave one orphan diary/marker write behind. That
+// is the same exposure the externally-triggered PreCompact hook already
+// has, and every write is fail-soft (a stale marker just causes one full
+// re-summary; delete removes the agent dir afterwards anyway). The
+// existence check below closes the common case — the agent was already
+// gone before the summary started.
+func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
+	go func() {
+		m.mu.Lock()
+		_, ok := m.agents[agentID]
+		m.mu.Unlock()
+		if !ok {
+			return
+		}
+		if err := TurnSummarize(agentID, tool, m.logger); err != nil {
+			m.logger.Warn("post-turn summary failed", "agent", agentID, "err", err)
+		}
+	}()
 }
 
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
@@ -1933,19 +1962,31 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 
+	chatCtx, cancel := context.WithCancel(ctx)
+
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()
+		cancel()
 		return nil, ErrAgentResetting
 	}
 	if m.switching[agentID] {
 		m.busyMu.Unlock()
+		cancel()
 		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
 	}
+	// Register the cancel func while still holding busyMu.
+	// acquireResetGuard flips m.resetting under the same lock, so
+	// making the check + registration atomic against that flag closes
+	// the TOCTOU where a one-shot passes the resetting check but is
+	// not yet visible to cancelOneShots/waitOneShotClear — such a
+	// chat could otherwise spawn its CLI (recreating session JSONLs)
+	// after a reset/delete has already drained and started wiping.
+	// Lock nesting (busyMu → oneShotCancelsMu) is safe: no code path
+	// acquires them in the opposite order.
+	osID := m.trackOneShot(agentID, cancel)
 	m.busyMu.Unlock()
 
-	chatCtx, cancel := context.WithCancel(ctx)
-	osID := m.trackOneShot(agentID, cancel)
 	outCh := make(chan ChatEvent, 64)
 
 	// Append per-conversation context (Slack channel/thread block, etc.)
@@ -3088,6 +3129,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		}
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 		m.updatePostChatIndex(agentID)
+		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
 	}()
 	return nil
 }

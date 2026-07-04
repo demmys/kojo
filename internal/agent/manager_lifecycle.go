@@ -35,6 +35,36 @@ func (m *Manager) ResetData(id string) error {
 		return err
 	}
 
+	// Serialise against an in-flight summarization (post-turn
+	// TurnSummarize goroutine or a late PreCompact hook fire). All
+	// summary WRITES happen inside PreCompactSummarize under this
+	// lock after re-reading the session/transcript state, so holding
+	// it across the wipe guarantees a summary either completes before
+	// the wipe (its output is wiped with everything else) or starts
+	// after it (finds no messages, writes nothing). Without this, a
+	// summary racing the wipe could resurrect just-reset conversation
+	// content into memory/recent.md and the marker. Bounded wait: a
+	// multi-chunk summarization can hold the lock for minutes, and
+	// blocking the reset guard that long would freeze the agent's API
+	// surface — better to surface ErrAgentBusy and let the user retry.
+	releasePreCompact, err := acquirePreCompactLockBounded(id)
+	if err != nil {
+		return err
+	}
+	defer releasePreCompact()
+
+	// Cancel and drain in-flight one-shot chats (Slack, Discord, Group
+	// DM) BEFORE wiping anything. A still-running one-shot CLI process
+	// would otherwise recreate its session JSONL after
+	// clearClaudeSession below, and its eventual PreCompact hook fire
+	// could resurrect just-reset conversation content into
+	// memory/recent.md. Nothing destructive has happened yet, so a
+	// drain timeout aborts the reset cleanly.
+	m.cancelOneShots(id)
+	if err := m.waitOneShotClear(id); err != nil {
+		return err
+	}
+
 	dir := agentDir(id)
 
 	// Truncate the DB transcript. The per-agent kojo.db row is the v1
@@ -377,6 +407,21 @@ func (m *Manager) Unarchive(id string) error {
 	return nil
 }
 
+// acquirePreCompactLockBounded acquires the per-agent PreCompact
+// (summarization) lock, polling for up to 10 seconds instead of blocking
+// indefinitely — a multi-chunk summarization can hold the lock for
+// minutes, and the reset/delete callers already hold the reset guard.
+// Returns ErrAgentBusy (wrapped) when the lock can't be had in time.
+func acquirePreCompactLockBounded(id string) (func(), error) {
+	for i := 0; i < 100; i++ {
+		if unlock, ok := preCompactLocks.TryLock(id); ok {
+			return unlock, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("%w: summarization in progress, try again later", ErrAgentBusy)
+}
+
 // Delete removes an agent and its data.
 //
 // Takes Manager.LockPatch to serialize against in-flight PATCH-style
@@ -399,6 +444,35 @@ func (m *Manager) Delete(id string) error {
 	defer cleanup()
 
 	if err := m.waitBusyClear(id); err != nil {
+		return err
+	}
+
+	// Serialise against an in-flight summarization (post-turn
+	// TurnSummarize goroutine or a late PreCompact hook fire) — same
+	// rationale (and same bounded wait) as the matching lock in
+	// ResetData: a summary racing the deletion could otherwise
+	// recreate memory files and the kv marker after they were removed.
+	//
+	// The lock entry is deliberately NOT dropped from the keyed-mutex
+	// map: any drop scheme lets a waiter queued on the old mutex run
+	// concurrently with a latecomer that recreated the entry, breaking
+	// the serialization this lock exists for. The leak is one map
+	// entry + mutex per deleted agent id per process lifetime —
+	// negligible next to the correctness cost of dropping.
+	releasePreCompact, err := acquirePreCompactLockBounded(id)
+	if err != nil {
+		return err
+	}
+	defer releasePreCompact()
+
+	// Cancel and drain in-flight one-shot chats (Slack, Discord, Group
+	// DM) BEFORE the tombstone so a drain timeout can still abort the
+	// deletion cleanly. A still-running one-shot CLI would recreate
+	// its session JSONL after clearClaudeSession below, and its late
+	// PreCompact hook fire — still authenticated at that point — could
+	// resurrect memory files for the deleted agent.
+	m.cancelOneShots(id)
+	if err := m.waitOneShotClear(id); err != nil {
 		return err
 	}
 
@@ -430,6 +504,8 @@ func (m *Manager) Delete(id string) error {
 	}
 
 	m.cron.Remove(id)
+	// (One-shot chats were cancelled and drained before the tombstone
+	// above; cancel again to catch any that started in between.)
 	m.cancelOneShots(id)
 
 	// Remove agent from group DMs
@@ -437,12 +513,16 @@ func (m *Manager) Delete(id string) error {
 		m.groupdms.RemoveAgent(id)
 	}
 
+	// Remove CLI session files (claude project JSONLs live OUTSIDE the
+	// agent dir, so the RemoveAll below doesn't reach them). Besides
+	// cleaning up orphans, doing this under the PreCompact lock is what
+	// makes a queued summarization harmless: when it eventually runs,
+	// the session source is gone and the transcript is tombstoned, so
+	// it returns without writing.
+	clearClaudeSession(id, m.logger)
+
 	// Close cached memory index before removing directory
 	m.closeIndex(id)
-
-	// Drop the per-agent PreCompact lock so the global map doesn't
-	// accumulate dead entries over the process lifetime.
-	dropAgentPreCompactLock(id)
 
 	// Wipe the autosummary marker (kv + legacy file). The kv table
 	// has no FK to agents, so without an explicit DELETE here the

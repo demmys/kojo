@@ -116,6 +116,15 @@ const (
 	// from blowing up every turn's input cost.
 	recentSummaryMaxRunes = 8000
 
+	// turnSummaryMinBacklogBytes gates the post-turn incremental
+	// summarization (TurnSummarize). A turn only triggers an LLM
+	// summary once the un-summarized backlog (stripped message content
+	// past the marker cursor) reaches this many bytes. Keeps quick
+	// back-and-forth turns from paying an LLM call each, while long
+	// working turns get summarized soon after they land instead of
+	// waiting for the 150k-token pre-compaction fire.
+	turnSummaryMinBacklogBytes = 32 * 1024
+
 	// transcriptMaxBytes caps how much of a session JSONL we'll read.
 	// Bounds memory + DoS exposure on the (now-validated) transcript
 	// path coming from the PreCompact hook. Generous compared to
@@ -131,13 +140,6 @@ const (
 // LLM, both append to today's diary, and race on recent.md / marker
 // writes — multiplying the very cost the rate limiter is meant to avoid.
 var preCompactLocks keyedMutex
-
-// dropAgentPreCompactLock releases the per-agent lock entry for an
-// agent that's being deleted, so the map doesn't grow without bound
-// over the lifetime of the process. Safe to call on an unknown ID.
-func dropAgentPreCompactLock(agentID string) {
-	preCompactLocks.Drop(agentID)
-}
 
 // validateTranscriptPath ensures a transcript path is safe to open.
 // The PreCompact hook supplies this path via stdin and the path
@@ -738,8 +740,9 @@ const (
 
 // generateSummary is the LLM call used for summarization. Package
 // variable so tests can substitute a deterministic fake instead of
-// spawning a real claude/codex process.
-var generateSummary = generateWithPreferred
+// spawning a real claude/codex process. Routes claude through the
+// cheap pinned summary model (summaryModel/summaryEffort).
+var generateSummary = generateSummaryWithPreferred
 
 // lastN returns the trailing n elements of msgs (all of them when
 // len(msgs) <= n).
@@ -912,15 +915,23 @@ func messagesFingerprint(msgs []*Message) string {
 func PreCompactSummarize(agentID string, tool string, transcriptPath string, logger *slog.Logger) error {
 	defer preCompactLocks.Lock(agentID)()
 
-	// Validate the hook-supplied transcript path before opening. An
-	// invalid path is treated as "no hint, fall back to discovery" — we
-	// don't want a misconfigured hook to break summarisation entirely.
+	// Validate the supplied transcript path before opening. When a path
+	// WAS supplied but fails validation (deleted mid-race, symlink
+	// escape, wrong suffix), we do NOT fall back to mtime-based
+	// discovery: the caller identified a specific session, and
+	// discovery could silently substitute a concurrent one-shot /
+	// Slack-thread JSONL — summarizing the wrong conversation is worse
+	// than degrading to the transcript fallback below. Discovery only
+	// runs when no path was supplied at all (older claude builds whose
+	// PreCompact hook doesn't populate the field).
 	resolvedTranscript := ""
+	pathInvalid := false
 	if transcriptPath != "" {
 		if v, err := validateTranscriptPath(agentID, transcriptPath); err == nil {
 			resolvedTranscript = v
 		} else {
-			logger.Warn("autosummary: invalid transcript_path, falling back",
+			pathInvalid = true
+			logger.Warn("autosummary: invalid transcript_path, skipping session source",
 				"agent", agentID, "err", err)
 		}
 	}
@@ -930,7 +941,10 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 	// summary", so loading the whole file does NOT mean re-summarizing
 	// it every fire.
 	source := markerSourceSession
-	msgs := loadSessionMessages(agentID, tool, resolvedTranscript, 0, logger)
+	var msgs []*Message
+	if !pathInvalid {
+		msgs = loadSessionMessages(agentID, tool, resolvedTranscript, 0, logger)
+	}
 	if len(msgs) == 0 {
 		// Fallback to kojo transcript (last N only — agent_messages
 		// has no stable cursor across the summarize/reset lifecycle).
@@ -1099,6 +1113,68 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		return fmt.Errorf("summary backlog remaining: %d chunks deferred", deferredChunks)
 	}
 	return nil
+}
+
+// TurnSummarize runs the incremental summarization after a completed
+// chat turn, when enough un-summarized backlog has accumulated. This is
+// the proactive sibling of the PreCompact hook: instead of waiting for
+// the 150k-token compaction fire (and racing its chunk budget against
+// session deletion), the backlog is worked down a turn at a time, so
+// memory/recent.md stays close to the live conversation and the
+// eventual pre-compaction fire has little left to do.
+//
+// The gate is deliberately cheap and lock-free: it streams the session
+// JSONL, strips volatile context, and measures the content bytes past
+// the marker cursor. Below turnSummaryMinBacklogBytes it returns nil
+// without any LLM call. At or above, it delegates to PreCompactSummarize,
+// which re-reads state under the per-agent lock — a concurrent fire that
+// advanced the cursor in between simply shrinks (or empties) the backlog
+// there, so the racy read here can cause at most one redundant no-op
+// pass, never a duplicate summary.
+//
+// Only the claude tool is supported (the session JSONL is the cursor's
+// substrate); other tools return nil immediately. The agent's MAIN
+// session file (deterministic UUID from the agent ID) is targeted
+// explicitly — mtime-based discovery could otherwise pick a concurrent
+// Slack/Discord thread's JSONL and summarize the wrong conversation.
+// One-shot / session-key threads are deliberately not summarized here.
+func TurnSummarize(agentID string, tool string, logger *slog.Logger) error {
+	if tool != "claude" {
+		return nil
+	}
+	absDir, err := filepath.Abs(agentDir(agentID))
+	if err != nil {
+		return nil
+	}
+	sessionPath := filepath.Join(claudeProjectDir(absDir), agentIDToUUID(agentID)+".jsonl")
+	if _, err := os.Stat(sessionPath); err != nil {
+		// No main session yet (fresh agent, or reset just cleared it).
+		return nil
+	}
+	msgs := loadSessionMessages(agentID, tool, sessionPath, 0, logger)
+	if len(msgs) == 0 {
+		return nil
+	}
+	stripped := stripVolatileContext(msgs)
+	marker := readMarker(agentID)
+	start := sessionCursorStart(stripped, marker)
+
+	backlog := 0
+	for _, m := range stripped[start:] {
+		backlog += len(m.Content)
+	}
+	if backlog < turnSummaryMinBacklogBytes {
+		logger.Debug("turn summary skipped: backlog below threshold",
+			"agent", agentID, "backlogBytes", backlog, "threshold", turnSummaryMinBacklogBytes)
+		return nil
+	}
+	// Pass the main session path explicitly so PreCompactSummarize
+	// operates on the exact file the gate measured. If a reset deletes
+	// the file in between, path validation fails inside and the call
+	// degrades to discovery/transcript fallback — fail-soft (the reset
+	// path itself summarizes before deleting, so nothing is lost; at
+	// worst one redundant summary fires).
+	return PreCompactSummarize(agentID, tool, sessionPath, logger)
 }
 
 // writeRecentSummary writes content to path atomically (tempfile in same

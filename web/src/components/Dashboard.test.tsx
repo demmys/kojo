@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   groupList: vi.fn(),
   unread: vi.fn(),
   openDM: vi.fn(),
+  createThread: vi.fn(),
   agentList: vi.fn(),
 }));
 
@@ -15,6 +16,7 @@ vi.mock("../lib/groupdmApi", () => ({
     list: mocks.groupList,
     unread: mocks.unread,
     openDM: mocks.openDM,
+    createThread: mocks.createThread,
     create: vi.fn(),
   },
   getLastRead: vi.fn((roomId: string) => (roomId === "g1" ? "m9" : null)),
@@ -99,6 +101,14 @@ beforeEach(() => {
     ),
   );
   mocks.openDM.mockResolvedValue(room({ id: "d1", name: "Alice", kind: "dm" }));
+  mocks.createThread.mockResolvedValue(
+    room({
+      id: "t1",
+      name: "Alice",
+      kind: "thread",
+      members: [{ agentId: "ag_a", agentName: "Alice" }],
+    }),
+  );
 });
 
 afterEach(() => {
@@ -124,10 +134,10 @@ describe("Dashboard room list", () => {
     expect(mocks.unread).toHaveBeenCalledWith("d1", null);
   });
 
-  it("opens a DM from the agent row and navigates to the room", async () => {
+  it("starts a new thread from the agent row and navigates to the room", async () => {
     const router = renderDashboard();
-    fireEvent.click(await screen.findByLabelText("Start thread with Alice"));
-    await waitFor(() => expect(mocks.openDM).toHaveBeenCalledWith({ agentId: "ag_a" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/d1"));
+    fireEvent.click(await screen.findByLabelText("New thread with Alice"));
+    await waitFor(() => expect(mocks.createThread).toHaveBeenCalledWith("ag_a"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/t1"));
   });
 });

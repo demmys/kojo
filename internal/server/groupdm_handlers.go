@@ -826,6 +826,47 @@ func (s *Server) handleFindOrCreateDM(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, status, g)
 }
 
+// handleCreateThread creates a brand-new parallel thread room (kind "thread")
+// for one agent. Unlike POST /api/v1/dms it never dedups — every call yields a
+// fresh room so an agent can hold many independent threads. The default name
+// is the agent's display name; the first agent reply may auto-title it.
+func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentID string `json:"agentId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if req.AgentID == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "agentId is required")
+		return
+	}
+	// Agents may only open threads with themselves; owners may open on
+	// anyone's behalf. Mirrors handleFindOrCreateDM's authorization.
+	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+		if !p.IsAgent() {
+			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
+			return
+		}
+		if req.AgentID != p.AgentID {
+			writeError(w, http.StatusForbidden, "forbidden", "caller must be the thread agent")
+			return
+		}
+	}
+	g, err := s.groupdms.CreateThread(req.AgentID)
+	if err != nil {
+		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid agentId")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusCreated, g)
+}
+
 // handleGetGroupUnread reports how many messages arrived after the caller's
 // read cursor (?after=<messageId>) and whether any @-mentions the human
 // operator. Drives the room-list unread / mention badges.

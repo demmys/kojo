@@ -1,0 +1,12 @@
+-- 0025_groupdm_message_usage.sql
+--
+-- Adds groupdm_messages.usage — per-message token usage recorded for agent
+-- replies produced by a thread-room one-shot turn (ChatOneShot's done event
+-- carries Usage). JSON object mirroring agent.Usage
+-- ({inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens}).
+-- NULL for user/system posts and for agent posts made outside a thread turn.
+--
+-- No CHECK constraint is added for groupdms.kind here: the column is plain
+-- TEXT (see 0022) so the new 'thread' kind (parallel human<->agent thread
+-- rooms) needs no schema change.
+ALTER TABLE groupdm_messages ADD COLUMN usage TEXT;

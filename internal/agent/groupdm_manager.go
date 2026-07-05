@@ -326,6 +326,25 @@ func (m *GroupDMManager) FindOrCreateDM(memberIDs []string) (*GroupDM, bool, err
 	return g, true, nil
 }
 
+// isThreadRoom reports whether g is a thread room: a first-class "thread"
+// room, or a single-agent "dm" (the legacy shape that predates the "thread"
+// kind). Thread rooms run a one-shot side conversation instead of the
+// cooldown/batch/hop notify fan-out.
+func isThreadRoom(g *GroupDM) bool {
+	if g.Kind == GroupDMKindThread {
+		return true
+	}
+	return g.Kind == GroupDMKindDM && len(g.Members) == 1
+}
+
+// CreateThread always creates a NEW thread room (kind "thread") for the given
+// agent — no member-set dedup, so an agent can have many parallel threads.
+// The default name is the agent's display name; the first agent reply may
+// auto-title it (see maybeAutoTitleThread).
+func (m *GroupDMManager) CreateThread(agentID string) (*GroupDM, error) {
+	return m.create("", []string{agentID}, 0, GroupDMStyleEfficient, defaultGroupDMVenue, GroupDMKindThread, false)
+}
+
 // CreateWithNotify creates a group and optionally sends a system notification
 // to every member after the row is persisted.
 func (m *GroupDMManager) CreateWithNotify(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers bool) (*GroupDM, error) {
@@ -336,7 +355,7 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	// DMs (kind "dm") allow a single agent member — the human operator is
 	// an implicit participant. Classic groups keep the 2-member floor.
 	minMembers := 2
-	if kind == GroupDMKindDM {
+	if kind == GroupDMKindDM || kind == GroupDMKindThread {
 		minMembers = 1
 	}
 	if len(memberIDs) < minMembers {
@@ -610,7 +629,7 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	// Thread rooms (kind "dm", single agent member) get extra teardown:
 	// cancel any in-flight thread turn and drop the per-thread Claude
 	// session JSONL so the throwaway side-conversation leaves nothing behind.
-	isThread := g.Kind == GroupDMKindDM && len(g.Members) == 1
+	isThread := isThreadRoom(g)
 	var threadAgentID string
 	if isThread {
 		threadAgentID = g.Members[0].AgentID
@@ -1066,7 +1085,7 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	// A "thread" room is a human↔agent DM with exactly one agent member.
 	// User posts there run a Slack-thread-like side conversation with that
 	// agent instead of the cooldown/batch/hop notify fan-out.
-	isThread := g.Kind == GroupDMKindDM && len(g.Members) == 1
+	isThread := isThreadRoom(g)
 	var threadAgentID string
 	if isThread {
 		threadAgentID = g.Members[0].AgentID
@@ -1164,10 +1183,19 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 
 	var reply strings.Builder
 	var streamErr string
+	var usage *Usage
 	for ev := range events {
 		switch ev.Type {
 		case "text":
 			reply.WriteString(ev.Delta)
+		case "done":
+			// The done event carries the turn's token usage. Prefer the
+			// event's Usage; fall back to the assembled message's Usage.
+			if ev.Usage != nil {
+				usage = ev.Usage
+			} else if ev.Message != nil && ev.Message.Usage != nil {
+				usage = ev.Message.Usage
+			}
 		case "error":
 			if streamErr == "" {
 				streamErr = ev.ErrorMessage
@@ -1186,9 +1214,12 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	if text == "" {
 		return // nothing substantive to post
 	}
-	if _, err := m.postThreadReply(groupID, agentID, text); err != nil {
+	if _, err := m.postThreadReply(groupID, agentID, text, usage); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
+	// Auto-title the thread on its first agent reply while the name is still
+	// the default (the agent's display name). No-op after the first rename.
+	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
 }
 
 // renderThreadPayload builds the one-shot payload for a thread turn from the
@@ -1215,7 +1246,7 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 // postThreadReply appends an agent-authored message to a thread room on the
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
-func (m *GroupDMManager) postThreadReply(groupID, agentID, content string) (*GroupMessage, error) {
+func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage *Usage) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -1231,6 +1262,7 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content string) (*Gro
 		memberIDs = append(memberIDs, mem.AgentID)
 	}
 	msg := newGroupMessage(agentID, senderName, content, nil)
+	msg.Usage = usage
 	msg.Mentions = m.parseMentions(content, memberIDs)
 	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
 		m.mu.Unlock()
@@ -1254,9 +1286,91 @@ func (m *GroupDMManager) handleThreadTurnError(groupID, agentID, payload string,
 	}
 	m.logger.Warn("thread turn failed", "group", groupID, "agent", agentID, "err", err)
 	m.recordDeadLetter(groupID, agentID, "thread turn: "+err.Error(), payload, 1)
-	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error()); perr != nil {
+	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error(), nil); perr != nil {
 		m.logger.Warn("failed to post thread failure notice", "group", groupID, "agent", agentID, "err", perr)
 	}
+}
+
+// threadTitleMaxLen caps an auto-generated thread title.
+const threadTitleMaxLen = 40
+
+// maybeAutoTitleThread renames a thread room to a short title derived from the
+// first user message, but only while the room name is still the default (the
+// member agent's current display name). This fires on the first agent reply;
+// once renamed the name no longer matches the default so later turns are
+// no-ops (the title is never overwritten).
+//
+// Deterministic fallback only: no model call. The title is the first non-empty
+// line of firstUserMessage, trimmed and sanitized to threadTitleMaxLen runes.
+func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage string) {
+	title := deriveThreadTitle(firstUserMessage)
+	if title == "" {
+		return
+	}
+
+	m.mu.Lock()
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil {
+		m.mu.Unlock()
+		return
+	}
+	if !isThreadRoom(g) {
+		m.mu.Unlock()
+		return
+	}
+	// Only rename while the name is still the default: the agent's current
+	// display name. copyGroup overlays the live name onto members, so the
+	// creation-time default equals the agent's present name.
+	defaultName := ""
+	if a, ok := m.agentMgr.Get(agentID); ok {
+		defaultName = a.Name
+	}
+	if g.Name != defaultName || title == g.Name {
+		m.mu.Unlock()
+		return
+	}
+	g.Name = title
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	if db := getGlobalStore(); db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, uerr := db.UpdateGroupDM(ctx, groupID, "", func(r *store.GroupDMRecord) error {
+			r.Name = title
+			return nil
+		})
+		cancel()
+		if uerr != nil {
+			m.mu.Unlock()
+			m.logger.Warn("failed to persist thread auto-title", "group", groupID, "err", uerr)
+			return
+		}
+	}
+	m.mu.Unlock()
+	if getGlobalStore() == nil {
+		m.save()
+	}
+	m.logger.Info("thread auto-titled", "group", groupID, "title", title)
+}
+
+// deriveThreadTitle builds a short, single-line title from a user message:
+// first non-blank line, collapsed whitespace, trimmed to threadTitleMaxLen
+// runes (with an ellipsis when truncated). Returns "" when nothing usable.
+func deriveThreadTitle(content string) string {
+	line := ""
+	for _, l := range strings.Split(content, "\n") {
+		if t := strings.TrimSpace(l); t != "" {
+			line = t
+			break
+		}
+	}
+	if line == "" {
+		return ""
+	}
+	line = strings.Join(strings.Fields(line), " ")
+	runes := []rune(line)
+	if len(runes) > threadTitleMaxLen {
+		return strings.TrimSpace(string(runes[:threadTitleMaxLen])) + "…"
+	}
+	return line
 }
 
 // cancelThreadTurn aborts the in-flight thread turn for a room, if any.

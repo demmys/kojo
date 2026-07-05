@@ -41,9 +41,13 @@ var validNotifyModes = map[string]bool{
 // validGroupDMKinds enumerates the room kinds. "group" is the classic
 // multi-member room; "dm" is a first-class 1:1 room (sugar over the same
 // machinery, listed separately in the UI). Empty is normalized to "group".
+// "thread" is a first-class parallel human↔agent thread room: always freshly
+// created (no member-set dedup / dm_member_key), driven by a one-shot side
+// conversation just like a single-agent "dm". Empty is normalized to "group".
 var validGroupDMKinds = map[string]bool{
-	"group": true,
-	"dm":    true,
+	"group":  true,
+	"dm":     true,
+	"thread": true,
 }
 
 // UserSenderID is the reserved agent_id for messages posted by the
@@ -687,6 +691,10 @@ type GroupDMMessageRecord struct {
 	// Mentions is a JSON array of mentioned member ids ("user" for the
 	// human operator). nil when the message mentions nobody.
 	Mentions json.RawMessage
+	// Usage is a JSON object of token usage for an agent thread reply
+	// (mirrors agent.Usage). nil for user/system posts and agent posts
+	// made outside a thread turn.
+	Usage json.RawMessage
 
 	Version   int
 	ETag      string
@@ -705,6 +713,7 @@ type groupDMMessageETagInput struct {
 	Attachments json.RawMessage `json:"attachments,omitempty"`
 	Hop         int             `json:"hop,omitempty"`
 	Mentions    json.RawMessage `json:"mentions,omitempty"`
+	Usage       json.RawMessage `json:"usage,omitempty"`
 	UpdatedAt   int64           `json:"updated_at"`
 	DeletedAt   *int64          `json:"deleted_at"`
 }
@@ -719,6 +728,7 @@ func computeGroupDMMessageETag(r *GroupDMMessageRecord) (string, error) {
 		Attachments: r.Attachments,
 		Hop:         r.Hop,
 		Mentions:    r.Mentions,
+		Usage:       r.Usage,
 		UpdatedAt:   r.UpdatedAt,
 		DeletedAt:   r.DeletedAt,
 	})
@@ -918,6 +928,10 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 	if err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: mentions: %w", err)
 	}
+	out.Usage, err = nullJSON(out.Usage)
+	if err != nil {
+		return nil, fmt.Errorf("store.AppendGroupDMMessage: usage: %w", err)
+	}
 	if out.Hop < 0 {
 		out.Hop = 0
 	}
@@ -928,13 +942,13 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 
 	const q = `
 INSERT INTO groupdm_messages (
-  id, groupdm_id, seq, agent_id, content, attachments, hop, mentions,
+  id, groupdm_id, seq, agent_id, content, attachments, hop, mentions, usage,
   version, etag, created_at, updated_at, deleted_at, peer_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
 	if _, err := tx.ExecContext(ctx, q,
 		out.ID, out.GroupDMID, out.Seq, nullableText(out.AgentID),
 		nullableText(out.Content), nullableRaw(out.Attachments),
-		out.Hop, nullableRaw(out.Mentions),
+		out.Hop, nullableRaw(out.Mentions), nullableRaw(out.Usage),
 		out.Version, out.ETag, out.CreatedAt, out.UpdatedAt, nullableText(out.PeerID),
 	); err != nil {
 		return nil, fmt.Errorf("store.AppendGroupDMMessage: %w", err)
@@ -962,7 +976,7 @@ func (s *Store) ListGroupDMMessages(ctx context.Context, groupID string, opts Gr
 	args := []any{groupID}
 	q := `
 SELECT m.id, m.groupdm_id, m.seq, COALESCE(m.agent_id,''),
-       COALESCE(m.content,''), m.attachments, m.hop, m.mentions,
+       COALESCE(m.content,''), m.attachments, m.hop, m.mentions, m.usage,
        m.version, m.etag, m.created_at, m.updated_at, m.deleted_at, COALESCE(m.peer_id,'')
   FROM groupdm_messages m
   JOIN groupdms         g ON g.id = m.groupdm_id
@@ -1048,11 +1062,12 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 		rec         GroupDMMessageRecord
 		attachments sql.NullString
 		mentions    sql.NullString
+		usage       sql.NullString
 		deletedAt   sql.NullInt64
 	)
 	if err := r.Scan(
 		&rec.ID, &rec.GroupDMID, &rec.Seq, &rec.AgentID,
-		&rec.Content, &attachments, &rec.Hop, &mentions,
+		&rec.Content, &attachments, &rec.Hop, &mentions, &usage,
 		&rec.Version, &rec.ETag, &rec.CreatedAt, &rec.UpdatedAt, &deletedAt, &rec.PeerID,
 	); err != nil {
 		return nil, err
@@ -1062,6 +1077,9 @@ func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	}
 	if mentions.Valid {
 		rec.Mentions = json.RawMessage(mentions.String)
+	}
+	if usage.Valid {
+		rec.Usage = json.RawMessage(usage.String)
 	}
 	if deletedAt.Valid {
 		v := deletedAt.Int64

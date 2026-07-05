@@ -340,13 +340,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     if (dmOpening) return;
     setDmOpening(agentId);
     try {
-      // Find-or-create: server returns the existing room or a new one.
-      const room = await groupdmApi.openDM({ agentId });
+      // Always create a fresh thread room — an agent can hold many in parallel.
+      const room = await groupdmApi.createThread(agentId);
       setGroupDMs((prev) => [room, ...prev.filter((g) => g.id !== room.id)]);
       navigate(`/groupdms/${room.id}`);
     } catch (err) {
-      console.error("Failed to open DM", err);
-      window.alert(`Failed to open DM: ${errMsg(err)}`);
+      console.error("Failed to start thread", err);
+      window.alert(`Failed to start thread: ${errMsg(err)}`);
     } finally {
       setDmOpening(null);
     }
@@ -371,8 +371,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   });
   // First-class 1:1 rooms get their own "DMs" section; everything else
   // (including legacy rooms without a kind) stays under "Group DMs".
-  const dmRooms = sortedRooms.filter((g) => g.kind === "dm");
-  const groupRooms = sortedRooms.filter((g) => g.kind !== "dm");
+  const dmRooms = sortedRooms.filter((g) => g.kind === "dm" || g.kind === "thread");
+  const groupRooms = sortedRooms.filter((g) => g.kind !== "dm" && g.kind !== "thread");
 
   const unreadBadge = (roomId: string) => {
     const u = unreadByRoom.get(roomId);
@@ -694,14 +694,26 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       onClick={(e) => void openAgentDM(agent.id, e)}
                       disabled={dmOpening !== null}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-copper disabled:opacity-40"
-                      title={`Start thread with ${agent.name}`}
-                      aria-label={`Start thread with ${agent.name}`}
+                      title="New thread"
+                      aria-label={`New thread with ${agent.name}`}
                     >
                       {dmOpening === agent.id ? (
                         <span className="font-mono text-[10px]">…</span>
                       ) : (
-                        <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">
-                          <path fillRule="evenodd" d="M10 2c-4.418 0-8 3.134-8 7 0 1.941.9 3.698 2.354 4.97-.096.708-.373 1.577-1.005 2.409a.5.5 0 00.438.798c1.618-.09 2.87-.667 3.75-1.284A9.06 9.06 0 0010 16.999c4.418 0 8-3.134 8-7s-3.582-7-8-7z" clipRule="evenodd" />
+                        // MessageSquarePlus: a chat bubble with a "+", conveying
+                        // "start a new thread/conversation".
+                        <svg
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          className="h-4 w-4"
+                        >
+                          <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                          <line x1="12" y1="8" x2="12" y2="14" />
+                          <line x1="9" y1="11" x2="15" y2="11" />
                         </svg>
                       )}
                     </button>

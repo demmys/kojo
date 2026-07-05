@@ -10,6 +10,11 @@ const mocks = vi.hoisted(() => ({
   setMaxHops: vi.fn(),
   setLastRead: vi.fn(),
   archive: vi.fn(),
+  agentGet: vi.fn(),
+}));
+
+vi.mock("../../lib/agentApi", () => ({
+  agentApi: { get: mocks.agentGet },
 }));
 
 vi.mock("../../lib/groupdmApi", () => ({
@@ -91,6 +96,7 @@ beforeEach(() => {
     hasMore: false,
   });
   mocks.clearMessages.mockResolvedValue({ ok: true, deleted: 1 });
+  mocks.agentGet.mockResolvedValue({ id: "ag_alice", name: "Alice", model: "claude-sonnet-4-5" });
 });
 
 afterEach(() => {
@@ -174,9 +180,13 @@ describe("GroupDMChat thread room", () => {
 
     const archiveBtn = await screen.findByTitle("Archive thread");
     expect(archiveBtn).toBeInTheDocument();
-    // Group-only affordances are hidden for threads.
+    // Group-only affordances are hidden for threads: cooldown, hops, style,
+    // venue, and clear-history.
     expect(screen.queryByTitle("Max relay hops (empty = default 4, max 20)")).not.toBeInTheDocument();
     expect(screen.queryByTitle("Notification cooldown (seconds)")).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/^Style:/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/^Venue:/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Clear message history")).not.toBeInTheDocument();
 
     fireEvent.click(archiveBtn);
     expect(await screen.findByText("Archive “Alice”?")).toBeInTheDocument();
@@ -184,6 +194,28 @@ describe("GroupDMChat thread room", () => {
 
     await waitFor(() => expect(mocks.archive).toHaveBeenCalledWith("g1"));
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+  });
+
+  it("renders a token usage line under an agent reply", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "ag_alice",
+          agentName: "Alice",
+          content: "here you go",
+          usage: { inputTokens: 1200, outputTokens: 340 },
+          timestamp: "2026-06-15T00:00:01Z",
+        },
+      ],
+      hasMore: false,
+    });
+    renderGroup();
+
+    expect(await screen.findByText("here you go")).toBeInTheDocument();
+    // "1,200→340 tokens" (locale-formatted). Match on the arrow-joined counts.
+    expect(await screen.findByText(/1,200.*340 tokens/)).toBeInTheDocument();
   });
 });
 

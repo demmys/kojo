@@ -30,6 +30,8 @@ import {
 } from "../chatComposer";
 import { AgentAvatar } from "../agent/AgentAvatar";
 import { AttachmentList, MessageContent } from "../agent/ChatMessage";
+import { agentApi } from "../../lib/agentApi";
+import { estimateTurnCost } from "../../lib/pricing";
 
 const PAGE_SIZE = 50;
 
@@ -59,6 +61,9 @@ export function GroupDMChat() {
   });
 
   const [notFound, setNotFound] = useState(false);
+  // Model of a thread room's single agent member — used to price the token
+  // usage line under agent replies.
+  const [threadAgentModel, setThreadAgentModel] = useState<string | undefined>(undefined);
   const [showStyleMenu, setShowStyleMenu] = useState(false);
   const [showVenueMenu, setShowVenueMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
@@ -161,6 +166,25 @@ export function GroupDMChat() {
     });
   }, [id]);
 
+  // Resolve the thread agent's model for pricing the usage line. Only threads
+  // (single agent member) carry per-reply usage, so skip group rooms.
+  useEffect(() => {
+    if (!group) return;
+    const threadLike =
+      group.kind === "thread" || (group.kind === "dm" && group.members.length === 1);
+    if (!threadLike || group.members.length === 0) return;
+    let cancelled = false;
+    agentApi
+      .get(group.members[0].agentId)
+      .then((a) => {
+        if (!cancelled) setThreadAgentModel(a.model);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [group]);
+
   // Poll for new messages — merge with already-loaded older messages when
   // the server still reports older pages. A fully-covered page replaces the
   // local transcript so remote clears do not keep stale rows on screen.
@@ -256,7 +280,8 @@ export function GroupDMChat() {
   // A "thread" room is a human↔agent DM with a single agent member: a
   // temporary Slack-thread-like side conversation. Group-only affordances
   // (cooldown / hops settings) are hidden and Delete becomes Archive.
-  const isThread = group.kind === "dm" && group.members.length === 1;
+  const isThread =
+    group.kind === "thread" || (group.kind === "dm" && group.members.length === 1);
 
   // Lightweight "replying…" indicator: in a thread, the newest message being
   // the user's own post means the agent's turn is still running (polling will
@@ -354,7 +379,8 @@ export function GroupDMChat() {
               : group.members.slice(0, 2).map((m) => m.agentName).join(", ") + `, +${group.members.length - 2}`}
           </div>
         </div>
-        {/* Style selector */}
+        {/* Style selector — group-only (threads keep only Archive). */}
+        {!isThread && (
         <div className="shrink-0 relative">
           <button
             onClick={() => setShowStyleMenu((v) => !v)}
@@ -391,8 +417,11 @@ export function GroupDMChat() {
             </>
           )}
         </div>
+        )}
         {/* Venue selector — physical-setting hint that calibrates how members
-            should speak (text-only chatroom vs. co-located in-person). */}
+            should speak (text-only chatroom vs. co-located in-person).
+            Group-only. */}
+        {!isThread && (
         <div className="shrink-0 relative">
           <button
             onClick={() => setShowVenueMenu((v) => !v)}
@@ -435,6 +464,7 @@ export function GroupDMChat() {
             </>
           )}
         </div>
+        )}
         {/* Cooldown setting — group-only (threads have no notify fan-out) */}
         {!isThread && (
         <div className="shrink-0">
@@ -528,6 +558,7 @@ export function GroupDMChat() {
           )}
         </div>
         )}
+        {!isThread && (
         <button
           onClick={() => {
             setClearError("");
@@ -541,6 +572,7 @@ export function GroupDMChat() {
             <path d="M7.25 6.5a.75.75 0 000 1.5h5.5a.75.75 0 000-1.5h-5.5zM7.25 9.5a.75.75 0 000 1.5h1.5a.75.75 0 000-1.5h-1.5z" />
           </svg>
         </button>
+        )}
         {isThread ? (
           <button
             onClick={() => {
@@ -644,6 +676,9 @@ export function GroupDMChat() {
                     showTime={false}
                   />
                 </div>
+                {msg.usage && msg.usage.inputTokens != null && (
+                  <ThreadUsageLine usage={msg.usage} model={threadAgentModel} />
+                )}
               </div>
             </div>
           );
@@ -864,6 +899,33 @@ export function GroupDMChat() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ThreadUsageLine renders per-reply token counts (input→output, cache read/
+// write when present) and an approximate USD cost when the thread agent's
+// model is priced. Mirrors ChatMessage's UsageLine (muted mono style).
+function ThreadUsageLine({
+  usage,
+  model,
+}: {
+  usage: NonNullable<GroupMessage["usage"]>;
+  model?: string;
+}) {
+  const cacheRead = usage.cacheReadInputTokens ?? 0;
+  const cacheWrite = usage.cacheCreationInputTokens ?? 0;
+  const cost = estimateTurnCost(model, usage);
+  return (
+    <div className="mt-1 font-mono text-[11px] text-ink-faint">
+      {usage.inputTokens.toLocaleString()}&rarr;{usage.outputTokens.toLocaleString()} tokens
+      {(cacheRead > 0 || cacheWrite > 0) && (
+        <>
+          {" "}
+          (cache {cacheRead.toLocaleString()}r/{cacheWrite.toLocaleString()}w)
+        </>
+      )}
+      {cost != null && <> &middot; &asymp;${cost.toFixed(4)}</>}
     </div>
   );
 }

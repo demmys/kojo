@@ -255,6 +255,48 @@ func TestHandleFindOrCreateDM(t *testing.T) {
 	}
 }
 
+// TestHandleCreateThread verifies POST /api/v1/threads always creates a fresh
+// kind="thread" room (no dedup), unlike POST /api/v1/dms.
+func TestHandleCreateThread(t *testing.T) {
+	srv, _, group, _ := newGroupDMHandlerTestServer(t)
+	aliceID := group.Members[0].AgentID
+
+	mk := func(body string, p auth.Principal) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/threads", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.handleCreateThread(rr, authedRequest(req, p))
+		return rr
+	}
+
+	rr := mk(`{"agentId":"`+aliceID+`"}`, auth.Principal{Role: auth.RoleOwner})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var t1 agent.GroupDM
+	readJSONResponse(t, rr, &t1)
+	if t1.Kind != agent.GroupDMKindThread || len(t1.Members) != 1 {
+		t.Fatalf("thread = kind %q members %d", t1.Kind, len(t1.Members))
+	}
+
+	// Second call must create a DISTINCT room (always new, no dedup).
+	rr = mk(`{"agentId":"`+aliceID+`"}`, auth.Principal{Role: auth.RoleOwner})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("second status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var t2 agent.GroupDM
+	readJSONResponse(t, rr, &t2)
+	if t2.ID == t1.ID {
+		t.Errorf("threads deduped: both have id %s", t1.ID)
+	}
+
+	// Agent may not open a thread as another agent.
+	bobID := group.Members[1].AgentID
+	rr = mk(`{"agentId":"`+aliceID+`"}`, auth.Principal{Role: auth.RoleAgent, AgentID: bobID})
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("foreign thread status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestArchiveThenRecreateDM verifies that archiving (deleting) a thread room
 // frees the partial-unique dm_member_key so POST /api/v1/dms creates a fresh
 // room rather than resurrecting the tombstoned one.

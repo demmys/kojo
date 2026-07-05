@@ -118,6 +118,11 @@ type GroupDMKind string
 const (
 	GroupDMKindGroup GroupDMKind = "group"
 	GroupDMKindDM    GroupDMKind = "dm"
+	// GroupDMKindThread is a parallel human↔agent thread room. Unlike a
+	// single-agent "dm" it is always created fresh (no member-set dedup) so
+	// an agent can have many independent threads at once. Behaves like a
+	// single-agent dm for the thread-turn / archive / UI paths.
+	GroupDMKindThread GroupDMKind = "thread"
 )
 
 // GroupMember is a participant in a group DM.
@@ -151,6 +156,8 @@ type GroupMessage struct {
 	// human operator) referenced via @name in Content, parsed at post time.
 	Mentions  []string `json:"mentions,omitempty"`
 	Timestamp string   `json:"timestamp"`
+	// Usage is the token usage of an agent thread reply (nil otherwise).
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 func generateGroupID() string {
@@ -196,6 +203,13 @@ func appendGroupMessage(groupID string, msg *GroupMessage, expectedLatestSeq int
 			return fmt.Errorf("appendGroupMessage: marshal attachments: %w", err)
 		}
 		rec.Attachments = buf
+	}
+	if msg.Usage != nil {
+		buf, err := json.Marshal(msg.Usage)
+		if err != nil {
+			return fmt.Errorf("appendGroupMessage: marshal usage: %w", err)
+		}
+		rec.Usage = buf
 	}
 	ts := parseAgentRFC3339Millis(msg.Timestamp)
 	if ts == 0 {
@@ -445,6 +459,12 @@ func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
 		var atts []MessageAttachment
 		if err := json.Unmarshal(rec.Attachments, &atts); err == nil {
 			out.Attachments = atts
+		}
+	}
+	if len(rec.Usage) > 0 && string(rec.Usage) != "null" {
+		var u Usage
+		if err := json.Unmarshal(rec.Usage, &u); err == nil {
+			out.Usage = &u
 		}
 	}
 	return out

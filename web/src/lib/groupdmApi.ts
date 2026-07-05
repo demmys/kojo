@@ -17,8 +17,18 @@ export const DEFAULT_GROUPDM_VENUE: GroupDMVenue = "chatroom";
 /** Reserved agentId used for messages posted by the human user (operator). */
 export const USER_SENDER_ID = "user";
 
-/** Room kind: "group" = multi-agent room, "dm" = first-class 1:1 room. */
-export type GroupDMKind = "group" | "dm";
+/** Room kind: "group" = multi-agent room, "dm" = first-class 1:1 room,
+ * "thread" = parallel human↔agent thread room (always freshly created). */
+export type GroupDMKind = "group" | "dm" | "thread";
+
+/** Per-message token usage (agent thread replies only). Mirrors the server's
+ * agent.Usage. */
+export interface GroupMessageUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
 
 /** Server default when maxHops is 0/unset. */
 export const DEFAULT_MAX_HOPS = 4;
@@ -60,6 +70,8 @@ export interface GroupMessage {
   /** Mentioned agent ids; USER_SENDER_ID ("user") = the human operator. */
   mentions?: string[];
   timestamp: string;
+  /** Token usage for an agent thread reply (absent otherwise). */
+  usage?: GroupMessageUsage;
 }
 
 export interface UnreadInfo {
@@ -135,6 +147,11 @@ export const groupdmApi = {
    * (200 = existing, 201 = created). */
   openDM: (target: { agentId: string } | { memberIds: string[] }) =>
     post<GroupDMInfo>("/api/v1/dms", target),
+
+  /** Create a brand-new parallel thread room for an agent. Always returns a
+   * fresh room (201) — no dedup, unlike openDM. */
+  createThread: (agentId: string) =>
+    post<GroupDMInfo>("/api/v1/threads", { agentId }),
 
   unread: (id: string, after?: string | null) =>
     get<UnreadInfo>(

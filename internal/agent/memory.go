@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -75,16 +76,12 @@ const DefaultUserContent = `# About the User
 
 // DefaultStatusContent is the initial status.json body seeded into new
 // agent dirs (ensureAgentDir) and surfaced by the API / system prompt
-// when an agent has no status row yet. The keys are a starting point,
-// not a schema — the agent may rewrite, add, or remove keys freely;
-// values are freeform strings.
-const DefaultStatusContent = `{
-  "mood": "neutral",
-  "energy": "rested",
-  "sleepiness": "awake",
-  "fatigue": "none",
-  "affection": "getting to know you"
-}
+// when an agent has no status row yet. Empty on purpose — status is
+// freeform key-value JSON the agent writes about itself as it goes;
+// starting empty avoids putting words (and default values) in the
+// agent's mouth. writeStatusSection omits the whole "Your Status"
+// section from the system prompt while the object stays empty.
+const DefaultStatusContent = `{}
 `
 
 // curlFlagsForAPI builds the curl flag string used in every
@@ -834,10 +831,34 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	return sb.String()
 }
 
+// isEmptyStatusContent reports whether a status.json body carries no
+// agent-authored state yet — either genuinely empty or a JSON object with
+// no keys (the seeded `{}` placeholder, however it is whitespace-formatted).
+// writeStatusSection uses this to omit the whole "Your Status" section
+// (header included) from the system prompt until the agent actually writes
+// something into it, rather than showing an empty/placeholder block turn
+// after turn. Parses as JSON rather than string-matching braces so oddly
+// spaced (`{ }`) or malformed content is judged correctly; anything that
+// isn't an empty object (including non-object JSON or invalid JSON — the
+// agent's own malformed edit) is treated as non-empty so it still surfaces
+// for the agent to see and fix.
+func isEmptyStatusContent(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return true
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return false
+	}
+	return len(obj) == 0
+}
+
 // writeStatusSection appends the "# Your Status" block to the system
 // prompt. Reads status.json from the disk mirror (same source
-// buildSystemPrompt uses for user.md); when the file is absent the
-// default template is shown with a nudge to materialise it. Content is
+// buildSystemPrompt uses for user.md); when the file is absent or empty
+// (`{}`) the whole section — including this header — is omitted, since
+// there is no state yet for the agent to be reminded of. Content is
 // fenced with the same backtick-escape guard as MEMORY.md since the
 // body is agent-authored data.
 func writeStatusSection(sb *strings.Builder, agentID string) {
@@ -851,12 +872,13 @@ func writeStatusSection(sb *strings.Builder, agentID string) {
 		}
 	}
 
+	if isEmptyStatusContent(content) {
+		return
+	}
+
 	sb.WriteString("\n# Your Status\n\n")
 	sb.WriteString(fmt.Sprintf("Your current state lives in %s — freeform key-value JSON you maintain about yourself (mood, energy, sleepiness, fatigue, affection, or whatever keys fit you; values are freeform strings). It colors how you feel, speak, and act right now, layered on top of who you are.\n\n", statusPath))
-	if content == "" {
-		sb.WriteString("The file does not exist yet. Below is the starting template — write it to the path above (Edit tool) and make it yours.\n\n")
-		content = strings.TrimSpace(DefaultStatusContent)
-	} else if lastUpdated != "" {
+	if lastUpdated != "" {
 		sb.WriteString(fmt.Sprintf("Last updated: %s\n\n", lastUpdated))
 	}
 	// Oversized guard: rune-level head/tail truncation (persona style)

@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   clearMessages: vi.fn(),
   setMaxHops: vi.fn(),
   setLastRead: vi.fn(),
+  archive: vi.fn(),
 }));
 
 vi.mock("../../lib/groupdmApi", () => ({
@@ -29,6 +30,7 @@ vi.mock("../../lib/groupdmApi", () => ({
     setMaxHops: mocks.setMaxHops,
     postUserMessage: vi.fn(),
     delete: vi.fn(),
+    archive: mocks.archive,
   },
 }));
 
@@ -149,6 +151,39 @@ describe("GroupDMChat max hops setting", () => {
     expect(
       await screen.findByTitle("Max relay hops (empty = default 4, max 20)"),
     ).toHaveTextContent("8hops");
+  });
+});
+
+describe("GroupDMChat thread room", () => {
+  const threadGroup = {
+    id: "g1",
+    name: "Alice",
+    kind: "dm" as const,
+    members: [{ agentId: "ag_alice", agentName: "Alice", status: "online" as const }],
+    cooldown: 0,
+    style: "efficient" as const,
+    venue: "chatroom" as const,
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+  };
+
+  it("shows Archive (not group settings) and archives on confirm", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.archive.mockResolvedValue({ ok: true });
+    const router = renderGroup();
+
+    const archiveBtn = await screen.findByTitle("Archive thread");
+    expect(archiveBtn).toBeInTheDocument();
+    // Group-only affordances are hidden for threads.
+    expect(screen.queryByTitle("Max relay hops (empty = default 4, max 20)")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Notification cooldown (seconds)")).not.toBeInTheDocument();
+
+    fireEvent.click(archiveBtn);
+    expect(await screen.findByText("Archive “Alice”?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+
+    await waitFor(() => expect(mocks.archive).toHaveBeenCalledWith("g1"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
   });
 });
 

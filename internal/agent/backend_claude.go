@@ -1003,6 +1003,22 @@ func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
 	return agentIDToUUID(agentID)
 }
 
+// removeClaudeSession best-effort deletes the Claude session JSONL for the
+// given (agentID, sessionKey) pair. Used when a thread room is archived so the
+// throwaway side-conversation's --resume artifact does not linger. Errors are
+// ignored: a missing file is the expected common case (session never created).
+func removeClaudeSession(agentID, sessionKey string) {
+	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+	if sessionID == "" {
+		return
+	}
+	absDir, err := filepath.Abs(agentDir(agentID))
+	if err != nil {
+		return
+	}
+	_ = os.Remove(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
+}
+
 // recoverFromSession reads the Claude session JSONL for the agent and
 // returns the text that Claude actually generated for the last user message.
 // If sessionID is non-empty, the matching session file is used; otherwise

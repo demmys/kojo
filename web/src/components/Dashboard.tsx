@@ -694,8 +694,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       onClick={(e) => void openAgentDM(agent.id, e)}
                       disabled={dmOpening !== null}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-copper disabled:opacity-40"
-                      title={`DM ${agent.name}`}
-                      aria-label={`DM ${agent.name}`}
+                      title={`Start thread with ${agent.name}`}
+                      aria-label={`Start thread with ${agent.name}`}
                     >
                       {dmOpening === agent.id ? (
                         <span className="font-mono text-[10px]">…</span>
@@ -729,12 +729,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
           )}
         </section>
 
-        {/* DMs Section — first-class 1:1 rooms (kind === "dm") */}
+        {/* Threads Section — first-class 1:1 rooms (kind === "dm") */}
         {dmRooms.length > 0 && (
           <section>
             <div className="mb-2 flex items-center justify-between px-0.5">
               <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-                DMs · {dmRooms.length}
+                Threads · {dmRooms.length}
               </h2>
             </div>
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">

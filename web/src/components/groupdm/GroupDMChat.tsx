@@ -73,6 +73,10 @@ export function GroupDMChat() {
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const deleteDialogRef = useRef<HTMLDivElement>(null);
+  const [showArchiveDialog, setShowArchiveDialog] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveError, setArchiveError] = useState("");
+  const archiveDialogRef = useRef<HTMLDivElement>(null);
   const [showClearDialog, setShowClearDialog] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [clearError, setClearError] = useState("");
@@ -118,6 +122,11 @@ export function GroupDMChat() {
   useEffect(() => {
     if (showDeleteDialog) deleteDialogRef.current?.focus();
   }, [showDeleteDialog]);
+
+  // Focus archive dialog overlay for Escape key
+  useEffect(() => {
+    if (showArchiveDialog) archiveDialogRef.current?.focus();
+  }, [showArchiveDialog]);
 
   // Focus clear-history dialog overlay for Escape key
   useEffect(() => {
@@ -243,6 +252,26 @@ export function GroupDMChat() {
   }
 
   if (!group) return null;
+
+  // A "thread" room is a human↔agent DM with a single agent member: a
+  // temporary Slack-thread-like side conversation. Group-only affordances
+  // (cooldown / hops settings) are hidden and Delete becomes Archive.
+  const isThread = group.kind === "dm" && group.members.length === 1;
+
+  // Lightweight "replying…" indicator: in a thread, the newest message being
+  // the user's own post means the agent's turn is still running (polling will
+  // append the reply and flip this off). Safety: the server-side thread turn
+  // is capped at 10 minutes (notifyTimeout), so the indicator also clears
+  // once the last user message is older than that — it must not persist
+  // forever across reloads or on a rare empty reply. Recomputed on every
+  // 3s poll re-render, so the cutoff takes effect without its own timer.
+  const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const THREAD_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
+  const awaitingReply =
+    isThread &&
+    lastMsg !== null &&
+    lastMsg.agentId === USER_SENDER_ID &&
+    Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
 
   // Build a color map for agents
   const palette = [
@@ -406,7 +435,8 @@ export function GroupDMChat() {
             </>
           )}
         </div>
-        {/* Cooldown setting */}
+        {/* Cooldown setting — group-only (threads have no notify fan-out) */}
+        {!isThread && (
         <div className="shrink-0">
           {editingCooldown ? (
             <form
@@ -448,7 +478,10 @@ export function GroupDMChat() {
             </button>
           )}
         </div>
-        {/* Max hops setting — agent-to-agent relay hop limit (0 = default 4) */}
+        )}
+        {/* Max hops setting — agent-to-agent relay hop limit (0 = default 4).
+            Group-only: threads never relay to other agents. */}
+        {!isThread && (
         <div className="shrink-0">
           {editingMaxHops ? (
             <form
@@ -494,6 +527,7 @@ export function GroupDMChat() {
             </button>
           )}
         </div>
+        )}
         <button
           onClick={() => {
             setClearError("");
@@ -507,19 +541,36 @@ export function GroupDMChat() {
             <path d="M7.25 6.5a.75.75 0 000 1.5h5.5a.75.75 0 000-1.5h-5.5zM7.25 9.5a.75.75 0 000 1.5h1.5a.75.75 0 000-1.5h-1.5z" />
           </svg>
         </button>
-        <button
-          onClick={() => {
-            setDeleteNotify(false);
-            setDeleteError("");
-            setShowDeleteDialog(true);
-          }}
-          className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
-          title="Delete group"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
-            <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
-          </svg>
-        </button>
+        {isThread ? (
+          <button
+            onClick={() => {
+              setArchiveError("");
+              setShowArchiveDialog(true);
+            }}
+            className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
+            title="Archive thread"
+            aria-label="Archive thread"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+              <path d="M2 4.75A.75.75 0 012.75 4h14.5a.75.75 0 01.75.75v1.5a.75.75 0 01-.75.75H2.75A.75.75 0 012 6.25v-1.5z" />
+              <path fillRule="evenodd" d="M3.5 8.5h13V15a1.5 1.5 0 01-1.5 1.5H5A1.5 1.5 0 013.5 15V8.5zM8 11a.75.75 0 000 1.5h4a.75.75 0 000-1.5H8z" clipRule="evenodd" />
+            </svg>
+          </button>
+        ) : (
+          <button
+            onClick={() => {
+              setDeleteNotify(false);
+              setDeleteError("");
+              setShowDeleteDialog(true);
+            }}
+            className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
+            title="Delete group"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
+              <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
+            </svg>
+          </button>
+        )}
       </header>
 
       {/* Messages */}
@@ -597,6 +648,16 @@ export function GroupDMChat() {
             </div>
           );
         })}
+        {awaitingReply && (
+          <div className="flex items-center gap-3" aria-live="polite">
+            <div className="flex gap-3">
+              {group.members.slice(0, 1).map((m) => (
+                <AgentAvatar key={m.agentId} agentId={m.agentId} name={m.agentName} size="xs" className="mt-0.5 shrink-0" />
+              ))}
+            </div>
+            <span className="text-[13px] italic text-ink-faint">replying…</span>
+          </div>
+        )}
         <div ref={messagesEndRef} />
         </div>
       </div>
@@ -748,6 +809,56 @@ export function GroupDMChat() {
                 className="rounded-[10px] border border-lamp-err/50 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err transition-colors hover:bg-lamp-err/20 disabled:opacity-50"
               >
                 {deleting ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Archive confirmation dialog (thread rooms) */}
+      {showArchiveDialog && (
+        <div
+          ref={archiveDialogRef}
+          tabIndex={-1}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 outline-none"
+          onClick={(e) => { if (e.target === e.currentTarget && !archiving) setShowArchiveDialog(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape" && !archiving) setShowArchiveDialog(false); }}
+        >
+          <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
+            <h3 className="mb-2 text-sm font-medium text-ink">
+              Archive &ldquo;{group.name}&rdquo;?
+            </h3>
+            <p className="mb-4 text-xs text-ink-dim">
+              This permanently closes the thread. It cannot be restored.
+            </p>
+            {archiveError && (
+              <p className="mb-3 text-xs text-lamp-err">{archiveError}</p>
+            )}
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setShowArchiveDialog(false)}
+                disabled={archiving}
+                className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  setArchiving(true);
+                  setArchiveError("");
+                  try {
+                    await groupdmApi.archive(group.id);
+                    navigate("/");
+                  } catch (e) {
+                    setArchiveError(e instanceof Error ? e.message : "Failed to archive");
+                  } finally {
+                    setArchiving(false);
+                  }
+                }}
+                disabled={archiving}
+                className="rounded-[10px] border border-lamp-err/50 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err transition-colors hover:bg-lamp-err/20 disabled:opacity-50"
+              >
+                {archiving ? "Archiving…" : "Archive"}
               </button>
             </div>
           </div>

@@ -108,9 +108,9 @@ afterEach(() => {
 });
 
 describe("Dashboard room list", () => {
-  it("splits dm rooms into a DMs section separate from Group DMs", async () => {
+  it("splits dm rooms into a Threads section separate from Group DMs", async () => {
     renderDashboard();
-    expect(await screen.findByText("DMs · 1")).toBeInTheDocument();
+    expect(await screen.findByText("Threads · 1")).toBeInTheDocument();
     expect(screen.getByText("Group DMs · 1")).toBeInTheDocument();
   });
 
@@ -126,7 +126,7 @@ describe("Dashboard room list", () => {
 
   it("opens a DM from the agent row and navigates to the room", async () => {
     const router = renderDashboard();
-    fireEvent.click(await screen.findByLabelText("DM Alice"));
+    fireEvent.click(await screen.findByLabelText("Start thread with Alice"));
     await waitFor(() => expect(mocks.openDM).toHaveBeenCalledWith({ agentId: "ag_a" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/d1"));
   });

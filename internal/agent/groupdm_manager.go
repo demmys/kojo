@@ -191,6 +191,22 @@ type GroupDMManager struct {
 	// an unheld *sync.Mutex is small. Same trade-off as
 	// Manager.patchMus.
 	patchMus keyedMutex
+
+	// threadMus serializes thread-turn execution per thread room (kind
+	// "dm" with a single agent member). Two rapid user posts to the same
+	// thread wait on this so they never --resume the same Claude session
+	// UUID concurrently; the second post's turn just waits.
+	threadMus keyedMutex
+
+	// threadCancels holds the cancel func of the in-flight thread turn per
+	// room so Delete (archive) can abort a running turn. Guarded by
+	// threadCancelMu.
+	threadCancelMu sync.Mutex
+	threadCancels  map[string]context.CancelFunc
+
+	// oneShot runs a one-shot agent turn for thread rooms. Defaults to
+	// agentMgr.ChatOneShot; overridable in tests to stub the agent turn.
+	oneShot func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)
 }
 
 // NewGroupDMManager creates a new GroupDMManager.
@@ -201,9 +217,10 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		logger:      logger,
 		notify:      make(map[string]*notifyState),
 		triggerHop:  make(map[string]triggerHopEntry),
-		latestMsgID: make(map[string]string),
-		deleting:    make(map[string]bool),
-		persistGen:  make(map[string]int64),
+		latestMsgID:   make(map[string]string),
+		deleting:      make(map[string]bool),
+		persistGen:    make(map[string]int64),
+		threadCancels: make(map[string]context.CancelFunc),
 	}
 	m.load()
 	return m
@@ -590,6 +607,14 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 		copy(members, g.Members)
 		groupName = g.Name
 	}
+	// Thread rooms (kind "dm", single agent member) get extra teardown:
+	// cancel any in-flight thread turn and drop the per-thread Claude
+	// session JSONL so the throwaway side-conversation leaves nothing behind.
+	isThread := g.Kind == GroupDMKindDM && len(g.Members) == 1
+	var threadAgentID string
+	if isThread {
+		threadAgentID = g.Members[0].AgentID
+	}
 	// Mark deleting before unlocking. PostMessage / AddMember / etc.
 	// check m.deleting under the same lock and bail out, so a post
 	// landing between this unlock and the DB tombstone won't surface
@@ -622,6 +647,12 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 
 	// Clean up cooldown entries for this group
 	m.cleanNotifyKeys(id)
+
+	// Thread teardown: abort a running turn and remove its session artifact.
+	if isThread {
+		m.cancelThreadTurn(id)
+		removeClaudeSession(threadAgentID, "groupdm:"+id)
+	}
 
 	m.logger.Info("group DM deleted", "id", id, "notify", notify)
 
@@ -1032,6 +1063,14 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	for i, mem := range g.Members {
 		memberIDs[i] = mem.AgentID
 	}
+	// A "thread" room is a human↔agent DM with exactly one agent member.
+	// User posts there run a Slack-thread-like side conversation with that
+	// agent instead of the cooldown/batch/hop notify fan-out.
+	isThread := g.Kind == GroupDMKindDM && len(g.Members) == 1
+	var threadAgentID string
+	if isThread {
+		threadAgentID = g.Members[0].AgentID
+	}
 
 	msg := newGroupMessage(UserSenderID, UserSenderName, content, attachments)
 	msg.Mentions = m.parseMentions(content, memberIDs)
@@ -1051,7 +1090,12 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	// settings-only upsert would drop as a no-op.
 	m.touchStore(groupID, updatedAt)
 
-	if notify {
+	if isThread {
+		// Thread room: skip notifyAgent (no cooldown/batch/hops). Run a
+		// temporary parallel conversation with the single agent member,
+		// isolated from the agent's main chat.
+		go m.runThreadTurn(threadAgentID, groupID, groupName, msg)
+	} else if notify {
 		for _, r := range recipients {
 			go m.notifyAgent(r.AgentID, groupID, groupName, msg, true,
 				containsMention(msg.Mentions, r.AgentID))
@@ -1059,6 +1103,169 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	}
 
 	return msg, nil
+}
+
+// threadSystemPromptExtra is appended to the system prompt for a thread turn.
+// It tells the agent this is a throwaway side-conversation with the operator,
+// isolated from its main chat, and that no curl/API call is needed to reply.
+const threadSystemPromptExtra = "You are in a temporary side-thread with the human operator — a parallel, throwaway conversation. It is fully isolated from your main conversation and from every other room: nothing said here appears in your main chat, and your main chat's context is not carried into this thread. Always answer the operator's message — directly and concisely; a brief acknowledgement is fine when there is nothing more to add. Do NOT use curl or any API call to reply — just write your reply as your normal response and it will be posted into the thread automatically."
+
+// runThreadTurn executes one temporary side-thread turn for a thread room
+// (kind "dm", single agent member). It resumes a per-thread Claude session so
+// successive posts share context, but stays isolated from the agent's main
+// chat. Serialized per room so two rapid posts never --resume the same session
+// concurrently; the reply is posted daemon-authored on the agent's behalf,
+// bypassing CAS and suppressing notify.
+func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *GroupMessage) {
+	// Serialize per thread — the second concurrent post waits here so both
+	// turns don't --resume the same session UUID at once.
+	release := m.threadMus.Lock(groupID)
+	defer release()
+
+	// Recheck the room is still live: a turn queued behind the mutex may
+	// have waited across an archive (Delete). Running it anyway would
+	// re-create the just-removed session JSONL and post into a tombstoned
+	// room — bail instead.
+	m.mu.Lock()
+	_, err := m.liveGroupLocked(groupID)
+	m.mu.Unlock()
+	if err != nil {
+		m.logger.Debug("thread turn skipped (room archived)", "group", groupID, "agent", agentID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+
+	// Register the cancel so archive (Delete) can abort a running turn.
+	m.threadCancelMu.Lock()
+	m.threadCancels[groupID] = cancel
+	m.threadCancelMu.Unlock()
+	defer func() {
+		m.threadCancelMu.Lock()
+		delete(m.threadCancels, groupID)
+		m.threadCancelMu.Unlock()
+	}()
+
+	oneShot := m.oneShot
+	if oneShot == nil {
+		oneShot = m.agentMgr.ChatOneShot
+	}
+
+	payload := m.renderThreadPayload(groupName, msg)
+	events, err := oneShot(ctx, agentID, payload, OneShotOpts{
+		SessionKey:        "groupdm:" + groupID,
+		SystemPromptExtra: threadSystemPromptExtra,
+	})
+	if err != nil {
+		m.handleThreadTurnError(groupID, agentID, payload, err)
+		return
+	}
+
+	var reply strings.Builder
+	var streamErr string
+	for ev := range events {
+		switch ev.Type {
+		case "text":
+			reply.WriteString(ev.Delta)
+		case "error":
+			if streamErr == "" {
+				streamErr = ev.ErrorMessage
+			}
+		}
+	}
+	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		streamErr = fmt.Sprintf("thread turn timed out after %s", notifyTimeout)
+	}
+	if streamErr != "" {
+		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
+		return
+	}
+
+	text := strings.TrimSpace(reply.String())
+	if text == "" {
+		return // nothing substantive to post
+	}
+	if _, err := m.postThreadReply(groupID, agentID, text); err != nil {
+		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
+	}
+}
+
+// renderThreadPayload builds the one-shot payload for a thread turn from the
+// posted message: a sanitized sender header, the raw content, and any
+// attachment paths. No curl/CAS reply instructions — the reply is posted for
+// the agent automatically.
+func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage) string {
+	var b strings.Builder
+	safeSender := strings.TrimSpace(sanitizeHeaderField(msg.AgentName))
+	if safeSender == "" {
+		safeSender = "the operator"
+	}
+	fmt.Fprintf(&b, "[Thread: %s] Message from %s (human operator):\n", sanitizeHeaderField(groupName), safeSender)
+	b.WriteString(msg.Content)
+	for _, a := range msg.Attachments {
+		fmt.Fprintf(&b, "\n📎 %s (%s, %s)",
+			sanitizeHeaderField(a.Path),
+			sanitizeHeaderField(a.Name),
+			sanitizeHeaderField(a.Mime))
+	}
+	return b.String()
+}
+
+// postThreadReply appends an agent-authored message to a thread room on the
+// agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
+// agent produced the text via a one-shot turn, not a direct API post.
+func (m *GroupDMManager) postThreadReply(groupID, agentID, content string) (*GroupMessage, error) {
+	m.mu.Lock()
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	var senderName string
+	if a, ok := m.agentMgr.Get(agentID); ok {
+		senderName = a.Name
+	}
+	memberIDs := make([]string, 0, len(g.Members))
+	for _, mem := range g.Members {
+		memberIDs = append(memberIDs, mem.AgentID)
+	}
+	msg := newGroupMessage(agentID, senderName, content, nil)
+	msg.Mentions = m.parseMentions(content, memberIDs)
+	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("store message: %w", err)
+	}
+	m.latestMsgID[groupID] = msg.ID
+	g.UpdatedAt = time.Now().Format(time.RFC3339)
+	updatedAt := g.UpdatedAt
+	m.mu.Unlock()
+	m.touchStore(groupID, updatedAt)
+	return msg, nil
+}
+
+// handleThreadTurnError logs and dead-letters a failed thread turn, then posts
+// a best-effort visible failure notice into the room. A cancelled turn is the
+// archive path tearing the thread down — the room is going away, so it neither
+// posts nor dead-letters.
+func (m *GroupDMManager) handleThreadTurnError(groupID, agentID, payload string, err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	m.logger.Warn("thread turn failed", "group", groupID, "agent", agentID, "err", err)
+	m.recordDeadLetter(groupID, agentID, "thread turn: "+err.Error(), payload, 1)
+	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error()); perr != nil {
+		m.logger.Warn("failed to post thread failure notice", "group", groupID, "agent", agentID, "err", perr)
+	}
+}
+
+// cancelThreadTurn aborts the in-flight thread turn for a room, if any.
+func (m *GroupDMManager) cancelThreadTurn(groupID string) {
+	m.threadCancelMu.Lock()
+	if cancel := m.threadCancels[groupID]; cancel != nil {
+		cancel()
+	}
+	m.threadCancelMu.Unlock()
 }
 
 // Messages returns paginated messages for a group plus the current head ID

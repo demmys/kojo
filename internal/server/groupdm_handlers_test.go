@@ -255,6 +255,49 @@ func TestHandleFindOrCreateDM(t *testing.T) {
 	}
 }
 
+// TestArchiveThenRecreateDM verifies that archiving (deleting) a thread room
+// frees the partial-unique dm_member_key so POST /api/v1/dms creates a fresh
+// room rather than resurrecting the tombstoned one.
+func TestArchiveThenRecreateDM(t *testing.T) {
+	srv, _, group, _ := newGroupDMHandlerTestServer(t)
+	aliceID := group.Members[0].AgentID
+
+	openDM := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/dms",
+			strings.NewReader(`{"agentId":"`+aliceID+`"}`))
+		rr := httptest.NewRecorder()
+		srv.handleFindOrCreateDM(rr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+		return rr
+	}
+
+	rr := openDM()
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var first agent.GroupDM
+	readJSONResponse(t, rr, &first)
+
+	// Archive it (DELETE = tombstone, the thread-room archive path).
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/groupdms/"+first.ID, nil)
+	req.SetPathValue("id", first.ID)
+	drr := httptest.NewRecorder()
+	srv.handleDeleteGroupDM(drr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+	if drr.Code != http.StatusOK {
+		t.Fatalf("archive status = %d, body = %s", drr.Code, drr.Body.String())
+	}
+
+	// A new open must create a fresh room, not find the tombstoned one.
+	rr = openDM()
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("recreate status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var second agent.GroupDM
+	readJSONResponse(t, rr, &second)
+	if second.ID == first.ID {
+		t.Errorf("recreated room reused archived id %s", first.ID)
+	}
+}
+
 func TestHandleGetGroupUnread(t *testing.T) {
 	srv, gdm, group, _ := newGroupDMHandlerTestServer(t)
 	m1, err := gdm.PostUserMessage(context.Background(), group.ID, "one", nil, false)

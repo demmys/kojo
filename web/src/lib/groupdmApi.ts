@@ -150,6 +150,10 @@ export const groupdmApi = {
   delete: (id: string, notify = false) =>
     del<{ ok: boolean }>(`/api/v1/groupdms/${id}${notify ? "?notify=true" : ""}`),
 
+  /** Archive a thread room. Alias of delete (thread archive = tombstone, no
+   * restore); no member notification. */
+  archive: (id: string) => del<{ ok: boolean }>(`/api/v1/groupdms/${id}`),
+
   clearMessages: (id: string) =>
     del<{ ok: boolean; deleted: number }>(`/api/v1/groupdms/${id}/messages`),
 

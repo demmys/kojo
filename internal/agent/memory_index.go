@@ -19,9 +19,9 @@ import (
 const (
 	indexDir        = "index"
 	indexDBFile     = "memory.db"
-	maxResults      = 6
-	maxContextLen   = 3000
-	maxSnippetRunes = 500
+	maxResults      = 4
+	maxContextLen   = 2000
+	maxSnippetRunes = 300
 
 	hybridVectorWeight = 0.7
 	hybridTextWeight   = 0.3

@@ -390,6 +390,19 @@ type Agent struct {
 	// against decommission, or a freshly switched-to peer that
 	// hasn't broadcast its registration yet).
 	HolderPeerName string `json:"holderPeerName,omitempty"`
+	// DisabledInjections is the set of context-injection section keys
+	// the Owner has switched off for this agent. Empty / absent = all
+	// sections enabled (the historical behavior). Keys are validated
+	// against validInjectionKeys on PATCH; see InjectionDisabled for
+	// the read side. Persisted inside agents.settings_json like every
+	// other per-agent setting — no schema migration required, absent
+	// key decodes to nil.
+	//
+	// Owner-only on the API surface: handleUpdateAgent rejects a PATCH
+	// body carrying this field from a non-Owner principal, because
+	// toggling injections changes the agent's capability surface.
+	DisabledInjections []string `json:"disabledInjections,omitempty"`
+
 	// HolderPeerStatus mirrors peer_registry.status for HolderPeer at
 	// list/read time so the UI can grey out chat (and surface an
 	// "offline" banner) without a second round-trip to /api/v1/peers.
@@ -520,6 +533,82 @@ type AgentUpdateConfig struct {
 	// overwrites the agent's flag. The next prepareChat / skill sync
 	// installs or removes the SKILL.md accordingly.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
+	// DisabledInjections replaces the whole set when non-nil; pass an
+	// empty array to re-enable everything. Owner-only (enforced at the
+	// HTTP handler). Keys validated via ValidateDisabledInjections.
+	DisabledInjections *[]string `json:"disabledInjections"`
+}
+
+// Context-injection section keys togglable via Agent.DisabledInjections.
+const (
+	InjectionUserContext        = "user_context"        // user.md block in the system prompt
+	InjectionMemoryMD           = "memory_md"           // Current MEMORY.md injected block
+	InjectionCredentials        = "credentials"         // credentials pointer + warnings
+	InjectionGroupDM            = "groupdm"             // Group DM section (memberships + guide pointer)
+	InjectionTodoAPI            = "todo_api"            // todo guide pointer + Active Todos in volatile context
+	InjectionAttachments        = "attachments"         // attachment staging pointer
+	InjectionStatus             = "status"              // Your Status section
+	InjectionDiaryNotes         = "diary_notes"         // Recent Activity block in volatile context
+	InjectionMemorySearch       = "memory_search"       // Relevant Memory block in volatile context
+	InjectionRecentConversation = "recent_conversation" // session-resume transcript fallback
+)
+
+var validInjectionKeys = map[string]bool{
+	InjectionUserContext:        true,
+	InjectionMemoryMD:           true,
+	InjectionCredentials:        true,
+	InjectionGroupDM:            true,
+	InjectionTodoAPI:            true,
+	InjectionAttachments:        true,
+	InjectionStatus:             true,
+	InjectionDiaryNotes:         true,
+	InjectionMemorySearch:       true,
+	InjectionRecentConversation: true,
+}
+
+// ValidInjectionKey reports whether key is a known injection section.
+func ValidInjectionKey(key string) bool { return validInjectionKeys[key] }
+
+// ValidateDisabledInjections rejects unknown keys so a typo'd PATCH
+// fails loudly instead of silently never disabling anything.
+func ValidateDisabledInjections(keys []string) error {
+	for _, k := range keys {
+		if !ValidInjectionKey(k) {
+			return fmt.Errorf("unknown injection key: %q", k)
+		}
+	}
+	return nil
+}
+
+// normalizeDisabledInjections dedupes while preserving order so the
+// persisted set stays minimal and stable.
+func normalizeDisabledInjections(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// InjectionDisabled reports whether the given context-injection section
+// is switched off for this agent. Nil agent / empty set = enabled.
+func (a *Agent) InjectionDisabled(key string) bool {
+	if a == nil {
+		return false
+	}
+	for _, k := range a.DisabledInjections {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 func generateID() string {

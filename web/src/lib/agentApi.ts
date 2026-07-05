@@ -142,7 +142,30 @@ export interface AgentInfo {
   // add/edit/delete, etc.) that would 409 with agent_busy and show a
   // banner instead.
   isSwitching?: boolean;
+  // disabledInjections lists context-injection keys turned OFF for this
+  // agent (see CONTEXT_INJECTION_KEYS below). Absent/empty means every
+  // injection is enabled — the common case, so the server omits the
+  // field entirely rather than sending an empty array on most agents.
+  disabledInjections?: string[];
 }
+
+// CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
+// disabledInjections. Unknown keys are rejected by the server with 400,
+// so this list must stay in sync with the backend's validation.
+export const CONTEXT_INJECTION_KEYS = [
+  "user_context",
+  "memory_md",
+  "credentials",
+  "groupdm",
+  "todo_api",
+  "attachments",
+  "status",
+  "diary_notes",
+  "memory_search",
+  "recent_conversation",
+] as const;
+
+export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
 // Empty model/voice/stylePrompt are interpreted as "use default" at
@@ -179,6 +202,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   allowProtectedPaths?: string[];
   thinkingMode?: string;
   tts?: TTSConfig | null;
+  disabledInjections?: string[];
 }
 
 export interface AgentMessageAttachment {

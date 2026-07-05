@@ -114,7 +114,7 @@ const (
 	// stops a user / agent from hand-editing memory/recent.md. A hard
 	// cap on the read side keeps a hostile or accidentally-large file
 	// from blowing up every turn's input cost.
-	recentSummaryMaxRunes = 8000
+	recentSummaryMaxRunes = 4000
 
 	// turnSummaryMinBacklogBytes gates the post-turn incremental
 	// summarization (TurnSummarize). A turn only triggers an LLM

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -242,5 +243,63 @@ func TestManagerTask_UnknownAgent(t *testing.T) {
 	}
 	if err := m.DeleteTask(ctx, "missing", "task_x", ""); !errors.Is(err, ErrAgentNotFound) {
 		t.Errorf("delete: got %v, want ErrAgentNotFound", err)
+	}
+}
+
+// TestManagerTask_ActiveTasksSummary_Truncation verifies the injection
+// cap: at most activeTasksSummaryMaxItems todos are listed and the
+// overflow is summarized in a "…and N more" line so a runaway todo list
+// can't blow up every turn's input cost.
+func TestManagerTask_ActiveTasksSummary_Truncation(t *testing.T) {
+	m := taskFixture(t, "ag_trunc")
+	ctx := context.Background()
+
+	total := activeTasksSummaryMaxItems + 7
+	for i := 0; i < total; i++ {
+		if _, err := m.CreateTask(ctx, "ag_trunc", TaskCreateParams{Title: fmt.Sprintf("todo number %03d", i)}); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	out := m.ActiveTasksSummary(ctx, "ag_trunc")
+	if got := strings.Count(out, "- `[task_"); got != activeTasksSummaryMaxItems {
+		t.Errorf("listed %d todos, want %d", got, activeTasksSummaryMaxItems)
+	}
+	if !strings.Contains(out, "…and 7 more (use the todo API to list all)") {
+		t.Errorf("missing overflow line: %q", out)
+	}
+}
+
+// TestManagerTask_ActiveTasksSummary_CharCap verifies the ~char budget:
+// long titles trip the cumulative cap before the item cap.
+func TestManagerTask_ActiveTasksSummary_CharCap(t *testing.T) {
+	m := taskFixture(t, "ag_charcap")
+	ctx := context.Background()
+
+	long := strings.Repeat("x", 800)
+	for i := 0; i < 15; i++ {
+		if _, err := m.CreateTask(ctx, "ag_charcap", TaskCreateParams{Title: long}); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	out := m.ActiveTasksSummary(ctx, "ag_charcap")
+	listed := strings.Count(out, "- `[task_")
+	if listed >= 15 {
+		t.Errorf("char cap did not truncate: listed all %d", listed)
+	}
+	if !strings.Contains(out, "more (use the todo API to list all)") {
+		t.Errorf("missing overflow line: %q", out)
+	}
+	// Per-line cap: the raw 800-char title must not appear verbatim.
+	if strings.Contains(out, long) {
+		t.Errorf("oversized title injected untruncated")
+	}
+	if !strings.Contains(out, strings.Repeat("x", activeTasksSummaryMaxTitleRunes)+"…") {
+		t.Errorf("expected truncated title with ellipsis")
+	}
+	// The cap bounds the WHOLE summary — header and trailer included.
+	if len(out) > activeTasksSummaryMaxChars {
+		t.Errorf("summary exceeds total char cap: %d > %d", len(out), activeTasksSummaryMaxChars)
 	}
 }

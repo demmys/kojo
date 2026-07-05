@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router";
-import { agentApi, type AgentInfo, type TruncateMemoryResult } from "../../lib/agentApi";
+import {
+  agentApi,
+  CONTEXT_INJECTION_KEYS,
+  type AgentInfo,
+  type ContextInjectionKey,
+  type TruncateMemoryResult,
+} from "../../lib/agentApi";
 import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
 import { errMsg } from "../../lib/utils";
@@ -28,6 +34,7 @@ import { Button } from "../ui/Button";
 
 const SECTIONS = [
   { id: "identity", label: "Identity" },
+  { id: "injections", label: "Context Injections" },
   { id: "model", label: "Model & Tools" },
   { id: "schedule", label: "Schedule" },
   { id: "voice", label: "Voice" },
@@ -38,6 +45,25 @@ const SECTIONS = [
 
 // Stable id list so useScrollSpy's effect deps don't churn every render.
 const SECTION_IDS = SECTIONS.map((s) => s.id);
+
+// Label + one-line description for each context-injection checklist item.
+// Keys must match CONTEXT_INJECTION_KEYS (imported from agentApi) — the
+// server 400s on any key outside that allowlist.
+const INJECTION_INFO: Record<ContextInjectionKey, { label: string; desc: string }> = {
+  user_context: { label: "User Context", desc: "User profile (user.md)" },
+  memory_md: { label: "MEMORY.md", desc: "MEMORY.md contents in system prompt" },
+  credentials: { label: "Credentials", desc: "Credentials usage guide" },
+  groupdm: { label: "Group DM", desc: "Group DM capability" },
+  todo_api: { label: "Todos", desc: "Persistent todos (guide + per-turn list)" },
+  attachments: { label: "Attachments", desc: "File attachment staging" },
+  status: { label: "Status", desc: "Agent status block" },
+  diary_notes: { label: "Diary Notes", desc: "Recent activity diary (per turn)" },
+  memory_search: { label: "Memory Search", desc: "Memory search results (per turn)" },
+  recent_conversation: {
+    label: "Recent Conversation",
+    desc: "Recent conversation fallback on session resume",
+  },
+};
 
 /**
  * Scroll-spy: tracks which SectionCard is currently in the reading zone so
@@ -185,6 +211,10 @@ export function AgentSettings() {
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
+  // Context-injection checklist. Checked = enabled = NOT present in this
+  // array. Absent/empty on the server means "everything enabled", so an
+  // untouched agent loads with this as [].
+  const [disabledInjections, setDisabledInjections] = useState<string[]>([]);
   const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
   // TTS settings
   const [ttsEnabled, setTTSEnabled] = useState(false);
@@ -295,6 +325,7 @@ export function AgentSettings() {
       setSilentEnd(a.silentEnd ?? "");
       setNotifyDuringSilent(a.notifyDuringSilent ?? true);
       setAllowedTools(a.allowedTools ?? []);
+      setDisabledInjections(a.disabledInjections ?? []);
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
       setTTSEnabled(a.tts?.enabled ?? false);
@@ -483,6 +514,7 @@ export function AgentSettings() {
           cronMessage: "",
           allowedTools,
           allowProtectedPaths,
+          disabledInjections,
           tts: {
             enabled: ttsEnabled,
             model: ttsModel,
@@ -857,6 +889,12 @@ export function AgentSettings() {
     }
   };
 
+  const toggleInjection = (key: ContextInjectionKey, enabled: boolean) => {
+    setDisabledInjections((prev) =>
+      enabled ? prev.filter((k) => k !== key) : prev.includes(key) ? prev : [...prev, key],
+    );
+  };
+
   const activeSection = useScrollSpy(SECTION_IDS, !!agent);
 
   if (!agent) return null;
@@ -1037,6 +1075,29 @@ export function AgentSettings() {
                 className={!publicProfileOverride ? "resize-none opacity-60" : "resize-none"}
               />
             </Field>
+          </div>
+        </SectionCard>
+
+        {/* ── Context Injections ── */}
+        <SectionCard
+          id="injections"
+          title="Context Injections"
+          description="Pick which pieces of context get injected into this agent's system prompt / per-turn context. Unchecking one saves a little context budget at the cost of that capability."
+        >
+          <div className="space-y-3">
+            {CONTEXT_INJECTION_KEYS.map((key) => {
+              const info = INJECTION_INFO[key];
+              const enabled = !disabledInjections.includes(key);
+              return (
+                <ToggleRow
+                  key={key}
+                  checked={enabled}
+                  onChange={(v) => toggleInjection(key, v)}
+                  title={info.label}
+                  desc={info.desc}
+                />
+              );
+            })}
           </div>
         </SectionCard>
 

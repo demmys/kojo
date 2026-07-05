@@ -1171,6 +1171,11 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 			return "", false, verr
 		}
 	}
+	if cfg.DisabledInjections != nil {
+		if verr := ValidateDisabledInjections(*cfg.DisabledInjections); verr != nil {
+			return "", false, verr
+		}
+	}
 	return nextCronMessage, cronMessageDirty, nil
 }
 
@@ -1445,6 +1450,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	if cfg.DeviceSwitchEnabled != nil {
 		a.DeviceSwitchEnabled = cfg.DeviceSwitchEnabled
+	}
+	if cfg.DisabledInjections != nil {
+		// Validated upstream (validateUpdateConfigPure).
+		a.DisabledInjections = normalizeDisabledInjections(*cfg.DisabledInjections)
 	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
@@ -1735,7 +1744,11 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// Gated on blob store presence because without a blob.Store
 	// there is no canonical place to store the bytes and the user UI
 	// cannot fetch them. The feature is always-on when both gates pass.
-	SyncAttachSkillForTool(agentID, agentCopy.Tool, m.blobStore != nil, m.logger)
+	// Also gated on the per-agent attachments injection toggle so
+	// disabling the prompt section removes the SKILL.md copy of the
+	// same contract instead of leaving it reachable via the skill tree.
+	SyncAttachSkillForTool(agentID, agentCopy.Tool,
+		m.blobStore != nil && !agentCopy.InjectionDisabled(InjectionAttachments), m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
@@ -1745,7 +1758,26 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// - Claude: --mcp-config CLI arg (in backend_claude.go)
 	// - Codex: -c flag override (in backend_codex.go)
 
-	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, m.creds != nil)
+	// Lazily sync the shared guide files (group DM / todo / credential /
+	// memory / attachment how-tos) that the compact "## kojo Guides"
+	// prompt section points at. Idempotent and throttled internally.
+	syncGuidesThrottled(m.logger)
+
+	// Credentials section is gated on the agent actually HAVING at
+	// least one stored credential — not merely on the store existing.
+	// The count itself is deliberately not surfaced in the prompt
+	// (cache stability); only the boolean gates the pointer line.
+	hasCreds := false
+	if m.creds != nil {
+		if list, err := m.creds.ListCredentials(agentID); err == nil {
+			hasCreds = len(list) > 0
+		} else {
+			m.logger.Warn("prepareChat: credential list failed; omitting credentials section this turn",
+				"agent", agentID, "err", err)
+		}
+	}
+
+	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, hasCreds)
 
 	// Refresh the memory index, but emit query-based recall through the
 	// volatile context (per-turn user message), NOT the system prompt —
@@ -1759,13 +1791,14 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		if indexNewMessages {
 			idx.IndexNewMessages(agentID)
 		}
-		if !skipMemoryContext {
+		if !skipMemoryContext && !agentCopy.InjectionDisabled(InjectionMemorySearch) {
 			queryContext = idx.BuildContextFromQuery(query)
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
 	recentMessagesContext := ""
-	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) {
+	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
+		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
 		recentMessagesContext = m.BuildRecentMessagesContext(ctx, agentID)
 	}
 

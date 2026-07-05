@@ -29,6 +29,7 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     allowedTools: ["Bash"],
     allowProtectedPaths: ["/etc"],
     tts: { enabled: false, model: "", voice: "", stylePrompt: "" },
+    disabledInjections: [],
     ...over,
   };
 }
@@ -150,5 +151,13 @@ describe("buildAgentSavePayload", () => {
     expect(out.silentStart).toBe("23:00");
     expect(out.silentEnd).toBe("08:00");
     expect(out.cronExpr).toBe("*/5 * * * *");
+  });
+
+  it("passes through disabledInjections verbatim", () => {
+    expect(buildAgentSavePayload(baseState()).disabledInjections).toEqual([]);
+    expect(
+      buildAgentSavePayload(baseState({ disabledInjections: ["memory_search", "diary_notes"] }))
+        .disabledInjections,
+    ).toEqual(["memory_search", "diary_notes"]);
   });
 });

@@ -221,16 +221,12 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 		"kojo will reset it automatically",
 		todayDiary, // absolute path, not relative — prevents cwd-dependent writes
 		"Short exchanges count",
-		// Lean-index rules — MEMORY.md hygiene guardrails
-		"LEAN index, not a dumping ground",
+		// Lean-index rules live in the guide file now; the prompt keeps
+		// the short rule plus a pointer to memory-conventions.md.
+		"LEAN index",
 		"~200 lines",
-		dir + "/memory/archive/",
-		"{YYYY-MM}.md",
-		dir + "/memory/projects/",
-		dir + "/memory/topics/",
-		"Delete stale entries",
-		"Don't pile new on top of old",
-		"Do NOT write dates",
+		"delete stale entries",
+		filepath.Join(GuideDir(), "memory-conventions.md"),
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(prompt, s) {

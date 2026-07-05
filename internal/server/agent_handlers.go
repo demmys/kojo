@@ -618,6 +618,20 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 					"privileged is owner-only; use POST /api/v1/agents/{id}/privilege")
 				return
 			}
+			// disabledInjections changes the agent's capability /
+			// context surface, so unlike persona / effort it is NOT
+			// self-PATCHable — Owner only. Peers pass for the same
+			// reason CanMutateSelf admits them: the Hub authorised the
+			// original caller before signing and forwarding, and an
+			// agent's self-PATCH never crosses the proxy (agents talk
+			// to their local daemon and may only PATCH themselves).
+			// Case-insensitive match for the same casing-trick reason
+			// as privileged.
+			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"disabledInjections is owner-only")
+				return
+			}
 		}
 	}
 	var cfg agent.AgentUpdateConfig

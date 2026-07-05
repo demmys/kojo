@@ -921,7 +921,12 @@ func (m *Manager) List() []*Agent {
 		if info, ok := avMap[a.ID]; ok {
 			applyAvatarMeta(a, info.has, info.hash)
 		}
-		list = append(list, copyAgent(a))
+		c := copyAgent(a)
+		// Fold in the live in-flight-chat flag. m.mu → busyMu is the
+		// established lock order (see regeneratePublicProfile), so it's
+		// safe to consult IsBusy while holding m.mu here.
+		c.Busy = m.IsBusyForStatus(a.ID)
+		list = append(list, c)
 	}
 	return list
 }

@@ -165,6 +165,11 @@ export interface AgentInfo {
   // enabled (the feature is opt-out); the configured effort acts as the
   // ceiling/fallback while enabled. claude / grok tools only.
   autoEffort?: boolean;
+  // busy is a runtime-only flag: true while the agent has an in-flight
+  // interactive/cron chat (server-side Manager.IsBusy). The dashboard
+  // folds it into the "N running" figure so a chatting agent counts even
+  // when it has no terminal session. Server-derived; never sent on update.
+  busy?: boolean;
 }
 
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
@@ -239,7 +244,12 @@ export interface AgentMessage {
   toolUses?: ToolUse[];
   attachments?: AgentMessageAttachment[];
   timestamp: string;
-  usage?: { inputTokens: number; outputTokens: number };
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+  };
   // Strong HTTP entity tag of the row backing this message; passed to
   // PATCH /messages/{msgId} as If-Match for optimistic concurrency.
   // Optional because legacy / transitional rows may not have one.

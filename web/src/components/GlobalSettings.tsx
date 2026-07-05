@@ -4,6 +4,7 @@ import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
 import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
 import { PeersSection } from "./globalsettings/PeersSection";
+import { SystemSection } from "./globalsettings/SystemSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useEnterSends } from "../lib/preferences";
@@ -45,6 +46,7 @@ export function GlobalSettings() {
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
+        <SystemSection setError={setError} />
 
         {error && <Banner tone="error">{error}</Banner>}
         {success && <Banner tone="success">Saved</Banner>}

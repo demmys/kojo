@@ -946,6 +946,9 @@ func main() {
 		// default — operators flip it once their UI / agent CLI have
 		// caught up and stopped sending bare PUT/PATCH/DELETEs.
 		RequireIfMatch: os.Getenv("KOJO_REQUIRE_IF_MATCH") == "1",
+		// RepoDir enables POST /api/v1/system/rebuild (`make build` +
+		// in-place binary swap). Empty disables the endpoint.
+		RepoDir:        os.Getenv("KOJO_REPO_DIR"),
 		V0LegacyDir:    sessionV0LegacyDir,
 		PeerOnly:       *peerMode,
 		PendingSyncKEK: pendingSyncKEK,

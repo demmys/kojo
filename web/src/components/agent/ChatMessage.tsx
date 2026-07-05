@@ -9,6 +9,7 @@ import { AttachmentList } from "./MessageAttachments";
 import { FilePathChip, splitFilePaths } from "./filePaths";
 import { MediaOverlay } from "./MediaOverlay";
 import { actionBtnClass, ThinkingBlock } from "./StreamingMessage";
+import { estimateTurnCost } from "../../lib/pricing";
 
 // Re-exported so existing importers (GroupDMChat, AgentChat, tests) keep a
 // single "./ChatMessage" entry point even though the implementations now
@@ -23,6 +24,9 @@ interface ChatMessageProps {
   agentName: string;
   agentId: string;
   avatarHash?: string;
+  // Agent's configured model (AgentInfo.model), threaded through so the
+  // per-turn usage line can show an approximate cost when the model is priced.
+  agentModel?: string;
   onEdit?: (msgId: string, content: string) => Promise<void>;
   onDelete?: (msgId: string) => Promise<void>;
   onRegenerate?: (msgId: string) => Promise<void>;
@@ -39,6 +43,7 @@ export const ChatMessage = memo(function ChatMessage({
   agentName,
   agentId,
   avatarHash,
+  agentModel,
   onEdit,
   onDelete,
   onRegenerate,
@@ -113,9 +118,7 @@ export const ChatMessage = memo(function ChatMessage({
 
         {/* Usage */}
         {message.usage && message.usage.inputTokens != null && (
-          <div className="mt-1 font-mono text-[11px] text-ink-faint">
-            {message.usage.inputTokens.toLocaleString()}&rarr;{message.usage.outputTokens.toLocaleString()} tokens
-          </div>
+          <UsageLine usage={message.usage} model={agentModel} />
         )}
 
         {/* TTS playback button — assistant messages only */}
@@ -129,6 +132,33 @@ export const ChatMessage = memo(function ChatMessage({
     </div>
   );
 });
+
+// UsageLine renders the per-turn token counts (input→output, plus cache
+// read/write when present) and an approximate USD cost when the agent's
+// model is priced. Same muted mono style as the original token line.
+function UsageLine({
+  usage,
+  model,
+}: {
+  usage: NonNullable<AgentMessage["usage"]>;
+  model?: string;
+}) {
+  const cacheRead = usage.cacheReadInputTokens ?? 0;
+  const cacheWrite = usage.cacheCreationInputTokens ?? 0;
+  const cost = estimateTurnCost(model, usage);
+  return (
+    <div className="mt-1 font-mono text-[11px] text-ink-faint">
+      {usage.inputTokens.toLocaleString()}&rarr;{usage.outputTokens.toLocaleString()} tokens
+      {(cacheRead > 0 || cacheWrite > 0) && (
+        <>
+          {" "}
+          (cache {cacheRead.toLocaleString()}r/{cacheWrite.toLocaleString()}w)
+        </>
+      )}
+      {cost != null && <> &middot; &asymp;${cost.toFixed(4)}</>}
+    </div>
+  );
+}
 
 // TTSPlayButton renders a tiny speaker / spinner / stop icon based on
 // the current play state. Kept inline because it has no other consumers

@@ -884,6 +884,7 @@ export function AgentChat() {
               agentName={agent.name}
               agentId={agent.id}
               avatarHash={agent.avatarHash}
+              agentModel={agent.model}
               ttsEnabled={ttsAgentEnabled}
               ttsPlayState={tts.state[msg.id]}
               // TTS synthesize is an agent sub-route that the remote-

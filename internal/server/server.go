@@ -259,6 +259,12 @@ type Server struct {
 	// restartPending dedups concurrent restart requests; cleared only
 	// if the drain times out and the restart aborts.
 	restartPending atomic.Bool
+	// repoDir is the source checkout POST /api/v1/system/rebuild runs
+	// `make build` in. Empty disables the rebuild endpoint (409).
+	// Wired from Config.RepoDir ($KOJO_REPO_DIR).
+	repoDir string
+	// rebuildRunning guards against concurrent rebuilds (→ 409).
+	rebuildRunning atomic.Bool
 }
 
 type Config struct {
@@ -356,6 +362,12 @@ type Config struct {
 	// refuses to start when --unsafe is OFF but no NodeKeyResolver
 	// is available (i.e. the operator forgot to opt in).
 	Unsafe bool
+
+	// RepoDir is the source checkout POST /api/v1/system/rebuild runs
+	// `make build` in, then copies the built binary over
+	// os.Executable() (in-place deploy). Empty disables the endpoint
+	// (returns 409). cmd/kojo reads $KOJO_REPO_DIR to set this.
+	RepoDir string
 }
 
 func New(cfg Config) *Server {
@@ -405,6 +417,7 @@ func New(cfg Config) *Server {
 		logger:               logger,
 		devMode:              cfg.DevMode,
 		version:              cfg.Version,
+		repoDir:              cfg.RepoDir,
 		unsafePeer:           cfg.Unsafe,
 		thumbPurgeDone:       make(chan struct{}),
 		ttsSweepDone:         make(chan struct{}),
@@ -569,6 +582,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
 	mux.HandleFunc("POST /api/v1/system/restart", s.handleSystemRestart)
+	mux.HandleFunc("POST /api/v1/system/rebuild", s.handleSystemRebuild)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)
 	mux.HandleFunc("GET /api/v1/sessions/{id}", s.handleGetSession)

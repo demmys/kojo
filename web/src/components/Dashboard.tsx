@@ -452,7 +452,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   };
   const hasAnySessions = sessions.some((s) => !s.internal);
   const visibleSessions = sessions.filter((s) => !s.internal);
-  const runningCount = visibleSessions.filter((s) => s.status === "running").length;
+  // "Running" = live terminal sessions plus agents with an in-flight chat.
+  // The session counter alone stayed at 0 while agents chatted (no terminal
+  // session is spawned for a chat turn), so fold in the server-side busy flag.
+  const busyAgentCount = agents.filter((a) => a.busy).length;
+  const runningCount =
+    visibleSessions.filter((s) => s.status === "running").length + busyAgentCount;
   // updatedAt is RFC3339 with seconds resolution, so agents touched in the
   // same second tie. Manager.List() iterates a map, so input order is random
   // per request; a 0-return comparator would let that randomness through

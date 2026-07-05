@@ -105,6 +105,15 @@ export function isThumbSupported(nameOrPath: string): boolean {
 
 export const api = {
   info: (peerId?: string) => get<ServerInfo>(withPeer("/api/v1/info", peerId)),
+
+  system: {
+    // Runs `make build` server-side and swaps the running binary in
+    // place. Does not restart — the caller invokes restart() next.
+    rebuild: () => post<{ status: string; output?: string }>("/api/v1/system/rebuild"),
+    // Gracefully drains in-flight turns then re-execs the daemon.
+    restart: () => post<{ status: string; version?: string }>("/api/v1/system/restart"),
+  },
+
   dirSuggest: (prefix: string, peerId?: string) =>
     get<{ dirs: string[] }>(withPeer(`/api/v1/dirs?prefix=${encodeURIComponent(prefix)}`, peerId)).then((r) => r.dirs),
   customModels: (baseURL: string) =>

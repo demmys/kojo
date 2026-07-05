@@ -424,6 +424,13 @@ type Agent struct {
 	// One of "online" / "offline" / "degraded". Empty when HolderPeer
 	// is empty or the registry has no row for the holder.
 	HolderPeerStatus string `json:"holderPeerStatus,omitempty"`
+
+	// Busy is a runtime-only flag set by Manager.List when the agent has
+	// an in-flight interactive/cron chat (see Manager.IsBusy). Never
+	// persisted — stripped from settings_json on Save and Load like the
+	// holder* fields. The dashboard folds it into its "N running" figure
+	// so a chatting agent registers even when no terminal session is up.
+	Busy bool `json:"busy,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM

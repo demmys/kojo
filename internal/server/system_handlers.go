@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -20,9 +23,10 @@ const restartDrainTimeout = 15 * time.Minute
 // passes a closure that marks the restart intent and cancels the
 // signal context, funneling into the same ordered graceful-shutdown
 // path as SIGINT; after that drain main re-execs the binary in place.
-// When never set (tests, unsupported platforms), the handler returns
-// 501.
-func (s *Server) SetRestartTrigger(fn func()) {
+// The closure reports whether the intent was accepted (false = a
+// signal shutdown already won the race). When never set (tests,
+// unsupported platforms), the handler returns 501.
+func (s *Server) SetRestartTrigger(fn func() bool) {
 	s.restartMu.Lock()
 	s.restartTrigger = fn
 	s.restartMu.Unlock()
@@ -41,14 +45,64 @@ func (s *Server) SetRestartTrigger(fn func()) {
 // itself busy — the drain waits for that turn to finish, so the
 // caller's final response is delivered before the process swaps.
 //
+// Optional JSON body {"wake": true, "agentId": "ag_..."} arms a
+// restart-wake marker: after the re-exec, boot auto-triggers ONE
+// system-role chat turn for the agent so it can verify the deploy and
+// continue without a human message. Agents may only wake themselves
+// (agentId defaults to the caller); the Owner must name an agentId
+// explicitly. The marker is armed only when the drain succeeds, right
+// before the shutdown trigger. A duplicate request while a restart is
+// pending gets already_pending and its wake payload is IGNORED.
+//
 // Responds 202 immediately: {"status":"pending"} on the first call,
 // {"status":"already_pending"} on duplicates while a drain is in
 // progress.
 func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
-	if p := auth.FromContext(r.Context()); !p.CanRestartServer() {
+	p := auth.FromContext(r.Context())
+	if !p.CanRestartServer() {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"restart requires Owner or a privileged agent")
 		return
+	}
+	// Optional body. An empty body (the pre-wake curl) must keep
+	// working, so io.EOF is tolerated; anything else malformed is 400.
+	var body struct {
+		Wake    bool   `json:"wake"`
+		AgentID string `json:"agentId"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	wakeID := ""
+	if body.Wake {
+		wakeID = body.AgentID
+		if p.IsAgent() {
+			// Agents may only wake themselves — waking someone else
+			// would drop an unexpected system turn into that agent's
+			// transcript.
+			if wakeID == "" {
+				wakeID = p.AgentID
+			} else if wakeID != p.AgentID {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"agents may only wake themselves")
+				return
+			}
+		}
+		if wakeID == "" {
+			writeError(w, http.StatusBadRequest, "bad_request",
+				"wake requires agentId when called by the Owner")
+			return
+		}
+		if s.agents == nil {
+			writeError(w, http.StatusNotImplemented, "unsupported",
+				"wake is not supported in this run mode")
+			return
+		}
+		if _, ok := s.agents.Get(wakeID); !ok {
+			writeError(w, http.StatusNotFound, "not_found", "agent not found: "+wakeID)
+			return
+		}
 	}
 	s.restartMu.Lock()
 	trigger := s.restartTrigger
@@ -74,8 +128,35 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Arm the wake marker BEFORE the trigger: the trigger cancels
+		// the signal ctx and main's shutdown (store close, exec) starts
+		// racing immediately, so a post-trigger write could be lost.
+		// Armed only after the drain succeeded, so an aborted drain
+		// never leaves a marker.
+		armed := false
+		if wakeID != "" {
+			// Re-validate: the target may have been deleted or
+			// archived while the drain waited.
+			if a, ok := s.agents.Get(wakeID); !ok || a.Archived {
+				s.logger.Warn("restart: wake target gone or archived; wake skipped", "agent", wakeID)
+			} else if err := s.agents.ArmRestartWake(wakeID); err != nil {
+				s.logger.Warn("restart: wake marker write failed; restarting without wake",
+					"agent", wakeID, "err", err)
+			} else {
+				armed = true
+			}
+		}
 		s.logger.Info("restart: chats drained; shutting down for re-exec")
-		trigger()
+		if !trigger() {
+			// A signal-initiated shutdown won the race — this is a
+			// stop, not a restart. Best-effort disarm; if the store
+			// closes first the leftover marker fires one benign (and
+			// factually accurate) "restarted" turn on the next boot.
+			s.logger.Info("restart: trigger refused (shutdown already in flight)")
+			if armed {
+				s.agents.DisarmRestartWake()
+			}
+		}
 	}()
 	writeJSONResponse(w, http.StatusAccepted, map[string]any{
 		"status":  "pending",

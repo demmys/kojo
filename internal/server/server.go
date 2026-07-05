@@ -205,8 +205,11 @@ type Server struct {
 	// POST /api/v1/system/restart after every agent chat has drained.
 	// cmd/kojo wires it to "mark restart intent + cancel the signal
 	// ctx" so the restart reuses the ordered graceful-shutdown path.
+	// Returns false when the intent was refused (a signal-initiated
+	// shutdown was already in flight) so the caller can skip
+	// restart-coupled side effects like the wake marker.
 	// nil (tests, windows) → the endpoint returns 501.
-	restartTrigger func()
+	restartTrigger func() bool
 	restartMu      sync.Mutex
 	// restartPending dedups concurrent restart requests; cleared only
 	// if the drain times out and the restart aborts.

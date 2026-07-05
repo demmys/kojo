@@ -1213,16 +1213,17 @@ func main() {
 	// because a successful exec never returns to run defers.
 	var tsShutdown func()
 	if restartSupported {
-		srv.SetRestartTrigger(func() {
+		srv.SetRestartTrigger(func() bool {
 			// If a signal already initiated shutdown, do NOT
 			// convert the operator's stop into a restart — the
 			// drain goroutine can fire this trigger while the
 			// ordered shutdown below is already in flight.
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			restartRequested.Store(true)
 			stop()
+			return true
 		})
 	}
 
@@ -1591,6 +1592,14 @@ func main() {
 		tsShutdown = sync.OnceFunc(func() { _ = tsServer.Close() })
 		defer tsShutdown()
 	}
+
+	// Consume a restart-wake marker if the previous process armed one
+	// (POST /api/v1/system/restart {"wake":true}) — fires ONE chat turn
+	// for the marked agent so it can verify its own deploy. Placed after
+	// every listener branch so agent.SetKojoAPIBase is already wired
+	// into the system prompt the woken turn will be built with. The
+	// timestamp fences the consumer to pre-boot markers only.
+	go agentMgr.ConsumeRestartWake(version, time.Now())
 
 	<-ctx.Done()
 	logger.Info("received shutdown signal")

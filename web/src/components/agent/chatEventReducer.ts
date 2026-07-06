@@ -1,4 +1,4 @@
-import type { AgentMessage, ChatEvent } from "../../lib/agentApi";
+import type { AgentMessage, ChatEvent, ToolUse } from "../../lib/agentApi";
 
 /**
  * Pure helpers extracted from AgentChat's onEvent so the trickier
@@ -17,7 +17,29 @@ export type StreamingTool = {
   name: string;
   input: string;
   output: string | null;
+  /** Narrative text bubble from a subagent turn (name is "" for these). */
+  text?: string;
+  /** Nested subagent (Task tool) tool calls / text bubbles, keyed by
+   *  this tool's id via events carrying a matching parentToolUseId. */
+  children?: StreamingTool[];
 };
+
+/**
+ * Convert a still-streaming StreamingTool (output possibly null) into
+ * the persisted ToolUse shape ToolUseCard renders, recursing into
+ * subagent children so nested tool chips render the same way whether
+ * the turn is live or already persisted.
+ */
+export function toToolUse(t: StreamingTool): ToolUse {
+  return {
+    id: t.id,
+    name: t.name,
+    input: t.input,
+    output: t.output ?? "",
+    text: t.text,
+    children: t.children?.map(toToolUse),
+  };
+}
 
 /**
  * Tool-match predicate used by `tool_result` events: prefer the
@@ -64,6 +86,55 @@ export function newToolFromEvent(event: ChatEvent): StreamingTool | null {
     input: event.toolInput ?? "",
     output: null,
   };
+}
+
+/**
+ * Route a subagent (Task tool) event — one carrying `parentToolUseId` —
+ * into the Children of the matching top-level StreamingTool. Mirrors
+ * newToolFromEvent / applyToolResult but nests one level instead of
+ * appending to the top-level list, so subagent tool calls and narrative
+ * text render under their parent Task tool chip rather than mixed into
+ * the main turn's stream.
+ *
+ * Returns the input array unchanged (new copy) when:
+ *   - event has no parentToolUseId (not a subagent event), or
+ *   - no top-level tool with that id has been seen yet (best-effort
+ *     live view only — the persisted message's Children are always
+ *     authoritative once `done` arrives).
+ */
+export function applySubagentEvent(prev: readonly StreamingTool[], event: ChatEvent): StreamingTool[] {
+  const parentId = event.parentToolUseId;
+  if (!parentId) return [...prev];
+  const idx = prev.findIndex((t) => t.id === parentId);
+  if (idx === -1) return [...prev];
+
+  const parent = prev[idx];
+  const children = parent.children ? parent.children.slice() : [];
+
+  if (event.type === "tool_use" && event.toolName) {
+    children.push({ id: event.toolUseId ?? "", name: event.toolName, input: event.toolInput ?? "", output: null });
+  } else if (event.type === "tool_result") {
+    const m = matchToolForResult(event.toolUseId ?? "", event.toolName);
+    for (let i = children.length - 1; i >= 0; i--) {
+      if (m(children[i])) {
+        children[i] = { ...children[i], output: event.toolOutput ?? "" };
+        break;
+      }
+    }
+  } else if (event.type === "text") {
+    const last = children[children.length - 1];
+    if (last && last.name === "") {
+      children[children.length - 1] = { ...last, text: (last.text ?? "") + (event.delta ?? "") };
+    } else {
+      children.push({ id: "", name: "", input: "", output: null, text: event.delta ?? "" });
+    }
+  } else {
+    return [...prev];
+  }
+
+  const out = prev.slice();
+  out[idx] = { ...parent, children };
+  return out;
 }
 
 /**

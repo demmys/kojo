@@ -50,6 +50,18 @@ type ToolUse struct {
 	Name   string `json:"name"`
 	Input  string `json:"input"`  // JSON string
 	Output string `json:"output"` // truncated output
+	// Text holds a subagent narrative snippet when this entry is a
+	// synthetic "text bubble" child rather than a real tool call (Name
+	// and Input are empty in that case). Only ever populated on entries
+	// that live inside Children.
+	Text string `json:"text,omitempty"`
+	// Children holds tool calls (and narrative text bubbles) emitted by
+	// a subagent spawned via the Task tool, when this ToolUse is that
+	// Task invocation. Populated flat (one level) even for nested
+	// sub-subagents — see parseClaudeStream's subagentOwner mapping,
+	// which folds any deeper nesting onto the top-level Task ToolUse
+	// instead of building a recursive tree.
+	Children []ToolUse `json:"children,omitempty"`
 }
 
 // Usage tracks token consumption for a message.
@@ -87,6 +99,16 @@ type ChatEvent struct {
 	Attachments  []MessageAttachment `json:"attachments,omitempty"` // streamed kojo-attach files
 	Usage        *Usage              `json:"usage,omitempty"`
 	ErrorMessage string              `json:"errorMessage,omitempty"`
+	// ParentToolUseID is set when this event originates from a subagent
+	// spawned by a Task tool call rather than the main assistant turn.
+	// Its value is the tool_use ID of the parent Task invocation (or, for
+	// a nested sub-subagent, the ID of an intermediate subagent tool call
+	// — callers should resolve that up to the nearest top-level Task via
+	// the same flat-owner logic parseClaudeStream uses). Consumers that
+	// accumulate the main turn's text/toolUses MUST skip events carrying
+	// a non-empty ParentToolUseID; the UI instead nests them under the
+	// matching Task tool chip.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 }
 
 func generateMessageID() string {

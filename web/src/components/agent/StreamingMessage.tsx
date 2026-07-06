@@ -7,7 +7,7 @@ import { AttachmentList } from "./MessageAttachments";
 import { FilePathChip, splitFilePaths } from "./filePaths";
 import { MediaOverlay } from "./MediaOverlay";
 import { Lamp } from "../ui/Lamp";
-import type { StreamingTool } from "./chatEventReducer";
+import { toToolUse, type StreamingTool } from "./chatEventReducer";
 
 // Quiet meta-row control: mono 11px ink-faint, hover ink. The `isUser`
 // parameter is retained for call-site compatibility; the meta styling is
@@ -145,7 +145,7 @@ export function StreamingMessage({
         {toolUses.length > 0 && (
           <div className="mt-2">
             {toolUses.map((tu, i) => (
-              <ToolUseCard key={i} toolUse={{ ...tu, output: tu.output ?? "" }} />
+              <ToolUseCard key={i} toolUse={toToolUse(tu)} />
             ))}
           </div>
         )}

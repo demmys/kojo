@@ -4,9 +4,11 @@ import {
   appendSystemErrorIfNew,
   appendUniqueMessage,
   applyDoneMessage,
+  applySubagentEvent,
   applyToolResult,
   matchToolForResult,
   newToolFromEvent,
+  toToolUse,
   type StreamingTool,
 } from "./chatEventReducer";
 
@@ -206,5 +208,78 @@ describe("applyDoneMessage", () => {
     const prev = [msg("a", "user")];
     const after = applyDoneMessage(prev, { type: "text", delta: "x" } as ChatEvent, null);
     expect(after).toBe(prev);
+  });
+});
+
+describe("applySubagentEvent", () => {
+  it("nests a subagent tool_use under the matching top-level Task tool", () => {
+    const prev: StreamingTool[] = [tool("task1", "Task")];
+    const after = applySubagentEvent(prev, {
+      type: "tool_use",
+      toolUseId: "sub1",
+      toolName: "Bash",
+      toolInput: "ls /tmp",
+      parentToolUseId: "task1",
+    });
+    expect(after[0].children).toEqual([{ id: "sub1", name: "Bash", input: "ls /tmp", output: null }]);
+    // Top-level list untouched otherwise.
+    expect(after[0].id).toBe("task1");
+  });
+
+  it("fills subagent tool output by matching id within children", () => {
+    const withChild: StreamingTool[] = [
+      { ...tool("task1", "Task"), children: [tool("sub1", "Bash")] },
+    ];
+    const after = applySubagentEvent(withChild, {
+      type: "tool_result",
+      toolUseId: "sub1",
+      toolName: "Bash",
+      toolOutput: "file1\nfile2",
+      parentToolUseId: "task1",
+    });
+    expect(after[0].children?.[0].output).toBe("file1\nfile2");
+  });
+
+  it("accumulates subagent narrative text into a trailing text-bubble child", () => {
+    let cur: StreamingTool[] = [tool("task1", "Task")];
+    cur = applySubagentEvent(cur, { type: "text", delta: "Listing ", parentToolUseId: "task1" });
+    cur = applySubagentEvent(cur, { type: "text", delta: "/tmp", parentToolUseId: "task1" });
+    expect(cur[0].children).toEqual([{ id: "", name: "", input: "", output: null, text: "Listing /tmp" }]);
+  });
+
+  it("is a no-op copy when the parent tool hasn't been seen yet", () => {
+    const prev: StreamingTool[] = [];
+    const after = applySubagentEvent(prev, {
+      type: "tool_use",
+      toolUseId: "sub1",
+      toolName: "Bash",
+      parentToolUseId: "task1",
+    });
+    expect(after).toEqual([]);
+    expect(after).not.toBe(prev);
+  });
+
+  it("is a no-op copy when parentToolUseId is absent", () => {
+    const prev: StreamingTool[] = [tool("task1", "Task")];
+    const after = applySubagentEvent(prev, { type: "text", delta: "x" });
+    expect(after).toEqual(prev);
+    expect(after).not.toBe(prev);
+  });
+});
+
+describe("toToolUse", () => {
+  it("normalizes a null output to empty string and recurses into children", () => {
+    const st: StreamingTool = {
+      ...tool("task1", "Task"),
+      children: [tool("sub1", "Bash", "done")],
+    };
+    expect(toToolUse(st)).toEqual({
+      id: "task1",
+      name: "Task",
+      input: "",
+      output: "",
+      text: undefined,
+      children: [{ id: "sub1", name: "Bash", input: "", output: "done", text: undefined, children: undefined }],
+    });
   });
 });

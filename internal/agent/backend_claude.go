@@ -387,6 +387,34 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 	var currentToolInput strings.Builder
 	toolIDToName := make(map[string]string)
 
+	// Subagent (Task tool) tracking. Every event carrying a non-empty
+	// parent_tool_use_id belongs to a subagent turn and must NOT pollute
+	// fullText/thinking/toolUses above — instead it's accumulated per
+	// parent ID here and attached to the matching Task ToolUse once
+	// parsing finishes.
+	subagents := make(map[string]*subagentState)
+	// subagentOwner maps any tool_use ID seen inside a subagent to the
+	// top-level Task ToolUse ID it should ultimately attach to. This is
+	// how a nested sub-subagent (parent_tool_use_id pointing at a tool
+	// call that itself lives inside a subagent, not in the main
+	// toolUses slice) gets flat-appended onto the original top-level
+	// Task's children instead of requiring a recursive tree.
+	subagentOwner := make(map[string]string)
+	resolveOwner := func(parentID string) string {
+		if o, ok := subagentOwner[parentID]; ok {
+			return o
+		}
+		return parentID
+	}
+	getSubagent := func(owner string) *subagentState {
+		s, ok := subagents[owner]
+		if !ok {
+			s = &subagentState{toolIDToName: make(map[string]string)}
+			subagents[owner] = s
+		}
+		return s
+	}
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -398,6 +426,12 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			logger.Debug("failed to parse claude stream event", "err", err)
 			continue
 		}
+		// Capture parent_tool_use_id BEFORE any stream_event unwrap below
+		// overwrites `event` with the inner payload — the field only ever
+		// appears on the outer wrapper (for streamed deltas) or directly
+		// on a complete top-level assistant/user event, never on the
+		// inner content_block_* payload itself.
+		rawParentID := event.ParentToolUseID
 
 		// Unwrap stream_event wrapper emitted by --include-partial-messages.
 		if event.Type == "stream_event" && len(event.Event) > 0 {
@@ -412,6 +446,11 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			event = inner
 		}
 
+		parentID := ""
+		if rawParentID != "" {
+			parentID = resolveOwner(rawParentID)
+		}
+
 		switch event.Type {
 		case "system":
 			status := "thinking"
@@ -424,6 +463,37 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			}
 
 		case "assistant":
+			if parentID != "" {
+				// Subagent turn: complete (non-streamed-delta) assistant
+				// message belonging to a Task-spawned subagent. Route its
+				// text and tool_use blocks into the subagent accumulator
+				// instead of the main fullText/toolUses — this is the fix
+				// for the pre-existing leak where an unwrapped subagent
+				// message content polluted the parent turn.
+				sub := getSubagent(parentID)
+				for _, block := range event.Message.Content {
+					switch block.Type {
+					case "text":
+						if block.Text != "" {
+							sub.appendText(block.Text)
+							if !send(ChatEvent{Type: "text", Delta: block.Text, ParentToolUseID: parentID}) {
+								res.cancelled = true
+								return res
+							}
+						}
+					case "tool_use":
+						input := string(block.Input)
+						sub.children = append(sub.children, ToolUse{ID: block.ID, Name: block.Name, Input: input})
+						sub.toolIDToName[block.ID] = block.Name
+						subagentOwner[block.ID] = parentID
+						if !send(ChatEvent{Type: "tool_use", ToolUseID: block.ID, ToolName: block.Name, ToolInput: input, ParentToolUseID: parentID}) {
+							res.cancelled = true
+							return res
+						}
+					}
+				}
+				break
+			}
 			var atext strings.Builder
 			for _, block := range event.Message.Content {
 				switch block.Type {
@@ -465,13 +535,41 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 
 		case "content_block_start":
 			if event.ContentBlock.Type == "tool_use" {
-				currentToolName = event.ContentBlock.Name
-				currentToolID = event.ContentBlock.ID
-				currentToolInput.Reset()
-				toolIDToName[currentToolID] = currentToolName
+				if parentID != "" {
+					sub := getSubagent(parentID)
+					sub.currentToolName = event.ContentBlock.Name
+					sub.currentToolID = event.ContentBlock.ID
+					sub.currentToolInput.Reset()
+					sub.toolIDToName[sub.currentToolID] = sub.currentToolName
+				} else {
+					currentToolName = event.ContentBlock.Name
+					currentToolID = event.ContentBlock.ID
+					currentToolInput.Reset()
+					toolIDToName[currentToolID] = currentToolName
+				}
 			}
 
 		case "content_block_delta":
+			if parentID != "" {
+				sub := getSubagent(parentID)
+				switch event.Delta.Type {
+				case "text_delta":
+					if event.Delta.Text != "" {
+						sub.appendText(event.Delta.Text)
+						if !send(ChatEvent{Type: "text", Delta: event.Delta.Text, ParentToolUseID: parentID}) {
+							res.cancelled = true
+							return res
+						}
+					}
+				case "thinking_delta":
+					// Subagent thinking isn't surfaced today — no UI slot
+					// for nested reasoning text, and it isn't persisted on
+					// the parent ToolUse's Children. Dropped silently.
+				case "input_json_delta":
+					sub.currentToolInput.WriteString(event.Delta.PartialJSON)
+				}
+				break
+			}
 			switch event.Delta.Type {
 			case "text_delta":
 				if event.Delta.Text != "" {
@@ -494,6 +592,22 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			}
 
 		case "content_block_stop":
+			if parentID != "" {
+				sub := getSubagent(parentID)
+				if sub.currentToolName != "" {
+					input := sub.currentToolInput.String()
+					sub.children = append(sub.children, ToolUse{ID: sub.currentToolID, Name: sub.currentToolName, Input: input})
+					subagentOwner[sub.currentToolID] = parentID
+					if !send(ChatEvent{Type: "tool_use", ToolUseID: sub.currentToolID, ToolName: sub.currentToolName, ToolInput: input, ParentToolUseID: parentID}) {
+						res.cancelled = true
+						return res
+					}
+					sub.currentToolName = ""
+					sub.currentToolID = ""
+					sub.currentToolInput.Reset()
+				}
+				break
+			}
 			if currentToolName != "" {
 				input := currentToolInput.String()
 				tu := ToolUse{
@@ -512,6 +626,23 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 			}
 
 		case "user":
+			if parentID != "" {
+				sub := getSubagent(parentID)
+				for _, block := range event.Message.Content {
+					if block.Type == "tool_result" && block.ToolUseID != "" {
+						toolName := sub.toolIDToName[block.ToolUseID]
+						if toolName != "" {
+							output := block.contentText()
+							if !send(ChatEvent{Type: "tool_result", ToolUseID: block.ToolUseID, ToolName: toolName, ToolOutput: output, ParentToolUseID: parentID}) {
+								res.cancelled = true
+								return res
+							}
+							matchToolOutput(sub.children, block.ToolUseID, toolName, output)
+						}
+					}
+				}
+				break
+			}
 			for _, block := range event.Message.Content {
 				if block.Type == "tool_result" && block.ToolUseID != "" {
 					toolName := toolIDToName[block.ToolUseID]
@@ -566,15 +697,75 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 		logger.Warn("claude stream scanner error", "err", err)
 	}
 
+	// Attach accumulated subagent state onto the matching top-level
+	// Task ToolUse. Every key in `subagents` is either a top-level
+	// tool_use ID (found directly in toolUses) or — for a subagent
+	// whose parent_tool_use_id we never resolved to a known owner
+	// (e.g. it arrived before its own Task tool_use closed) — left
+	// dangling and dropped, matching the "no recursion" flattening
+	// rule: we only ever attach one level deep onto a real top-level
+	// Task call.
+	if len(subagents) > 0 {
+		byID := make(map[string]int, len(toolUses))
+		for i, tu := range toolUses {
+			byID[tu.ID] = i
+		}
+		for owner, sub := range subagents {
+			idx, ok := byID[owner]
+			if !ok {
+				continue
+			}
+			toolUses[idx].Children = append([]ToolUse(nil), sub.children...)
+		}
+	}
+
 	res.fullText = fullText.String()
 	res.thinking = thinking.String()
 	res.toolUses = toolUses
 	return res
 }
 
+// subagentState accumulates one subagent's (Task tool call's) streamed
+// output — its own tool_use/tool_result flow interleaved with narrative
+// text, in arrival order — keyed by the top-level Task ToolUse ID it will
+// be attached to as Children.
+//
+// children holds both real tool_use entries (Name/Input set) and
+// synthetic text bubbles (Name/Input empty, Text set) in the order they
+// arrived, so the persisted transcript preserves "said X, ran tool Y,
+// said Z" ordering rather than collapsing all narrative text into a
+// single trailing bubble.
+type subagentState struct {
+	children         []ToolUse
+	toolIDToName     map[string]string
+	currentToolName  string
+	currentToolID    string
+	currentToolInput strings.Builder
+}
+
+// appendText appends a text delta to the trailing text-bubble entry of
+// sub.children, creating one if the last entry isn't already a text
+// bubble (or there are no entries yet).
+func (sub *subagentState) appendText(text string) {
+	if n := len(sub.children); n > 0 && sub.children[n-1].Name == "" {
+		sub.children[n-1].Text += text
+		return
+	}
+	sub.children = append(sub.children, ToolUse{Text: text})
+}
+
 // Claude stream-json event types
 type claudeStreamEvent struct {
 	Type string `json:"type"`
+
+	// ParentToolUseID tags events that belong to a subagent spawned by a
+	// Task tool call, rather than the main assistant turn. Appears as a
+	// sibling of "type" on the "stream_event" wrapper (streamed subagent
+	// deltas) and directly on complete top-level "assistant"/"user"
+	// events (non-streamed subagent turns) — never on the inner payload
+	// once a stream_event wrapper has been unwrapped, so callers must
+	// capture it before overwriting `event` with the inner value.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
 
 	// "stream_event" wrapper (--include-partial-messages)
 	Event json.RawMessage `json:"event,omitempty"`
@@ -643,6 +834,13 @@ type claudeContentBlock struct {
 	Thinking  string          `json:"thinking,omitempty"`    // thinking block
 	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
 	Content   json.RawMessage `json:"content,omitempty"`     // tool_result output (string or array)
+	// tool_use block fields. These only appear on complete (non-streamed)
+	// assistant messages — a subagent's tool_use, since subagent turns in
+	// practice arrive as fully-materialized "assistant" events rather
+	// than via content_block_start/input_json_delta/content_block_stop.
+	ID    string          `json:"id,omitempty"`    // tool_use
+	Name  string          `json:"name,omitempty"`  // tool_use
+	Input json.RawMessage `json:"input,omitempty"` // tool_use, raw JSON object
 }
 
 // contentText extracts a plain-text representation from a claudeContentBlock's Content field.

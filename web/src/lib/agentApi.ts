@@ -267,6 +267,14 @@ export interface ToolUse {
   name: string;
   input: string;
   output: string;
+  // Narrative text bubble from a subagent (Task tool) turn. Only ever
+  // set on entries that live inside `children` (name/input are empty
+  // in that case).
+  text?: string;
+  // Tool calls (and text bubbles) emitted by a subagent spawned via
+  // this Task tool call. Populated one level deep even for nested
+  // sub-subagents (see backend_claude.go's subagentOwner flattening).
+  children?: ToolUse[];
 }
 
 export interface Credential {
@@ -304,6 +312,10 @@ export interface ChatEvent {
   attachments?: AgentMessageAttachment[]; // streamed kojo-attach files
   errorMessage?: string;
   startedAt?: string; // RFC3339 timestamp of when processing started
+  // Set when this event belongs to a subagent (Task tool) turn rather
+  // than the main assistant turn. Value is the tool_use ID of the
+  // parent Task invocation this event should nest under.
+  parentToolUseId?: string;
 }
 
 export interface AgentTask {

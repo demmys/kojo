@@ -27,6 +27,7 @@ function extractPreview(input: string): string | undefined {
 export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardProps) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const preview = extractPreview(toolUse.input);
+  const children = toolUse.children ?? [];
 
   return (
     <div className="my-1 overflow-hidden rounded-[10px] border border-hairline bg-surface text-xs">
@@ -50,6 +51,11 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
             {preview}
           </span>
         )}
+        {children.length > 0 && (
+          <span className="shrink-0 rounded-full bg-app/60 px-1.5 py-0.5 font-mono text-[10px] text-ink-faint">
+            {children.length} sub
+          </span>
+        )}
       </button>
       {expanded && (
         <div className="space-y-2 border-t border-hairline bg-app/40 px-3 py-2">
@@ -67,6 +73,20 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
               <pre className="max-h-60 overflow-x-auto overflow-y-auto whitespace-pre-wrap wrap-anywhere text-ink-dim">
                 {toolUse.output}
               </pre>
+            </div>
+          )}
+          {children.length > 0 && (
+            <div className="border-l-2 border-hairline pl-2">
+              <div className="mb-1 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Subagent</div>
+              {children.map((child, i) =>
+                child.name ? (
+                  <ToolUseCard key={i} toolUse={child} />
+                ) : (
+                  <p key={i} className="my-1 whitespace-pre-wrap wrap-anywhere text-ink-dim">
+                    {child.text}
+                  </p>
+                ),
+              )}
             </div>
           )}
         </div>

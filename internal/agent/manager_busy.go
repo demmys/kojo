@@ -576,6 +576,11 @@ func (m *Manager) SnapshotAccumulatedMessageRecord(agentID string) *store.Messag
 		unsub()
 		var tBuf, thBuf strings.Builder
 		for _, ev := range past {
+			if ev.ParentToolUseID != "" {
+				// Subagent event — already folded into its parent
+				// Task ToolUse's Children by the backend.
+				continue
+			}
 			switch ev.Type {
 			case "text":
 				tBuf.WriteString(ev.Delta)

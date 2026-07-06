@@ -27,8 +27,10 @@ import {
   appendSystemErrorIfNew,
   appendUniqueMessage,
   applyDoneMessage,
+  applySubagentEvent,
   applyToolResult,
   newToolFromEvent,
+  toToolUse,
   type StreamingTool,
 } from "./chatEventReducer";
 
@@ -408,6 +410,15 @@ export function AgentChat() {
 
   const onEvent = useCallback(
     (event: ChatEvent) => {
+      // Subagent (Task tool) events nest under their parent Task tool
+      // chip's children instead of joining the main turn's streamText /
+      // streamTools. Routed before the main switch so none of the
+      // top-level cases below ever see a subagent event.
+      if (event.parentToolUseId) {
+        liveStreamToolsRef.current = applySubagentEvent(liveStreamToolsRef.current, event);
+        setStreamTools((prev) => applySubagentEvent(prev, event));
+        return;
+      }
       switch (event.type) {
         case "status":
           setStreamStatus(event.status ?? "");
@@ -585,9 +596,7 @@ export function AgentChat() {
         role: "assistant" as const,
         content: text,
         thinking: thinking || undefined,
-        toolUses: tools.length > 0
-          ? tools.map((t) => ({ id: t.id || undefined, name: t.name, input: t.input, output: t.output ?? "" }))
-          : undefined,
+        toolUses: tools.length > 0 ? tools.map(toToolUse) : undefined,
         attachments: atts.length > 0 ? atts : undefined,
         timestamp: localRFC3339(),
       }]);

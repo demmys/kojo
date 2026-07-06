@@ -52,6 +52,13 @@ func (a *chatAccumulator) OnEvent(ev *ChatEvent) {
 	if a == nil || ev == nil {
 		return
 	}
+	if ev.ParentToolUseID != "" {
+		// Subagent (Task tool) event — belongs under the parent Task
+		// ToolUse's Children, which the backend attaches directly
+		// before emitting "done". Accumulating it here too would leak
+		// subagent text/tool calls into abort-time and §3.7 snapshots.
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	switch ev.Type {

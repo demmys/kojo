@@ -2427,6 +2427,14 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 	// mirrors every event into the busy entry's shared accumulator
 	// so the §3.7 self-call snapshot path sees the same data.
 	accumulate := func(event *ChatEvent) {
+		// Subagent (Task tool) events are attached to the parent Task
+		// ToolUse's Children by the backend before "done" fires — skip
+		// them here so they don't also leak into the main turn's
+		// abort-recovery text/toolUses.
+		if event.ParentToolUseID != "" {
+			sharedAcc.OnEvent(event)
+			return
+		}
 		switch event.Type {
 		case "text":
 			accText.WriteString(event.Delta)

@@ -251,8 +251,18 @@ func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot Threa
 	if !ok {
 		return false, ThreadLiveSnapshot{}
 	}
+	// Deep-copy: a shallow copy() would share each ToolUse's Children
+	// slice backing array with the live state. A later
+	// appendThreadLiveChildToolUse/appendThreadLiveChildText that still
+	// has spare capacity mutates that array in place rather than
+	// reallocating, which would race with this snapshot's JSON encoding.
 	toolUses := make([]ToolUse, len(st.ToolUses))
-	copy(toolUses, st.ToolUses)
+	for i, tu := range st.ToolUses {
+		toolUses[i] = tu
+		if len(tu.Children) > 0 {
+			toolUses[i].Children = append([]ToolUse(nil), tu.Children...)
+		}
+	}
 	return true, ThreadLiveSnapshot{
 		Status:   st.Status,
 		Thinking: st.Thinking,
@@ -336,6 +346,68 @@ func (m *GroupDMManager) setThreadLiveToolOutput(groupID, id, name, output strin
 	if st, ok := m.threadLive[groupID]; ok {
 		matchToolOutput(st.ToolUses, id, name, output)
 		st.UpdatedAt = time.Now()
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// findThreadLiveToolUse returns the index of the ToolUse with the given ID
+// in st.ToolUses, or -1 if absent. Caller holds threadLiveMu.
+func findThreadLiveToolUse(st *threadLiveState, id string) int {
+	for i := range st.ToolUses {
+		if st.ToolUses[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// appendThreadLiveChildToolUse records a subagent (Task tool) tool_use event
+// as a Children entry under the matching top-level Task ToolUse, so the
+// live snapshot's nested progress mirrors the persisted transcript's
+// ToolUse.Children shape. Events whose parentID doesn't match any known
+// top-level ToolUse (not yet observed, or a deeper nested subagent) are
+// dropped rather than guessed at — the live view is best-effort, and the
+// final persisted message is authoritative regardless.
+func (m *GroupDMManager) appendThreadLiveChildToolUse(groupID, parentID string, tu ToolUse) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		if idx := findThreadLiveToolUse(st, parentID); idx >= 0 {
+			st.ToolUses[idx].Children = append(st.ToolUses[idx].Children, tu)
+			st.UpdatedAt = time.Now()
+		}
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// setThreadLiveChildToolOutput fills in the Output of a subagent tool_use
+// Children entry under the matching top-level Task ToolUse.
+func (m *GroupDMManager) setThreadLiveChildToolOutput(groupID, parentID, id, name, output string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		if idx := findThreadLiveToolUse(st, parentID); idx >= 0 {
+			matchToolOutput(st.ToolUses[idx].Children, id, name, output)
+			st.UpdatedAt = time.Now()
+		}
+	}
+	m.threadLiveMu.Unlock()
+}
+
+// appendThreadLiveChildText appends subagent narrative text to the trailing
+// text-bubble Children entry (Name=="") under the matching top-level Task
+// ToolUse, creating one if the last child isn't already a text bubble.
+func (m *GroupDMManager) appendThreadLiveChildText(groupID, parentID, delta string) {
+	m.threadLiveMu.Lock()
+	if st, ok := m.threadLive[groupID]; ok {
+		if idx := findThreadLiveToolUse(st, parentID); idx >= 0 {
+			children := st.ToolUses[idx].Children
+			if n := len(children); n > 0 && children[n-1].Name == "" {
+				children[n-1].Text += delta
+			} else {
+				children = append(children, ToolUse{Text: delta})
+			}
+			st.ToolUses[idx].Children = children
+			st.UpdatedAt = time.Now()
+		}
 	}
 	m.threadLiveMu.Unlock()
 }
@@ -1327,6 +1399,22 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	var thinking string
 	var toolUses []ToolUse
 	for ev := range events {
+		// Subagent (Task tool) events route into the matching top-level
+		// ToolUse's Children in the live snapshot instead of the main
+		// reply/thinking/toolUses accumulation — the final persisted
+		// message already gets its Children from the backend, so this
+		// is purely for live nested progress display.
+		if ev.ParentToolUseID != "" {
+			switch ev.Type {
+			case "tool_use":
+				m.appendThreadLiveChildToolUse(groupID, ev.ParentToolUseID, ToolUse{ID: ev.ToolUseID, Name: ev.ToolName, Input: ev.ToolInput})
+			case "tool_result":
+				m.setThreadLiveChildToolOutput(groupID, ev.ParentToolUseID, ev.ToolUseID, ev.ToolName, ev.ToolOutput)
+			case "text":
+				m.appendThreadLiveChildText(groupID, ev.ParentToolUseID, ev.Delta)
+			}
+			continue
+		}
 		switch ev.Type {
 		case "status":
 			m.updateThreadLiveStatus(groupID, ev.Status)

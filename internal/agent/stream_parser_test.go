@@ -407,6 +407,120 @@ func TestLimitedWriter_ZeroLimit(t *testing.T) {
 	}
 }
 
+// --- subagent (Task tool / parent_tool_use_id) characterization tests ---
+//
+// Line shapes below mirror a captured real stream from:
+//   claude -p --model haiku --output-format stream-json --include-partial-messages \
+//     "Use the Agent tool ... to have a subagent list files ... then summarize."
+// Subagent turns arrived as complete (non-streamed-delta) "assistant"/"user"
+// events carrying a top-level parent_tool_use_id — never via stream_event
+// content_block_* deltas in that capture — so these tests exercise that
+// shape. The content_block_delta path (guarded identically in
+// parseClaudeStream) is covered by TestParseClaudeStream_SubagentStreamedDeltas.
+
+func TestParseClaudeStream_SubagentDoesNotPolluteMainText(t *testing.T) {
+	events, result := collectEvents(t,
+		// Main turn spawns a Task tool call.
+		`{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_task1","name":"Task"}}`,
+		`{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+		`{"type":"content_block_stop"}`,
+		// Subagent turn: complete assistant event with parent_tool_use_id,
+		// containing its own tool_use (Bash) block.
+		`{"type":"assistant","parent_tool_use_id":"toolu_task1","message":{"content":[`+
+			`{"type":"text","text":"Listing /tmp"},`+
+			`{"type":"tool_use","id":"toolu_sub_bash1","name":"Bash","input":{"command":"ls /tmp"}}`+
+			`]}}`,
+		// Subagent tool result.
+		`{"type":"user","parent_tool_use_id":"toolu_task1","message":{"content":[`+
+			`{"type":"tool_result","tool_use_id":"toolu_sub_bash1","content":"file1\nfile2"}`+
+			`]}}`,
+		// Subagent final summary text.
+		`{"type":"assistant","parent_tool_use_id":"toolu_task1","message":{"content":[`+
+			`{"type":"text","text":"Found 2 files."}`+
+			`]}}`,
+		// Main turn's own text, after the subagent finishes.
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"Done."}}`,
+	)
+
+	if result.fullText != "Done." {
+		t.Errorf("fullText = %q, want %q (subagent text must not leak into the main turn)", result.fullText, "Done.")
+	}
+	if len(result.toolUses) != 1 {
+		t.Fatalf("toolUses = %d, want 1 (only the top-level Task call)", len(result.toolUses))
+	}
+
+	task := result.toolUses[0]
+	if task.Name != "Task" {
+		t.Errorf("toolUses[0].Name = %q, want Task", task.Name)
+	}
+	// Children preserve arrival order (text, then tool call, then text) —
+	// they are NOT collapsed into a single trailing text bubble, so a
+	// live UI can render "said X, ran Y, said Z" instead of "ran Y, said
+	// X+Z".
+	if len(task.Children) != 3 {
+		t.Fatalf("Task.Children = %d, want 3 (text, Bash call, text), got %+v", len(task.Children), task.Children)
+	}
+	if task.Children[0].Text != "Listing /tmp" {
+		t.Errorf("Task.Children[0].Text = %q, want %q", task.Children[0].Text, "Listing /tmp")
+	}
+	if task.Children[1].Name != "Bash" || task.Children[1].Output != "file1\nfile2" {
+		t.Errorf("Task.Children[1] = %+v, want Bash call with matched output", task.Children[1])
+	}
+	if task.Children[2].Text != "Found 2 files." {
+		t.Errorf("Task.Children[2].Text = %q, want %q", task.Children[2].Text, "Found 2 files.")
+	}
+
+	// Every event tagged with the subagent's parent id must carry
+	// ParentToolUseID on the wire too, so a live UI can route it without
+	// re-deriving ownership.
+	for _, e := range events {
+		if e.Type == "text" && e.Delta == "Listing /tmp" && e.ParentToolUseID != "toolu_task1" {
+			t.Errorf("subagent text event missing ParentToolUseID: %+v", e)
+		}
+		if e.Type == "tool_use" && e.ToolUseID == "toolu_sub_bash1" && e.ParentToolUseID != "toolu_task1" {
+			t.Errorf("subagent tool_use event missing ParentToolUseID: %+v", e)
+		}
+		if e.Type == "text" && e.Delta == "Done." && e.ParentToolUseID != "" {
+			t.Errorf("main-turn text event must not carry ParentToolUseID: %+v", e)
+		}
+	}
+}
+
+func TestParseClaudeStream_SubagentStreamedDeltas(t *testing.T) {
+	// Alternate shape: subagent tool_use streamed via content_block_start/
+	// input_json_delta/content_block_stop, with parent_tool_use_id riding
+	// the stream_event wrapper (as documented on --include-partial-messages).
+	events, result := collectEvents(t,
+		`{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_task1","name":"Task"}}`,
+		`{"type":"content_block_stop"}`,
+		`{"type":"stream_event","parent_tool_use_id":"toolu_task1","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_sub1","name":"Read"}}}`,
+		`{"type":"stream_event","parent_tool_use_id":"toolu_task1","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}}`,
+		`{"type":"stream_event","parent_tool_use_id":"toolu_task1","event":{"type":"content_block_stop"}}`,
+		`{"type":"user","parent_tool_use_id":"toolu_task1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_sub1","content":"ok"}]}}`,
+	)
+
+	if result.fullText != "" {
+		t.Errorf("fullText = %q, want empty", result.fullText)
+	}
+	if len(result.toolUses) != 1 || len(result.toolUses[0].Children) != 1 {
+		t.Fatalf("unexpected toolUses shape: %+v", result.toolUses)
+	}
+	child := result.toolUses[0].Children[0]
+	if child.Name != "Read" || child.Output != "ok" {
+		t.Errorf("child = %+v, want Read tool with matched output", child)
+	}
+
+	sawParented := false
+	for _, e := range events {
+		if e.ToolUseID == "toolu_sub1" && e.ParentToolUseID == "toolu_task1" {
+			sawParented = true
+		}
+	}
+	if !sawParented {
+		t.Error("expected at least one event for toolu_sub1 carrying ParentToolUseID")
+	}
+}
+
 // --- claudeEncodePath characterization tests ---
 
 func TestClaudeEncodePath(t *testing.T) {

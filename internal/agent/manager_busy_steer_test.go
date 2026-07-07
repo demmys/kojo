@@ -12,7 +12,7 @@ import (
 // return ErrAgentNotBusy immediately.
 func TestSteerIdleNotBusy(t *testing.T) {
 	m := newTestManager(t)
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
 
 	if err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Fatalf("Steer idle = %v, want ErrAgentNotBusy", err)
@@ -26,7 +26,12 @@ func TestSteerIdleNotBusy(t *testing.T) {
 func TestSteerWaitsForPreparingTurn(t *testing.T) {
 	m := newTestManager(t)
 	m.preparing = map[string]int{"ag_x": 1}
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
+	// Persist the agent so Steer's durable append (post-injection) succeeds;
+	// this test is about the wait behavior, not the persistence failure path.
+	if err := m.store.Upsert(m.agents["ag_x"]); err != nil {
+		t.Fatal(err)
+	}
 
 	var steered atomic.Value
 	go func() {
@@ -55,7 +60,12 @@ func TestSteerWaitsForPreparingTurn(t *testing.T) {
 // handle rather than returning ErrSteerUnsupported.
 func TestSteerWaitsForSteerHandle(t *testing.T) {
 	m := newTestManager(t)
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
+	// Persist the agent so Steer's durable append succeeds; this test targets
+	// the wait-for-handle behavior, not the persistence failure path.
+	if err := m.store.Upsert(m.agents["ag_x"]); err != nil {
+		t.Fatal(err)
+	}
 	m.busy["ag_x"] = busyEntry{startedAt: time.Now()}
 
 	var steered atomic.Value
@@ -76,6 +86,31 @@ func TestSteerWaitsForSteerHandle(t *testing.T) {
 	}
 	if got, _ := steered.Load().(string); got != "late-handle" {
 		t.Fatalf("steer fn got %q, want %q", got, "late-handle")
+	}
+}
+
+// Steer while the busy slot is held by a background notification turn
+// (a subagent from an earlier turn finishing — no steer handle, never
+// gets one) must fail fast with ErrAgentNotBusy so the web client falls
+// back to a queued normal send. The pre-fix behavior polled for the full
+// steerHandleWait and then bounced ErrSteerUnsupported, which the client
+// surfaced as a rollback that silently dropped the user's message.
+func TestSteerUnsolicitedTurnFailsFastNotBusy(t *testing.T) {
+	m := newTestManager(t)
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
+	m.busy["ag_x"] = busyEntry{
+		startedAt:   time.Now(),
+		source:      BusySourceNotification,
+		unsolicited: true,
+		outCh:       make(chan ChatEvent, 1),
+	}
+
+	start := time.Now()
+	if err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
+		t.Fatalf("Steer during background notification turn = %v, want ErrAgentNotBusy", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("unsolicited-turn steer took %v, want fast fail", time.Since(start))
 	}
 }
 
@@ -102,7 +137,7 @@ func TestSteerUnsupportedBackendFailsFast(t *testing.T) {
 func TestSteerPrepareAbortedReturnsNotBusy(t *testing.T) {
 	m := newTestManager(t)
 	m.preparing = map[string]int{"ag_x": 1}
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
 
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -121,7 +156,7 @@ func TestSteerPrepareAbortedReturnsNotBusy(t *testing.T) {
 // ErrAgentNotBusy so the client falls back to a normal send.
 func TestSteerDoesNotCrossTurnGenerations(t *testing.T) {
 	m := newTestManager(t)
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
 	outA := make(chan ChatEvent, 1)
 	m.busy["ag_x"] = busyEntry{startedAt: time.Now(), outCh: outA}
 
@@ -154,7 +189,7 @@ func TestSteerDoesNotCrossTurnGenerations(t *testing.T) {
 func TestSteerContextCancelUnblocks(t *testing.T) {
 	m := newTestManager(t)
 	m.preparing = map[string]int{"ag_x": 1}
-	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "claude"}
+	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {

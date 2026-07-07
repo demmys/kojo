@@ -86,6 +86,65 @@ func TestManager_Steer_InjectsAndPersists(t *testing.T) {
 	}
 }
 
+// TestManager_Steer_AppendFailureIsNotSwallowed verifies the durability
+// invariant: if the steered text is injected into the live turn but the
+// transcript append fails (here: the agent row is absent from the store, as
+// happens when it was evicted mid device-switch), Steer must NOT report
+// success. A swallowed append error would return HTTP 2xx for a message that
+// vanishes on the next reload.
+func TestManager_Steer_AppendFailureIsNotSwallowed(t *testing.T) {
+	m := newTestManager(t)
+	// Deliberately do NOT upsert "ag_gone" into the store, so appendMessage
+	// fails with store.ErrNotFound.
+
+	var injected string
+	m.busyMu.Lock()
+	m.busy["ag_gone"] = busyEntry{
+		startedAt: time.Now(),
+		cancel:    func() {},
+		outCh:     make(chan ChatEvent, 4),
+		steer: func(text string) error {
+			injected = text
+			return nil
+		},
+	}
+	m.busyMu.Unlock()
+
+	err := m.Steer(context.Background(), "ag_gone", "steer that cannot persist")
+	if err == nil {
+		t.Fatal("Steer returned nil despite a failed transcript append (2xx would lose the message on reload)")
+	}
+	// The text should still have reached the live turn — the failure is
+	// purely about durability, not delivery.
+	if injected != "steer that cannot persist" {
+		t.Errorf("steer func got %q, want the injected text", injected)
+	}
+}
+
+// TestManager_AnswerQuestion_AppendFailureIsNotSwallowed mirrors the Steer
+// invariant for the AskUserQuestion answer path.
+func TestManager_AnswerQuestion_AppendFailureIsNotSwallowed(t *testing.T) {
+	m := newTestManager(t)
+	// "ag_gone" is intentionally absent from the store → append fails.
+
+	m.busyMu.Lock()
+	m.busy["ag_gone"] = busyEntry{
+		startedAt: time.Now(),
+		cancel:    func() {},
+		outCh:     make(chan ChatEvent, 4),
+		answer: func(requestID string, answers map[string]any, deny bool, denyMessage string) error {
+			return nil
+		},
+	}
+	m.busyMu.Unlock()
+
+	err := m.AnswerQuestion(context.Background(), "ag_gone", "req-1",
+		map[string]any{"色選択": "青"}, false, "")
+	if err == nil {
+		t.Fatal("AnswerQuestion returned nil despite a failed transcript append")
+	}
+}
+
 // TestManager_Steer_SteerFuncError propagates the backend's error (e.g.
 // process already exited / stdin closed) rather than swallowing it.
 func TestManager_Steer_SteerFuncError(t *testing.T) {

@@ -56,6 +56,16 @@ type busyEntry struct {
 	// the steered user message appear inline without waiting for a
 	// transcript refetch.
 	outCh chan<- ChatEvent
+	// unsolicited marks a background notification turn surfaced by the
+	// persistent claude session (a subagent from an EARLIER turn finishing —
+	// see handleBackgroundTurn / claude_session.openUnsolicitedLocked). Such a
+	// turn holds the busy slot and streams to the UI but is NOT a steerable
+	// user turn: it never registers a steer handle. awaitSteerHandle keys off
+	// this to fail-fast with ErrAgentNotBusy instead of polling steerHandleWait
+	// and then bouncing ErrSteerUnsupported. A user message that arrives while
+	// such a turn is streaming must fall back to a queued normal send that
+	// opens a fresh turn once the notification turn ends.
+	unsolicited bool
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -2473,7 +2483,7 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent) 
 			outCh = make(chan ChatEvent, 64)
 			bc := newChatBroadcaster(outCh)
 			acc := newChatAccumulator()
-			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh}
+			m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true}
 			// Count this in-flight unsolicited turn so drains (waitChatIdle /
 			// WaitAllChatsIdle) don't observe idle while it is writing.
 			m.notifying[agentID]++

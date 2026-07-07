@@ -112,8 +112,16 @@ func (m *Manager) Steer(ctx context.Context, agentID, text string) error {
 		return err
 	}
 	msg := newUserMessage(text, nil)
+	// Durability invariant: a steer we report as accepted (HTTP 2xx) MUST be
+	// in the transcript. The text is already injected into the live turn
+	// above, so a swallowed append error would let the assistant answer a
+	// message that vanishes on the next reload (e.g. the agent row was
+	// evicted mid device-switch, or the store write deadlined). Surface the
+	// failure so the caller gets a non-2xx and can retry, instead of a
+	// silent loss.
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save steer message", "agent", agentID, "err", appendErr)
+		return fmt.Errorf("steer accepted but not persisted: %w", appendErr)
 	}
 	// Re-acquire busyMu for the live-event push. clearBusy removes the
 	// entry under busyMu BEFORE close(outCh), so an entry re-observed here
@@ -153,9 +161,13 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 		return nil
 	}
 	// Record the answers as a user message so the exchange survives reload.
+	// Same durability invariant as Steer: the answers were already delivered
+	// to the live turn, so a swallowed append error would let the turn act on
+	// a Q&A exchange that disappears on reload. Surface the failure instead.
 	msg := newUserMessage(formatAnswers(answers), nil)
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save answer message", "agent", agentID, "err", appendErr)
+		return fmt.Errorf("answer accepted but not persisted: %w", appendErr)
 	}
 	m.busyMu.Lock()
 	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {
@@ -221,6 +233,18 @@ func (m *Manager) awaitSteerHandle(ctx context.Context, agentID string) (busyEnt
 		preparing := m.preparing[agentID] > 0
 		m.busyMu.Unlock()
 		if busyOK {
+			// A background notification turn (a subagent from an EARLIER
+			// turn finishing, surfaced by the persistent claude session)
+			// holds the busy slot and streams to the UI, but is not a
+			// steerable user turn — it never registers a steer handle.
+			// Fail-fast with ErrAgentNotBusy so the caller falls back to a
+			// queued normal send (a fresh turn once the notification turn
+			// ends) instead of polling steerHandleWait and then bouncing
+			// ErrSteerUnsupported, which the web client surfaces as a
+			// rollback that silently drops the user's message.
+			if entry.unsolicited {
+				return busyEntry{}, ErrAgentNotBusy
+			}
 			if pinnedCh == nil {
 				pinnedCh = entry.outCh
 			} else if entry.outCh != pinnedCh {

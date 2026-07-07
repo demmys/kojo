@@ -222,6 +222,16 @@ func (s *Server) handlePutAgentStatus(w http.ResponseWriter, r *http.Request) {
 	s.handlePutWorkspaceFile(w, r, store.WorkspaceFileKindStatus)
 }
 
+func (s *Server) handleGetAgentAnchor(w http.ResponseWriter, r *http.Request) {
+	s.handleGetWorkspaceFile(w, r, store.WorkspaceFileKindAnchor)
+}
+
+func (s *Server) handlePutAgentAnchor(w http.ResponseWriter, r *http.Request) {
+	// No JSON validation — the anchor is free-form markdown, unlike
+	// status.json which the settings UI renders as a key-value table.
+	s.handlePutWorkspaceFile(w, r, store.WorkspaceFileKindAnchor)
+}
+
 // validateStatusJSON enforces the shape contract for status.json writes
 // arriving over the REST surface: a single flat JSON object whose values
 // are scalars (string / number / bool). Nested objects and arrays are

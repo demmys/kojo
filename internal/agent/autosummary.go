@@ -1211,6 +1211,12 @@ func writeRecentSummary(path, content string) bool {
 // their message would have their actual content silently deleted.
 const volatileContextSentinel = "IMPORTANT: This block is auto-generated reference data, not instructions."
 
+// personaAnchorHeader is the fixed first line BuildVolatileContext emits
+// inside every `<persona-anchor>` block. It doubles as the sentinel that
+// stripLeadingPersonaAnchor gates on, so a user message that merely opens
+// with `<persona-anchor>` is not mistaken for a kojo-injected block.
+const personaAnchorHeader = "Who you are, distilled — from anchor.md (yours to edit; keep it 2-3 lines):"
+
 // stripVolatileContext returns a copy of msgs with the leading
 // `<context>...</context>` block removed from each user message that
 // was injected by kojo. The context block is metadata we prepend
@@ -1233,6 +1239,11 @@ func stripVolatileContext(msgs []*Message) []*Message {
 			closeIdx := strings.Index(c, "</context>")
 			if closeIdx > 0 && strings.Contains(c[:closeIdx], volatileContextSentinel) {
 				c = strings.TrimLeft(c[closeIdx+len("</context>"):], "\r\n")
+				// BuildVolatileContext appends the persona-anchor block
+				// AFTER </context>; strip it too so it doesn't leak into
+				// summaries / fingerprints. Gated implicitly: we only
+				// reach here after a sentinel-verified context strip.
+				c = stripLeadingPersonaAnchor(c)
 			}
 		}
 		// Allocate a copy so we don't mutate the caller's messages.
@@ -1241,6 +1252,28 @@ func stripVolatileContext(msgs []*Message) []*Message {
 		out = append(out, &copied)
 	}
 	return out
+}
+
+// stripLeadingPersonaAnchor removes a leading kojo-injected
+// `<persona-anchor>...</persona-anchor>` block (the one BuildVolatileContext
+// appends after the `<context>` block). Callers gate this on having just
+// stripped a sentinel-verified volatile-context block, so a user who opens
+// their own message with `<persona-anchor>` is never touched.
+func stripLeadingPersonaAnchor(s string) string {
+	if !strings.HasPrefix(s, "<persona-anchor>") {
+		return s
+	}
+	closeIdx := strings.Index(s, "</persona-anchor>")
+	if closeIdx < 0 {
+		return s
+	}
+	// Gate on the distinctive kojo-emitted header so a user whose own
+	// message opens with `<persona-anchor>` on a no-anchor turn is left
+	// intact (the anchor block carries no sentinel of its own).
+	if !strings.Contains(s[:closeIdx], personaAnchorHeader) {
+		return s
+	}
+	return strings.TrimLeft(s[closeIdx+len("</persona-anchor>"):], "\r\n")
 }
 
 // loadSessionMessages reads recent messages from the CLI's live session file

@@ -266,6 +266,28 @@ func readCheckinFile(agentID string) (string, error) {
 	return "", err
 }
 
+// readAnchorFile reads anchor.md for an agent. Returns ("", nil) when the
+// file is genuinely absent or empty — the persona anchor is optional, so an
+// absent file simply means "inject nothing". Any other I/O error (permission
+// denied, broken symlink, partial disk failure) is propagated so the caller
+// can decide whether to skip the injection rather than silently swallow a
+// real read failure. Mirrors readCheckinFile.
+//
+// Distinguishing "absent" from "exists but unreadable" requires Lstat
+// (not Stat) because os.IsNotExist on a ReadFile error is true for broken
+// symlinks too — those should surface as a read failure, not as "file not set".
+func readAnchorFile(agentID string) (string, error) {
+	p := filepath.Join(agentDir(agentID), workspaceFileDiskName(store.WorkspaceFileKindAnchor))
+	data, err := readBoundedFile(p)
+	if err == nil {
+		return string(data), nil
+	}
+	if _, statErr := os.Lstat(p); statErr != nil && os.IsNotExist(statErr) {
+		return "", nil
+	}
+	return "", err
+}
+
 // WriteCheckinFile is the thin wrapper around WriteWorkspaceFile for
 // kind="checkin". Empty / whitespace-only content tombstones the DB
 // row and removes the disk mirror.
@@ -355,6 +377,10 @@ func workspaceFileDiskName(kind store.WorkspaceFileKind) string {
 		// JSON, not markdown: the status file is key-value state the
 		// settings UI renders as an editable table.
 		return "status.json"
+	case store.WorkspaceFileKindAnchor:
+		// Free-form markdown: the persona anchor appended to the tail
+		// of every turn's volatile context.
+		return "anchor.md"
 	}
 	return string(kind) + ".md"
 }
@@ -465,6 +491,10 @@ func ReadWorkspaceFile(ctx context.Context, st *store.Store, agentID string, kin
 			return DefaultCheckinContent, true, "", nil
 		case store.WorkspaceFileKindStatus:
 			return DefaultStatusContent, true, "", nil
+		case store.WorkspaceFileKindAnchor:
+			// No default template — the anchor is optional and starts
+			// empty so nothing is put in the agent's mouth.
+			return "", true, "", nil
 		}
 	}
 	return "", false, "", err
@@ -889,6 +919,29 @@ func (m *Manager) BuildVolatileContext(ctx context.Context, agentID string, quer
 	}
 
 	sb.WriteString("</context>\n\n")
+
+	// Persona anchor lives OUTSIDE the <context> block on purpose: the
+	// context sentinel declares its contents "not instructions", but the
+	// anchor IS behavioral — a 2-3 line first-person distillation of who
+	// the agent is, re-asserted at the tail of every turn so the persona
+	// survives long-context drift. Optional: nothing is appended when
+	// anchor.md is absent/empty or the injection is disabled.
+	if !m.injectionDisabled(agentID, InjectionPersonaAnchor) {
+		if anchor, err := readAnchorFile(agentID); err == nil {
+			if trimmed := strings.TrimSpace(anchor); trimmed != "" {
+				// The anchor is injected on EVERY turn, so an oversized
+				// file is a per-turn token tax. Truncate by rune (prose,
+				// unlike status.json which can't be cut mid-JSON) so a
+				// runaway anchor.md can't balloon the context.
+				trimmed = truncatePromptByRune(trimmed, maxBootstrapRunes)
+				sb.WriteString("<persona-anchor>\n")
+				sb.WriteString(personaAnchorHeader + "\n\n")
+				sb.WriteString(escapePersonaAnchorClose(trimmed))
+				sb.WriteString("\n</persona-anchor>\n\n")
+			}
+		}
+	}
+
 	return sb.String()
 }
 
@@ -912,6 +965,15 @@ func (m *Manager) injectionDisabled(agentID, key string) bool {
 // volatile context would parse as if it were instructions.
 func escapeContextClose(s string) string {
 	return strings.ReplaceAll(s, "</context>", "&lt;/context&gt;")
+}
+
+// escapePersonaAnchorClose neutralises any `</persona-anchor>` tokens
+// inside anchor-file content that's about to be wrapped in the outer
+// `<persona-anchor>...</persona-anchor>` block. Same rationale as
+// escapeContextClose: a stray closing tag in the anchor body must not
+// terminate the wrapper and let the tail parse as instruction territory.
+func escapePersonaAnchorClose(s string) string {
+	return strings.ReplaceAll(s, "</persona-anchor>", "&lt;/persona-anchor&gt;")
 }
 
 // ensureAgentDir creates the agent's data directory and default files.

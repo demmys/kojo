@@ -211,6 +211,9 @@ func TestAgentWorkspaceFileKindValidation(t *testing.T) {
 	if !IsValidWorkspaceFileKind(WorkspaceFileKindUser) || !IsValidWorkspaceFileKind(WorkspaceFileKindCheckin) {
 		t.Errorf("user/checkin kinds should be valid")
 	}
+	if !IsValidWorkspaceFileKind(WorkspaceFileKindStatus) || !IsValidWorkspaceFileKind(WorkspaceFileKindAnchor) {
+		t.Errorf("status/anchor kinds should be valid")
+	}
 	if IsValidWorkspaceFileKind(WorkspaceFileKind("")) {
 		t.Errorf("empty kind should be invalid")
 	}

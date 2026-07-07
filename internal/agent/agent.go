@@ -634,6 +634,7 @@ const (
 	InjectionDiaryNotes         = "diary_notes"         // Recent Activity block in volatile context
 	InjectionMemorySearch       = "memory_search"       // Relevant Memory block in volatile context
 	InjectionRecentConversation = "recent_conversation" // session-resume transcript fallback
+	InjectionPersonaAnchor      = "persona_anchor"      // persona anchor block appended after volatile context
 )
 
 var validInjectionKeys = map[string]bool{
@@ -647,6 +648,7 @@ var validInjectionKeys = map[string]bool{
 	InjectionDiaryNotes:         true,
 	InjectionMemorySearch:       true,
 	InjectionRecentConversation: true,
+	InjectionPersonaAnchor:      true,
 }
 
 // ValidInjectionKey reports whether key is a known injection section.

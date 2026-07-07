@@ -197,6 +197,7 @@ export const CONTEXT_INJECTION_KEYS = [
   "diary_notes",
   "memory_search",
   "recent_conversation",
+  "persona_anchor",
 ] as const;
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
@@ -634,6 +635,25 @@ export const agentApi = {
   putAgentStatus: (id: string, content: string, expectedEtag?: string) =>
     putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
       `/api/v1/agents/${id}/status`,
+      { content },
+      expectedEtag,
+    ),
+
+  // anchor.md workspace file — the agent's optional persona anchor: a
+  // 2-3 line first-person distillation (pronoun, tone, attitude) appended
+  // to the tail of every turn's volatile context so the persona survives
+  // long-context drift. Free-form markdown (no JSON validation, unlike
+  // status). Empty body clears the file. GET returns an empty template
+  // with isDefault=true when anchor.md is absent. Same default-template /
+  // etag contract as user-context.
+  getAgentAnchor: (id: string) =>
+    getWithEtag<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/anchor`,
+    ),
+
+  putAgentAnchor: (id: string, content: string, expectedEtag?: string) =>
+    putWithIfMatch<{ content: string; isDefault: boolean; etag?: string }>(
+      `/api/v1/agents/${id}/anchor`,
       { content },
       expectedEtag,
     ),

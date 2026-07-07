@@ -1075,7 +1075,10 @@ func stripArrivalContextBlock(s string) string {
 	if !strings.Contains(trimmed[:closeIdx], volatileContextSentinel) {
 		return s
 	}
-	return strings.TrimLeft(trimmed[closeIdx+len("</context>"):], "\r\n")
+	// BuildVolatileContext appends the persona-anchor block after
+	// </context>; strip it too so it doesn't survive into the arrival
+	// prompt. Reached only after a sentinel-verified context strip.
+	return stripLeadingPersonaAnchor(strings.TrimLeft(trimmed[closeIdx+len("</context>"):], "\r\n"))
 }
 
 // truncatePromptByRune caps body at `runeLimit` runes (NOT bytes), so the

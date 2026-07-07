@@ -416,6 +416,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		// Agent reads/writes its own status.json workspace file (the
 		// self-maintained state injected into the system prompt tail).
 		return method == http.MethodGet || method == http.MethodPut
+	case "/anchor":
+		// Agent reads/writes its own anchor.md workspace file (the
+		// optional persona anchor appended to the volatile-context tail).
+		return method == http.MethodGet || method == http.MethodPut
 	case "/checkin-file":
 		// Agent reads/writes its own checkin.md workspace file. GET
 		// surfaces DefaultCheckinContent when checkin.md is absent so

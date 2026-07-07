@@ -63,6 +63,10 @@ const INJECTION_INFO: Record<ContextInjectionKey, { label: string; desc: string 
     label: "Recent Conversation",
     desc: "Recent conversation fallback on session resume",
   },
+  persona_anchor: {
+    label: "口調アンカー",
+    desc: "Persona anchor appended to the per-turn context tail (anchor.md)",
+  },
 };
 
 /**
@@ -189,6 +193,13 @@ export function AgentSettings() {
   const [loadedStatus, setLoadedStatus] = useState("");
   const [statusEtag, setStatusEtag] = useState("");
   const [statusLoadGen, setStatusLoadGen] = useState(0);
+  // anchor.md workspace file — the agent's optional persona anchor. Same
+  // default-vs-saved tracking / etag threading as user.md above so an
+  // unedited empty template doesn't get persisted on Save.
+  const [anchorContent, setAnchorContent] = useState("");
+  const [anchorIsDefault, setAnchorIsDefault] = useState(false);
+  const [loadedAnchor, setLoadedAnchor] = useState("");
+  const [anchorEtag, setAnchorEtag] = useState("");
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
@@ -325,7 +336,8 @@ export function AgentSettings() {
       agentApi.getCheckinFile(id),
       agentApi.getUserContext(id),
       agentApi.getAgentStatus(id),
-    ]).then(([agentRes, checkinRes, userCtxRes, statusRes]) => {
+      agentApi.getAgentAnchor(id),
+    ]).then(([agentRes, checkinRes, userCtxRes, statusRes, anchorRes]) => {
       if (agentRes.status !== "fulfilled") {
         navigateRef.current("/");
         return;
@@ -405,6 +417,18 @@ export function AgentSettings() {
         setStatusIsDefault(true);
         setLoadedStatus("");
         setStatusEtag("");
+      }
+      if (anchorRes.status === "fulfilled") {
+        const v = anchorRes.value.value;
+        setAnchorContent(v.content);
+        setAnchorIsDefault(v.isDefault);
+        setLoadedAnchor(v.content);
+        setAnchorEtag(anchorRes.value.etag ?? v.etag ?? "");
+      } else {
+        setAnchorContent("");
+        setAnchorIsDefault(true);
+        setLoadedAnchor("");
+        setAnchorEtag("");
       }
       setStatusLoadGen((g) => g + 1);
     });
@@ -514,6 +538,7 @@ export function AgentSettings() {
       // StatusField serializer may reformat identical data (indentation,
       // key spacing), so also skip when it still parses to the template.
       const statusDirty = statusContent !== loadedStatus && !statusIsDefault;
+      const anchorDirty = anchorContent !== loadedAnchor;
 
       const updated = await agentApi.update(
         id!,
@@ -619,6 +644,18 @@ export function AgentSettings() {
         // server-canonical body (the PUT may have normalized types).
         setStatusLoadGen((g) => g + 1);
       }
+      if (anchorDirty) {
+        const wrapped = await agentApi.putAgentAnchor(
+          id!,
+          anchorContent,
+          anchorEtag || undefined,
+        );
+        const res = wrapped.value;
+        setAnchorIsDefault(res.isDefault);
+        setAnchorContent(res.content);
+        setLoadedAnchor(res.content);
+        setAnchorEtag(wrapped.etag ?? res.etag ?? "");
+      }
 
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
@@ -645,14 +682,16 @@ export function AgentSettings() {
         // status mid-edit). Re-pin JUST their etags so the next Save can
         // succeed; bodies stay as the user typed them.
         try {
-          const [ck, uc, st] = await Promise.allSettled([
+          const [ck, uc, st, an] = await Promise.allSettled([
             agentApi.getCheckinFile(id!),
             agentApi.getUserContext(id!),
             agentApi.getAgentStatus(id!),
+            agentApi.getAgentAnchor(id!),
           ]);
           if (ck.status === "fulfilled") setCheckinEtag(ck.value.etag ?? ck.value.value.etag ?? "");
           if (uc.status === "fulfilled") setUserContextEtag(uc.value.etag ?? uc.value.value.etag ?? "");
           if (st.status === "fulfilled") setStatusEtag(st.value.etag ?? st.value.value.etag ?? "");
+          if (an.status === "fulfilled") setAnchorEtag(an.value.etag ?? an.value.value.etag ?? "");
         } catch {
           /* swallow — primary error is already shown */
         }
@@ -1071,6 +1110,29 @@ export function AgentSettings() {
                   // so Save persists the edit (same contract as user.md).
                   if (statusIsDefault) setStatusIsDefault(false);
                 }}
+              />
+            </Field>
+
+            {/* Persona Anchor (anchor.md) */}
+            <Field
+              label="口調アンカー"
+              help={
+                <>
+                  毎ターンの文脈末尾に注入される2〜3行の人格要約 (一人称・口調・態度)。空なら何も注入されない。長文はトークン税になるので短く。{" "}
+                  {anchorIsDefault && "Template — not yet saved."}
+                </>
+              }
+            >
+              <Textarea
+                mono
+                value={anchorContent}
+                onChange={(e) => {
+                  setAnchorContent(e.target.value);
+                  // First keystroke off the empty template — clear the
+                  // default flag so Save persists the edit.
+                  if (anchorIsDefault) setAnchorIsDefault(false);
+                }}
+                rows={3}
               />
             </Field>
 

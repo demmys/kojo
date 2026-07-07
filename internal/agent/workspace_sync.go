@@ -22,6 +22,7 @@ var workspaceFileKinds = []store.WorkspaceFileKind{
 	store.WorkspaceFileKindUser,
 	store.WorkspaceFileKindCheckin,
 	store.WorkspaceFileKindStatus,
+	store.WorkspaceFileKindAnchor,
 }
 
 // workspaceFilePath returns the canonical on-disk mirror path for one

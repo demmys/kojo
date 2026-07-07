@@ -35,6 +35,14 @@ const (
 	// system prompt tail and edited by the agent itself as its state
 	// drifts. Added by migration 0021.
 	WorkspaceFileKindStatus WorkspaceFileKind = "status"
+
+	// WorkspaceFileKindAnchor is the agent's optional persona anchor file
+	// (anchor.md on disk — markdown): a 2-3 line first-person distillation
+	// of the agent's persona (pronoun, tone, attitude) appended to the tail
+	// of every turn's volatile context so the persona survives long-context
+	// drift. Optional — nothing is injected when absent/empty — and edited
+	// by the agent itself.
+	WorkspaceFileKindAnchor WorkspaceFileKind = "anchor"
 )
 
 // validWorkspaceFileKinds mirrors the SQL CHECK constraint. Map shape
@@ -43,6 +51,7 @@ var validWorkspaceFileKinds = map[WorkspaceFileKind]bool{
 	WorkspaceFileKindUser:    true,
 	WorkspaceFileKindCheckin: true,
 	WorkspaceFileKindStatus:  true,
+	WorkspaceFileKindAnchor:  true,
 }
 
 // IsValidWorkspaceFileKind reports whether kind is one of the

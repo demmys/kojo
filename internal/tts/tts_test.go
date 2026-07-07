@@ -41,20 +41,24 @@ func TestPCMToWAVHeader(t *testing.T) {
 }
 
 func TestHashRequestStable(t *testing.T) {
-	a := hashRequest("m", "v", "s", "t", "opus", true)
-	b := hashRequest("m", "v", "s", "t", "opus", true)
+	a := hashRequest("gemini", "m", "v", "s", "t", "opus", true)
+	b := hashRequest("gemini", "m", "v", "s", "t", "opus", true)
 	if a != b {
 		t.Fatalf("hash not stable: %s vs %s", a, b)
 	}
-	if c := hashRequest("m", "v", "s", "t", "opus", false); c == a {
+	if c := hashRequest("gemini", "m", "v", "s", "t", "opus", false); c == a {
 		t.Errorf("relax flag should change hash")
 	}
-	if c := hashRequest("m", "v", "s", "t", "wav", true); c == a {
+	if c := hashRequest("gemini", "m", "v", "s", "t", "wav", true); c == a {
 		t.Errorf("format should change hash")
 	}
+	// Provider must be part of the key so gemini/grok never collide.
+	if c := hashRequest("grok", "m", "v", "s", "t", "opus", true); c == a {
+		t.Errorf("provider should change hash")
+	}
 	// Adversarial: ensure length-prefixing avoids boundary collisions.
-	x := hashRequest("ab", "cd", "", "", "wav", true)
-	y := hashRequest("a", "bcd", "", "", "wav", true)
+	x := hashRequest("gemini", "ab", "cd", "", "", "wav", true)
+	y := hashRequest("gemini", "a", "bcd", "", "", "wav", true)
 	if x == y {
 		t.Errorf("boundary collision: hashes should differ")
 	}

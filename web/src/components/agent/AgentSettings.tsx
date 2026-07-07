@@ -221,6 +221,7 @@ export function AgentSettings() {
   const [allowProtectedPaths, setAllowProtectedPaths] = useState<string[]>([]);
   // TTS settings
   const [ttsEnabled, setTTSEnabled] = useState(false);
+  const [ttsProvider, setTTSProvider] = useState<"gemini" | "grok">("gemini");
   const [ttsModel, setTTSModel] = useState("");
   const [ttsVoice, setTTSVoice] = useState("");
   const [ttsStylePrompt, setTTSStylePrompt] = useState("");
@@ -230,6 +231,24 @@ export function AgentSettings() {
   const ttsPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // playPreview synthesizes a fixed sample line for the chosen voice
+  // browseVoices normalizes the current provider's catalog into a single
+  // shape for the "browse all voices" grid (name, display label, F/M
+  // gender, optional trait).
+  const browseVoices =
+    ttsProvider === "grok"
+      ? (ttsCapability?.grokVoiceCatalog ?? []).map((v) => ({
+          name: v.name,
+          display: v.label,
+          gender: v.gender === "female" ? "F" : v.gender === "male" ? "M" : "",
+          trait: "",
+        }))
+      : (ttsCapability?.voiceCatalog ?? []).map((v) => ({
+          name: v.name,
+          display: v.name,
+          gender: v.gender ?? "",
+          trait: v.trait,
+        }));
+
   // and plays it. Concurrent preview clicks supersede the previous one.
   const playPreview = async (voiceName: string) => {
     if (!ttsCapability) return;
@@ -245,8 +264,10 @@ export function AgentSettings() {
     try {
       const fmt = pickBestFormat(ttsCapability.formats);
       const res = await ttsApi.preview(voiceName, {
-        model: ttsModel || undefined,
-        stylePrompt: ttsStylePrompt.trim() || undefined,
+        provider: ttsProvider,
+        model: ttsProvider === "grok" ? undefined : ttsModel || undefined,
+        stylePrompt:
+          ttsProvider === "grok" ? undefined : ttsStylePrompt.trim() || undefined,
         format: fmt,
       });
       const audio = new Audio(ttsApi.audioUrl(res.url));
@@ -333,6 +354,7 @@ export function AgentSettings() {
       setAllowProtectedPaths(a.allowProtectedPaths ?? []);
       setPrivileged(a.privileged ?? false);
       setTTSEnabled(a.tts?.enabled ?? false);
+      setTTSProvider(a.tts?.provider === "grok" ? "grok" : "gemini");
       setTTSModel(a.tts?.model ?? "");
       setTTSVoice(a.tts?.voice ?? "");
       setTTSStylePrompt(a.tts?.stylePrompt ?? "");
@@ -522,9 +544,10 @@ export function AgentSettings() {
           disabledInjections,
           tts: {
             enabled: ttsEnabled,
-            model: ttsModel,
+            provider: ttsProvider,
+            model: ttsProvider === "grok" ? "" : ttsModel,
             voice: ttsVoice,
-            stylePrompt: ttsStylePrompt,
+            stylePrompt: ttsProvider === "grok" ? "" : ttsStylePrompt,
           },
         }),
         // The form's snapshot etag — captured at GET time, NOT a global
@@ -1315,19 +1338,40 @@ export function AgentSettings() {
         <SectionCard
           id="voice"
           title="Voice"
-          description="Read assistant replies out loud via Gemini TTS. Manual playback per message; auto playback toggled in the chat header."
+          description="Read assistant replies out loud via Gemini or xAI Grok TTS. Manual playback per message; auto playback toggled in the chat header."
           action={<Toggle checked={ttsEnabled} onChange={setTTSEnabled} aria-label="Enable TTS" />}
         >
           {ttsEnabled && (
             <div className="space-y-4">
-              <Field label="Model">
-                <Select value={ttsModel} onChange={(e) => setTTSModel(e.target.value)}>
-                  <option value="">Default ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
-                  {(ttsCapability?.models ?? []).map((m) => (
-                    <option key={m} value={m}>{m}</option>
-                  ))}
+              <Field
+                label="Provider"
+                help="Gemini uses a free-form style prompt; Grok has no style prompt — control delivery with the voice and inline speech tags ([pause], [laugh], <whisper>…</whisper>) embedded in replies."
+              >
+                <Select
+                  value={ttsProvider}
+                  onChange={(e) => {
+                    const p = e.target.value === "grok" ? "grok" : "gemini";
+                    setTTSProvider(p);
+                    // Voice ids don't cross providers — reset to default.
+                    setTTSVoice("");
+                    setTTSPreviewError("");
+                  }}
+                >
+                  <option value="gemini">Gemini</option>
+                  <option value="grok">Grok (xAI)</option>
                 </Select>
               </Field>
+
+              {ttsProvider === "gemini" && (
+                <Field label="Model">
+                  <Select value={ttsModel} onChange={(e) => setTTSModel(e.target.value)}>
+                    <option value="">Default ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
+                    {(ttsCapability?.models ?? []).map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
 
               <Field
                 label="Voice"
@@ -1344,33 +1388,47 @@ export function AgentSettings() {
                 }
                 help={
                   <>
-                    Gender from Cloud TTS Chirp3-HD mapping. Use{" "}
-                    <span className="text-ink-dim">Preview</span> to listen.
+                    Use <span className="text-ink-dim">Preview</span> to listen.
                   </>
                 }
                 error={ttsPreviewError || undefined}
               >
                 <Select value={ttsVoice} onChange={(e) => setTTSVoice(e.target.value)}>
-                  <option value="">
-                    Default ({ttsCapability?.defaults.voice ?? "Kore"})
-                  </option>
-                  {(ttsCapability?.voiceCatalog ?? []).map((v) => (
-                    <option key={v.name} value={v.name}>
-                      {v.name} ({v.gender || "?"}) — {v.trait}
-                    </option>
-                  ))}
+                  {ttsProvider === "grok" ? (
+                    <>
+                      <option value="">
+                        Default ({ttsCapability?.defaults.grokVoice ?? "eve"})
+                      </option>
+                      {(ttsCapability?.grokVoiceCatalog ?? []).map((v) => (
+                        <option key={v.name} value={v.name}>
+                          {v.label} ({v.gender || "?"})
+                        </option>
+                      ))}
+                    </>
+                  ) : (
+                    <>
+                      <option value="">
+                        Default ({ttsCapability?.defaults.voice ?? "Kore"})
+                      </option>
+                      {(ttsCapability?.voiceCatalog ?? []).map((v) => (
+                        <option key={v.name} value={v.name}>
+                          {v.name} ({v.gender || "?"}) — {v.trait}
+                        </option>
+                      ))}
+                    </>
+                  )}
                 </Select>
               </Field>
 
               {/* All-voices preview grid — lets the user audition every voice
                   without leaving the settings page. Each row stays compact
-                  so 30 voices fit without dominating the form. */}
+                  so the full catalog fits without dominating the form. */}
               <details className="overflow-hidden rounded-[10px] border border-hairline bg-raised">
                 <summary className="cursor-pointer select-none px-3 py-2 text-[12px] text-ink-dim">
-                  Browse all 30 voices
+                  Browse all {browseVoices.length} voices
                 </summary>
                 <div className="grid max-h-64 grid-cols-2 gap-1 overflow-y-auto p-2">
-                  {(ttsCapability?.voiceCatalog ?? []).map((v) => (
+                  {browseVoices.map((v) => (
                     <button
                       type="button"
                       key={v.name}
@@ -1394,8 +1452,8 @@ export function AgentSettings() {
                             {v.gender}
                           </span>
                         )}
-                        <span className="text-ink">{v.name}</span>
-                        <span className="text-ink-faint"> — {v.trait}</span>
+                        <span className="text-ink">{v.display}</span>
+                        {v.trait && <span className="text-ink-faint"> — {v.trait}</span>}
                       </span>
                       <span
                         className={`ml-2 text-[10px] ${
@@ -1409,6 +1467,17 @@ export function AgentSettings() {
                 </div>
               </details>
 
+              {ttsProvider === "grok" && (
+                <Banner tone="info">
+                  Grok has no style prompt. Delivery is set by the voice and by
+                  inline speech tags in the reply text — e.g.{" "}
+                  <code className="text-ink-dim">[pause]</code>,{" "}
+                  <code className="text-ink-dim">[laugh]</code>,{" "}
+                  <code className="text-ink-dim">&lt;whisper&gt;…&lt;/whisper&gt;</code>.
+                </Banner>
+              )}
+
+              {ttsProvider === "gemini" && (
               <Field
                 label="Style Prompt"
                 help={
@@ -1442,8 +1511,9 @@ export function AgentSettings() {
                   maxLength={500}
                 />
               </Field>
+              )}
 
-              {ttsCapability && !ttsCapability.ffmpeg && (
+              {ttsProvider === "gemini" && ttsCapability && !ttsCapability.ffmpeg && (
                 <Banner tone="warn">
                   ffmpeg not detected — only WAV output is available. Install ffmpeg to enable Opus/MP3 (much smaller).
                 </Banner>

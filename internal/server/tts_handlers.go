@@ -27,9 +27,10 @@ var (
 func (s *Server) ensureTTSService() *tts.Service {
 	ttsServiceOnce.Do(func() {
 		creds := s.agents.Credentials()
-		ttsService = tts.NewService(func() (string, error) {
-			return agent.LoadGeminiAPIKey(creds)
-		})
+		ttsService = tts.NewService(
+			func() (string, error) { return agent.LoadGeminiAPIKey(creds) },
+			func() (string, error) { return agent.LoadXAIAPIKey(creds) },
+		)
 	})
 	return ttsService
 }
@@ -126,6 +127,7 @@ func (s *Server) handleTTSSynthesize(w http.ResponseWriter, r *http.Request) {
 
 	svc := s.ensureTTSService()
 	res, err := svc.Synthesize(r.Context(), tts.SynthesizeRequest{
+		Provider:    a.TTS.Provider,
 		Model:       a.TTS.Model,
 		Voice:       a.TTS.Voice,
 		StylePrompt: a.TTS.StylePrompt,
@@ -152,6 +154,7 @@ func (s *Server) handleTTSSynthesize(w http.ResponseWriter, r *http.Request) {
 // context so users can audition voices on the settings screen before
 // committing.
 type ttsPreviewRequest struct {
+	Provider    string `json:"provider,omitempty"` // "gemini" (default) | "grok"
 	Voice       string `json:"voice"`
 	Model       string `json:"model,omitempty"`
 	StylePrompt string `json:"stylePrompt,omitempty"`
@@ -182,9 +185,17 @@ func (s *Server) handleTTSPreview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	if !tts.IsValidVoice(body.Voice) {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid voice")
-		return
+	switch body.Provider {
+	case tts.ProviderGrok:
+		if !tts.IsValidGrokVoice(body.Voice) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid voice")
+			return
+		}
+	default:
+		if !tts.IsValidVoice(body.Voice) {
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid voice")
+			return
+		}
 	}
 	format, ok := resolveTTSFormat(w, body.Format)
 	if !ok {
@@ -199,6 +210,7 @@ func (s *Server) handleTTSPreview(w http.ResponseWriter, r *http.Request) {
 
 	svc := s.ensureTTSService()
 	res, err := svc.Synthesize(r.Context(), tts.SynthesizeRequest{
+		Provider:    body.Provider,
 		Model:       body.Model,
 		Voice:       body.Voice,
 		StylePrompt: body.StylePrompt,
@@ -273,16 +285,26 @@ func (s *Server) handleTTSAudio(w http.ResponseWriter, r *http.Request) {
 // `voiceCatalog` carries the descriptive trait label alongside each
 // voice id; `voices` is preserved as a flat list for legacy callers.
 func (s *Server) handleTTSCapability(w http.ResponseWriter, r *http.Request) {
+	// Grok voice catalog: fetched live and cached in-process, falling back
+	// to the static list when no xAI key is available.
+	grokVoices := tts.GrokVoiceCatalog
+	if s.agents != nil {
+		if key, err := agent.LoadXAIAPIKey(s.agents.Credentials()); err == nil && key != "" {
+			grokVoices = tts.GrokVoices(r.Context(), key)
+		}
+	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{
-		"ffmpeg":       tts.FFmpegAvailable(),
-		"formats":      tts.SupportedFormats(),
-		"voices":       tts.Voices,
-		"voiceCatalog": tts.VoiceCatalog,
-		"models":       tts.Models,
+		"ffmpeg":           tts.FFmpegAvailable(),
+		"formats":          tts.SupportedFormats(),
+		"voices":           tts.Voices,
+		"voiceCatalog":     tts.VoiceCatalog,
+		"models":           tts.Models,
+		"grokVoiceCatalog": grokVoices,
 		"defaults": map[string]string{
 			"model":       tts.DefaultModel,
 			"voice":       tts.DefaultVoice,
 			"stylePrompt": tts.DefaultStylePrompt,
+			"grokVoice":   tts.DefaultGrokVoice,
 		},
 	})
 }

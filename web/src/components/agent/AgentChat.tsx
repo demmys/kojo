@@ -546,7 +546,10 @@ export function AgentChat() {
               !autoPlayedRef.current.has(event.message.id)
             ) {
               autoPlayedRef.current.add(event.message.id);
-              ttsPlayRef.current(event.message.id, event.message.content);
+              ttsPlayRef.current(event.message.id, event.message.content, {
+                queue: true,
+                title: agent?.name ?? "kojo",
+              });
             }
           } else if (id) {
             // Background chat finished — reload recent and merge with older loaded messages

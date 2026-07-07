@@ -17,9 +17,10 @@ import (
 // already sanitized at this layer — callers pass agent-derived
 // configuration directly.
 type SynthesizeRequest struct {
-	Model       string // "" = DefaultModel
+	Provider    string // "" or "gemini" = Gemini; "grok" = xAI Grok
+	Model       string // "" = DefaultModel (gemini only; ignored for grok)
 	Voice       string // "" = DefaultVoice
-	StylePrompt string // "" = DefaultStylePrompt
+	StylePrompt string // "" = DefaultStylePrompt (gemini only; unused for grok)
 	Text        string // raw, will be sanitized inside Synthesize
 	Format      string // "opus" | "mp3" | "wav"
 }
@@ -40,17 +41,21 @@ type SynthesizeResult struct {
 // rotation in the credential store takes effect on the next call without
 // needing to rewire the service.
 type Service struct {
-	getAPIKey func() (string, error)
+	getAPIKey func() (string, error) // Gemini key
+	getXAIKey func() (string, error) // xAI (Grok) key
 	http      *http.Client
 }
 
-// NewService constructs a Service. apiKeyFn must return the current
-// Gemini Developer API key.
-func NewService(apiKeyFn func() (string, error)) *Service {
+// NewService constructs a Service. geminiKeyFn returns the current Gemini
+// Developer API key; xaiKeyFn returns the current xAI (Grok) API key.
+// Either may be nil if that provider is not configured — the missing key
+// surfaces as an error on the corresponding synthesize path.
+func NewService(geminiKeyFn, xaiKeyFn func() (string, error)) *Service {
 	return &Service{
-		getAPIKey: apiKeyFn,
+		getAPIKey: geminiKeyFn,
+		getXAIKey: xaiKeyFn,
 		http: &http.Client{
-			// 60 s covers Gemini TTS for the largest accepted input.
+			// 60 s covers TTS for the largest accepted input.
 			Timeout: 60 * time.Second,
 		},
 	}
@@ -67,6 +72,16 @@ func NewService(apiKeyFn func() (string, error)) *Service {
 func (s *Service) Synthesize(ctx context.Context, req SynthesizeRequest) (*SynthesizeResult, error) {
 	if s == nil {
 		return nil, errors.New("tts service not initialized")
+	}
+	provider := req.Provider
+	if provider == "" {
+		provider = ProviderGemini
+	}
+	if provider == ProviderGrok {
+		return s.synthesizeGrok(ctx, req)
+	}
+	if provider != ProviderGemini {
+		return nil, fmt.Errorf("invalid provider: %q", provider)
 	}
 	model := req.Model
 	if model == "" {
@@ -106,7 +121,7 @@ func (s *Service) Synthesize(ctx context.Context, req SynthesizeRequest) (*Synth
 		return nil, errors.New("empty text after sanitize")
 	}
 
-	hash := hashRequest(model, voice, style, text, format, true /* relax/uncensored */)
+	hash := hashRequest(ProviderGemini, model, voice, style, text, format, true /* relax/uncensored */)
 	if data, ok := cacheGet(hash, format); ok {
 		return &SynthesizeResult{Hash: hash, Format: format, AudioBytes: data, Cached: true}, nil
 	}
@@ -148,11 +163,73 @@ func (s *Service) Synthesize(ctx context.Context, req SynthesizeRequest) (*Synth
 	}
 	// Hash is keyed on the *final* format so cache lookups by format
 	// land on the right file.
-	hash = hashRequest(model, voice, style, text, format, true)
+	hash = hashRequest(ProviderGemini, model, voice, style, text, format, true)
 
 	if err := cachePut(hash, format, audio); err != nil {
 		// Cache write failures are non-fatal; we still return the audio.
 		_ = err
+	}
+	return &SynthesizeResult{Hash: hash, Format: format, AudioBytes: audio, Cached: false}, nil
+}
+
+// Provider identifiers for TTSConfig / SynthesizeRequest.
+const (
+	ProviderGemini = "gemini"
+	ProviderGrok   = "grok"
+)
+
+// synthesizeGrok is the xAI Grok synthesis path. Grok returns an encoded
+// container (mp3 or wav) directly, so there is no PCM/ffmpeg step — the
+// bytes are cached as-is. The style prompt is intentionally not used (see
+// callGrok).
+func (s *Service) synthesizeGrok(ctx context.Context, req SynthesizeRequest) (*SynthesizeResult, error) {
+	voice := req.Voice
+	if voice == "" {
+		voice = DefaultGrokVoice
+	}
+	if !IsValidGrokVoice(voice) {
+		return nil, fmt.Errorf("invalid grok voice: %q", voice)
+	}
+	// Grok emits mp3 or wav only; opus requests map to mp3.
+	format := req.Format
+	switch format {
+	case "wav":
+	case "opus", "mp3", "":
+		format = "mp3"
+	default:
+		return nil, fmt.Errorf("invalid format: %q", format)
+	}
+
+	text := Sanitize(req.Text)
+	if text == "" {
+		return nil, errors.New("empty text after sanitize")
+	}
+
+	// Cache key: provider-scoped, style omitted (grok ignores it), model
+	// omitted (single TTS model). Built-in voice ids are lowercased so
+	// "Eve"/"eve" share a cache entry; custom voice ids are case-sensitive
+	// on xAI's side, so keep them verbatim to avoid Foo/foo collisions.
+	keyVoice := voice
+	if isBuiltinGrokVoice(voice) {
+		keyVoice = strings.ToLower(voice)
+	}
+	hash := hashRequest(ProviderGrok, "", keyVoice, "", text, format, true)
+	if data, ok := cacheGet(hash, format); ok {
+		return &SynthesizeResult{Hash: hash, Format: format, AudioBytes: data, Cached: true}, nil
+	}
+
+	audio, gotFormat, err := s.callGrok(ctx, voice, text, format)
+	if err != nil {
+		return nil, err
+	}
+	if gotFormat != format {
+		// Defensive: rehash on the actual container so the /audio lookup
+		// resolves the right extension.
+		format = gotFormat
+		hash = hashRequest(ProviderGrok, "", keyVoice, "", text, format, true)
+	}
+	if err := cachePut(hash, format, audio); err != nil {
+		_ = err // non-fatal, mirror the gemini path
 	}
 	return &SynthesizeResult{Hash: hash, Format: format, AudioBytes: audio, Cached: false}, nil
 }

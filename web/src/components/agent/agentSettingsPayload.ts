@@ -31,6 +31,7 @@ export interface AgentSettingsFormState {
   allowProtectedPaths: string[];
   tts: {
     enabled: boolean;
+    provider?: "gemini" | "grok";
     model: string;
     voice: string;
     stylePrompt: string;
@@ -104,6 +105,7 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
       state.tool === "claude" || state.tool === "custom" ? state.allowProtectedPaths : undefined,
     tts: {
       enabled: state.tts.enabled,
+      provider: state.tts.provider === "grok" ? "grok" : undefined,
       model: state.tts.model || undefined,
       voice: state.tts.voice || undefined,
       stylePrompt: state.tts.stylePrompt.trim() || undefined,

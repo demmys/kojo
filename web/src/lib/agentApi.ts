@@ -206,6 +206,7 @@ export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
 // synthesize time.
 export interface TTSConfig {
   enabled: boolean;
+  provider?: "gemini" | "grok";
   model?: string;
   voice?: string;
   stylePrompt?: string;

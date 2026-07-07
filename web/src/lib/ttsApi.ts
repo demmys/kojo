@@ -7,16 +7,27 @@ export interface VoiceInfo {
   gender?: "F" | "M" | "";
 }
 
+// GrokVoiceInfo mirrors an xAI /v1/tts/voices entry.
+export interface GrokVoiceInfo {
+  name: string; // voice_id, e.g. "eve"
+  label: string; // display name, e.g. "Eve"
+  gender?: "male" | "female" | "";
+}
+
+export type TTSProvider = "gemini" | "grok";
+
 export interface TTSCapability {
   ffmpeg: boolean;
   formats: string[]; // ["opus", "mp3", "wav"] — server-supported
   voices: string[];  // flat list of voice ids (legacy)
-  voiceCatalog: VoiceInfo[]; // voice id + descriptive trait
+  voiceCatalog: VoiceInfo[]; // gemini voice id + descriptive trait
+  grokVoiceCatalog: GrokVoiceInfo[]; // xAI voice catalog
   models: string[];  // accepted model ids
   defaults: {
     model: string;
     voice: string;
     stylePrompt: string;
+    grokVoice: string;
   };
 }
 
@@ -47,9 +58,15 @@ export const ttsApi = {
   // is essentially free.
   preview: (
     voice: string,
-    opts: { model?: string; stylePrompt?: string; format?: "opus" | "mp3" | "wav" } = {},
+    opts: {
+      provider?: TTSProvider;
+      model?: string;
+      stylePrompt?: string;
+      format?: "opus" | "mp3" | "wav";
+    } = {},
   ) =>
     post<TTSSynthesizeResponse>("/api/v1/tts/preview", {
+      provider: opts.provider,
       voice,
       model: opts.model,
       stylePrompt: opts.stylePrompt,

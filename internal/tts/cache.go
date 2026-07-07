@@ -19,10 +19,11 @@ const cacheTTL = 24 * time.Hour
 
 // hashRequest computes a stable cache key for a synthesis request.
 // Any field that affects the audio output must be part of the key.
-func hashRequest(model, voice, stylePrompt, text, format string, relax bool) string {
+func hashRequest(provider, model, voice, stylePrompt, text, format string, relax bool) string {
 	h := sha256.New()
-	// length-prefix each field to avoid collisions across boundaries
-	parts := []string{model, voice, stylePrompt, text, format, fmt.Sprintf("%t", relax)}
+	// length-prefix each field to avoid collisions across boundaries.
+	// provider is part of the key so gemini/grok entries never collide.
+	parts := []string{provider, model, voice, stylePrompt, text, format, fmt.Sprintf("%t", relax)}
 	for _, p := range parts {
 		fmt.Fprintf(h, "%d:%s\x00", len(p), p)
 	}

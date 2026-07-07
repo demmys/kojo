@@ -17,11 +17,21 @@ func ValidateTTS(c *TTSConfig) error {
 	if c == nil {
 		return nil
 	}
-	if c.Model != "" && !tts.IsValidModel(c.Model) {
-		return fmt.Errorf("invalid tts model: %q", c.Model)
-	}
-	if c.Voice != "" && !tts.IsValidVoice(c.Voice) {
-		return fmt.Errorf("invalid tts voice: %q", c.Voice)
+	switch c.Provider {
+	case "", tts.ProviderGemini:
+		if c.Model != "" && !tts.IsValidModel(c.Model) {
+			return fmt.Errorf("invalid tts model: %q", c.Model)
+		}
+		if c.Voice != "" && !tts.IsValidVoice(c.Voice) {
+			return fmt.Errorf("invalid tts voice: %q", c.Voice)
+		}
+	case tts.ProviderGrok:
+		// Grok ignores Model; voice is an xAI voice_id (built-in or custom).
+		if c.Voice != "" && !tts.IsValidGrokVoice(c.Voice) {
+			return fmt.Errorf("invalid grok tts voice: %q", c.Voice)
+		}
+	default:
+		return fmt.Errorf("invalid tts provider: %q", c.Provider)
 	}
 	if l := len([]rune(c.StylePrompt)); l > 500 {
 		return fmt.Errorf("tts stylePrompt too long: %d runes (max 500)", l)
@@ -60,13 +70,18 @@ type TTSConfig struct {
 	// Enabled gates the TTS feature for this agent. Even when the per-
 	// browser auto-play toggle is on, a disabled agent never synthesizes.
 	Enabled bool `json:"enabled"`
+	// Provider selects the synthesis backend: "gemini" (default when empty)
+	// or "grok" (xAI). Grok ignores Model/StylePrompt.
+	Provider string `json:"provider,omitempty"`
 	// Model is the Gemini TTS model id (e.g. "gemini-3.1-flash-tts-preview").
-	// Empty = use the kojo default.
+	// Empty = use the kojo default. Unused when Provider is "grok".
 	Model string `json:"model,omitempty"`
-	// Voice picks one of the 30 prebuilt voices. Empty = default.
+	// Voice picks a prebuilt voice. For gemini it must be one of the 30
+	// Gemini voices; for grok it is an xAI voice_id. Empty = provider default.
 	Voice string `json:"voice,omitempty"`
 	// StylePrompt is a free-form natural-language instruction prepended to
-	// the input ("落ち着いた日本語で淡々と…"). Empty = kojo default.
+	// the input ("落ち着いた日本語で淡々と…"). Empty = kojo default. Gemini
+	// only — grok has no free-text style field and ignores this.
 	StylePrompt string `json:"stylePrompt,omitempty"`
 }
 

@@ -255,6 +255,60 @@ export function appendSystemErrorIfNew(
 }
 
 /**
+ * Drop local optimistic "pending_" rows that a freshly fetched page has
+ * already echoed back with a real server id (matched by role+content —
+ * the same rule the WS `message` branch uses). Without this, a refetch
+ * after a missed WS echo (tab hidden during send, server restart,
+ * reconnect race) keeps the pending_ copy alongside the server row and
+ * the user's input renders twice at the tail of the transcript.
+ */
+export function dropEchoedPending(
+  local: AgentMessage[],
+  fetched: readonly AgentMessage[],
+): AgentMessage[] {
+  // Each fetched row is consumed at most once, so two identical
+  // in-flight sends can't both vanish against a single server row.
+  const pool = fetched.slice();
+  return local.filter((m) => {
+    if (!m.id.startsWith("pending_")) return true;
+    // pending_ ids embed the client-side send time (Date.now()).
+    const sentMs = Number(m.id.slice("pending_".length));
+    const idx = pool.findIndex((f) => {
+      if (f.role !== m.role || f.content !== m.content) return false;
+      if (!sameAttachmentSignature(f.attachments, m.attachments)) return false;
+      // Only rows persisted around/after the optimistic send count as
+      // its echo — an OLD identical message in the page must not eat a
+      // fresh in-flight send (a false drop here loses the user's text
+      // if the send itself was lost). 2 min of slack absorbs
+      // client/server clock skew.
+      if (Number.isFinite(sentMs)) {
+        const fMs = new Date(f.timestamp).getTime();
+        if (Number.isFinite(fMs) && fMs < sentMs - 120_000) return false;
+      }
+      return true;
+    });
+    if (idx === -1) return true;
+    pool.splice(idx, 1);
+    return false;
+  });
+}
+
+/**
+ * Attachment lists match when they pair up by name+size in order.
+ * Paths are excluded on purpose: the server may relocate an upload,
+ * while name+size survive the round-trip unchanged.
+ */
+function sameAttachmentSignature(
+  a: AgentMessage["attachments"],
+  b: AgentMessage["attachments"],
+): boolean {
+  const la = a ?? [];
+  const lb = b ?? [];
+  if (la.length !== lb.length) return false;
+  return la.every((x, i) => x.name === lb[i].name && x.size === lb[i].size);
+}
+
+/**
  * Apply a `done` event's message payload to the transcript, accounting
  * for the abort-marker handoff. Three cases:
  *

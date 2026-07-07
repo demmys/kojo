@@ -6,6 +6,7 @@ import {
   applyDoneMessage,
   applySubagentEvent,
   applyToolResult,
+  dropEchoedPending,
   matchToolForResult,
   newToolFromEvent,
   toToolUse,
@@ -165,6 +166,92 @@ describe("appendSystemErrorIfNew", () => {
     ];
     const after = appendSystemErrorIfNew(prev, "⚠️ Error: oops", nowMs, ts);
     expect(after.length).toBe(2);
+  });
+});
+
+describe("dropEchoedPending", () => {
+  it("drops a pending_ row echoed back by the fetched page", () => {
+    const local = [msg("pending_1", "user", "hello")];
+    const fetched = [msg("srv1", "user", "hello")];
+    expect(dropEchoedPending(local, fetched)).toEqual([]);
+  });
+
+  it("keeps a pending_ row with no echo in the fetched page", () => {
+    const local = [msg("pending_1", "user", "still in flight")];
+    const fetched = [msg("srv1", "user", "something else")];
+    expect(dropEchoedPending(local, fetched)).toEqual(local);
+  });
+
+  it("requires role to match, not just content", () => {
+    const local = [msg("pending_1", "user", "hello")];
+    const fetched = [msg("srv1", "assistant", "hello")];
+    expect(dropEchoedPending(local, fetched)).toEqual(local);
+  });
+
+  it("leaves error_/aborted_ synthetics alone even on content match", () => {
+    const local = [
+      msg("error_1", "system", "boom"),
+      msg("aborted_1", "assistant", "partial"),
+    ];
+    const fetched = [
+      msg("srv1", "system", "boom"),
+      msg("srv2", "assistant", "partial"),
+    ];
+    expect(dropEchoedPending(local, fetched)).toEqual(local);
+  });
+
+  it("drops only the echoed rows from a mixed list", () => {
+    const local = [
+      msg("pending_1", "user", "echoed"),
+      msg("pending_2", "user", "not yet"),
+    ];
+    const fetched = [msg("srv1", "user", "echoed")];
+    expect(dropEchoedPending(local, fetched)).toEqual([msg("pending_2", "user", "not yet")]);
+  });
+
+  it("does not let an old identical row eat a fresh in-flight send", () => {
+    // pending sent at 2026-05-16T12:00:00Z; fetched row persisted an
+    // hour earlier — same text, but it is NOT this send's echo.
+    const sentMs = new Date("2026-05-16T12:00:00Z").getTime();
+    const local = [msg(`pending_${sentMs}`, "user", "ok")];
+    const old = { ...msg("srv1", "user", "ok"), timestamp: "2026-05-16T11:00:00Z" };
+    expect(dropEchoedPending(local, [old])).toEqual(local);
+  });
+
+  it("drops against a row within the clock-skew slack window", () => {
+    // Server clock 30 s behind the client: still recognized as the echo.
+    const sentMs = new Date("2026-05-16T12:00:00Z").getTime();
+    const local = [msg(`pending_${sentMs}`, "user", "ok")];
+    const echoed = { ...msg("srv1", "user", "ok"), timestamp: "2026-05-16T11:59:30Z" };
+    expect(dropEchoedPending(local, [echoed])).toEqual([]);
+  });
+
+  it("keeps a pending row whose attachments differ from the fetched row", () => {
+    const att = { path: "/up/a.png", name: "a.png", size: 10, mime: "image/png" };
+    const local = [{ ...msg("pending_1", "user", "see file"), attachments: [att] }];
+    const fetched = [msg("srv1", "user", "see file")]; // no attachments
+    expect(dropEchoedPending(local, fetched)).toEqual(local);
+  });
+
+  it("matches attachments by name+size, ignoring server-relocated paths", () => {
+    const local = [{
+      ...msg("pending_1", "user", ""),
+      attachments: [{ path: "/local/a.png", name: "a.png", size: 10, mime: "image/png" }],
+    }];
+    const fetched = [{
+      ...msg("srv1", "user", ""),
+      attachments: [{ path: "/srv/data/a.png", name: "a.png", size: 10, mime: "image/png" }],
+    }];
+    expect(dropEchoedPending(local, fetched)).toEqual([]);
+  });
+
+  it("consumes each fetched row at most once for identical pendings", () => {
+    const local = [
+      msg("pending_1", "user", "ok"),
+      msg("pending_2", "user", "ok"),
+    ];
+    const fetched = [msg("srv1", "user", "ok")];
+    expect(dropEchoedPending(local, fetched)).toEqual([msg("pending_2", "user", "ok")]);
   });
 });
 

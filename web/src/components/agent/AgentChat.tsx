@@ -34,6 +34,7 @@ import {
   applySubagentEvent,
   applySubagentEventToMessages,
   applyToolResult,
+  dropEchoedPending,
   newToolFromEvent,
   toToolUse,
   type StreamingTool,
@@ -279,7 +280,13 @@ export function AgentChat() {
         // Mirrors the merge in the background-done branch.
         const newIds = new Set(r.messages.map((m) => m.id));
         const olderKept = existing.filter((m) => !newIds.has(m.id) && !/^(pending|error|aborted)_/.test(m.id));
-        const localSynthetic = existing.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id));
+        // dropEchoedPending: a pending_ row whose WS echo was missed
+        // (hidden tab / restart) is already in r.messages under its
+        // server id — keeping it would render the input twice.
+        const localSynthetic = dropEchoedPending(
+          existing.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id)),
+          r.messages,
+        );
         return [...olderKept, ...r.messages, ...localSynthetic];
       });
       // Don't shrink hasMore — older pages may already be loaded.
@@ -508,13 +515,10 @@ export function AgentChat() {
               setPendingQuestions([]);
             }
             // A steered user message comes back over the WS with a real
-            // server id; drop the optimistic "pending_" copy (matched by
-            // role+content) before the id-keyed dedupe append.
-            setMessages((prev) => appendUniqueMessage(
-              prev.filter((x) =>
-                !(x.id.startsWith("pending_") && x.role === m.role && x.content === m.content)),
-              m,
-            ));
+            // server id; drop the optimistic "pending_" copy (same
+            // role+content+attachments+send-time matching as the refetch
+            // merges) before the id-keyed dedupe append.
+            setMessages((prev) => appendUniqueMessage(dropEchoedPending(prev, [m]), m));
           }
           break;
         }
@@ -556,7 +560,9 @@ export function AgentChat() {
             agentApi.messages(id, PAGE_SIZE).then((r) => {
               setMessages((prev) => {
                 const newIds = new Set(r.messages.map((m) => m.id));
-                const older = prev.filter((m) => !newIds.has(m.id));
+                // dropEchoedPending: see onConnected — a pending_ row
+                // whose WS echo was missed is in r.messages already.
+                const older = dropEchoedPending(prev.filter((m) => !newIds.has(m.id)), r.messages);
                 return [...older, ...r.messages];
               });
               // Don't overwrite hasMore — older pages are already loaded
@@ -610,7 +616,14 @@ export function AgentChat() {
       if (seq !== refetchSeqRef.current) return;
       setMessages((prev) => {
         const newIds = new Set(r.messages.map((m) => m.id));
-        const localSynthetic = prev.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id));
+        // dropEchoedPending: a pending_ row whose WS echo was missed
+        // (hidden tab during send, server restart, reconnect race) is
+        // already in r.messages under its real server id — keeping it
+        // duplicates the user's input at the transcript tail.
+        const localSynthetic = dropEchoedPending(
+          prev.filter((m) => !newIds.has(m.id) && /^(pending|error|aborted)_/.test(m.id)),
+          r.messages,
+        );
         const missing = prev.filter((m) => !newIds.has(m.id) && !/^(pending|error|aborted)_/.test(m.id));
         // Split rows the fetch didn't return by timestamp against the
         // page's oldest row: paged-in history goes before the page,

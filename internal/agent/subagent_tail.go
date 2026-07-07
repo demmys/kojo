@@ -50,6 +50,15 @@ const (
 	// memory. Any remainder is picked up on the next tick (offset advances
 	// only past fully-read lines).
 	subagentScanBytesPerTick = 4 * 1024 * 1024
+
+	// subagentMaxAttachRetries bounds how many ticks a batch of durable
+	// children is retried when its owning message isn't in the store yet (the
+	// turn-boundary race where the owning turn's message hasn't been persisted
+	// when the backfill scan runs). ~20 ticks (30s) covers the persist window
+	// with margin; past it the tool_use is treated as genuinely orphaned
+	// (scrolled out / one-shot transcript) and dropped so it can't retry
+	// forever.
+	subagentMaxAttachRetries = 20
 )
 
 // subagentActivity is one batch of newly-observed background-subagent output
@@ -63,7 +72,12 @@ type subagentActivity struct {
 
 // subagentActivityFunc consumes a batch of background-subagent activity. Set by
 // the Manager; nil disables surfacing (events are still parsed but dropped).
-type subagentActivityFunc func(agentID string, act subagentActivity)
+// It returns whether the durable attach of act.Children landed (true when there
+// was no durable work, or the owning message was found and merged). A false
+// return means the owning message wasn't in the store yet (or was transiently
+// gone): the tailer keeps the children and retries the durable attach on a
+// later tick WITHOUT re-pushing the live events (which already went out once).
+type subagentActivityFunc func(agentID string, act subagentActivity) bool
 
 // subagentTranscriptLine is one line of a subagent's own JSONL transcript. It
 // reuses claudeContentBlock so tool_use / tool_result / text extraction matches
@@ -270,6 +284,13 @@ func trimRightCR(b []byte) []byte {
 type subagentFileState struct {
 	offset    int64
 	toolUseID string
+	// pending holds durable children whose owning message wasn't in the store
+	// on the tick they were first read (the turn-boundary persist race). They
+	// are retried — durable-only, no live re-push — until the attach lands or
+	// pendingTries hits subagentMaxAttachRetries. The file offset still
+	// advances past their source lines, so live push happens at most once.
+	pending      []ToolUse
+	pendingTries int
 }
 
 // subagentTailer polls a persistent session's subagents directory and surfaces
@@ -318,14 +339,19 @@ func (t *subagentTailer) run(ctx context.Context) {
 	defer ticker.Stop()
 	// One immediate scan so a subagent that already finished by the time the
 	// session spawned (recovery/backfill) is picked up without a full interval
-	// of latency.
-	t.scanOnce()
+	// of latency. This initial catch-up SUPPRESSES live push: on a respawn /
+	// session re-attach the child JSONLs already hold historical events that
+	// live watchers saw during the previous process, so replaying them onto
+	// the current turn would double them in the UI (the durable merge dedupes
+	// storage, but live pushes have no dedup). Offsets still advance to EOF so
+	// the steady-state ticks below surface only genuinely-new output.
+	t.scan(true)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			t.scanOnce()
+			t.scan(false)
 		}
 	}
 }
@@ -372,10 +398,17 @@ func dirExists(path string) bool {
 	return err == nil && info.IsDir()
 }
 
-// scanOnce walks the subagents dir once, tailing each agent-*.jsonl from its
+// scanOnce walks the subagents dir once with live push enabled. Used for the
+// turn-boundary backfill kick; the periodic poll calls scan directly.
+func (t *subagentTailer) scanOnce() { t.scan(false) }
+
+// scan walks the subagents dir once, tailing each agent-*.jsonl from its
 // stored offset and emitting any new activity. Idempotent: an unchanged file
-// produces no offset advance and no emit.
-func (t *subagentTailer) scanOnce() {
+// with no pending durable retry produces no offset advance and no emit. When
+// suppressLive is set, live events are withheld (durable attach still happens)
+// — used for the initial catch-up pass so a respawn doesn't replay historical
+// events into the live UI.
+func (t *subagentTailer) scan(suppressLive bool) {
 	t.scanMu.Lock()
 	defer t.scanMu.Unlock()
 	dir := t.subagentsDir()
@@ -397,11 +430,11 @@ func (t *subagentTailer) scanOnce() {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		t.scanFile(dir, name)
+		t.scanFile(dir, name, suppressLive)
 	}
 }
 
-func (t *subagentTailer) scanFile(dir, name string) {
+func (t *subagentTailer) scanFile(dir, name string, suppressLive bool) {
 	path := filepath.Join(dir, name)
 
 	t.mu.Lock()
@@ -412,6 +445,8 @@ func (t *subagentTailer) scanFile(dir, name string) {
 	}
 	toolUseID := st.toolUseID
 	offset := st.offset
+	pending := st.pending
+	pendingTries := st.pendingTries
 	t.mu.Unlock()
 
 	if toolUseID == "" {
@@ -431,19 +466,17 @@ func (t *subagentTailer) scanFile(dir, name string) {
 	if err != nil {
 		return
 	}
-	if info.Size() <= offset {
-		// Nothing new (or the file was truncated/rotated — reset to re-read).
-		if info.Size() < offset {
-			offset = 0
-		} else {
-			t.mu.Lock()
-			t.files[path].toolUseID = toolUseID
-			t.mu.Unlock()
-			return
-		}
-	}
 
-	lines, newOffset := scanAppendedLines(f, offset, subagentScanBytesPerTick)
+	newOffset := offset
+	var lines [][]byte
+	if info.Size() < offset {
+		// File was truncated/rotated — reset and re-read from the start.
+		offset = 0
+		newOffset = 0
+	}
+	if info.Size() > offset {
+		lines, newOffset = scanAppendedLines(f, offset, subagentScanBytesPerTick)
+	}
 
 	var events []ChatEvent
 	var children []ToolUse
@@ -453,17 +486,55 @@ func (t *subagentTailer) scanFile(dir, name string) {
 		children = append(children, chs...)
 	}
 
-	t.mu.Lock()
-	t.files[path].offset = newOffset
-	t.files[path].toolUseID = toolUseID
-	t.mu.Unlock()
+	// Fold newly-read children into any pending (previously-unattached) set so
+	// a single emit carries both. mergeSubagentChildren keeps it idempotent.
+	durable := pending
+	if len(children) > 0 {
+		durable, _ = mergeSubagentChildren(durable, children)
+	}
+	liveEvents := events
+	if suppressLive {
+		liveEvents = nil
+	}
 
-	if len(events) == 0 && len(children) == 0 {
+	// Nothing to surface: still persist the advanced offset (a suppressed or
+	// content-less read consumed bytes) so those lines aren't re-read.
+	if len(liveEvents) == 0 && len(durable) == 0 {
+		t.mu.Lock()
+		t.files[path].offset = newOffset
+		t.files[path].toolUseID = toolUseID
+		t.mu.Unlock()
 		return
 	}
-	t.emit(t.agentID, subagentActivity{
+
+	attached := t.emit(t.agentID, subagentActivity{
 		ToolUseID: toolUseID,
-		Events:    events,
-		Children:  children,
+		Events:    liveEvents,
+		Children:  durable,
 	})
+
+	t.mu.Lock()
+	fs := t.files[path]
+	fs.offset = newOffset
+	fs.toolUseID = toolUseID
+	switch {
+	case len(durable) == 0 || attached:
+		// Durable work landed (or there was none) — clear any retry state.
+		fs.pending = nil
+		fs.pendingTries = 0
+	case pendingTries+1 >= subagentMaxAttachRetries:
+		// Owner never materialised within the retry window — treat the
+		// tool_use as genuinely orphaned and stop retrying.
+		t.logger.Debug("subagent tail: giving up durable attach after retries",
+			"agent", t.agentID, "toolUseId", toolUseID)
+		fs.pending = nil
+		fs.pendingTries = 0
+	default:
+		// Owner not persisted yet — keep the children for a durable-only
+		// retry next tick. The offset already advanced, so the live events
+		// above are delivered at most once.
+		fs.pending = durable
+		fs.pendingTries = pendingTries + 1
+	}
+	t.mu.Unlock()
 }

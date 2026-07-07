@@ -96,13 +96,31 @@ func (m *Manager) persistRateLimit(agentID string, snap RateLimitSnapshot) {
 	}
 }
 
+// expired reports whether the snapshot's rate-limit window has already reset,
+// making it stale telemetry that should no longer drive a badge or context
+// note. A zero ResetsAt (window unknown) is never treated as expired.
+func (s RateLimitSnapshot) expired(nowUnix int64) bool {
+	return s.ResetsAt > 0 && s.ResetsAt <= nowUnix
+}
+
 // RateLimit returns the latest rate-limit snapshot for an agent. It checks
 // the in-memory cache first, then lazily loads (and caches) the persisted
 // snapshot from the kv table so a badge renders correctly after a restart
-// before any new turn runs. ok is false when nothing has ever been recorded.
+// before any new turn runs. ok is false when nothing has ever been recorded,
+// or when the newest snapshot's window has already reset (stale telemetry) —
+// in which case the stale in-memory and kv copies are lazily dropped so
+// callers show nothing until fresh data lands.
 func (m *Manager) RateLimit(agentID string) (RateLimitSnapshot, bool) {
+	now := time.Now().Unix()
+
 	m.rateLimitsMu.Lock()
 	if snap, ok := m.rateLimits[agentID]; ok {
+		if snap.expired(now) {
+			delete(m.rateLimits, agentID)
+			m.rateLimitsMu.Unlock()
+			m.deleteRateLimit(agentID)
+			return RateLimitSnapshot{}, false
+		}
 		m.rateLimitsMu.Unlock()
 		return snap, true
 	}
@@ -110,6 +128,10 @@ func (m *Manager) RateLimit(agentID string) (RateLimitSnapshot, bool) {
 
 	snap, ok := m.loadRateLimit(agentID)
 	if !ok {
+		return RateLimitSnapshot{}, false
+	}
+	if snap.expired(now) {
+		m.deleteRateLimit(agentID)
 		return RateLimitSnapshot{}, false
 	}
 	m.rateLimitsMu.Lock()
@@ -124,6 +146,34 @@ func (m *Manager) RateLimit(agentID string) (RateLimitSnapshot, bool) {
 	}
 	m.rateLimitsMu.Unlock()
 	return snap, true
+}
+
+// deleteRateLimit best-effort removes the persisted snapshot row. Called when
+// RateLimit observes a snapshot whose window has already reset, so a stale row
+// doesn't keep rehydrating an expired badge on the next reload. It re-reads
+// the row and deletes conditionally on its etag, only when the STORED snapshot
+// is itself expired — a fresh row written concurrently by recordRateLimit
+// must survive. Failures are display-only and logged at debug.
+func (m *Manager) deleteRateLimit(agentID string) {
+	st := m.Store()
+	if st == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), rateLimitKVTimeout)
+	defer cancel()
+	rec, err := st.GetKV(ctx, rateLimitKVNamespace, rateLimitKVKey(agentID))
+	if err != nil {
+		return
+	}
+	var snap RateLimitSnapshot
+	if err := json.Unmarshal([]byte(rec.Value), &snap); err == nil &&
+		!snap.expired(time.Now().Unix()) {
+		return // a fresh snapshot landed meanwhile — keep it
+	}
+	if err := st.DeleteKV(ctx, rateLimitKVNamespace, rateLimitKVKey(agentID), rec.ETag); err != nil &&
+		!errors.Is(err, store.ErrNotFound) {
+		m.logger.Debug("delete stale rate-limit snapshot", "agent", agentID, "err", err)
+	}
 }
 
 func (m *Manager) loadRateLimit(agentID string) (RateLimitSnapshot, bool) {

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -96,5 +97,56 @@ func TestManagerRateLimit_RecordAndReload(t *testing.T) {
 	}
 	if snap2.Status != "allowed_warning" || snap2.ResetsAt != 1783526400 {
 		t.Errorf("reloaded snapshot = %+v", snap2)
+	}
+}
+
+// TestManagerRateLimit_ExpiredSnapshotAbsent verifies a snapshot whose window
+// has already reset is treated as absent (no stale badge) and lazily purged
+// from both the in-memory cache and the kv row.
+func TestManagerRateLimit_ExpiredSnapshotAbsent(t *testing.T) {
+	st := newAgentStore(t)
+	m := &Manager{store: st, logger: testLogger()}
+
+	past := time.Now().Unix() - 60 // window reset a minute ago
+	m.recordRateLimit("ag", RateLimitInfo{
+		Status:      "rejected",
+		ResetsAt:    past,
+		Utilization: 1.0,
+	})
+
+	// In-memory read must report absent and drop the stale entry.
+	if _, ok := m.RateLimit("ag"); ok {
+		t.Fatalf("RateLimit on expired snapshot = ok; want absent")
+	}
+	m.rateLimitsMu.Lock()
+	_, cached := m.rateLimits["ag"]
+	m.rateLimitsMu.Unlock()
+	if cached {
+		t.Error("expired snapshot left in in-memory cache")
+	}
+
+	// The kv row should have been lazily deleted.
+	ctx := t.Context()
+	if _, err := st.db.GetKV(ctx, rateLimitKVNamespace, rateLimitKVKey("ag")); err == nil {
+		t.Error("expired snapshot kv row not deleted")
+	}
+
+	// A reload path (fresh Manager) that finds only an expired persisted row
+	// must also report absent.
+	m.recordRateLimit("ag", RateLimitInfo{Status: "rejected", ResetsAt: past, Utilization: 1.0})
+	m2 := &Manager{store: st, logger: testLogger()}
+	if _, ok := m2.RateLimit("ag"); ok {
+		t.Fatalf("reload of expired snapshot = ok; want absent")
+	}
+}
+
+// TestManagerRateLimit_ZeroResetsNeverExpires guards the zero-ResetsAt case:
+// a snapshot with an unknown window must not be treated as expired.
+func TestManagerRateLimit_ZeroResetsNeverExpires(t *testing.T) {
+	st := newAgentStore(t)
+	m := &Manager{store: st, logger: testLogger()}
+	m.recordRateLimit("ag", RateLimitInfo{Status: "allowed_warning", Utilization: 0.8})
+	if _, ok := m.RateLimit("ag"); !ok {
+		t.Fatalf("RateLimit with zero ResetsAt = absent; want present")
 	}
 }

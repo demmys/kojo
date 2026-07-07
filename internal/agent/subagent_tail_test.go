@@ -258,13 +258,14 @@ func TestSubagentTailerEndToEnd(t *testing.T) {
 
 	var mu sync.Mutex
 	var batches []subagentActivity
-	emit := func(agentID string, act subagentActivity) {
+	emit := func(agentID string, act subagentActivity) bool {
 		mu.Lock()
 		defer mu.Unlock()
 		if agentID != "ag_x" {
 			t.Errorf("agentID: got %q", agentID)
 		}
 		batches = append(batches, act)
+		return true
 	}
 
 	tl := newSubagentTailer("ag_x", workDir, testLogger(), func() string { return sid }, emit)
@@ -304,6 +305,148 @@ func TestSubagentTailerEndToEnd(t *testing.T) {
 	last := batches[1]
 	if len(last.Events) != 1 || last.Events[0].Type != "tool_result" || last.Events[0].ToolOutput != "ok" {
 		t.Errorf("appended events: %+v", last.Events)
+	}
+}
+
+// TestSubagentTailerInitialScanSuppressesLive verifies the initial catch-up
+// pass (scan(true)) attaches children durably but withholds live events, so a
+// respawn re-reading existing JSONL from offset 0 doesn't replay historical
+// output into the live UI. A subsequent normal scan of newly-appended lines
+// still surfaces live events.
+func TestSubagentTailerInitialScanSuppressesLive(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfgDir)
+	workDir := t.TempDir()
+	const sid = "sess-live"
+
+	subDir := filepath.Join(claudeProjectDir(mustAbs(t, workDir)), sid, "subagents")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(subDir, "agent-y.meta.json")
+	jsonlPath := filepath.Join(subDir, "agent-y.jsonl")
+	if err := os.WriteFile(metaPath, []byte(`{"toolUseId":"toolu_task2"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	line1 := `{"type":"assistant","uuid":"u1","isSidechain":true,"message":{"content":[{"type":"text","text":"historical"}]}}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(line1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var batches []subagentActivity
+	emit := func(agentID string, act subagentActivity) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		batches = append(batches, act)
+		return true
+	}
+	tl := newSubagentTailer("ag_y", workDir, testLogger(), func() string { return sid }, emit)
+
+	// Initial catch-up: durable children, no live events.
+	tl.scan(true)
+	mu.Lock()
+	if len(batches) != 1 {
+		mu.Unlock()
+		t.Fatalf("initial scan: got %d batches want 1", len(batches))
+	}
+	if len(batches[0].Events) != 0 {
+		mu.Unlock()
+		t.Errorf("initial scan pushed live events: %+v", batches[0].Events)
+	}
+	if len(batches[0].Children) != 1 {
+		mu.Unlock()
+		t.Errorf("initial scan: durable children = %+v, want 1", batches[0].Children)
+	}
+	mu.Unlock()
+
+	// New output after the catch-up must surface live.
+	line2 := `{"type":"assistant","uuid":"u2","isSidechain":true,"message":{"content":[{"type":"text","text":"fresh"}]}}` + "\n"
+	appendToFile(t, jsonlPath, line2)
+	tl.scan(false)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(batches) != 2 {
+		t.Fatalf("after append: got %d batches want 2", len(batches))
+	}
+	if len(batches[1].Events) != 1 || batches[1].Events[0].Delta != "fresh" {
+		t.Errorf("post-catchup live events = %+v, want the fresh text", batches[1].Events)
+	}
+}
+
+// TestSubagentTailerRetriesDurableAttach verifies that when the durable attach
+// misses (owning message not persisted yet — emit returns false), the tailer
+// keeps the children and retries durable-only on the next scan WITHOUT
+// re-pushing the live events (offset already advanced), then clears once the
+// attach lands.
+func TestSubagentTailerRetriesDurableAttach(t *testing.T) {
+	cfgDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfgDir)
+	workDir := t.TempDir()
+	const sid = "sess-retry"
+
+	subDir := filepath.Join(claudeProjectDir(mustAbs(t, workDir)), sid, "subagents")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(subDir, "agent-z.meta.json")
+	jsonlPath := filepath.Join(subDir, "agent-z.jsonl")
+	if err := os.WriteFile(metaPath, []byte(`{"toolUseId":"toolu_task3"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	line1 := `{"type":"assistant","uuid":"u1","isSidechain":true,"message":{"content":[{"type":"tool_use","id":"toolu_c1","name":"Bash","input":{"command":"ls"}}]}}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(line1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var batches []subagentActivity
+	var attachOK bool // controls the simulated durable-attach outcome
+	emit := func(agentID string, act subagentActivity) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		batches = append(batches, act)
+		return attachOK
+	}
+	tl := newSubagentTailer("ag_z", workDir, testLogger(), func() string { return sid }, emit)
+
+	// First scan: owner not persisted yet → attach misses. Live events flow.
+	tl.scan(false)
+	mu.Lock()
+	if len(batches) != 1 || len(batches[0].Events) != 1 {
+		mu.Unlock()
+		t.Fatalf("first scan: batches=%+v", batches)
+	}
+	mu.Unlock()
+
+	// Second scan, no new bytes: the pending durable batch is retried
+	// durable-ONLY (no live re-push), still missing.
+	tl.scan(false)
+	mu.Lock()
+	if len(batches) != 2 {
+		mu.Unlock()
+		t.Fatalf("retry scan: got %d batches want 2", len(batches))
+	}
+	if len(batches[1].Events) != 0 {
+		mu.Unlock()
+		t.Errorf("retry re-pushed live events: %+v", batches[1].Events)
+	}
+	if len(batches[1].Children) != 1 || batches[1].Children[0].ID != "toolu_c1" {
+		mu.Unlock()
+		t.Errorf("retry durable children = %+v", batches[1].Children)
+	}
+	mu.Unlock()
+
+	// Attach now lands: next scan clears pending, and a further scan is silent.
+	mu.Lock()
+	attachOK = true
+	mu.Unlock()
+	tl.scan(false)
+	tl.scan(false)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(batches) != 3 {
+		t.Fatalf("after attach landed: got %d batches want 3 (no further retries)", len(batches))
 	}
 }
 

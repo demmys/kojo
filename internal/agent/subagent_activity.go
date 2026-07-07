@@ -13,29 +13,42 @@ const subagentBackfillWindow = 200
 // owning message's Task ToolUse so a reload keeps them (Option C backfill) and
 // (b) pushes the live events onto any active turn's broadcaster so a connected
 // client sees them nest under the Task chip immediately (Option A live tail).
-func (m *Manager) handleSubagentActivity(agentID string, act subagentActivity) {
+// Returns whether the durable attach of act.Children landed, so the tailer
+// knows whether to retry: true when there was no durable work, the owner was
+// found and merged, or the agent is no longer owned here (a drop, not a
+// retryable miss); false when the owning message wasn't in the store yet.
+func (m *Manager) handleSubagentActivity(agentID string, act subagentActivity) bool {
 	if act.ToolUseID == "" {
-		return
+		return true
 	}
 	// §3.7 fencing: don't write transcript for an agent this peer no longer
-	// owns (evicted mid device-switch). Mirrors processChatEvents' guard.
+	// owns (evicted mid device-switch). Mirrors processChatEvents' guard. Not
+	// retryable — the agent won't come back to this peer.
 	m.mu.Lock()
 	_, here := m.agents[agentID]
 	m.mu.Unlock()
 	if !here {
-		return
+		return true
 	}
 
+	attached := true
 	if len(act.Children) > 0 {
-		if err := m.attachSubagentChildren(agentID, act.ToolUseID, act.Children); err != nil &&
-			!errors.Is(err, ErrMessageNotFound) {
-			m.logger.Warn("subagent activity: durable attach failed",
-				"agent", agentID, "toolUseId", act.ToolUseID, "err", err)
+		if err := m.attachSubagentChildren(agentID, act.ToolUseID, act.Children); err != nil {
+			// ErrMessageNotFound means the owning message isn't in the store
+			// (yet): retryable — the turn that owns this Task may still be
+			// persisting. Any other error is a real store failure; retrying is
+			// also the safe choice.
+			attached = false
+			if !errors.Is(err, ErrMessageNotFound) {
+				m.logger.Warn("subagent activity: durable attach failed",
+					"agent", agentID, "toolUseId", act.ToolUseID, "err", err)
+			}
 		}
 	}
 	if len(act.Events) > 0 {
 		m.pushSubagentEventsLive(agentID, act.Events)
 	}
+	return attached
 }
 
 // attachSubagentChildren finds the persisted message whose Task ToolUse matches

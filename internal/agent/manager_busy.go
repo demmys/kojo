@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -108,20 +109,31 @@ func (m *Manager) Steer(ctx context.Context, agentID, text string) error {
 	if err != nil {
 		return err
 	}
-	if err := entry.steer(text); err != nil {
-		return err
-	}
+	// Persist FIRST (reserve the row), THEN inject into the live turn. If we
+	// injected first and the append failed, the model would have already
+	// consumed input that never persisted; the resulting 500 → client retry
+	// could then double-inject the same text. With persist-first, an injection
+	// failure rolls the reserved row back so the not_busy fallback (a normal
+	// send) doesn't leave a duplicate. Ordering is also correct: the steer
+	// user message lands before the assistant's continued output (persisted at
+	// turn end).
 	msg := newUserMessage(text, nil)
-	// Durability invariant: a steer we report as accepted (HTTP 2xx) MUST be
-	// in the transcript. The text is already injected into the live turn
-	// above, so a swallowed append error would let the assistant answer a
-	// message that vanishes on the next reload (e.g. the agent row was
-	// evicted mid device-switch, or the store write deadlined). Surface the
-	// failure so the caller gets a non-2xx and can retry, instead of a
-	// silent loss.
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save steer message", "agent", agentID, "err", appendErr)
 		return fmt.Errorf("steer accepted but not persisted: %w", appendErr)
+	}
+	if err := entry.steer(text); err != nil {
+		// Injection failed — the turn ended between the handle check and this
+		// write, or the stdin pipe closed (ErrAgentNotBusy). Roll back the
+		// reserved row so the caller's normal-send fallback doesn't duplicate
+		// it, and propagate the original error (esp. ErrAgentNotBusy, which the
+		// contract requires for that fallback).
+		if delErr := deleteMessage(agentID, msg.ID, ""); delErr != nil &&
+			!errors.Is(delErr, ErrMessageNotFound) {
+			m.logger.Warn("failed to roll back steer message after injection failure",
+				"agent", agentID, "err", delErr)
+		}
+		return err
 	}
 	// Re-acquire busyMu for the live-event push. clearBusy removes the
 	// entry under busyMu BEFORE close(outCh), so an entry re-observed here
@@ -154,20 +166,28 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 	if !ok || entry.answer == nil {
 		return ErrAgentNotBusy
 	}
-	if err := entry.answer(requestID, answers, deny, denyMessage); err != nil {
-		return err
-	}
+	// Deny resolves the control_request without persisting anything — nothing
+	// to reserve or roll back.
 	if deny {
-		return nil
+		return entry.answer(requestID, answers, deny, denyMessage)
 	}
-	// Record the answers as a user message so the exchange survives reload.
-	// Same durability invariant as Steer: the answers were already delivered
-	// to the live turn, so a swallowed append error would let the turn act on
-	// a Q&A exchange that disappears on reload. Surface the failure instead.
+	// Allow: persist the answer record FIRST (reserve the row), THEN deliver it
+	// to the live turn. Persist-first mirrors Steer — an answer delivered before
+	// persistence that then 500s could be re-delivered on retry (duplicate
+	// injection into the turn). On delivery failure we roll the reserved row
+	// back and propagate the error (ErrAgentNotBusy / ErrQuestionNotFound).
 	msg := newUserMessage(formatAnswers(answers), nil)
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save answer message", "agent", agentID, "err", appendErr)
 		return fmt.Errorf("answer accepted but not persisted: %w", appendErr)
+	}
+	if err := entry.answer(requestID, answers, deny, denyMessage); err != nil {
+		if delErr := deleteMessage(agentID, msg.ID, ""); delErr != nil &&
+			!errors.Is(delErr, ErrMessageNotFound) {
+			m.logger.Warn("failed to roll back answer message after delivery failure",
+				"agent", agentID, "err", delErr)
+		}
+		return err
 	}
 	m.busyMu.Lock()
 	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {

@@ -423,6 +423,10 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		// outlives the spawning turn: durably attach to the owning message and
 		// live-push to watchers (Option A live tail + Option C backfill).
 		cb.SetSubagentActivityHandler(m.handleSubagentActivity)
+		// Record rate-limit telemetry that lands while the session is idle
+		// (post-result usage windows) — the in-turn path already taps it via
+		// the turn sink; this covers the no-sink idle case.
+		cb.SetRateLimitHandler(m.recordRateLimit)
 	}
 
 	m.cron = newCronScheduler(m, logger)

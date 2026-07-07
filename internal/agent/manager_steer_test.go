@@ -87,11 +87,11 @@ func TestManager_Steer_InjectsAndPersists(t *testing.T) {
 }
 
 // TestManager_Steer_AppendFailureIsNotSwallowed verifies the durability
-// invariant: if the steered text is injected into the live turn but the
-// transcript append fails (here: the agent row is absent from the store, as
-// happens when it was evicted mid device-switch), Steer must NOT report
-// success. A swallowed append error would return HTTP 2xx for a message that
-// vanishes on the next reload.
+// invariant under the persist-first order: if the transcript append fails
+// (here: the agent row is absent, as when it was evicted mid device-switch),
+// Steer must NOT report success AND must NOT have injected the text into the
+// live turn — persisting first means a failed reservation never reaches the
+// model, so a client retry can't double-inject.
 func TestManager_Steer_AppendFailureIsNotSwallowed(t *testing.T) {
 	m := newTestManager(t)
 	// Deliberately do NOT upsert "ag_gone" into the store, so appendMessage
@@ -114,10 +114,47 @@ func TestManager_Steer_AppendFailureIsNotSwallowed(t *testing.T) {
 	if err == nil {
 		t.Fatal("Steer returned nil despite a failed transcript append (2xx would lose the message on reload)")
 	}
-	// The text should still have reached the live turn — the failure is
-	// purely about durability, not delivery.
-	if injected != "steer that cannot persist" {
-		t.Errorf("steer func got %q, want the injected text", injected)
+	// Persist-first: the reservation failed, so the text must never have been
+	// injected into the live turn.
+	if injected != "" {
+		t.Errorf("steer func was called (%q) despite the reservation failing; persist-first must not inject", injected)
+	}
+}
+
+// TestManager_Steer_InjectionFailureRollsBackRow verifies that when the row is
+// reserved (persist succeeds) but injection then fails (turn ended between the
+// handle check and the write), the reserved row is deleted so the caller's
+// normal-send fallback doesn't leave a duplicate — and the original error
+// (ErrAgentNotBusy) still propagates for that fallback.
+func TestManager_Steer_InjectionFailureRollsBackRow(t *testing.T) {
+	m := newTestManager(t)
+	m.agents["ag_test"] = &Agent{ID: "ag_test", Name: "Test", Tool: "claude"}
+	if err := m.store.Upsert(m.agents["ag_test"]); err != nil {
+		t.Fatal(err)
+	}
+	m.busyMu.Lock()
+	m.busy["ag_test"] = busyEntry{
+		startedAt: time.Now(),
+		cancel:    func() {},
+		outCh:     make(chan ChatEvent, 4),
+		steer: func(text string) error {
+			return ErrAgentNotBusy // turn ended before the write landed
+		},
+	}
+	m.busyMu.Unlock()
+
+	err := m.Steer(context.Background(), "ag_test", "lands nowhere")
+	if !errors.Is(err, ErrAgentNotBusy) {
+		t.Fatalf("Steer = %v, want ErrAgentNotBusy to propagate for the not_busy fallback", err)
+	}
+	msgs, err := m.Messages("ag_test", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mm := range msgs {
+		if mm.Role == "user" && mm.Content == "lands nowhere" {
+			t.Error("reserved steer row was not rolled back after injection failure")
+		}
 	}
 }
 
@@ -149,6 +186,12 @@ func TestManager_AnswerQuestion_AppendFailureIsNotSwallowed(t *testing.T) {
 // process already exited / stdin closed) rather than swallowing it.
 func TestManager_Steer_SteerFuncError(t *testing.T) {
 	m := newTestManager(t)
+	// Upsert so the persist-first reservation succeeds and the steer func is
+	// actually reached (otherwise the append failure would short-circuit).
+	m.agents["ag_test"] = &Agent{ID: "ag_test", Name: "Test", Tool: "claude"}
+	if err := m.store.Upsert(m.agents["ag_test"]); err != nil {
+		t.Fatal(err)
+	}
 	m.busyMu.Lock()
 	m.busy["ag_test"] = busyEntry{
 		startedAt: time.Now(),

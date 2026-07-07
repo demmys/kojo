@@ -197,6 +197,21 @@ func (s *Server) SetRestartTrigger(fn func() bool) {
 // Responds 202 immediately: {"status":"pending"} on the first call,
 // {"status":"already_pending"} on duplicates while a drain is in
 // progress.
+// wakeThreadForRestart decides which in-flight thread a restart wake should be
+// routed back to. It captures the thread ONLY when the wake target itself is
+// the caller — an agent restarting from inside its own one-shot (group-DM)
+// thread turn, so the post-restart wake lands back in that thread. An
+// owner-initiated wake runs on no agent turn of its own, so any one-shot the
+// target happens to have in flight is unrelated; capturing it would misroute
+// the wake into an arbitrary group-DM thread. Owner-driven wakes (and the
+// no-wake case) default to the agent's main conversation ("").
+func wakeThreadForRestart(p auth.Principal, wakeID string, lookup func(string) string) string {
+	if wakeID == "" || !p.IsAgent() || p.AgentID != wakeID {
+		return ""
+	}
+	return lookup(wakeID)
+}
+
 func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
 	if !p.CanRestartServer() {
@@ -248,10 +263,14 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	// turn is still in flight. By the time the drain goroutine arms the
 	// marker every chat has gone idle, so the reverse lookup would be
 	// empty. Empty string = main conversation (the common case).
-	wakeSessionKey := ""
-	if wakeID != "" {
-		wakeSessionKey = s.agents.InFlightOneShotSessionKey(wakeID)
-	}
+	//
+	// Only capture it when the WAKE TARGET itself is the caller (an agent
+	// waking itself from inside a one-shot thread turn). An OWNER-initiated
+	// restart runs on no agent turn of its own, so any one-shot the target
+	// happens to have in flight is unrelated — routing the wake there would
+	// misdeliver it to an arbitrary groupdm thread. Default to the main
+	// conversation for owner-driven wakes.
+	wakeSessionKey := wakeThreadForRestart(p, wakeID, s.agents.InFlightOneShotSessionKey)
 	s.restartMu.Lock()
 	trigger := s.restartTrigger
 	s.restartMu.Unlock()

@@ -315,6 +315,12 @@ func TestManager_AnswerQuestion_Allow(t *testing.T) {
 // answer handle propagates (→ 404 at the HTTP layer).
 func TestManager_AnswerQuestion_Unknown(t *testing.T) {
 	m := newTestManager(t)
+	// Upsert so the persist-first reservation succeeds and the answer handle
+	// is reached; its ErrQuestionNotFound then drives the rollback + propagate.
+	m.agents["ag_test"] = &Agent{ID: "ag_test", Name: "Test", Tool: "claude"}
+	if err := m.store.Upsert(m.agents["ag_test"]); err != nil {
+		t.Fatal(err)
+	}
 	m.busyMu.Lock()
 	m.busy["ag_test"] = busyEntry{
 		startedAt: time.Now(),

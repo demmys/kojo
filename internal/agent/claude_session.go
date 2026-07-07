@@ -620,6 +620,13 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 			if !isTurnOpeningEvent(event) {
 				s.lastActivity = time.Now()
 				s.mu.Unlock()
+				// A rate_limit_event arriving while idle (post-result usage
+				// telemetry) opens no turn, but the snapshot must still be
+				// recorded — the idle path has no turn sink to carry it to the
+				// Manager tap, so route it directly.
+				if event.Type == "rate_limit_event" && event.RateLimitInfo != nil && s.b.onRateLimit != nil {
+					s.b.onRateLimit(s.agentID, *event.RateLimitInfo)
+				}
 				continue
 			}
 			s.openUnsolicitedLocked()
@@ -837,6 +844,14 @@ func (s *claudeSession) onEOF() {
 		if s.cmd.Process != nil {
 			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
 		}
+	}
+	// Cancel procCtx so anything tied to it — notably the subagent tailer's
+	// poll-loop ticker goroutine — stops. When the CLI exits on its own (EOF
+	// on stdout) nothing else cancels it, so without this the ticker would
+	// leak for the life of the daemon. Idempotent: a no-op when a close()/
+	// reap/forceKill already cancelled it.
+	if s.procCancel != nil {
+		s.procCancel()
 	}
 	stderr := ""
 	if s.stderr != nil {

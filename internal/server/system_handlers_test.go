@@ -117,6 +117,31 @@ func TestSystemRestart_WakeArmsMarker(t *testing.T) {
 	}
 }
 
+// TestWakeThreadForRestart verifies the wake is routed to an in-flight thread
+// ONLY when the wake target itself is the caller. An owner-initiated wake (or a
+// no-wake request) must never capture the target's unrelated one-shot thread.
+func TestWakeThreadForRestart(t *testing.T) {
+	lookup := func(id string) string { return "groupdm:g1" }
+	cases := []struct {
+		name string
+		p    auth.Principal
+		wake string
+		want string
+	}{
+		{"agent wakes itself in a thread", auth.Principal{Role: auth.RolePrivAgent, AgentID: "ag_x"}, "ag_x", "groupdm:g1"},
+		{"owner wakes an agent", auth.Principal{Role: auth.RoleOwner}, "ag_x", ""},
+		{"agent wakes another (blocked upstream, still safe here)", auth.Principal{Role: auth.RolePrivAgent, AgentID: "ag_y"}, "ag_x", ""},
+		{"no wake target", auth.Principal{Role: auth.RoleOwner}, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wakeThreadForRestart(tc.p, tc.wake, lookup); got != tc.want {
+				t.Errorf("wakeThreadForRestart = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func newRebuildRequest(p auth.Principal) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/system/rebuild", nil)
 	return authedRequest(r, p)

@@ -359,6 +359,13 @@ type ClaudeBackend struct {
 	// owning message's ToolUse.Children and pushes it live. nil disables
 	// background-subagent surfacing.
 	onSubagentActivity subagentActivityFunc
+
+	// onRateLimit is invoked by a session when a rate_limit_event arrives
+	// while the session is IDLE (post-result usage-window telemetry that
+	// opens no turn). During a turn the same telemetry rides the turn sink to
+	// the Manager tap; the idle path has no sink, so it routes here directly
+	// so the snapshot is still recorded. nil drops idle telemetry.
+	onRateLimit func(agentID string, info RateLimitInfo)
 }
 
 // BackgroundTurnFunc consumes an unsolicited turn's events (a background
@@ -383,6 +390,12 @@ func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
 // live/backfilled background-subagent output (Option A + C).
 func (b *ClaudeBackend) SetSubagentActivityHandler(fn subagentActivityFunc) {
 	b.onSubagentActivity = fn
+}
+
+// SetRateLimitHandler registers the Manager callback used to record rate-limit
+// telemetry that arrives while the persistent session is idle.
+func (b *ClaudeBackend) SetRateLimitHandler(fn func(agentID string, info RateLimitInfo)) {
+	b.onRateLimit = fn
 }
 
 // SetProxyURL configures an ANTHROPIC_BASE_URL to inject into Claude CLI env.

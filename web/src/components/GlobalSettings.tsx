@@ -9,7 +9,11 @@ import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useXAIApiKey } from "./globalsettings/useXAIApiKey";
 import { useEnterSends } from "../lib/preferences";
+import { useLocale, setLocale, useT, type Locale } from "../lib/i18n";
 import { PageHeader } from "./ui/PageHeader";
+import { SectionCard } from "./ui/SectionCard";
+import { Field } from "./ui/Field";
+import { Select } from "./ui/Select";
 import { Banner } from "./ui/Banner";
 
 // How long the "Saved" banner stays visible after a successful mutation.
@@ -17,6 +21,8 @@ const SUCCESS_BANNER_MS = 2000;
 
 export function GlobalSettings() {
   const navigate = useNavigate();
+  const t = useT();
+  const locale = useLocale();
   const [error, setError] = useState("");
   const [success, setSuccess] = useState(false);
   const [enterSends, setEnterSends] = useEnterSends();
@@ -41,9 +47,20 @@ export function GlobalSettings() {
 
   return (
     <div className="h-full overflow-y-auto bg-app text-ink">
-      <PageHeader title="Settings" onBack={() => navigate("/")} hideBackAtLg />
+      <PageHeader title={t("common.settings")} onBack={() => navigate("/")} hideBackAtLg />
 
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
+        <SectionCard title={t("gs.language")}>
+          <Field help={t("gs.languageHelp")}>
+            <Select
+              value={locale}
+              onChange={(e) => setLocale(e.target.value as Locale)}
+            >
+              <option value="ja">日本語</option>
+              <option value="en">English</option>
+            </Select>
+          </Field>
+        </SectionCard>
         <ApiKeysSection gemini={gemini} embedding={embedding} xai={xai} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
@@ -51,7 +68,7 @@ export function GlobalSettings() {
         <SystemSection setError={setError} />
 
         {error && <Banner tone="error">{error}</Banner>}
-        {success && <Banner tone="success">Saved</Banner>}
+        {success && <Banner tone="success">{t("common.saved")}</Banner>}
       </main>
     </div>
   );

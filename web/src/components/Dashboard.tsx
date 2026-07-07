@@ -9,6 +9,7 @@ import { TransferSkipsNotice } from "./agent/TransferSkipsNotice";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { useCollapsedSet } from "../hooks/useCollapsedSet";
 import { errMsg } from "../lib/utils";
+import { useT } from "../lib/i18n";
 import { Header } from "./ui/Header";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { Chip } from "./ui/Chip";
@@ -89,6 +90,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ variant = "page" }: DashboardProps) {
+  const t = useT();
   const location = useLocation();
   const sidebar = variant === "sidebar";
   // Active row is derived from the URL so it survives remounts and stays in
@@ -372,8 +374,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         {u.mentionsUser && (
           <span
             className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-copper px-1 font-mono text-[10px] font-bold text-app"
-            title="Mentions you"
-            aria-label="Mentions you"
+            title={t("dash.mentionsYou")}
+            aria-label={t("dash.mentionsYou")}
           >
             @
           </span>
@@ -381,8 +383,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         {u.count > 0 && (
           <span
             className="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-lamp-run/80 px-1.5 font-mono text-[10px] font-bold text-app"
-            title={`${u.count}${u.hasMore ? "+" : ""} unread`}
-            aria-label={`${u.count}${u.hasMore ? "+" : ""} unread`}
+            title={t("dash.unread", { count: `${u.count}${u.hasMore ? "+" : ""}` })}
+            aria-label={t("dash.unread", { count: `${u.count}${u.hasMore ? "+" : ""}` })}
           >
             {u.count}
             {u.hasMore ? "+" : ""}
@@ -424,8 +426,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         <button
           onClick={(e) => toggleCollapseGroupDM(g.id, e)}
           className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
-          title={open ? "Collapse" : "Expand"}
-          aria-label={open ? "Collapse" : "Expand"}
+          title={open ? t("dash.collapse") : t("dash.expand")}
+          aria-label={open ? t("dash.collapse") : t("dash.expand")}
         >
           <svg
             className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
@@ -499,7 +501,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     e.preventDefault();
     const memberIds = [...newGroupMemberIds];
     if (memberIds.length < 2) {
-      setCreateGroupError("Select at least 2 members");
+      setCreateGroupError(t("dash.selectMin2"));
       return;
     }
     setCreatingGroup(true);
@@ -513,7 +515,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
       setShowCreateGroupDialog(false);
       navigate(`/groupdms/${created.id}`);
     } catch (err) {
-      setCreateGroupError(err instanceof Error ? err.message : "Failed to create group");
+      setCreateGroupError(err instanceof Error ? err.message : t("dash.createGroupFailed"));
     } finally {
       setCreatingGroup(false);
     }
@@ -573,22 +575,26 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         <div className="flex items-center gap-1.5 pt-3 font-mono text-[12px] text-ink-dim">
           <Lamp state="run" pulse={runningCount > 0} size={7} />
           <span className="truncate">
-            {runningCount} running · {sortedAgents.length} agents · {visibleSessions.length} sessions
-            {groupDMs.length > 0 ? ` · ${groupDMs.length} DMs` : ""}
+            {t("dash.fleetSummary", {
+              running: runningCount,
+              agents: sortedAgents.length,
+              sessions: visibleSessions.length,
+            })}
+            {groupDMs.length > 0 ? t("dash.fleetDms", { count: groupDMs.length }) : ""}
           </span>
         </div>
 
         {pushState === "default" && (
           <div className="mt-3 flex items-center gap-3 rounded-[10px] border border-hairline bg-surface px-3 py-2">
             <span className="flex-1 text-[13px] text-ink-dim">
-              Enable notifications when sessions finish?
+              {t("dash.enableNotifPrompt")}
             </span>
             <button
               onClick={pushSubscribe}
               disabled={pushLoading}
               className="whitespace-nowrap text-[13px] font-medium text-copper transition-colors hover:text-copper-bright disabled:opacity-40"
             >
-              {pushLoading ? "..." : "Enable"}
+              {pushLoading ? "..." : t("dash.enable")}
             </button>
           </div>
         )}
@@ -598,7 +604,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         <section>
           <div className="mb-2 flex items-center justify-between px-0.5">
             <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-              Agents · {sortedAgents.length}
+              {t("dash.agents")} · {sortedAgents.length}
             </h2>
             {agents.some((a) => (a.cronExpr ?? "") !== "") && (
               <button
@@ -617,26 +623,28 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                   }`} />
                 </span>
                 <span className="font-mono text-[10px] text-ink-faint">
-                  {cronPaused ? "cron paused" : "cron running"}
+                  {cronPaused ? t("dash.cronPaused") : t("dash.cronRunning")}
                 </span>
               </button>
             )}
           </div>
 
           {sortedAgents.length === 0 ? (
-            <p className="py-8 text-center text-sm text-ink-faint">No agents yet</p>
+            <p className="py-8 text-center text-sm text-ink-faint">{t("dash.noAgents")}</p>
           ) : (
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {sortedAgents.map((agent) => {
                 const open = !collapsedAgents.has(agent.id);
                 const ts = agent.lastMessage ? agent.lastMessage.timestamp : agent.createdAt;
                 const preview = agent.holderPeer
-                  ? `転移中 @ ${agent.holderPeerName || agent.holderPeer.slice(0, 8)} — 最新発言はこの端末では未反映`
+                  ? t("dash.transferringPreview", {
+                      peer: agent.holderPeerName || agent.holderPeer.slice(0, 8),
+                    })
                   : agent.lastMessage
-                    ? `${agent.lastMessage.role === "user" ? "You: " : ""}${agent.lastMessage.content}`
+                    ? `${agent.lastMessage.role === "user" ? t("dash.youPrefix") : ""}${agent.lastMessage.content}`
                     : agent.persona
                       ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
-                      : "No messages yet";
+                      : t("dash.noMessagesYet");
                 return (
                   <div
                     key={agent.id}
@@ -657,19 +665,21 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                           {agent.busy && !agent.awaitingAnswer && (
                             <span
                               className="h-2 w-2 shrink-0 animate-lamp-pulse rounded-full bg-copper"
-                              title="処理中"
-                              aria-label="処理中"
+                              title={t("dash.processing")}
+                              aria-label={t("dash.processing")}
                             />
                           )}
                           {agent.awaitingAnswer && (
                             <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-warn/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-warn">
                               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-lamp-warn" />
-                              回答待ち
+                              {t("dash.awaitingAnswer")}
                             </span>
                           )}
                           {agent.holderPeer && (
                             <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
-                              転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}
+                              {t("dash.transferring", {
+                                peer: agent.holderPeerName || agent.holderPeer.slice(0, 8),
+                              })}
                             </span>
                           )}
                           {open && <RelTime value={ts} className="ml-auto" />}
@@ -694,11 +704,10 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       <button
                         onClick={async (e) => {
                           e.stopPropagation();
-                          if (!window.confirm(
-                            `Force-reclaim "${agent.name}" to this host?\n` +
-                            `現在のholder (${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}) との通信を放棄し、` +
-                            `この端末でランタイムを再起動する。`,
-                          )) return;
+                          if (!window.confirm(t("dash.forceReclaimConfirm", {
+                            name: agent.name,
+                            holder: agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8),
+                          }))) return;
                           try {
                             await agentApi.forceReclaim(agent.id);
                             // List poll picks the new state up on the
@@ -707,21 +716,21 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             setAgents(fresh);
                           } catch (err) {
                             console.error("force-reclaim failed", err);
-                            window.alert(`Force-reclaim failed: ${errMsg(err)}`);
+                            window.alert(t("dash.forceReclaimFailed", { err: errMsg(err) }));
                           }
                         }}
                         className="my-2 mr-1 shrink-0 self-start rounded-full border border-lamp-warn/40 px-2 py-1 text-[10px] text-lamp-warn transition-colors hover:bg-lamp-warn/10"
-                        title="Force-reclaim: rewrite agent_locks back to this host and restart the runtime. Use when device-switch left the agent stuck on an unreachable peer."
+                        title={t("dash.forceReclaimTitle")}
                       >
-                        強制復帰
+                        {t("dash.forceReclaim")}
                       </button>
                     )}
 
                     <button
                       onClick={(e) => openAgentDM(agent.id, e)}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-copper disabled:opacity-40"
-                      title="New thread"
-                      aria-label={`New thread with ${agent.name}`}
+                      title={t("dash.newThread")}
+                      aria-label={t("dash.newThreadWith", { name: agent.name })}
                     >
                       {/* MessageSquarePlus: a chat bubble with a "+", conveying
                           "start a new thread/conversation". */}
@@ -743,8 +752,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                     <button
                       onClick={(e) => toggleCollapseAgent(agent.id, e)}
                       className="flex w-8 shrink-0 items-center justify-center text-ink-faint transition-colors hover:text-ink-dim"
-                      title={open ? "Collapse" : "Expand"}
-                      aria-label={open ? "Collapse" : "Expand"}
+                      title={open ? t("dash.collapse") : t("dash.expand")}
+                      aria-label={open ? t("dash.collapse") : t("dash.expand")}
                     >
                       <svg
                         className={`h-3 w-3 transition-transform ${open ? "rotate-90" : ""}`}
@@ -768,7 +777,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
           <section>
             <div className="mb-2 flex items-center justify-between px-0.5">
               <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-                Threads · {dmRooms.length}
+                {t("dash.threads")} · {dmRooms.length}
               </h2>
             </div>
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
@@ -781,7 +790,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         <section>
           <div className="mb-2 flex items-center justify-between px-0.5">
             <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-              Group DMs · {groupRooms.length}
+              {t("dash.groupDms")} · {groupRooms.length}
             </h2>
             <button
               onClick={() => {
@@ -791,12 +800,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
               disabled={sortedAgents.length < 2}
               className="rounded-full border border-hairline px-2.5 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink disabled:opacity-40"
             >
-              + Group
+              {t("dash.plusGroup")}
             </button>
           </div>
 
           {groupRooms.length === 0 ? (
-            <p className="py-8 text-center text-sm text-ink-faint">No group DMs</p>
+            <p className="py-8 text-center text-sm text-ink-faint">{t("dash.noGroupDms")}</p>
           ) : (
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {groupRooms.map(roomRow)}
@@ -808,12 +817,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
         <section>
           <div className="mb-2 flex items-center justify-between px-0.5">
             <h2 className="font-mono text-[11px] uppercase tracking-wide text-ink-faint">
-              Sessions · {groups.length}
+              {t("dash.sessions")} · {groups.length}
             </h2>
           </div>
 
           {!hasAnySessions ? (
-            <p className="py-8 text-center text-sm text-ink-faint">No sessions</p>
+            <p className="py-8 text-center text-sm text-ink-faint">{t("dash.noSessions")}</p>
           ) : (
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {groups.map((g) => {
@@ -844,7 +853,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             )}
                             {g.primary.exitCode !== undefined && (
                               <span className="shrink-0 font-mono text-[11px] text-ink-faint">
-                                exit {g.primary.exitCode}
+                                {t("dash.exit", { code: g.primary.exitCode })}
                               </span>
                             )}
                           </div>
@@ -856,8 +865,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                         <button
                           onClick={() => navigate(`/new?tool=${encodeURIComponent(g.tool)}&workDir=${encodeURIComponent(g.workDir)}`)}
                           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:bg-hover hover:text-ink"
-                          title="New session"
-                          aria-label="New session"
+                          title={t("dash.newSession")}
+                          aria-label={t("dash.newSession")}
                         >
                           <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
                             <path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" />
@@ -867,8 +876,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                           <button
                             onClick={(e) => deleteGroup(g, e)}
                             className="rounded-[10px] p-2 text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err"
-                            title="Remove"
-                            aria-label="Remove"
+                            title={t("dash.remove")}
+                            aria-label={t("dash.remove")}
                           >
                             <svg viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
                               <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
@@ -895,7 +904,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                           onClick={() => toggleExpand(g.key)}
                           className="w-full border-t border-hairline px-3 py-2 text-left font-mono text-[11px] text-ink-faint transition-colors hover:text-ink-dim"
                         >
-                          {expanded.has(g.key) ? "Hide" : `+${stoppedOthers.length} more`}
+                          {expanded.has(g.key) ? t("dash.hide") : t("dash.more", { count: stoppedOthers.length })}
                         </button>
                         {expanded.has(g.key) && stoppedOthers.map((s) => (
                           <button
@@ -906,7 +915,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             <Lamp state={sessionLampState(s)} size={6} />
                             <span>{s.status}</span>
                             {s.toolSessionId && <span>{s.toolSessionId.slice(0, 8)}</span>}
-                            {s.exitCode !== undefined && <span>(exit {s.exitCode})</span>}
+                            {s.exitCode !== undefined && <span>{t("dash.exitParen", { code: s.exitCode })}</span>}
                             <RelTime value={s.createdAt} className="ml-auto" />
                           </button>
                         ))}
@@ -940,13 +949,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
             className="flex max-h-[85vh] w-full max-w-[420px] flex-col rounded-[10px] border border-hairline bg-raised shadow-xl shadow-black/50"
           >
             <div className="flex shrink-0 items-center justify-between border-b border-hairline px-4 py-3">
-              <h3 className="text-sm font-medium text-ink">New group DM</h3>
+              <h3 className="text-sm font-medium text-ink">{t("dash.newGroupDm")}</h3>
               <button
                 type="button"
                 onClick={() => setShowCreateGroupDialog(false)}
                 disabled={creatingGroup}
                 className="rounded p-1 text-ink-faint transition-colors hover:text-ink disabled:opacity-40"
-                aria-label="Close"
+                aria-label={t("common.close")}
               >
                 <svg viewBox="0 0 16 16" fill="currentColor" className="h-4 w-4">
                   <path d="M5.28 4.22a.75.75 0 00-1.06 1.06L6.94 8l-2.72 2.72a.75.75 0 101.06 1.06L8 9.06l2.72 2.72a.75.75 0 101.06-1.06L9.06 8l2.72-2.72a.75.75 0 00-1.06-1.06L8 6.94 5.28 4.22z" />
@@ -956,7 +965,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
 
             <div className="space-y-4 overflow-y-auto p-4">
               <label className="block">
-                <span className="mb-1 block text-xs text-ink-dim">Name</span>
+                <span className="mb-1 block text-xs text-ink-dim">{t("dash.name")}</span>
                 <input
                   value={newGroupName}
                   onChange={(e) => setNewGroupName(e.target.value)}
@@ -975,13 +984,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                   disabled={creatingGroup}
                   className="rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
                 />
-                Notify members
+                {t("dash.notifyMembers")}
               </label>
 
               <div>
                 <div className="mb-2 flex items-center justify-between">
-                  <span className="text-xs text-ink-dim">Members</span>
-                  <span className="text-[10px] text-ink-faint">{newGroupMemberIds.size} selected</span>
+                  <span className="text-xs text-ink-dim">{t("dash.members")}</span>
+                  <span className="text-[10px] text-ink-faint">{t("dash.selected", { count: newGroupMemberIds.size })}</span>
                 </div>
                 <div className="space-y-1.5">
                   {sortedAgents.map((agent) => {
@@ -1025,10 +1034,10 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                 disabled={creatingGroup}
                 className="rounded-[10px] px-3 py-1.5 text-sm text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <Button type="submit" variant="primary" disabled={creatingGroup || newGroupMemberIds.size < 2}>
-                {creatingGroup ? "Creating..." : "Create"}
+                {creatingGroup ? t("dash.creating") : t("dash.create")}
               </Button>
             </div>
           </form>

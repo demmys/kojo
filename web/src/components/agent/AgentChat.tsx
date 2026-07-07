@@ -4,6 +4,7 @@ import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachmen
 import { RateLimitBadge } from "./RateLimitBadge";
 import { UserQuestionCard, type PendingQuestion } from "./UserQuestionCard";
 import { errMsg, localRFC3339 } from "../../lib/utils";
+import { useT } from "../../lib/i18n";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
 import { useTTSAutoToggle, useTTSPlayer } from "../../hooks/useTTS";
@@ -43,6 +44,7 @@ import {
 const PAGE_SIZE = 30;
 
 export function AgentChat() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -570,7 +572,7 @@ export function AgentChat() {
           }
           // Show process error as system message (e.g. auth failures, stderr).
           if (event.errorMessage) {
-            const errorContent = `⚠️ Error: ${event.errorMessage}`;
+            const errorContent = t("chat.errorPrefix", { msg: event.errorMessage });
             setMessages((prev) =>
               appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
             );
@@ -580,7 +582,7 @@ export function AgentChat() {
         }
         case "error": {
           abortedIdRef.current = null; // Clear on every terminal path
-          const errorContent = `⚠️ Error: ${event.errorMessage || "An error occurred"}`;
+          const errorContent = t("chat.errorPrefix", { msg: event.errorMessage || t("chat.errorGeneric") });
           setMessages((prev) =>
             appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
           );
@@ -757,7 +759,7 @@ export function AgentChat() {
         // The queue endpoint is text-only. Files can be attached only
         // while online (AttachButton is disabled offline), so these
         // predate the outage — refuse rather than silently drop them.
-        setQueueError("Attachments can't be queued — remove them or wait for the device to reconnect.");
+        setQueueError(t("chat.attachmentsCantQueue"));
         return;
       }
       if (!text) return;
@@ -777,7 +779,7 @@ export function AgentChat() {
         if (sentForId !== idRef.current) return;
         if (r.queued) {
           const peer = r.holderPeerName || agent?.holderPeerName || (agent?.holderPeer ?? "").slice(0, 8);
-          setQueueNotice(`Queued — will deliver when device ${peer} reconnects.`);
+          setQueueNotice(t("chat.queuedNotice", { peer }));
           refreshQueued();
         } else {
           // Delivered after all (holder came back between our last poll
@@ -797,7 +799,7 @@ export function AgentChat() {
         const msg = errMsg(e);
         setQueueError(
           /queue_full/.test(msg)
-            ? "Queue is full for this agent (100 messages max) — cancel a queued message or wait for the device to reconnect."
+            ? t("chat.queueFull")
             : msg,
         );
         // The draft was cleared optimistically — put the failed text
@@ -897,7 +899,7 @@ export function AgentChat() {
             }
           }}
           className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
-          aria-label="Back"
+          aria-label={t("common.back")}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
             <path d="M12.5 5l-5 5 5 5" />
@@ -914,12 +916,12 @@ export function AgentChat() {
             />
             <span className="truncate">
               {holderOffline
-                ? `host offline @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}`
+                ? t("chat.hostOffline", { peer: agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8) })
                 : connected
                   ? streaming
-                    ? "typing…"
-                    : "online"
-                  : "connecting…"}
+                    ? t("chat.typing")
+                    : t("chat.online")
+                  : t("chat.connecting")}
             </span>
           </div>
         </div>
@@ -932,7 +934,7 @@ export function AgentChat() {
                 ? "text-copper hover:text-copper-bright"
                 : "text-ink-faint hover:text-ink"
             }`}
-            title={ttsAuto ? "Auto TTS: ON" : "Auto TTS: OFF"}
+            title={ttsAuto ? t("chat.autoTtsOn") : t("chat.autoTtsOff")}
             aria-pressed={ttsAuto}
           >
             {ttsAuto ? (
@@ -996,8 +998,8 @@ export function AgentChat() {
         <button
           onClick={() => navigate(`/agents/${agent.id}/credentials`, { replace: true })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
-          title="Credentials"
-          aria-label="Credentials"
+          title={t("chat.credentials")}
+          aria-label={t("chat.credentials")}
         >
           <span className="text-base leading-none">🔐</span>
         </button>
@@ -1007,8 +1009,8 @@ export function AgentChat() {
             state: { kojoFileBrowser: "root", kojoFileBrowserDepth: 0 },
           })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
-          title="Data folder"
-          aria-label="Data folder"
+          title={t("chat.dataFolder")}
+          aria-label={t("chat.dataFolder")}
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
             <path d="M3.75 3A1.75 1.75 0 002 4.75v1.5c0 .199.034.39.096.568A1.75 1.75 0 002 8.25v7A1.75 1.75 0 003.75 17h12.5A1.75 1.75 0 0018 15.25v-7a1.75 1.75 0 00-.096-.932c.062-.179.096-.37.096-.568v-1.5A1.75 1.75 0 0016.25 3h-4.086a1.75 1.75 0 01-1.237-.513l-.707-.707A1.75 1.75 0 009.086 1.28L8.914 1.28H3.75z" />
@@ -1017,8 +1019,8 @@ export function AgentChat() {
         <button
           onClick={() => navigate(`/agents/${agent.id}/settings`, { replace: true })}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
-          title="Settings"
-          aria-label="Settings"
+          title={t("chat.settings")}
+          aria-label={t("chat.settings")}
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
             <path fillRule="evenodd" d="M7.84 1.804A1 1 0 018.82 1h2.36a1 1 0 01.98.804l.331 1.652a6.993 6.993 0 011.929 1.115l1.598-.54a1 1 0 011.186.447l1.18 2.044a1 1 0 01-.205 1.251l-1.267 1.113a7.047 7.047 0 010 2.228l1.267 1.113a1 1 0 01.206 1.25l-1.18 2.045a1 1 0 01-1.187.447l-1.598-.54a6.993 6.993 0 01-1.929 1.115l-.33 1.652a1 1 0 01-.98.804H8.82a1 1 0 01-.98-.804l-.331-1.652a6.993 6.993 0 01-1.929-1.115l-1.598.54a1 1 0 01-1.186-.447l-1.18-2.044a1 1 0 01.205-1.251l1.267-1.114a7.05 7.05 0 010-2.227L1.821 7.773a1 1 0 01-.206-1.25l1.18-2.045a1 1 0 011.187-.447l1.598.54A6.993 6.993 0 017.51 3.456l.33-1.652zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
@@ -1035,7 +1037,7 @@ export function AgentChat() {
         {messages.length === 0 && !streaming && (
           <div className="py-16 text-center text-ink-faint">
             <p className="mb-1 text-lg text-ink-dim">{agent.name}</p>
-            <p className="text-sm">Send a message to start chatting</p>
+            <p className="text-sm">{t("chat.emptyPrompt")}</p>
           </div>
         )}
         {messages.map((msg) => {
@@ -1178,7 +1180,7 @@ export function AgentChat() {
                             }
                             return;
                           }
-                          const errorContent = `⚠️ Error: ${errMsg(e)}`;
+                          const errorContent = t("chat.errorPrefix", { msg: errMsg(e) });
                           setMessages([
                             ...snapshot,
                             {
@@ -1242,7 +1244,7 @@ export function AgentChat() {
               <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
             </svg>
             <span className="flex-1">
-              ホスト端末 <span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span> がオフライン。送信したメッセージは復帰時に配送する。
+              {t("chat.holderOfflineBannerPre")}<span className="font-mono">{agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)}</span>{t("chat.holderOfflineBannerPost")}
             </span>
           </div>
         )}
@@ -1268,7 +1270,7 @@ export function AgentChat() {
           <DismissibleError
             message={
               /api key|not configured/i.test(speech.error)
-                ? "xAI API キーが未設定。設定画面で登録して。"
+                ? t("chat.xaiKeyMissing")
                 : speech.error
             }
             onDismiss={() => speech.stop()}
@@ -1288,15 +1290,8 @@ export function AgentChat() {
             onClick={() => fileInputRef.current?.click()}
             uploading={uploading}
             disabled={uploading || streaming || holderOffline}
-            title={holderOffline ? "Holder peer offline" : "Attach files"}
+            title={holderOffline ? t("chat.holderPeerOffline") : t("composer.attachFiles")}
           />
-          {speech.supported && (
-            <MicButton
-              listening={speech.state === "listening"}
-              connecting={speech.state === "connecting"}
-              onClick={toggleVoice}
-            />
-          )}
           <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
             <textarea
               ref={textareaRef}
@@ -1306,25 +1301,34 @@ export function AgentChat() {
               onKeyDown={handleKeyDown}
               placeholder={
                 streaming
-                  ? `Steer the running turn… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
-                  : `Message… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
+                  ? t("chat.steerPlaceholder", { key: enterSends ? "Enter" : "Ctrl+Enter" })
+                  : t("chat.messagePlaceholder", { key: enterSends ? "Enter" : "Ctrl+Enter" })
               }
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />
             {(speech.state === "listening" || speech.interimText) && (
               <div className="px-3 pb-2 text-[13px] italic text-ink-faint">
-                {speech.interimText || "聞き取り中…"}
+                {speech.interimText || t("chat.listening")}
               </div>
             )}
           </div>
+          {/* Mic sits on the opposite side of the textarea from Attach —
+              the two were adjacent on the left and easy to mis-tap. */}
+          {speech.supported && (
+            <MicButton
+              listening={speech.state === "listening"}
+              connecting={speech.state === "connecting"}
+              onClick={toggleVoice}
+            />
+          )}
           {streaming ? (
             <>
               <StopButton onClick={handleAbort} />
               <SendButton
                 onClick={handleSend}
                 disabled={!input.trim()}
-                title="Steer the running turn"
+                title={t("chat.steerTitle")}
               />
             </>
           ) : (
@@ -1337,7 +1341,7 @@ export function AgentChat() {
                   ? !input.trim() && pendingFiles.length === 0
                   : (!input.trim() && pendingFiles.length === 0) || !connected
               }
-              title={holderOffline ? `Holder peer is offline — message will be queued and delivered when @ ${agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8)} reconnects` : undefined}
+              title={holderOffline ? t("chat.sendQueuedTitle", { peer: agent.holderPeerName || (agent.holderPeer ?? "").slice(0, 8) }) : undefined}
             />
           )}
         </div>

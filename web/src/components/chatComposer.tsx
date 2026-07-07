@@ -7,6 +7,7 @@
 
 import type { AgentMessageAttachment } from "../lib/agentApi";
 import { api, isThumbSupported } from "../lib/api";
+import { useT } from "../lib/i18n";
 
 /** The repeated 16x16 "×" glyph used on dismiss/remove buttons. */
 export function CloseIcon() {
@@ -28,13 +29,14 @@ export function FileIcon() {
 
 /** An inline error banner with a dismiss button. */
 export function DismissibleError({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  const t = useT();
   return (
     <div className="mb-2 flex items-center gap-2 rounded-[10px] border border-lamp-err/40 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err">
       <span className="flex-1">{message}</span>
       <button
         onClick={onDismiss}
         className="rounded text-lamp-err/70 transition-colors hover:text-lamp-err"
-        aria-label="Dismiss"
+        aria-label={t("common.dismiss")}
       >
         <CloseIcon />
       </button>
@@ -57,6 +59,7 @@ export function PendingAttachments({
   onRemove: (index: number) => void;
   thumb: boolean;
 }) {
+  const t = useT();
   if (files.length === 0) return null;
   return (
     <div className="mb-2 flex flex-wrap gap-2">
@@ -92,7 +95,7 @@ export function PendingAttachments({
           <button
             onClick={() => onRemove(i)}
             className="ml-0.5 rounded text-ink-faint transition-colors hover:text-ink"
-            aria-label={`Remove ${file.name}`}
+            aria-label={t("common.removeName", { name: file.name })}
           >
             <CloseIcon />
           </button>
@@ -114,6 +117,7 @@ export function LoadMoreButton({
   onClick: () => void;
   loading?: boolean;
 }) {
+  const t = useT();
   return (
     <div className="flex justify-center pt-1 pb-3">
       <button
@@ -133,7 +137,7 @@ export function LoadMoreButton({
           >
             <path d="M8 12V4M4 7l4-4 4 4" />
           </svg>
-          older messages
+          {t("composer.olderMessages")}
         </span>
       </button>
     </div>
@@ -152,13 +156,14 @@ export function AttachButton({
   disabled?: boolean;
   title?: string;
 }) {
+  const t = useT();
   return (
     <button
       onClick={onClick}
       disabled={disabled}
       className="shrink-0 rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink disabled:opacity-40"
-      title={title ?? "Attach files"}
-      aria-label="Attach files"
+      title={title ?? t("composer.attachFiles")}
+      aria-label={t("composer.attachFiles")}
     >
       {uploading ? (
         <svg className="h-5 w-5 animate-spin" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -191,12 +196,13 @@ export function MicButton({
   onClick: () => void;
   title?: string;
 }) {
+  const t = useT();
   return (
     <button
       onClick={onClick}
       disabled={disabled}
-      title={title ?? (listening ? "Stop voice input" : "Voice input")}
-      aria-label={listening ? "Stop voice input" : "Voice input"}
+      title={title ?? (listening ? t("composer.stopVoice") : t("composer.voiceInput"))}
+      aria-label={listening ? t("composer.stopVoice") : t("composer.voiceInput")}
       aria-pressed={listening}
       className={
         "shrink-0 rounded-[10px] p-2 transition-colors disabled:opacity-40 " +
@@ -230,12 +236,13 @@ export function SendButton({
   disabled?: boolean;
   title?: string;
 }) {
+  const t = useT();
   return (
     <button
       onClick={onClick}
       disabled={disabled}
-      title={title ?? "Send"}
-      aria-label="Send"
+      title={title ?? t("composer.send")}
+      aria-label={t("composer.send")}
       className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-copper text-[#14100b] transition-colors hover:bg-copper-bright disabled:cursor-not-allowed disabled:bg-raised disabled:text-ink-faint"
     >
       <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
@@ -247,11 +254,12 @@ export function SendButton({
 
 /** Stop-streaming button: lamp-err outline, square glyph. */
 export function StopButton({ onClick, title }: { onClick: () => void; title?: string }) {
+  const t = useT();
   return (
     <button
       onClick={onClick}
-      title={title ?? "Stop"}
-      aria-label="Stop"
+      title={title ?? t("composer.stop")}
+      aria-label={t("composer.stop")}
       className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-lamp-err text-lamp-err transition-colors hover:bg-lamp-err/10"
     >
       <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4">

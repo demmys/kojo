@@ -10,6 +10,7 @@ import {
 import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
 import { errMsg } from "../../lib/utils";
+import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
@@ -32,42 +33,19 @@ import { Toggle } from "../ui/Toggle";
 import { Banner } from "../ui/Banner";
 import { Button } from "../ui/Button";
 
-const SECTIONS = [
-  { id: "identity", label: "Identity" },
-  { id: "injections", label: "Context Injections" },
-  { id: "model", label: "Model & Tools" },
-  { id: "schedule", label: "Schedule" },
-  { id: "voice", label: "Voice" },
-  { id: "integrations", label: "Integrations" },
-  { id: "memory", label: "Memory" },
-  { id: "danger", label: "Danger" },
+// Section ids (also i18n keys under "settings.sec.<id>"). Stable list so
+// useScrollSpy's effect deps don't churn every render; labels are resolved
+// through t() at render time so they follow the active locale.
+const SECTION_IDS = [
+  "identity",
+  "injections",
+  "model",
+  "schedule",
+  "voice",
+  "integrations",
+  "memory",
+  "danger",
 ] as const;
-
-// Stable id list so useScrollSpy's effect deps don't churn every render.
-const SECTION_IDS = SECTIONS.map((s) => s.id);
-
-// Label + one-line description for each context-injection checklist item.
-// Keys must match CONTEXT_INJECTION_KEYS (imported from agentApi) — the
-// server 400s on any key outside that allowlist.
-const INJECTION_INFO: Record<ContextInjectionKey, { label: string; desc: string }> = {
-  user_context: { label: "User Context", desc: "User profile (user.md)" },
-  memory_md: { label: "MEMORY.md", desc: "MEMORY.md contents in system prompt" },
-  credentials: { label: "Credentials", desc: "Credentials usage guide" },
-  groupdm: { label: "Group DM", desc: "Group DM capability" },
-  todo_api: { label: "Todos", desc: "Persistent todos (guide + per-turn list)" },
-  attachments: { label: "Attachments", desc: "File attachment staging" },
-  status: { label: "Status", desc: "Agent status block" },
-  diary_notes: { label: "Diary Notes", desc: "Recent activity diary (per turn)" },
-  memory_search: { label: "Memory Search", desc: "Memory search results (per turn)" },
-  recent_conversation: {
-    label: "Recent Conversation",
-    desc: "Recent conversation fallback on session resume",
-  },
-  persona_anchor: {
-    label: "口調アンカー",
-    desc: "Persona anchor appended to the per-turn context tail (anchor.md)",
-  },
-};
 
 /**
  * Scroll-spy: tracks which SectionCard is currently in the reading zone so
@@ -130,6 +108,7 @@ function ToggleRow({
 }
 
 export function AgentSettings() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const navigateRef = useRef(navigate);
@@ -290,7 +269,7 @@ export function AgentSettings() {
       };
       audio.onerror = () => {
         if (ttsPreviewAudioRef.current === audio) {
-          setTTSPreviewError("Playback error");
+          setTTSPreviewError(t("settings.playbackError"));
           ttsPreviewAudioRef.current = null;
           setTTSPreviewVoice(null);
         }
@@ -665,7 +644,7 @@ export function AgentSettings() {
       // the user re-applies their edit (otherwise the next Save would
       // 412 again with the same stale etag they started with).
       if (err instanceof Error && err.name === "PreconditionFailedError") {
-        setError("Someone else updated this agent. Reloading…");
+        setError(t("settings.saveConflict"));
         try {
           const fresh = await agentApi.get(id!);
           setAgent(fresh);
@@ -723,9 +702,7 @@ export function AgentSettings() {
       agent &&
       (cronMessage !== loadedCheckin || savedTimeout !== timeoutMinutes)
     ) {
-      setCheckinNotice(
-        "Save your changes first — manual check-in uses the saved Check-in Message and Timeout.",
-      );
+      setCheckinNotice(t("settings.checkinSaveFirst"));
       setTimeout(() => setCheckinNotice(""), 5000);
       return;
     }
@@ -740,9 +717,7 @@ export function AgentSettings() {
       } catch {
         // non-fatal — stick with the stale value
       }
-      setCheckinNotice(
-        "Check-in started — the agent will reply in chat when it finishes.",
-      );
+      setCheckinNotice(t("settings.checkinStarted"));
       setTimeout(() => setCheckinNotice(""), 4000);
     } catch (err) {
       // Match against the server's typed error code rather than the HTTP
@@ -753,9 +728,7 @@ export function AgentSettings() {
       // red error.
       const msg = errMsg(err);
       if (/"code"\s*:\s*"busy"/.test(msg)) {
-        setCheckinNotice(
-          "Check-in skipped — the agent is already working on something.",
-        );
+        setCheckinNotice(t("settings.checkinSkipped"));
         setTimeout(() => setCheckinNotice(""), 4000);
       } else {
         setError(msg);
@@ -782,7 +755,7 @@ export function AgentSettings() {
   };
 
   const handleResetSession = async () => {
-    if (!confirm("Reset CLI session? Conversation history and memory are kept, but the AI will start a fresh context window.")) return;
+    if (!confirm(t("settings.resetSessionConfirm"))) return;
     setResettingSession(true);
     setError("");
     try {
@@ -818,14 +791,10 @@ export function AgentSettings() {
   const handleTruncateMemory = async () => {
     const iso = datetimeLocalToRFC3339(truncateSince);
     if (!iso) {
-      setError("Pick a date/time to truncate from.");
+      setError(t("settings.pickDate"));
       return;
     }
-    if (
-      !confirm(
-        `Delete every memory recorded at or after ${iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), the entire grok --resume session (events.jsonl has no per-record timestamp so partial cuts are not safe — the next turn opens a fresh session), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.`,
-      )
-    ) {
+    if (!confirm(t("settings.truncateConfirm", { iso }))) {
       return;
     }
     setTruncating(true);
@@ -844,7 +813,7 @@ export function AgentSettings() {
   };
 
   const handleResetData = async () => {
-    if (!confirm("Reset conversation logs and memory? Settings, persona, avatar, and credentials will be kept.")) return;
+    if (!confirm(t("settings.resetDataConfirm"))) return;
     setResetting(true);
     setError("");
     try {
@@ -868,7 +837,7 @@ export function AgentSettings() {
   const handleFork = async () => {
     const trimmed = forkName.trim();
     if (!trimmed) {
-      setForkError("Name is required");
+      setForkError(t("settings.nameRequired"));
       return;
     }
     setForking(true);
@@ -885,7 +854,7 @@ export function AgentSettings() {
   };
 
   const handleDelete = async () => {
-    if (!confirm("Delete this agent? This cannot be undone.")) return;
+    if (!confirm(t("settings.deleteConfirm"))) return;
     setDeleting(true);
     try {
       await agentApi.delete(id!);
@@ -897,12 +866,7 @@ export function AgentSettings() {
   };
 
   const handleArchive = async () => {
-    if (
-      !confirm(
-        "Archive this agent? Runtime activity stops; data is kept and can be restored from Settings.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
-      )
-    )
-      return;
+    if (!confirm(t("settings.archiveConfirm"))) return;
     setArchiving(true);
     try {
       await agentApi.archive(id!);
@@ -969,23 +933,23 @@ export function AgentSettings() {
   return (
     <div className="min-h-full bg-app text-ink">
       <PageHeader
-        title="Settings"
+        title={t("common.settings")}
         onBack={() => navigate(`/agents/${id}`, { replace: true })}
         below={
           // Mobile section nav: sticky, horizontally scrollable chip row.
           <nav className="flex gap-1.5 overflow-x-auto border-t border-hairline px-4 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:hidden">
-            {SECTIONS.map((s) => (
+            {SECTION_IDS.map((s) => (
               <button
-                key={s.id}
+                key={s}
                 type="button"
-                onClick={() => scrollToSection(s.id)}
+                onClick={() => scrollToSection(s)}
                 className={`shrink-0 whitespace-nowrap rounded-full border px-2.5 py-1 font-mono text-[12px] transition-colors ${
-                  activeSection === s.id
+                  activeSection === s
                     ? "border-copper bg-copper/15 text-copper-bright"
                     : "border-hairline text-ink-dim hover:text-ink"
                 }`}
               >
-                {s.label}
+                {t(`settings.sec.${s}`)}
               </button>
             ))}
           </nav>
@@ -996,18 +960,18 @@ export function AgentSettings() {
         {/* Desktop sticky section rail */}
         <nav className="hidden lg:block">
           <div className="sticky top-24 space-y-0.5">
-            {SECTIONS.map((s) => (
+            {SECTION_IDS.map((s) => (
               <button
-                key={s.id}
+                key={s}
                 type="button"
-                onClick={() => scrollToSection(s.id)}
+                onClick={() => scrollToSection(s)}
                 className={`block w-full rounded-md px-2.5 py-1.5 text-left font-mono text-[12px] transition-colors ${
-                  activeSection === s.id
+                  activeSection === s
                     ? "bg-copper/10 text-copper-bright"
                     : "text-ink-dim hover:bg-hover hover:text-ink"
                 }`}
               >
-                {s.label}
+                {t(`settings.sec.${s}`)}
               </button>
             ))}
           </div>
@@ -1017,23 +981,23 @@ export function AgentSettings() {
         {/* ── Identity ── */}
         <SectionCard
           id="identity"
-          title="Identity"
-          description="Name, persona, and how this agent appears to others."
+          title={t("settings.sec.identity")}
+          description={t("settings.card.identity.desc")}
         >
           {/* Avatar */}
           <div className="mb-4 flex items-center gap-4">
             <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
             <div className="flex flex-wrap gap-2">
-              <Button onClick={() => fileRef.current?.click()}>Change Avatar</Button>
+              <Button onClick={() => fileRef.current?.click()}>{t("settings.changeAvatar")}</Button>
               <Button
                 onClick={handleGenerateAvatar}
                 disabled={generatingAvatar || !persona.trim()}
                 className="flex items-center gap-1.5"
               >
                 {generatingAvatar ? (
-                  <><span className="animate-spin">↻</span> Generating...</>
+                  <><span className="animate-spin">↻</span> {t("settings.generating")}</>
                 ) : (
-                  <>✨ Generate</>
+                  <>✨ {t("settings.generate")}</>
                 )}
               </Button>
               <input
@@ -1047,7 +1011,7 @@ export function AgentSettings() {
           </div>
 
           <div className="space-y-4">
-            <Field label="Name">
+            <Field label={t("settings.name")}>
               <Input value={name} onChange={(e) => setName(e.target.value)} />
             </Field>
 
@@ -1057,7 +1021,7 @@ export function AgentSettings() {
               textareaRows={6}
               personaPrompt={personaPrompt}
               setPersonaPrompt={setPersonaPrompt}
-              promptPlaceholder="e.g. もっと毒舌にして"
+              promptPlaceholder={t("settings.personaPromptPlaceholder")}
               busy={generatingPersona}
               spinning={generatingPersona}
               onGenerate={handleGeneratePersona}
@@ -1065,13 +1029,11 @@ export function AgentSettings() {
 
             {/* User Context (user.md) */}
             <Field
-              label="User Context"
+              label={t("settings.userContextLabel")}
               help={
                 <>
-                  Notes about the people this agent works with — name, timezone,
-                  communication preferences, etc. Injected into the system prompt as
-                  data (head/tail truncated above 1500 chars).{" "}
-                  {userContextIsDefault && "Template — not yet saved."}
+                  {t("settings.userContextHelp")}{" "}
+                  {userContextIsDefault && t("settings.templateNotSaved")}
                 </>
               }
             >
@@ -1091,13 +1053,11 @@ export function AgentSettings() {
 
             {/* Status (status.json) */}
             <Field
-              label="Status"
+              label={t("settings.statusLabel")}
               help={
                 <>
-                  The agent&apos;s self-maintained state (mood, energy, sleepiness,
-                  ...) injected into its system prompt. The agent updates this on
-                  its own as its state drifts; edits here override it.{" "}
-                  {statusIsDefault && "Template — not yet saved."}
+                  {t("settings.statusHelp")}{" "}
+                  {statusIsDefault && t("settings.templateNotSaved")}
                 </>
               }
             >
@@ -1115,11 +1075,11 @@ export function AgentSettings() {
 
             {/* Persona Anchor (anchor.md) */}
             <Field
-              label="口調アンカー"
+              label={t("settings.anchorLabel")}
               help={
                 <>
-                  毎ターンの文脈末尾に注入される2〜3行の人格要約 (一人称・口調・態度)。空なら何も注入されない。長文はトークン税になるので短く。{" "}
-                  {anchorIsDefault && "Template — not yet saved."}
+                  {t("settings.anchorHelp")}{" "}
+                  {anchorIsDefault && t("settings.templateNotSaved")}
                 </>
               }
             >
@@ -1138,7 +1098,7 @@ export function AgentSettings() {
 
             {/* Public Profile */}
             <Field
-              label="Public Profile"
+              label={t("settings.publicProfile")}
               action={
                 <label className="flex cursor-pointer items-center gap-1.5 text-[12px] text-ink-dim">
                   <input
@@ -1147,13 +1107,13 @@ export function AgentSettings() {
                     onChange={(e) => setPublicProfileOverride(e.target.checked)}
                     className="h-4 w-4 rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
                   />
-                  Override
+                  {t("settings.override")}
                 </label>
               }
               help={
                 publicProfileOverride
-                  ? "Manual override — won't be replaced when persona changes."
-                  : "Auto-generated from persona. Visible to other agents via directory."
+                  ? t("settings.publicProfileHelpOverride")
+                  : t("settings.publicProfileHelpAuto")
               }
             >
               <Textarea
@@ -1161,7 +1121,7 @@ export function AgentSettings() {
                 onChange={(e) => setPublicProfile(e.target.value)}
                 rows={2}
                 disabled={!publicProfileOverride}
-                placeholder={publicProfileOverride ? "Enter custom public profile" : "Auto-generated from persona"}
+                placeholder={publicProfileOverride ? t("settings.publicProfilePlaceholderOverride") : t("settings.publicProfilePlaceholderAuto")}
                 className={!publicProfileOverride ? "resize-none opacity-60" : "resize-none"}
               />
             </Field>
@@ -1171,20 +1131,19 @@ export function AgentSettings() {
         {/* ── Context Injections ── */}
         <SectionCard
           id="injections"
-          title="Context Injections"
-          description="Pick which pieces of context get injected into this agent's system prompt / per-turn context. Unchecking one saves a little context budget at the cost of that capability."
+          title={t("settings.sec.injections")}
+          description={t("settings.card.injections.desc")}
         >
           <div className="space-y-3">
             {CONTEXT_INJECTION_KEYS.map((key) => {
-              const info = INJECTION_INFO[key];
               const enabled = !disabledInjections.includes(key);
               return (
                 <ToggleRow
                   key={key}
                   checked={enabled}
                   onChange={(v) => toggleInjection(key, v)}
-                  title={info.label}
-                  desc={info.desc}
+                  title={t(`settings.inj.${key}.label`)}
+                  desc={t(`settings.inj.${key}.desc`)}
                 />
               );
             })}
@@ -1194,8 +1153,8 @@ export function AgentSettings() {
         {/* ── Model & Tools ── */}
         <SectionCard
           id="model"
-          title="Model & Tools"
-          description="Backend, model, and capability permissions."
+          title={t("settings.sec.model")}
+          description={t("settings.card.model.desc")}
         >
           <div className="space-y-4">
             <ToolPicker
@@ -1220,13 +1179,13 @@ export function AgentSettings() {
               <ToggleRow
                 checked={autoEffort}
                 onChange={setAutoEffort}
-                title="Auto Effort"
-                desc="Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback."
+                title={t("settings.autoEffort")}
+                desc={t("settings.autoEffortDesc")}
               />
             )}
 
             {needsCustomURL && (
-              <Field label="Custom Base URL" help="Anthropic Messages API compatible endpoint">
+              <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
                 <Input
                   mono
                   value={customBaseURL}
@@ -1241,8 +1200,8 @@ export function AgentSettings() {
               <Field
                 label={
                   <>
-                    Allowed Tools
-                    <span className="ml-2 text-ink-faint">(empty = all)</span>
+                    {t("settings.allowedTools")}
+                    <span className="ml-2 text-ink-faint">{t("settings.allEmpty")}</span>
                   </>
                 }
               >
@@ -1280,11 +1239,11 @@ export function AgentSettings() {
               <Field
                 label={
                   <>
-                    Allow Edits in Protected Paths
-                    <span className="ml-2 text-ink-faint">(bypass claude-code guard)</span>
+                    {t("settings.allowProtectedPaths")}
+                    <span className="ml-2 text-ink-faint">{t("settings.bypassGuard")}</span>
                   </>
                 }
-                help="Recent claude-code versions prompt on Edit/Write to .claude, .git, .husky even with bypassPermissions. Check to suppress."
+                help={t("settings.allowProtectedPathsHelp")}
               >
                 <div className="grid grid-cols-3 gap-1.5">
                   {["claude", "git", "husky"].map((p) => (
@@ -1310,9 +1269,9 @@ export function AgentSettings() {
 
             {/* Thinking Mode (llama.cpp only) */}
             {tool === "llama.cpp" && (
-              <Field label="Thinking">
+              <Field label={t("settings.thinking")}>
                 <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
-                  <option value="">auto (server default)</option>
+                  <option value="">{t("settings.thinkingAuto")}</option>
                   <option value="on">on</option>
                   <option value="off">off</option>
                 </Select>
@@ -1336,8 +1295,8 @@ export function AgentSettings() {
               checked={privileged}
               disabled={privilegeSaving}
               onChange={handleTogglePrivileged}
-              title="Privileged Agent"
-              desc="Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record."
+              title={t("settings.privileged")}
+              desc={t("settings.privilegedDesc")}
             />
           </div>
         </SectionCard>
@@ -1345,8 +1304,8 @@ export function AgentSettings() {
         {/* ── Schedule ── */}
         <SectionCard
           id="schedule"
-          title="Schedule"
-          description="When this agent runs on its own, and when it stays quiet."
+          title={t("settings.sec.schedule")}
+          description={t("settings.card.schedule.desc")}
         >
           <ScheduleEditor
             cronExpr={cronExpr}
@@ -1390,8 +1349,8 @@ export function AgentSettings() {
             <ToggleRow
               checked={notifyDuringSilent}
               onChange={setNotifyDuringSilent}
-              title="Receive DM During Silent Hours"
-              desc="When enabled, group DM notifications are delivered even during silent hours. When disabled, notifications are suppressed (messages remain in the transcript)."
+              title={t("settings.notifyDuringSilent")}
+              desc={t("settings.notifyDuringSilentDesc")}
             />
           </div>
         </SectionCard>
@@ -1399,15 +1358,15 @@ export function AgentSettings() {
         {/* ── Voice ── */}
         <SectionCard
           id="voice"
-          title="Voice"
-          description="Read assistant replies out loud via Gemini or xAI Grok TTS. Manual playback per message; auto playback toggled in the chat header."
-          action={<Toggle checked={ttsEnabled} onChange={setTTSEnabled} aria-label="Enable TTS" />}
+          title={t("settings.sec.voice")}
+          description={t("settings.card.voice.desc")}
+          action={<Toggle checked={ttsEnabled} onChange={setTTSEnabled} aria-label={t("settings.enableTts")} />}
         >
           {ttsEnabled && (
             <div className="space-y-4">
               <Field
-                label="Provider"
-                help="Gemini uses a free-form style prompt; Grok has no style prompt — control delivery with the voice and inline speech tags ([pause], [laugh], <whisper>…</whisper>) embedded in replies."
+                label={t("settings.provider")}
+                help={t("settings.providerHelp")}
               >
                 <Select
                   value={ttsProvider}
@@ -1425,9 +1384,9 @@ export function AgentSettings() {
               </Field>
 
               {ttsProvider === "gemini" && (
-                <Field label="Model">
+                <Field label={t("settings.model")}>
                   <Select value={ttsModel} onChange={(e) => setTTSModel(e.target.value)}>
-                    <option value="">Default ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
+                    <option value="">{t("settings.default")} ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
                     {(ttsCapability?.models ?? []).map((m) => (
                       <option key={m} value={m}>{m}</option>
                     ))}
@@ -1436,7 +1395,7 @@ export function AgentSettings() {
               )}
 
               <Field
-                label="Voice"
+                label={t("settings.voice")}
                 action={
                   ttsVoice ? (
                     <button
@@ -1444,13 +1403,13 @@ export function AgentSettings() {
                       onClick={() => playPreview(ttsVoice)}
                       className="text-[12px] text-copper transition-colors hover:text-copper-bright"
                     >
-                      {ttsPreviewVoice === ttsVoice ? "▶ Playing..." : "▶ Preview"}
+                      {ttsPreviewVoice === ttsVoice ? t("settings.playing") : t("settings.preview")}
                     </button>
                   ) : undefined
                 }
                 help={
                   <>
-                    Use <span className="text-ink-dim">Preview</span> to listen.
+                    {t("settings.voiceHelpPre")}<span className="text-ink-dim">{t("settings.voiceHelpLink")}</span>{t("settings.voiceHelpPost")}
                   </>
                 }
                 error={ttsPreviewError || undefined}
@@ -1459,7 +1418,7 @@ export function AgentSettings() {
                   {ttsProvider === "grok" ? (
                     <>
                       <option value="">
-                        Default ({ttsCapability?.defaults.grokVoice ?? "eve"})
+                        {t("settings.default")} ({ttsCapability?.defaults.grokVoice ?? "eve"})
                       </option>
                       {(ttsCapability?.grokVoiceCatalog ?? []).map((v) => (
                         <option key={v.name} value={v.name}>
@@ -1470,7 +1429,7 @@ export function AgentSettings() {
                   ) : (
                     <>
                       <option value="">
-                        Default ({ttsCapability?.defaults.voice ?? "Kore"})
+                        {t("settings.default")} ({ttsCapability?.defaults.voice ?? "Kore"})
                       </option>
                       {(ttsCapability?.voiceCatalog ?? []).map((v) => (
                         <option key={v.name} value={v.name}>
@@ -1487,7 +1446,7 @@ export function AgentSettings() {
                   so the full catalog fits without dominating the form. */}
               <details className="overflow-hidden rounded-[10px] border border-hairline bg-raised">
                 <summary className="cursor-pointer select-none px-3 py-2 text-[12px] text-ink-dim">
-                  Browse all {browseVoices.length} voices
+                  {t("settings.browseVoices", { count: browseVoices.length })}
                 </summary>
                 <div className="grid max-h-64 grid-cols-2 gap-1 overflow-y-auto p-2">
                   {browseVoices.map((v) => (
@@ -1531,8 +1490,7 @@ export function AgentSettings() {
 
               {ttsProvider === "grok" && (
                 <Banner tone="info">
-                  Grok has no style prompt. Delivery is set by the voice and by
-                  inline speech tags in the reply text — e.g.{" "}
+                  {t("settings.grokNoStyle")}
                   <code className="text-ink-dim">[pause]</code>,{" "}
                   <code className="text-ink-dim">[laugh]</code>,{" "}
                   <code className="text-ink-dim">&lt;whisper&gt;…&lt;/whisper&gt;</code>.
@@ -1541,24 +1499,21 @@ export function AgentSettings() {
 
               {ttsProvider === "gemini" && (
               <Field
-                label="Style Prompt"
+                label={t("settings.stylePrompt")}
                 help={
                   <span className="space-y-1">
                     <span className="block">
-                      Free-form prompt prepended to the text. Audio tags such as{" "}
-                      <code className="text-ink-dim">[whispers]</code>,{" "}
-                      <code className="text-ink-dim">[excited]</code>,{" "}
-                      <code className="text-ink-dim">[laughs]</code> can be embedded inline.
+                      {t("settings.stylePromptHelpText")}
                     </span>
                     <span className="block">
-                      Reference:{" "}
+                      {t("settings.stylePromptReference")}
                       <a
                         href="https://ai.google.dev/gemini-api/docs/speech-generation"
                         target="_blank"
                         rel="noreferrer"
                         className="text-copper hover:text-copper-bright"
                       >
-                        Gemini TTS prompt guide
+                        {t("settings.stylePromptGuide")}
                       </a>
                     </span>
                   </span>
@@ -1568,7 +1523,7 @@ export function AgentSettings() {
                   mono
                   value={ttsStylePrompt}
                   onChange={(e) => setTTSStylePrompt(e.target.value)}
-                  placeholder={ttsCapability?.defaults.stylePrompt ?? "落ち着いた日本語で、淡々と短く読み上げて。"}
+                  placeholder={ttsCapability?.defaults.stylePrompt ?? t("settings.stylePromptPlaceholder")}
                   rows={3}
                   maxLength={500}
                 />
@@ -1577,7 +1532,7 @@ export function AgentSettings() {
 
               {ttsProvider === "gemini" && ttsCapability && !ttsCapability.ffmpeg && (
                 <Banner tone="warn">
-                  ffmpeg not detected — only WAV output is available. Install ffmpeg to enable Opus/MP3 (much smaller).
+                  {t("settings.ffmpegWarn")}
                 </Banner>
               )}
             </div>
@@ -1592,25 +1547,25 @@ export function AgentSettings() {
             disabled={saving}
             className="mt-4 w-full"
           >
-            {saving ? "Saving..." : "Save TTS Settings"}
+            {saving ? t("settings.saving") : t("settings.saveTts")}
           </Button>
         </SectionCard>
 
         {/* ── Integrations ── */}
-        <SectionCard id="integrations" title="Integrations">
+        <SectionCard id="integrations" title={t("settings.sec.integrations")}>
           <SlackBotSettings agentId={id!} />
         </SectionCard>
 
         {/* ── Memory ── */}
         <SectionCard
           id="memory"
-          title="Memory"
-          description="Trim stored history. Persona, MEMORY.md, notes, and credentials are always kept."
+          title={t("settings.sec.memory")}
+          description={t("settings.card.memory.desc")}
         >
           <div className="space-y-4">
             <Field
-              label="Truncate memory since"
-              help="Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept."
+              label={t("settings.truncateLabel")}
+              help={t("settings.truncateHelp")}
             >
               <Input
                 type="datetime-local"
@@ -1625,16 +1580,21 @@ export function AgentSettings() {
               disabled={truncating || !truncateSince}
               className="w-full"
             >
-              {truncating ? "Truncating..." : "Truncate Memory From This Time"}
+              {truncating ? t("settings.truncating") : t("settings.truncateButton")}
             </Button>
             {truncateResult && (
               <div className="space-y-0.5 rounded-[10px] border border-hairline bg-raised p-2 text-[12px] text-ink-dim">
-                <div>Threshold: <span className="text-ink">{truncateResult.since}</span></div>
+                <div>{t("settings.truncateThreshold")}<span className="text-ink">{truncateResult.since}</span></div>
                 <div>
-                  Transcript: {truncateResult.messagesRemoved} ·
-                  {" "}Claude session: {truncateResult.claudeSessionEntriesRemoved} entries / {truncateResult.claudeSessionFilesRemoved} files ·
-                  {" "}Grok session: {truncateResult.grokSessionsRemoved ?? 0} sessions / {truncateResult.grokSessionFilesRemoved ?? 0} files ·
-                  {" "}Diary: {truncateResult.diaryEntriesRemoved} entries / {truncateResult.diaryFilesRemoved} files
+                  {t("settings.truncateResult", {
+                    messages: truncateResult.messagesRemoved,
+                    claudeEntries: truncateResult.claudeSessionEntriesRemoved,
+                    claudeFiles: truncateResult.claudeSessionFilesRemoved,
+                    grokSessions: truncateResult.grokSessionsRemoved ?? 0,
+                    grokFiles: truncateResult.grokSessionFilesRemoved ?? 0,
+                    diaryEntries: truncateResult.diaryEntriesRemoved,
+                    diaryFiles: truncateResult.diaryFilesRemoved,
+                  })}
                 </div>
               </div>
             )}
@@ -1645,10 +1605,10 @@ export function AgentSettings() {
                 disabled={resetting}
                 className="w-full"
               >
-                {resetting ? "Resetting..." : "Reset Data"}
+                {resetting ? t("settings.resetting") : t("settings.resetData")}
               </Button>
               <p className="mt-1.5 text-[12px] text-ink-faint">
-                Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.
+                {t("settings.resetDataHelp")}
               </p>
             </div>
           </div>
@@ -1657,7 +1617,7 @@ export function AgentSettings() {
         {/* Banners + primary save (covers every form field via handleSave). */}
         <div className="space-y-3">
           {error && <Banner tone="error">{error}</Banner>}
-          {success && <Banner tone="success">Saved</Banner>}
+          {success && <Banner tone="success">{t("common.saved")}</Banner>}
           {checkinNotice && <Banner tone="warn">{checkinNotice}</Banner>}
           <Button
             variant="primary"
@@ -1665,12 +1625,12 @@ export function AgentSettings() {
             disabled={saving}
             className="w-full py-3"
           >
-            {saving ? "Saving..." : "Save Changes"}
+            {saving ? t("settings.saving") : t("settings.saveChanges")}
           </Button>
         </div>
 
         {/* ── Danger Zone ── */}
-        <SectionCard id="danger" title="Danger Zone" danger>
+        <SectionCard id="danger" title={t("settings.card.danger")} danger>
           <div className="space-y-4">
             <div>
               <Button
@@ -1678,18 +1638,18 @@ export function AgentSettings() {
                 disabled={resettingSession}
                 className="w-full"
               >
-                {resettingSession ? "Resetting..." : "Reset CLI Session"}
+                {resettingSession ? t("settings.resetting") : t("settings.resetCliSession")}
               </Button>
               <p className="mt-1.5 text-[12px] text-ink-faint">
-                Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.
+                {t("settings.resetCliSessionHelp")}
               </p>
             </div>
             <div>
               <Button onClick={openForkDialog} className="w-full">
-                Fork Agent
+                {t("settings.forkAgent")}
               </Button>
               <p className="mt-1.5 text-[12px] text-ink-faint">
-                Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.
+                {t("settings.forkAgentHelp")}
               </p>
             </div>
             <div>
@@ -1698,10 +1658,10 @@ export function AgentSettings() {
                 disabled={archiving}
                 className="w-full"
               >
-                {archiving ? "Archiving..." : "Archive Agent"}
+                {archiving ? t("settings.archiving") : t("settings.archiveAgent")}
               </Button>
               <p className="mt-1.5 text-[12px] text-ink-faint">
-                Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).
+                {t("settings.archiveAgentHelp")}
               </p>
             </div>
             <Button
@@ -1710,15 +1670,15 @@ export function AgentSettings() {
               disabled={deleting}
               className="w-full border border-lamp-err/40"
             >
-              {deleting ? "Deleting..." : "Delete Agent"}
+              {deleting ? t("settings.deleting") : t("settings.deleteAgent")}
             </Button>
           </div>
         </SectionCard>
 
         {/* Info */}
         <div className="space-y-1 text-[12px] text-ink-faint">
-          <div>ID: {agent.id}</div>
-          <div>Created: {new Date(agent.createdAt).toLocaleString()}</div>
+          <div>{t("settings.idLabel", { id: agent.id })}</div>
+          <div>{t("settings.createdLabel", { date: new Date(agent.createdAt).toLocaleString() })}</div>
         </div>
         </main>
       </div>
@@ -1732,8 +1692,8 @@ export function AgentSettings() {
           onKeyDown={(e) => { if (e.key === "Escape" && !forking) setShowForkDialog(false); }}
         >
           <div className="w-[22rem] max-w-[calc(100vw-2rem)] rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
-            <h3 className="mb-3 text-[14px] font-semibold text-ink">Fork agent</h3>
-            <Field label="Name" className="mb-3">
+            <h3 className="mb-3 text-[14px] font-semibold text-ink">{t("settings.forkDialogTitle")}</h3>
+            <Field label={t("settings.name")} className="mb-3">
               <Input
                 value={forkName}
                 onChange={(e) => setForkName(e.target.value)}
@@ -1750,12 +1710,12 @@ export function AgentSettings() {
                 className="mt-0.5 h-4 w-4 rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
               />
               <span>
-                Include conversation history
-                <span className="block text-[12px] text-ink-faint">Persona and memory are always copied.</span>
+                {t("settings.forkIncludeHistory")}
+                <span className="block text-[12px] text-ink-faint">{t("settings.forkAlwaysCopied")}</span>
               </span>
             </label>
             <p className="mb-4 text-[12px] text-ink-faint">
-              Slack bot, notification sources, and credentials are not transferred.
+              {t("settings.forkNotTransferred")}
             </p>
             {forkError && (
               <div className="mb-3">
@@ -1764,14 +1724,14 @@ export function AgentSettings() {
             )}
             <div className="flex justify-end gap-2">
               <Button onClick={() => setShowForkDialog(false)} disabled={forking}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 variant="primary"
                 onClick={handleFork}
                 disabled={forking || !forkName.trim()}
               >
-                {forking ? "Forking…" : "Fork"}
+                {forking ? t("settings.forking") : t("settings.fork")}
               </Button>
             </div>
           </div>

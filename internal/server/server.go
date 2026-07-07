@@ -491,6 +491,26 @@ func New(cfg Config) *Server {
 		}
 	}
 
+	// send push notification when an agent's running turn raises an
+	// AskUserQuestion prompt it's waiting on a human to answer. Same
+	// PeerOnly guard as OnChatDone above — the peer never hosts agents, so
+	// this would never fire there, but skip it explicitly for clarity and
+	// to avoid a duplicate push if that ever changes.
+	if s.notify != nil && s.agents != nil && !cfg.PeerOnly {
+		s.agents.OnQuestionRaised = func(agentID string) {
+			name := agentID
+			if ag, ok := s.agents.Get(agentID); ok {
+				name = ag.Name
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"type":    "agent_awaiting_input",
+				"agentId": agentID,
+				"name":    truncateUTF8(name, 80),
+			})
+			s.notify.Send(payload)
+		}
+	}
+
 	mux := http.NewServeMux()
 	s.registerRoutes(mux, cfg)
 	s.mux = mux

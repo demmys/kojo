@@ -196,6 +196,21 @@ type Manager struct {
 	// OnChatDone is called when an agent finishes its response.
 	OnChatDone func(agent *Agent, message *Message)
 
+	// pendingQuestions tracks in-flight AskUserQuestion prompts raised by a
+	// running turn, keyed by agentID → set of requestIDs. Populated by
+	// markQuestionRaised when processChatEvents observes a user_question
+	// ChatEvent, and cleared by clearQuestion (wired as
+	// ChatOptions.OnQuestionResolved — fires on answer/deny/timeout) or by
+	// clearAllQuestionsForAgent, a safety net processChatEvents runs on
+	// every exit path so a question that never resolves can't leave
+	// AwaitingAnswer stuck on. Guarded by busyMu (same lock order as busy).
+	pendingQuestions map[string]map[string]struct{}
+
+	// OnQuestionRaised is called once per AskUserQuestion prompt surfaced
+	// to the UI — NOT on every List() poll — mirroring OnChatDone. Wired
+	// by server.go to push an "agent_awaiting_input" web-push notification.
+	OnQuestionRaised func(agentID string)
+
 	// chatWatchers tracks per-agent channels notified when a new chat starts.
 	chatWatchers   map[string]map[*chatWatcher]struct{}
 	chatWatchersMu sync.Mutex
@@ -1016,6 +1031,7 @@ func (m *Manager) List() []*Agent {
 		// established lock order (see regeneratePublicProfile), so it's
 		// safe to consult IsBusy while holding m.mu here.
 		c.Busy = m.IsBusyForStatus(a.ID)
+		c.AwaitingAnswer = m.HasPendingQuestion(a.ID)
 		list = append(list, c)
 	}
 	return list
@@ -2186,6 +2202,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			}
 			m.busyMu.Unlock()
 		},
+		OnQuestionResolved: func(requestID string) {
+			m.clearQuestion(agentID, requestID)
+		},
 	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
@@ -2555,6 +2574,14 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 }
 
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	// Safety net: whatever happens to this turn (normal done, error, abort,
+	// or the backend process dying outright), drop every AskUserQuestion
+	// still tracked as pending for this agent. Without this, a question
+	// resolved by a path that never calls ChatOptions.OnQuestionResolved
+	// (or a process that dies before resolving it at all) would leave
+	// Agent.AwaitingAnswer stuck on forever.
+	defer m.clearAllQuestionsForAgent(agentID)
+
 	// Accumulate streaming data so we can persist a partial message if
 	// the chat is aborted before a "done" event arrives.
 	var accText strings.Builder
@@ -2815,6 +2842,14 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// badge updates live over the WS.
 			if event.Type == "rate_limit" && event.RateLimit != nil {
 				m.recordRateLimit(agentID, *event.RateLimit)
+			}
+
+			// Track the pending AskUserQuestion so Agent.AwaitingAnswer and
+			// the OnQuestionRaised web-push notification reflect it. Cleared
+			// via ChatOptions.OnQuestionResolved on answer/deny/timeout, or
+			// by the clearAllQuestionsForAgent defer above at turn end.
+			if event.Type == "user_question" {
+				m.markQuestionRaised(agentID, event.RequestID)
 			}
 
 			// Terminal events (done/error) use blocking send so the
@@ -3690,6 +3725,9 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 					m.busy[agentID] = entry
 				}
 				m.busyMu.Unlock()
+			},
+			OnQuestionResolved: func(requestID string) {
+				m.clearQuestion(agentID, requestID)
 			},
 		})
 		if err != nil {

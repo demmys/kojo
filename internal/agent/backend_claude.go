@@ -179,6 +179,13 @@ type claudeQuestionState struct {
 	// timeout (automated turns). Stopped and cleared when the question is
 	// answered or the turn ends, so a resolved question never fires a late deny.
 	timers map[string]*time.Timer
+	// onResolved, if set, is called with a resolved question's requestID
+	// from answer() and denyAllPending() — the two paths that actually
+	// remove an entry from pending. Mirrors ChatOptions.OnQuestionResolved;
+	// set via setOnResolved so the Manager's callback (which closes over
+	// the current turn's agentID) can be kept fresh across turns on a
+	// long-lived persistent session without re-allocating the state.
+	onResolved func(requestID string)
 }
 
 func newClaudeQuestionState(stdinW *claudeStdinWriter) *claudeQuestionState {
@@ -187,6 +194,18 @@ func newClaudeQuestionState(stdinW *claudeStdinWriter) *claudeQuestionState {
 		pending: make(map[string]json.RawMessage),
 		timers:  make(map[string]*time.Timer),
 	}
+}
+
+// setOnResolved (re)wires the OnQuestionResolved callback. Safe to call
+// concurrently with answer()/denyAllPending() (guarded by q.mu) and with a
+// nil receiver (no-op) so callers don't need to nil-check qstate first.
+func (q *claudeQuestionState) setOnResolved(fn func(requestID string)) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.onResolved = fn
+	q.mu.Unlock()
 }
 
 // register records a pending question so a later answer can rebuild its
@@ -220,13 +239,18 @@ func (q *claudeQuestionState) stopTimerLocked(requestID string) {
 func (q *claudeQuestionState) answer(requestID string, answers map[string]any, deny bool, denyMessage string) error {
 	q.mu.Lock()
 	input, ok := q.pending[requestID]
+	var onResolved func(string)
 	if ok {
 		delete(q.pending, requestID)
 		q.stopTimerLocked(requestID)
+		onResolved = q.onResolved
 	}
 	q.mu.Unlock()
 	if !ok {
 		return ErrQuestionNotFound
+	}
+	if onResolved != nil {
+		onResolved(requestID)
 	}
 	var resp map[string]any
 	if deny {
@@ -267,8 +291,17 @@ func (q *claudeQuestionState) denyAllPending(reason string) {
 		q.stopTimerLocked(id)
 	}
 	q.pending = make(map[string]json.RawMessage)
+	onResolved := q.onResolved
 	q.mu.Unlock()
 	for _, id := range ids {
+		// Clear the caller's pending-question bookkeeping FIRST: the
+		// control_response write below is best-effort (a dead/wedged
+		// process can block or fail it), and if onResolved ran after a
+		// blocked write, Agent.AwaitingAnswer would stay stuck on for as
+		// long as the write stalls instead of clearing immediately.
+		if onResolved != nil {
+			onResolved(id)
+		}
 		_ = q.stdinW.writeControlResponse(id, map[string]any{"behavior": "deny", "message": reason})
 	}
 }
@@ -514,6 +547,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	var qstate *claudeQuestionState
 	if opts.OnQuestionReady != nil {
 		qstate = newClaudeQuestionState(stdinW)
+		qstate.setOnResolved(opts.OnQuestionResolved)
 		opts.OnQuestionReady(qstate.answer)
 	}
 	// Watched user turns hold a question until the turn ends; automated turns

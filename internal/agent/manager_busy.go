@@ -200,6 +200,69 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 	return nil
 }
 
+// markQuestionRaised records requestID as pending for agentID and fires
+// OnQuestionRaised exactly once for THIS requestID — re-observing a
+// requestID that is already tracked as pending (e.g. a duplicate
+// user_question event) doesn't re-notify, but a second distinct question
+// raised while an earlier one is still outstanding does, since each is its
+// own raise the user hasn't been told about yet. The callback runs in its
+// own goroutine (mirroring how OnChatDone is invoked) so a slow web-push
+// send can't delay forwarding the user_question ChatEvent to the WS client.
+func (m *Manager) markQuestionRaised(agentID, requestID string) {
+	m.busyMu.Lock()
+	if m.pendingQuestions == nil {
+		m.pendingQuestions = make(map[string]map[string]struct{})
+	}
+	set, ok := m.pendingQuestions[agentID]
+	if !ok {
+		set = make(map[string]struct{})
+		m.pendingQuestions[agentID] = set
+	}
+	_, alreadyPending := set[requestID]
+	set[requestID] = struct{}{}
+	m.busyMu.Unlock()
+	if !alreadyPending && m.OnQuestionRaised != nil {
+		go m.OnQuestionRaised(agentID)
+	}
+}
+
+// clearQuestion removes requestID from agentID's pending set. Wired as
+// ChatOptions.OnQuestionResolved so it fires whenever a question is
+// answered, denied, or auto-denied on timeout — regardless of which path
+// resolved it. Idempotent: safe to call for an already-cleared requestID
+// (e.g. Manager.AnswerQuestion and a racing backend timeout both resolving
+// the same question) or an agent with no tracked questions at all.
+func (m *Manager) clearQuestion(agentID, requestID string) {
+	m.busyMu.Lock()
+	if set, ok := m.pendingQuestions[agentID]; ok {
+		delete(set, requestID)
+		if len(set) == 0 {
+			delete(m.pendingQuestions, agentID)
+		}
+	}
+	m.busyMu.Unlock()
+}
+
+// clearAllQuestionsForAgent drops every pending question tracked for
+// agentID. Safety-net cleanup: processChatEvents defers this on every exit
+// path (done, error, abort, or the backend process dying outright) so a
+// question that never received an explicit resolution can never leave
+// AwaitingAnswer stuck on past the turn that raised it.
+func (m *Manager) clearAllQuestionsForAgent(agentID string) {
+	m.busyMu.Lock()
+	delete(m.pendingQuestions, agentID)
+	m.busyMu.Unlock()
+}
+
+// HasPendingQuestion reports whether agentID currently has an unanswered
+// AskUserQuestion prompt outstanding. Folded into Agent.AwaitingAnswer by
+// Manager.List.
+func (m *Manager) HasPendingQuestion(agentID string) bool {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	return len(m.pendingQuestions[agentID]) > 0
+}
+
 // formatAnswers renders an answers map as a readable transcript line, e.g.
 // "answered: 色選択 → 青". Keys are sorted for deterministic output.
 func formatAnswers(answers map[string]any) string {

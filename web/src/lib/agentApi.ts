@@ -175,6 +175,12 @@ export interface AgentInfo {
   // folds it into the "N running" figure so a chatting agent counts even
   // when it has no terminal session. Server-derived; never sent on update.
   busy?: boolean;
+  // awaitingAnswer is a runtime-only flag: true while the agent's running
+  // turn has an unanswered AskUserQuestion prompt outstanding (server-side
+  // Manager.HasPendingQuestion). The dashboard highlights the agent row so
+  // a turn blocked on human input is obvious at a glance. Server-derived;
+  // never sent on update.
+  awaitingAnswer?: boolean;
 }
 
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for

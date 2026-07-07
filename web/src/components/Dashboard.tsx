@@ -448,6 +448,15 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   const busyAgentCount = agents.filter((a) => a.busy).length;
   const runningCount =
     visibleSessions.filter((s) => s.status === "running").length + busyAgentCount;
+  // Rank agents waiting on a human answer above busy agents above everyone
+  // else, so a turn blocked on AskUserQuestion (and, one tier down, any
+  // in-flight chat) floats to the top regardless of recency. Lower rank
+  // sorts first.
+  const agentRank = (a: AgentInfo) => {
+    if (a.awaitingAnswer) return 0;
+    if (a.busy) return 1;
+    return 2;
+  };
   // Order by most-recent activity: newest last message first. lastMessageAt
   // is epoch-millis (server-derived from the message row's created_at), so
   // it survives restarts and doesn't suffer the same-second ties that the
@@ -457,6 +466,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   // undefined) sort last, ordered by createdAt desc; id is the final
   // deterministic tiebreak.
   const sortedAgents = [...agents].sort((a, b) => {
+    const rdiff = agentRank(a) - agentRank(b);
+    if (rdiff !== 0) return rdiff;
     const aTs = a.lastMessageAt ?? 0;
     const bTs = b.lastMessageAt ?? 0;
     if (aTs !== bTs) return bTs - aTs;
@@ -627,7 +638,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       ? agent.persona.slice(0, 60) + (agent.persona.length > 60 ? "..." : "")
                       : "No messages yet";
                 return (
-                  <div key={agent.id} className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}`}>
+                  <div
+                    key={agent.id}
+                    className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}${
+                      agent.awaitingAnswer ? " bg-lamp-warn/10" : ""
+                    }`}
+                  >
                     <button
                       onClick={() => navigate(`/agents/${agent.id}`)}
                       className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
@@ -638,6 +654,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
                           <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
+                          {agent.awaitingAnswer && (
+                            <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-warn/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-warn">
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-lamp-warn" />
+                              回答待ち
+                            </span>
+                          )}
                           {agent.holderPeer && (
                             <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
                               転移中 @ {agent.holderPeerName || agent.holderPeer.slice(0, 8)}

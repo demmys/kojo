@@ -129,6 +129,7 @@ var reservedAgentKeys = map[string]bool{
 	"holderPeerName":   true,
 	"holderPeerStatus": true,
 	"busy":             true,
+	"awaitingAnswer":   true,
 }
 
 // lowerKeySet returns a copy of src whose keys are all canonical-lower.
@@ -240,6 +241,7 @@ var loadStripKeys = map[string]bool{
 	"holderPeerName":   true,
 	"holderPeerStatus": true,
 	"busy":             true,
+	"awaitingAnswer":   true,
 }
 
 // agentStore persists agent metadata to the v1 SQLite store.

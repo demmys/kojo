@@ -10,12 +10,22 @@ self.addEventListener("push", (event) => {
   let body = "";
   let tag = "kojo";
   let navData = {};
+  let renotify = false;
 
   if (data.type === "agent_chat_done") {
     title = data.name || "Agent";
     body = data.preview || "Response ready";
     tag = `kojo-agent-${data.agentId}`;
     navData = { agentId: data.agentId };
+  } else if (data.type === "agent_awaiting_input") {
+    title = `回答待ち: ${data.name || "Agent"}`;
+    body = "エージェントが質問への回答を待っています";
+    tag = `kojo-agent-${data.agentId}`;
+    navData = { agentId: data.agentId };
+    // A second question raised on the same agent while an earlier
+    // notification is still sitting unread would otherwise be silently
+    // folded into the same tag with no re-alert.
+    renotify = true;
   }
 
   event.waitUntil(
@@ -23,6 +33,7 @@ self.addEventListener("push", (event) => {
       body,
       tag,
       data: navData,
+      renotify,
     })
   );
 });

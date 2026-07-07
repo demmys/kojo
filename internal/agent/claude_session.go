@@ -257,6 +257,11 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 		if opts.OnSteerReady != nil {
 			opts.OnSteerReady(sess.stdinW.writeUserLine)
 		}
+		// qstate is shared across every turn on this persistent process, so
+		// re-wire its resolved-callback each turn to whatever the current
+		// Chat() call passed (they all close over the same stable agentID,
+		// but keeping this fresh avoids relying on that coincidence).
+		sess.qstate.setOnResolved(opts.OnQuestionResolved)
 		if canAnswer {
 			opts.OnQuestionReady(sess.qstate.answer)
 		}

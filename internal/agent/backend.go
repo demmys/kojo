@@ -97,6 +97,19 @@ type ChatOptions struct {
 	// prompt to a user (or automated turns) simply never call this and
 	// auto-deny/auto-allow control_requests internally.
 	OnQuestionReady func(AnswerFunc)
+
+	// OnQuestionResolved, if set, is invoked by a backend every time a
+	// pending AskUserQuestion prompt is resolved — whether by an explicit
+	// answer/deny (via the AnswerFunc handed to OnQuestionReady), an
+	// automated-turn timeout, or a deny issued because no UI ever picked
+	// the question up. It receives the same requestID the question was
+	// raised under (see ChatEvent.RequestID on the "user_question" event),
+	// so the caller can clear whatever pending-question bookkeeping it
+	// keyed on that ID. May fire more than once for the same requestID if
+	// two resolution paths race (harmless — callers must make clearing
+	// idempotent). Backends that never surface questions simply never
+	// call this.
+	OnQuestionResolved func(requestID string)
 }
 
 // AnswerFunc resolves a pending interactive AskUserQuestion by writing the

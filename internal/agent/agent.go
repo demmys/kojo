@@ -439,6 +439,14 @@ type Agent struct {
 	// holder* fields. The dashboard folds it into its "N running" figure
 	// so a chatting agent registers even when no terminal session is up.
 	Busy bool `json:"busy,omitempty"`
+
+	// AwaitingAnswer is a runtime-only flag set by Manager.List when the
+	// agent's running turn has raised an AskUserQuestion prompt that is
+	// still unanswered (see Manager.HasPendingQuestion). Never persisted —
+	// stripped from settings_json on Save and Load like Busy and the
+	// holder* fields. The dashboard highlights the agent row so a
+	// blocked-on-human turn is obvious at a glance.
+	AwaitingAnswer bool `json:"awaitingAnswer,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -128,6 +129,58 @@ func (m *Manager) Steer(ctx context.Context, agentID, text string) error {
 	}
 	m.busyMu.Unlock()
 	return nil
+}
+
+// AnswerQuestion resolves a pending interactive AskUserQuestion raised by the
+// agent's running turn (claude backend only — see ChatOptions.OnQuestionReady).
+// On allow, answers maps each question string to the chosen answer; on deny the
+// tool call is refused with denyMessage. Returns ErrAgentNotBusy when no turn is
+// running (or the backend can't answer) and ErrQuestionNotFound when requestID
+// doesn't match a pending question. On a successful allow it appends a readable
+// user message recording the answers to the transcript (mirroring Steer) so the
+// Q&A survives a reload.
+func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string, answers map[string]any, deny bool, denyMessage string) error {
+	m.busyMu.Lock()
+	entry, ok := m.busy[agentID]
+	m.busyMu.Unlock()
+	if !ok || entry.answer == nil {
+		return ErrAgentNotBusy
+	}
+	if err := entry.answer(requestID, answers, deny, denyMessage); err != nil {
+		return err
+	}
+	if deny {
+		return nil
+	}
+	// Record the answers as a user message so the exchange survives reload.
+	msg := newUserMessage(formatAnswers(answers), nil)
+	if appendErr := appendMessage(agentID, msg); appendErr != nil {
+		m.logger.Warn("failed to save answer message", "agent", agentID, "err", appendErr)
+	}
+	m.busyMu.Lock()
+	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {
+		select {
+		case cur.outCh <- ChatEvent{Type: "message", Message: msg}:
+		default:
+		}
+	}
+	m.busyMu.Unlock()
+	return nil
+}
+
+// formatAnswers renders an answers map as a readable transcript line, e.g.
+// "answered: 色選択 → 青". Keys are sorted for deterministic output.
+func formatAnswers(answers map[string]any) string {
+	keys := make([]string, 0, len(answers))
+	for k := range answers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s → %v", k, answers[k]))
+	}
+	return "answered: " + strings.Join(parts, ", ")
 }
 
 // steerHandleWait bounds how long Steer waits for a starting turn to

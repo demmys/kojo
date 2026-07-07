@@ -52,7 +52,7 @@ func collect(t *testing.T, ch <-chan ChatEvent, timeout time.Duration) []ChatEve
 
 func TestSessionSolicitedTurn(t *testing.T) {
 	s, pw := newTestSession(t, nil)
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi")
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestSessionNotifResultDuringSolicitedTurn(t *testing.T) {
 	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent) {
 		bgCh <- events
 	})
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi")
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestSessionEmptyUnsolicitedDropped(t *testing.T) {
 
 func TestSessionEOFMidTurnErrors(t *testing.T) {
 	s, pw := newTestSession(t, nil)
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi")
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}
@@ -221,10 +221,10 @@ func TestSessionEOFMidTurnErrors(t *testing.T) {
 func TestSessionBusyRejectsSecondTurn(t *testing.T) {
 	s, pw := newTestSession(t, nil)
 	defer pw.Close()
-	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi"); err != nil {
+	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false); err != nil {
 		t.Fatalf("startTurn 1: %v", err)
 	}
-	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "again"); err != ErrAgentBusy {
+	if _, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "again", false); err != ErrAgentBusy {
 		t.Fatalf("startTurn 2 err = %v, want ErrAgentBusy", err)
 	}
 }
@@ -237,7 +237,7 @@ func TestSessionStrayIdleEventsDoNotOpenTurn(t *testing.T) {
 		}
 	})
 	// Complete a solicited turn.
-	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi")
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false)
 	if err != nil {
 		t.Fatalf("startTurn: %v", err)
 	}

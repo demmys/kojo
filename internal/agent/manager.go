@@ -46,6 +46,10 @@ type busyEntry struct {
 	// nil for backends that don't support mid-turn steering or before the
 	// backend's stdin pipe has become ready.
 	steer SteerFunc
+	// answer, when set, resolves a pending interactive AskUserQuestion on the
+	// running turn (claude backend only — see ChatOptions.OnQuestionReady).
+	// nil for backends/turns that can't surface a question to a user.
+	answer AnswerFunc
 	// outCh is the raw event channel the broadcaster fans out from. Steer
 	// pushes a "message" event onto it (mirroring how Chat injects the
 	// system-role turn-start message) so already-subscribed clients see
@@ -2130,6 +2134,14 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			}
 			m.busyMu.Unlock()
 		},
+		OnQuestionReady: func(fn AnswerFunc) {
+			m.busyMu.Lock()
+			if entry, ok := m.busy[agentID]; ok {
+				entry.answer = fn
+				m.busy[agentID] = entry
+			}
+			m.busyMu.Unlock()
+		},
 	})
 	if err != nil {
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
@@ -2752,10 +2764,12 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			handleTerminal(&event)
 
 			// Terminal events (done/error) use blocking send so the
-			// client always receives them. Streaming events use
+			// client always receives them. A user_question also blocks:
+			// dropping it would leave the CLI waiting on a control_response
+			// the UI never rendered, wedging the turn. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),
 			// they are dropped but processing continues.
-			if event.Type == "done" || event.Type == "error" {
+			if event.Type == "done" || event.Type == "error" || event.Type == "user_question" {
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
@@ -3558,6 +3572,16 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 				m.busyMu.Lock()
 				if entry, ok := m.busy[agentID]; ok {
 					entry.steer = fn
+					m.busy[agentID] = entry
+				}
+				m.busyMu.Unlock()
+			},
+			// A regenerate is a user-driven turn, so AskUserQuestion prompts
+			// should surface to the UI rather than auto-deny.
+			OnQuestionReady: func(fn AnswerFunc) {
+				m.busyMu.Lock()
+				if entry, ok := m.busy[agentID]; ok {
+					entry.answer = fn
 					m.busy[agentID] = entry
 				}
 				m.busyMu.Unlock()

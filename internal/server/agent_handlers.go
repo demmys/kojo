@@ -1733,6 +1733,47 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleAnswerAgentQuestion — POST /api/v1/agents/{id}/answer. Resolves a
+// pending interactive AskUserQuestion raised by the agent's running turn.
+// Body: {"requestId":"...","answers":{...}} to allow, or
+// {"requestId":"...","deny":true} to refuse. Mirrors the auth posture of the
+// steer handler (server-wide auth listener).
+func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var body struct {
+		RequestID   string         `json:"requestId"`
+		Answers     map[string]any `json:"answers"`
+		Deny        bool           `json:"deny"`
+		DenyMessage string         `json:"denyMessage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+	if strings.TrimSpace(body.RequestID) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "requestId is required")
+		return
+	}
+	if !body.Deny && len(body.Answers) == 0 {
+		writeError(w, http.StatusBadRequest, "bad_request", "answers or deny is required")
+		return
+	}
+
+	if err := s.agents.AnswerQuestion(r.Context(), id, body.RequestID, body.Answers, body.Deny, body.DenyMessage); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotBusy):
+			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
+		case errors.Is(err, agent.ErrQuestionNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "no pending question with that request id")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleRegenerateMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	msgID := r.PathValue("msgId")

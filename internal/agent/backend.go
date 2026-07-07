@@ -88,7 +88,24 @@ type ChatOptions struct {
 	// handle) and call later to inject text into the running turn.
 	// Backends that don't support steering simply never call this.
 	OnSteerReady func(SteerFunc)
+
+	// OnQuestionReady, if set, is invoked once by a backend that supports
+	// interactive AskUserQuestion prompts (claude: --permission-prompt-tool
+	// stdio) as soon as the turn can accept answers. The callback receives an
+	// AnswerFunc the caller can register (e.g. on a busy-turn handle) and call
+	// later to unblock a pending question. Backends that can't surface the
+	// prompt to a user (or automated turns) simply never call this and
+	// auto-deny/auto-allow control_requests internally.
+	OnQuestionReady func(AnswerFunc)
 }
+
+// AnswerFunc resolves a pending interactive AskUserQuestion by writing the
+// CLI control_response for requestID. When deny is true the tool call is
+// refused with denyMessage; otherwise answers maps each question string to
+// the chosen answer (a label, a ", "-joined list of labels for multiSelect,
+// or a free-form string). Returns ErrQuestionNotFound if requestID is not
+// pending, or ErrAgentNotBusy if the turn already ended.
+type AnswerFunc func(requestID string, answers map[string]any, deny bool, denyMessage string) error
 
 // SteerFunc injects an additional user message into an in-flight turn.
 // Returns an error if the turn has already finished (process exited /

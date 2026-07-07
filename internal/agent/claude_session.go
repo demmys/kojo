@@ -57,6 +57,9 @@ type claudeSession struct {
 	cmd        *exec.Cmd
 	stdinW     *claudeStdinWriter
 	stderr     *bytes.Buffer
+	// qstate answers interactive AskUserQuestion control_requests. Shared
+	// across turns on this process (requestIDs are unique per prompt).
+	qstate *claudeQuestionState
 
 	mu           sync.Mutex
 	state        sessionState
@@ -66,10 +69,11 @@ type claudeSession struct {
 	prevUsage    Usage // cumulative modelUsage totals seen so far (for per-turn delta)
 
 	// current turn (guarded by mu)
-	acc         *turnAccumulator
-	turnSink    chan ChatEvent  // events for the active turn
-	turnCtx     context.Context // solicited turn's context (Background for unsolicited)
-	unsolicited bool            // true when the active turn is a background notification
+	acc           *turnAccumulator
+	turnSink      chan ChatEvent  // events for the active turn
+	turnCtx       context.Context // solicited turn's context (Background for unsolicited)
+	unsolicited   bool            // true when the active turn is a background notification
+	turnCanAnswer bool            // true when a user can answer AskUserQuestion this turn
 	turnDone    chan struct{}   // closed when the active turn's result is delivered
 }
 
@@ -237,10 +241,16 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
 
-	ch, err := sess.startTurn(ctx, agent, userMessage)
+	// A question can only be surfaced when the caller wired an answer channel
+	// and the turn is watched by a user; otherwise readLoop auto-denies.
+	canAnswer := opts.OnQuestionReady != nil && !opts.AutomatedTrigger
+	ch, err := sess.startTurn(ctx, agent, userMessage, canAnswer)
 	if err == nil {
 		if opts.OnSteerReady != nil {
 			opts.OnSteerReady(sess.stdinW.writeUserLine)
+		}
+		if canAnswer {
+			opts.OnQuestionReady(sess.qstate.answer)
 		}
 		return ch, nil
 	}
@@ -346,6 +356,7 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		state:        sessIdle,
 		lastActivity: time.Now(),
 	}
+	s.qstate = newClaudeQuestionState(s.stdinW)
 	go s.readLoop(stdout)
 	b.logger.Info("claude persistent session spawned", "agent", agentID)
 	return s, nil
@@ -396,7 +407,7 @@ func (s *claudeSession) healthy(fp string) bool {
 // startTurn registers a solicited turn, writes the user message onto the live
 // stdin, and returns the turn's event channel. The returned channel receives
 // streaming events and a terminal done/error, then closes.
-func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage string) (<-chan ChatEvent, error) {
+func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage string, canAnswer bool) (<-chan ChatEvent, error) {
 	s.mu.Lock()
 	if s.state == sessDead {
 		s.mu.Unlock()
@@ -414,6 +425,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	done := make(chan struct{})
 	s.state = sessInTurn
 	s.unsolicited = false
+	s.turnCanAnswer = canAnswer
 	s.turnSink = sink
 	s.turnCtx = ctx
 	s.turnDone = done
@@ -438,14 +450,40 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	go func() {
 		select {
 		case <-ctx.Done():
-			// Start the escalation timer BEFORE the control write and fire the
-			// write in its own goroutine: a wedged stdin pipe must not delay
+			// The caller cancels ctx via defer AFTER a normal completion
+			// too, so both select arms can be ready at once and this arm
+			// can win. Re-check under the session lock that THIS turn is
+			// still the running one (turnDone identity) before firing any
+			// abort work — otherwise a deny/interrupt could land on an
+			// idle session or, worse, on the NEXT turn.
+			isStale := func() bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return s.turnDone != done || s.state != sessInTurn
+			}
+			if isStale() {
+				return
+			}
+			// Start the escalation timer BEFORE the control writes and fire them
+			// in their own goroutine: a wedged stdin pipe must not delay
 			// escalation. Without this the session could sit in sessInTurn
 			// forever and the Manager's busy/drain paths would never clear.
-			// close() EOFs stdin then cancels the process group; the readLoop's
-			// onEOF fails the turn and marks the session dead, so the next turn
-			// respawns via --resume.
-			go s.interrupt()
+			// Deny any question the model is blocked on FIRST (so the CLI can
+			// act on the interrupt rather than idling on an unanswered
+			// control_response), then interrupt. close() EOFs stdin then cancels
+			// the process group; the readLoop's onEOF fails the turn and marks
+			// the session dead, so the next turn respawns via --resume.
+			go func() {
+				// Re-check inside the goroutine too: it may be scheduled
+				// arbitrarily late, after this turn completed or the next
+				// one started, and both the deny and the interrupt write
+				// are process-global — neither may hit a successor turn.
+				if isStale() {
+					return
+				}
+				s.qstate.denyAllPending("turn aborted")
+				s.interrupt()
+			}()
 			select {
 			case <-done:
 			case <-time.After(10 * time.Second):
@@ -476,6 +514,22 @@ func (s *claudeSession) interrupt() {
 	s.stdinW.mu.Unlock()
 }
 
+// handleControlRequest resolves a can_use_tool control_request against the
+// active turn. Questions on an automated/unsolicited turn (or with no active
+// solicited turn) are auto-denied; questions on a watched user turn are
+// registered and surfaced via the turn sink; non-question tools auto-allow.
+func (s *claudeSession) handleControlRequest(cr *controlRequestMsg) {
+	s.mu.Lock()
+	acc := s.acc
+	automated := !s.turnCanAnswer || s.unsolicited || s.state != sessInTurn || acc == nil
+	s.mu.Unlock()
+	send := func(ChatEvent) bool { return true }
+	if acc != nil {
+		send = acc.send
+	}
+	handleControlRequest(cr, s.stdinW, s.qstate, automated, s.logger, send)
+}
+
 // readLoop parses the process stdout for its whole lifetime, demuxing turns.
 func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) {
 	scanner := bufio.NewScanner(stdout)
@@ -483,6 +537,10 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
+			continue
+		}
+		if cr, ok := maybeControlRequest(line); ok {
+			s.handleControlRequest(cr)
 			continue
 		}
 		event, rawParent, ok := decodeClaudeStreamLine(line, s.logger)
@@ -637,6 +695,9 @@ func (s *claudeSession) completeTurn() {
 	s.armReapLocked()
 	s.mu.Unlock()
 
+	// Release any question left unanswered at the turn boundary (abort path).
+	s.qstate.denyAllPending("turn ended before the question was answered")
+
 	if acc == nil || sink == nil {
 		return
 	}
@@ -746,6 +807,9 @@ func (s *claudeSession) onEOF() {
 		s.reapTimer = nil
 	}
 	s.mu.Unlock()
+
+	// Process is gone; clear any pending question (writes fail harmlessly).
+	s.qstate.denyAllPending("session process exited")
 
 	if sink != nil {
 		if acc != nil {

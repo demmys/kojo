@@ -300,8 +300,22 @@ export interface OTPEntry {
   period?: number;
 }
 
+// UserQuestionOption is one selectable answer for an AskUserQuestion prompt.
+export interface UserQuestionOption {
+  label: string;
+  description?: string;
+}
+
+// UserQuestion is one question in an AskUserQuestion control_request.
+export interface UserQuestion {
+  question: string;
+  header?: string;
+  options?: UserQuestionOption[];
+  multiSelect?: boolean;
+}
+
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -311,6 +325,10 @@ export interface ChatEvent {
   message?: AgentMessage;
   attachments?: AgentMessageAttachment[]; // streamed kojo-attach files
   errorMessage?: string;
+  // Set on "user_question" events: the control_request id echoed back to the
+  // answer endpoint, and the raw AskUserQuestion questions payload.
+  requestId?: string;
+  questions?: UserQuestion[];
   startedAt?: string; // RFC3339 timestamp of when processing started
   // Set when this event belongs to a subagent (Task tool) turn rather
   // than the main assistant turn. Value is the tool_use ID of the
@@ -646,6 +664,24 @@ export const agentApi = {
   // support steering — callers should fall back to a normal send.
   steerAgent: (agentId: string, content: string) =>
     post<{ ok: boolean }>(`/api/v1/agents/${agentId}/steer`, { content }),
+
+  // answerQuestion resolves a pending interactive AskUserQuestion on the
+  // agent's running turn. Pass answers (question → chosen answer) to allow, or
+  // deny=true to refuse. Rejects with "409:"/"404:" prefixed errors when the
+  // turn ended or the question already resolved.
+  answerAgentQuestion: (
+    agentId: string,
+    requestId: string,
+    answers: Record<string, string | string[]>,
+    deny = false,
+    denyMessage = "",
+  ) =>
+    post<{ ok: boolean }>(`/api/v1/agents/${agentId}/answer`, {
+      requestId,
+      answers,
+      deny,
+      denyMessage,
+    }),
 
   getQueuedMessages: (agentId: string) =>
     get<{ messages: QueuedAgentMessage[] }>(

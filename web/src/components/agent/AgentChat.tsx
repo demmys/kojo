@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useNavigate, useLocation } from "react-router";
-import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent, type QueuedAgentMessage } from "../../lib/agentApi";
+import { agentApi, type AgentInfo, type AgentMessage, type AgentMessageAttachment, type ChatEvent, type QueuedAgentMessage, type UserQuestion } from "../../lib/agentApi";
+import { UserQuestionCard, type PendingQuestion } from "./UserQuestionCard";
 import { errMsg, localRFC3339 } from "../../lib/utils";
 import { useEnterSends } from "../../lib/preferences";
 import { useAgentWebSocket } from "../../hooks/useAgentWebSocket";
@@ -79,6 +80,9 @@ export function AgentChat() {
   const [streamStartTime, setStreamStartTime] = useState<number>(Date.now());
   const [streamViewMode, setStreamViewMode] = useState<"markdown" | "plain">("markdown");
   const [streamAttachments, setStreamAttachments] = useState<AgentMessageAttachment[]>([]);
+  // Pending interactive AskUserQuestion prompts raised by the running turn.
+  // Rendered as cards below the live stream; cleared when the turn ends.
+  const [pendingQuestions, setPendingQuestions] = useState<PendingQuestion[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const {
     pendingFiles,
@@ -429,6 +433,7 @@ export function AgentChat() {
     setStreamThinking("");
     setStreamTools([]);
     setStreamAttachments([]);
+    setPendingQuestions([]);
     setStreamStatus("");
     setStreamStartTime(Date.now());
     liveStreamTextRef.current = "";
@@ -486,9 +491,25 @@ export function AgentChat() {
           }
           break;
         }
+        case "user_question": {
+          if (event.requestId && event.questions) {
+            const q: UserQuestion[] = event.questions;
+            const reqId = event.requestId;
+            setPendingQuestions((prev) =>
+              prev.some((p) => p.requestId === reqId)
+                ? prev
+                : [...prev, { requestId: reqId, questions: q }],
+            );
+          }
+          break;
+        }
         case "message": {
           if (event.message) {
             const m = event.message;
+            // An answered question comes back as a user message; drop its card.
+            if (m.role === "user" && m.content.startsWith("answered:")) {
+              setPendingQuestions([]);
+            }
             // A steered user message comes back over the WS with a real
             // server id; drop the optimistic "pending_" copy (matched by
             // role+content) before the id-keyed dedupe append.
@@ -1192,6 +1213,17 @@ export function AgentChat() {
             onViewModeChange={setStreamViewMode}
           />
         )}
+        {pendingQuestions.map((pq) => (
+          <UserQuestionCard
+            key={pq.requestId}
+            pending={pq}
+            onSubmit={async (answers) => {
+              if (!id) return;
+              await agentApi.answerAgentQuestion(id, pq.requestId, answers);
+              setPendingQuestions((prev) => prev.filter((p) => p.requestId !== pq.requestId));
+            }}
+          />
+        ))}
         <div ref={messagesEndRef} />
         </div>
       </div>

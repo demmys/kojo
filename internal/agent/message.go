@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -109,6 +110,16 @@ type ChatEvent struct {
 	// a non-empty ParentToolUseID; the UI instead nests them under the
 	// matching Task tool chip.
 	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+	// RequestID identifies a control_request the CLI raised for an
+	// interactive tool (currently AskUserQuestion). Set only on
+	// "user_question" events; the Web UI echoes it back to
+	// POST /agents/{id}/answer so the server can pair the answer with the
+	// blocked control_request.
+	RequestID string `json:"requestId,omitempty"`
+	// Questions carries the raw AskUserQuestion input.questions array
+	// (the CLI's tool input) so the UI can render the question card. Only
+	// populated on "user_question" events.
+	Questions json.RawMessage `json:"questions,omitempty"`
 }
 
 func generateMessageID() string {

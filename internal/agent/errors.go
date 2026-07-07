@@ -27,4 +27,9 @@ var (
 	// ErrAgentNotBusy is returned by Steer / SteerOneShot when there is no
 	// turn currently running to steer.
 	ErrAgentNotBusy = errors.New("agent has no turn in progress")
+
+	// ErrQuestionNotFound is returned by Manager.AnswerQuestion when the
+	// given requestID does not match any pending user_question on the
+	// agent's running turn (already answered, expired, or never existed).
+	ErrQuestionNotFound = errors.New("no pending question with that request id")
 )

@@ -848,6 +848,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/queued-messages", s.handleListQueuedAgentMessages)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/queued-messages/{qid}", s.handleCancelQueuedAgentMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/steer", s.handleSteerAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/answer", s.handleAnswerAgentQuestion)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/messages/{msgId}", s.handleUpdateMessage)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/messages/{msgId}", s.handleDeleteMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/messages/{msgId}/regenerate", s.handleRegenerateMessage)

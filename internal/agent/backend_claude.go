@@ -66,6 +66,37 @@ func (s *claudeStdinWriter) writeUserLine(text string) error {
 	return nil
 }
 
+// writeControlResponse writes a control_response line answering a CLI
+// control_request (the can_use_tool permission prompt). resp is the inner
+// "response" object (e.g. {"behavior":"allow","updatedInput":{...}} or
+// {"behavior":"deny","message":"..."}). Same closed/EPIPE handling as
+// writeUserLine so a response after the turn ended surfaces ErrAgentNotBusy.
+func (s *claudeStdinWriter) writeControlResponse(requestID string, resp map[string]any) error {
+	line, err := json.Marshal(map[string]any{
+		"type": "control_response",
+		"response": map[string]any{
+			"subtype":    "success",
+			"request_id": requestID,
+			"response":   resp,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrAgentNotBusy
+	}
+	if _, err = s.w.Write(append(line, '\n')); err != nil {
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
+			return ErrAgentNotBusy
+		}
+		return err
+	}
+	return nil
+}
+
 // close closes the underlying pipe exactly once. Safe to call multiple
 // times (e.g. once from the "result" observer and once from a deferred
 // cleanup on an early-return path).
@@ -77,6 +108,179 @@ func (s *claudeStdinWriter) close() {
 	}
 	s.closed = true
 	_ = s.w.Close()
+}
+
+// controlRequestMsg is the CLI's can_use_tool permission prompt, emitted on
+// stdout when --permission-prompt-tool stdio is set and the model calls a tool
+// that needs a decision. Under bypassPermissions the only tool that emits one
+// is AskUserQuestion (requires_user_interaction), but the generic can_use_tool
+// shape is handled defensively.
+type controlRequestMsg struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	Request   struct {
+		Subtype     string          `json:"subtype"`
+		ToolName    string          `json:"tool_name"`
+		DisplayName string          `json:"display_name"`
+		Input       json.RawMessage `json:"input"`
+		ToolUseID   string          `json:"tool_use_id"`
+	} `json:"request"`
+	RequiresUserInteraction bool `json:"requires_user_interaction"`
+}
+
+// maybeControlRequest cheaply detects and decodes a control_request line. It
+// returns (nil,false) for any other line so the caller falls through to the
+// normal stream decode.
+func maybeControlRequest(line string) (*controlRequestMsg, bool) {
+	if !strings.Contains(line, "\"control_request\"") {
+		return nil, false
+	}
+	var cr controlRequestMsg
+	if err := json.Unmarshal([]byte(line), &cr); err != nil {
+		return nil, false
+	}
+	if cr.Type != "control_request" {
+		return nil, false
+	}
+	return &cr, true
+}
+
+// automatedDenyMessage is written back when the model calls AskUserQuestion on
+// a turn no human is watching (cron, background notification, one-shot).
+const automatedDenyMessage = "No user is watching this automated turn; continue without asking and use your best judgment."
+
+// claudeQuestionState tracks the interactive AskUserQuestion prompts pending on
+// a live CLI process and answers them by writing control_response lines. One
+// instance is shared between the stream reader (which registers a pending
+// question and emits a user_question event) and the AnswerFunc the Manager
+// calls to resolve it. Safe for concurrent use.
+type claudeQuestionState struct {
+	stdinW *claudeStdinWriter
+
+	mu sync.Mutex
+	// pending maps a requestID to the CLI's original tool input (the whole
+	// {"questions":[...]} object) so the allow control_response can echo the
+	// questions array back verbatim alongside the answers.
+	pending map[string]json.RawMessage
+}
+
+func newClaudeQuestionState(stdinW *claudeStdinWriter) *claudeQuestionState {
+	return &claudeQuestionState{stdinW: stdinW, pending: make(map[string]json.RawMessage)}
+}
+
+// register records a pending question so a later answer can rebuild its
+// control_response.
+func (q *claudeQuestionState) register(requestID string, input json.RawMessage) {
+	q.mu.Lock()
+	q.pending[requestID] = append(json.RawMessage(nil), input...)
+	q.mu.Unlock()
+}
+
+// answer implements AnswerFunc: it builds and writes the control_response for a
+// pending question. Returns ErrQuestionNotFound if requestID is unknown.
+func (q *claudeQuestionState) answer(requestID string, answers map[string]any, deny bool, denyMessage string) error {
+	q.mu.Lock()
+	input, ok := q.pending[requestID]
+	if ok {
+		delete(q.pending, requestID)
+	}
+	q.mu.Unlock()
+	if !ok {
+		return ErrQuestionNotFound
+	}
+	var resp map[string]any
+	if deny {
+		if denyMessage == "" {
+			denyMessage = "The user declined to answer."
+		}
+		resp = map[string]any{"behavior": "deny", "message": denyMessage}
+	} else {
+		// Echo the original questions array back with the answers map, as the
+		// CLI expects for behavior=allow (see updatedInput contract).
+		var orig struct {
+			Questions json.RawMessage `json:"questions"`
+		}
+		_ = json.Unmarshal(input, &orig)
+		resp = map[string]any{
+			"behavior": "allow",
+			"updatedInput": map[string]any{
+				"questions": orig.Questions,
+				"answers":   answers,
+			},
+		}
+	}
+	return q.stdinW.writeControlResponse(requestID, resp)
+}
+
+// denyAllPending writes a deny control_response for every still-pending
+// question and clears the map. Called when a turn ends/aborts with a question
+// unanswered so the CLI isn't left blocked (best-effort — a dead process just
+// fails the write). Safe to call with a nil receiver.
+func (q *claudeQuestionState) denyAllPending(reason string) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	ids := make([]string, 0, len(q.pending))
+	for id := range q.pending {
+		ids = append(ids, id)
+	}
+	q.pending = make(map[string]json.RawMessage)
+	q.mu.Unlock()
+	for _, id := range ids {
+		_ = q.stdinW.writeControlResponse(id, map[string]any{"behavior": "deny", "message": reason})
+	}
+}
+
+// handleControlRequest resolves a decoded can_use_tool control_request. It
+// never blocks: non-AskUserQuestion tools are auto-allowed (preserving
+// bypassPermissions semantics); AskUserQuestion is auto-denied on automated
+// turns or when no answer channel exists (qstate nil), and otherwise registered
+// as pending with a user_question event emitted via send for the UI to render.
+func handleControlRequest(cr *controlRequestMsg, stdinW *claudeStdinWriter, qstate *claudeQuestionState, automated bool, logger *slog.Logger, send func(ChatEvent) bool) {
+	if cr.Request.Subtype != "can_use_tool" {
+		// Other control_request subtypes (e.g. our own interrupt's response
+		// path) are not permission prompts; nothing to answer here.
+		return
+	}
+	if cr.Request.ToolName != "AskUserQuestion" {
+		// Under bypassPermissions normal tools don't emit these, but answer
+		// defensively so an unexpected prompt never wedges the turn.
+		if err := stdinW.writeControlResponse(cr.RequestID, map[string]any{
+			"behavior":     "allow",
+			"updatedInput": cr.Request.Input,
+		}); err != nil {
+			logger.Debug("auto-allow control_request write failed", "tool", cr.Request.ToolName, "err", err)
+		}
+		return
+	}
+	if automated || qstate == nil {
+		if err := stdinW.writeControlResponse(cr.RequestID, map[string]any{
+			"behavior": "deny",
+			"message":  automatedDenyMessage,
+		}); err != nil {
+			logger.Debug("auto-deny AskUserQuestion write failed", "err", err)
+		}
+		return
+	}
+	// Interactive turn: register the pending question and surface it to the UI.
+	qstate.register(cr.RequestID, cr.Request.Input)
+	var inp struct {
+		Questions json.RawMessage `json:"questions"`
+	}
+	_ = json.Unmarshal(cr.Request.Input, &inp)
+	if !send(ChatEvent{
+		Type:      "user_question",
+		RequestID: cr.RequestID,
+		ToolUseID: cr.Request.ToolUseID,
+		Questions: inp.Questions,
+	}) {
+		// The turn was cancelled / the consumer went away before the question
+		// reached any UI: nobody can answer it, so deny now instead of leaving
+		// the CLI blocked on a control_response.
+		q, deny, denyMsg := cr.RequestID, true, automatedDenyMessage
+		_ = qstate.answer(q, nil, deny, denyMsg)
+	}
 }
 
 // ClaudeBackend implements ChatBackend using the Claude CLI with stream-json output.
@@ -224,6 +428,15 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		opts.OnSteerReady(stdinW.writeUserLine)
 	}
 
+	// qstate is only allocated for interactive turns that can surface an
+	// AskUserQuestion prompt to a user (OnQuestionReady set). Automated /
+	// unwatched one-shot turns leave it nil so questions are auto-denied.
+	var qstate *claudeQuestionState
+	if opts.OnQuestionReady != nil && !opts.AutomatedTrigger {
+		qstate = newClaudeQuestionState(stdinW)
+		opts.OnQuestionReady(qstate.answer)
+	}
+
 	ch := make(chan ChatEvent, 64)
 
 	go func() {
@@ -232,11 +445,14 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// an early-return path (cancelled stream, process error, etc.)
 		// that never reaches the "result" event below.
 		defer stdinW.close()
+		// Any question left pending at turn end/abort must be released so a
+		// blocked CLI can exit and a late answer maps to not-found.
+		defer qstate.denyAllPending("turn ended before the question was answered")
 
 		// send is a helper that respects context cancellation to avoid goroutine leaks.
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
-		result := parseClaudeStream(stdout, b.logger, send, stdinW.close)
+		result := parseClaudeStream(stdout, b.logger, send, stdinW.close, stdinW, qstate, opts.AutomatedTrigger)
 
 		// If stream was cancelled (send returned false), clean up process
 		// and emit a partial done event so the transcript is persisted.
@@ -360,13 +576,20 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 		"--permission-mode", "bypassPermissions",
 		// Disable tools that don't apply in kojo's non-interactive agent
 		// context:
-		//   - AskUserQuestion / EnterPlanMode / ExitPlanMode: prompt the
-		//     human via the host CLI's UI; the agent chat backend has no
-		//     way to surface or respond to those prompts.
+		//   - EnterPlanMode / ExitPlanMode: prompt the human via the host
+		//     CLI's UI; the agent chat backend has no way to surface those.
 		//   - CronCreate / CronDelete / CronList / ScheduleWakeup: the
 		//     scheduled job would fire against the user's claude, not
 		//     this agent's session.
-		"--disallowedTools", "AskUserQuestion,EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup",
+		// AskUserQuestion is NOT disallowed — it's routed through the
+		// control_request/control_response protocol so the Web UI can render
+		// the prompt (interactive turns) or the backend auto-denies it
+		// (automated turns). See --permission-prompt-tool below.
+		"--disallowedTools", "EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup",
+		// Route interactive-tool permission decisions (AskUserQuestion) to
+		// stdout control_request lines we answer on stdin, even under
+		// bypassPermissions. Without this the CLI never surfaces the prompt.
+		"--permission-prompt-tool", "stdio",
 	}
 
 	// Fable-family models emit some mid-turn prose as "narration" blocks
@@ -505,7 +728,11 @@ func mergeStreamTexts(r *streamParseResult) string {
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
 // via the send callback. Returns the accumulated parse result.
 // If send returns false (channel full / context cancelled), parsing stops immediately.
-func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func()) *streamParseResult {
+// qstate/automated drive interactive AskUserQuestion handling: qstate is nil
+// (or automated true) for turns with no watching user, in which case any
+// control_request is answered inline (auto-allow / auto-deny) rather than
+// surfaced.
+func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func(), stdinW *claudeStdinWriter, qstate *claudeQuestionState, automated bool) *streamParseResult {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -513,6 +740,15 @@ func parseClaudeStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
+			continue
+		}
+		if cr, ok := maybeControlRequest(line); ok {
+			// stdinW is nil only on hand-rolled test streams; a live process
+			// always has one so a control_request never goes unanswered (an
+			// unanswered can_use_tool would block the CLI forever).
+			if stdinW != nil {
+				handleControlRequest(cr, stdinW, qstate, automated, logger, send)
+			}
 			continue
 		}
 		event, rawParentID, ok := decodeClaudeStreamLine(line, logger)

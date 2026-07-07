@@ -30,6 +30,21 @@ const (
 	BusySourceNotification
 )
 
+// String renders the busy source as a short lowercase tag, used in
+// DrainBlockers output and logs.
+func (s BusySource) String() string {
+	switch s {
+	case BusySourceUser:
+		return "user"
+	case BusySourceCron:
+		return "cron"
+	case BusySourceNotification:
+		return "notification"
+	default:
+		return fmt.Sprintf("source(%d)", int(s))
+	}
+}
+
 type busyEntry struct {
 	cancel      context.CancelFunc
 	startedAt   time.Time
@@ -193,6 +208,7 @@ type Manager struct {
 	oneShotSeq       int64
 	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
 	oneShotSessions  map[string]map[int64]string             // agentID → id → SessionKey (restart-wake thread routing)
+	oneShotArmed     map[string]map[int64]time.Time          // agentID → id → armed-at (DrainBlockers age reporting)
 	oneShotCancelsMu sync.Mutex
 
 	// oneShotSteers tracks the steer handle for an in-flight ChatOneShot
@@ -410,6 +426,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		chatWatchers:    make(map[string]map[*chatWatcher]struct{}),
 		oneShotCancels:  make(map[string]map[int64]context.CancelFunc),
 		oneShotSessions: make(map[string]map[int64]string),
+		oneShotArmed:    make(map[string]map[int64]time.Time),
 		oneShotSteers:   make(map[string]SteerFunc),
 	}
 
@@ -3187,6 +3204,13 @@ func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessio
 		m.oneShotSessions[agentID] = make(map[int64]string)
 	}
 	m.oneShotSessions[agentID][id] = sessionKey
+	// Record when the one-shot was armed so DrainBlockers can report its
+	// age — a long-lived one-shot that never untracks is the most likely
+	// culprit for a stuck restart drain.
+	if m.oneShotArmed[agentID] == nil {
+		m.oneShotArmed[agentID] = make(map[int64]time.Time)
+	}
+	m.oneShotArmed[agentID][id] = time.Now()
 	return id
 }
 
@@ -3229,6 +3253,12 @@ func (m *Manager) untrackOneShot(agentID string, id int64) {
 			delete(m.oneShotSessions, agentID)
 		}
 	}
+	if set, ok := m.oneShotArmed[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotArmed, agentID)
+		}
+	}
 }
 
 // cancelOneShots cancels all in-flight one-shot chats for an agent.
@@ -3253,6 +3283,7 @@ func (m *Manager) cancelAllOneShots() {
 	all := m.oneShotCancels
 	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
+	m.oneShotArmed = make(map[string]map[int64]time.Time)
 	m.oneShotCancelsMu.Unlock()
 	for _, cancels := range all {
 		for _, cancel := range cancels {

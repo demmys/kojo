@@ -21,6 +21,60 @@ func newRestartRequest(p auth.Principal) *http.Request {
 	return authedRequest(r, p)
 }
 
+func TestSystemRestartStatus_ForbiddenForRegularAgent(t *testing.T) {
+	srv := &Server{logger: slog.Default()}
+	rr := httptest.NewRecorder()
+	r := authedRequest(httptest.NewRequest(http.MethodGet, "/api/v1/system/restart", nil),
+		auth.Principal{Role: auth.RoleAgent, AgentID: "ag_x"})
+	srv.handleSystemRestartStatus(rr, r)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rr.Code)
+	}
+}
+
+func TestSystemRestartStatus_Shape(t *testing.T) {
+	srv := &Server{logger: slog.Default()}
+	rr := httptest.NewRecorder()
+	r := authedRequest(httptest.NewRequest(http.MethodGet, "/api/v1/system/restart", nil),
+		auth.Principal{Role: auth.RoleOwner})
+	srv.handleSystemRestartStatus(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	readJSONResponse(t, rr, &body)
+	if _, ok := body["pending"].(bool); !ok {
+		t.Errorf("pending missing/not bool: %v", body["pending"])
+	}
+	if body["lastOutcome"] != "none" {
+		t.Errorf("lastOutcome = %v, want none", body["lastOutcome"])
+	}
+	if _, ok := body["lastError"]; !ok {
+		t.Errorf("lastError field missing")
+	}
+	if _, ok := body["blockers"].([]any); !ok {
+		t.Errorf("blockers missing/not array: %v", body["blockers"])
+	}
+
+	// After recording an abort, the status must reflect it.
+	srv.restartMu.Lock()
+	srv.restartLastOutcome = "aborted"
+	srv.restartLastError = "restart drain timed out; still blocked by [busy:ag_x(source=user,age=1m)]: context deadline exceeded"
+	srv.restartMu.Unlock()
+	rr2 := httptest.NewRecorder()
+	r2 := authedRequest(httptest.NewRequest(http.MethodGet, "/api/v1/system/restart", nil),
+		auth.Principal{Role: auth.RoleOwner})
+	srv.handleSystemRestartStatus(rr2, r2)
+	var body2 map[string]any
+	readJSONResponse(t, rr2, &body2)
+	if body2["lastOutcome"] != "aborted" {
+		t.Errorf("lastOutcome = %v, want aborted", body2["lastOutcome"])
+	}
+	if s, _ := body2["lastError"].(string); !strings.Contains(s, "busy:ag_x") {
+		t.Errorf("lastError missing blocker detail: %v", body2["lastError"])
+	}
+}
+
 func TestSystemRestart_ForbiddenForRegularAgent(t *testing.T) {
 	srv := &Server{logger: slog.Default()}
 	srv.SetRestartTrigger(func() bool { return true })

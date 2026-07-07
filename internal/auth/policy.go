@@ -265,7 +265,7 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	// re-checks via CanRestartServer). Owner is admitted by the
 	// IsOwner short-circuit at the top; RolePeer never reaches
 	// here (peer branch returned above).
-	if method == http.MethodPost && path == "/api/v1/system/restart" {
+	if (method == http.MethodPost || method == http.MethodGet) && path == "/api/v1/system/restart" {
 		return p.Role == RolePrivAgent
 	}
 

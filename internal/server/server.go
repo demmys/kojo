@@ -259,6 +259,12 @@ type Server struct {
 	// restartPending dedups concurrent restart requests; cleared only
 	// if the drain times out and the restart aborts.
 	restartPending atomic.Bool
+	// restartLastOutcome / restartLastError record the result of the most
+	// recent restart drain so GET /api/v1/system/restart can report why a
+	// restart aborted. "none" until the first abort; "aborted" with the
+	// blocker-bearing error after a drain timeout. Guarded by restartMu.
+	restartLastOutcome string
+	restartLastError   string
 	// repoDir is the source checkout POST /api/v1/system/rebuild runs
 	// `make build` in. Empty disables the rebuild endpoint (409).
 	// Wired from Config.RepoDir ($KOJO_REPO_DIR).
@@ -582,6 +588,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// Session routes
 	mux.HandleFunc("GET /api/v1/info", s.handleInfo)
 	mux.HandleFunc("POST /api/v1/system/restart", s.handleSystemRestart)
+	mux.HandleFunc("GET /api/v1/system/restart", s.handleSystemRestartStatus)
 	mux.HandleFunc("POST /api/v1/system/rebuild", s.handleSystemRebuild)
 	mux.HandleFunc("GET /api/v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/v1/sessions", s.handleCreateSession)

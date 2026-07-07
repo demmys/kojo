@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/auth"
@@ -212,6 +214,43 @@ func wakeThreadForRestart(p auth.Principal, wakeID string, lookup func(string) s
 	return lookup(wakeID)
 }
 
+// handleSystemRestartStatus GET /api/v1/system/restart
+//
+// Reports whether a restart drain is in flight, the outcome of the most
+// recent restart (only "aborted" is recorded — a success re-execs the
+// process), the abort error (with its blocker list), and the LIVE set of
+// drain blockers from Manager.DrainBlockers so an operator can see what a
+// stuck drain is waiting on at any time. Same auth as the restart POST
+// (Owner or a privileged agent).
+func (s *Server) handleSystemRestartStatus(w http.ResponseWriter, r *http.Request) {
+	p := auth.FromContext(r.Context())
+	if !p.CanRestartServer() {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"restart status requires Owner or a privileged agent")
+		return
+	}
+	s.restartMu.Lock()
+	outcome := s.restartLastOutcome
+	lastErr := s.restartLastError
+	s.restartMu.Unlock()
+	if outcome == "" {
+		outcome = "none"
+	}
+	var blockers []string
+	if s.agents != nil {
+		blockers = s.agents.DrainBlockers()
+	}
+	if blockers == nil {
+		blockers = []string{}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"pending":     s.restartPending.Load(),
+		"lastOutcome": outcome,
+		"lastError":   lastErr,
+		"blockers":    blockers,
+	})
+}
+
 func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
 	if !p.CanRestartServer() {
@@ -289,9 +328,31 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.Background(), restartDrainTimeout)
 			defer cancel()
 			if err := s.agents.WaitAllChatsIdle(ctx); err != nil {
-				s.logger.Error("restart aborted: chats did not drain; quiesce lifted", "err", err)
+				blockers := s.agents.DrainBlockers()
+				s.logger.Error("restart aborted: chats did not drain; quiesce lifted",
+					"err", err, "blockers", strings.Join(blockers, ", "))
 				s.agents.SetQuiescing(false)
 				s.restartPending.Store(false)
+				s.restartMu.Lock()
+				s.restartLastOutcome = "aborted"
+				s.restartLastError = err.Error()
+				s.restartMu.Unlock()
+				// Surface the abort in the wake target's transcript so a human
+				// (or the agent itself) sees the restart failed instead of it
+				// vanishing silently. This turn makes the agent busy — fine, the
+				// restart has already aborted, so there is no drain to re-block
+				// and no loop (the turn does not itself request a restart).
+				if wakeID != "" {
+					if a, ok := s.agents.Get(wakeID); ok && !a.Archived {
+						msg := fmt.Sprintf(
+							"[System] Restart aborted: chats did not drain within the timeout, so the daemon kept running the old build. Still-blocking items: [%s]. No action was taken and no restart is pending. Do NOT auto-retry the restart — surface this to a human to investigate the stuck items first.",
+							strings.Join(blockers, ", "))
+						if wErr := s.agents.WakeChatThread(wakeID, wakeSessionKey, msg); wErr != nil {
+							s.logger.Warn("restart abort notification failed",
+								"agent", wakeID, "err", wErr)
+						}
+					}
+				}
 				return
 			}
 			// Chats are idle: close any persistent claude processes so the

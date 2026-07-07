@@ -405,6 +405,99 @@ func (m *Manager) SetQuiescing(on bool) {
 	m.busyMu.Unlock()
 }
 
+// blockerAge renders a coarse human-readable age for a drain blocker
+// ("32m", "8s"). Minute resolution above a minute, second resolution
+// below, so DrainBlockers strings stay short and stable.
+func blockerAge(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if mins := int(d.Minutes()); mins > 0 {
+		return fmt.Sprintf("%dm", mins)
+	}
+	return fmt.Sprintf("%ds", int(d.Seconds()))
+}
+
+// DrainBlockers returns a sorted, human-readable list of everything
+// that currently prevents the daemon from reaching the fully-idle
+// state WaitAllChatsIdle waits for — one entry per blocking item with
+// its kind and agentID. Empty slice means idle. Used by the restart
+// drain logging, the timeout error, and the GET /api/v1/system/restart
+// status endpoint so a stuck drain is diagnosable instead of silent.
+//
+// Format examples:
+//
+//	busy:ag_x(source=notification,age=4m)
+//	preparing:ag_y(n=2)
+//	editing:ag_y
+//	resetting:ag_y
+//	mutating:ag_y(n=1)
+//	switching:ag_y
+//	notifying:ag_y(n=1)
+//	summarizing(n=1)
+//	oneShot:ag_z(id=7,key=groupdm:g_1,age=32m)
+//	profileGen:ag_w
+func (m *Manager) DrainBlockers() []string {
+	if m == nil {
+		return nil
+	}
+	now := time.Now()
+	var out []string
+
+	m.busyMu.Lock()
+	for id, e := range m.busy {
+		out = append(out, fmt.Sprintf("busy:%s(source=%s,age=%s)", id, e.source, blockerAge(now.Sub(e.startedAt))))
+	}
+	for id, n := range m.preparing {
+		out = append(out, fmt.Sprintf("preparing:%s(n=%d)", id, n))
+	}
+	for id := range m.editing {
+		out = append(out, "editing:"+id)
+	}
+	for id := range m.resetting {
+		out = append(out, "resetting:"+id)
+	}
+	for id, n := range m.mutating {
+		out = append(out, fmt.Sprintf("mutating:%s(n=%d)", id, n))
+	}
+	for id := range m.switching {
+		out = append(out, "switching:"+id)
+	}
+	for id, n := range m.notifying {
+		out = append(out, fmt.Sprintf("notifying:%s(n=%d)", id, n))
+	}
+	if m.summarizing > 0 {
+		out = append(out, fmt.Sprintf("summarizing(n=%d)", m.summarizing))
+	}
+	m.busyMu.Unlock()
+
+	m.oneShotCancelsMu.Lock()
+	for agentID, set := range m.oneShotCancels {
+		for id := range set {
+			parts := fmt.Sprintf("id=%d", id)
+			if key := m.oneShotSessions[agentID][id]; key != "" {
+				parts += ",key=" + key
+			}
+			if t, ok := m.oneShotArmed[agentID][id]; ok {
+				parts += ",age=" + blockerAge(now.Sub(t))
+			}
+			out = append(out, fmt.Sprintf("oneShot:%s(%s)", agentID, parts))
+		}
+	}
+	m.oneShotCancelsMu.Unlock()
+
+	m.mu.Lock()
+	for id, on := range m.profileGen {
+		if on {
+			out = append(out, "profileGen:"+id)
+		}
+	}
+	m.mu.Unlock()
+
+	sort.Strings(out)
+	return out
+}
+
 // WaitAllChatsIdle polls until every concurrent write path across
 // ALL agents has drained, or ctx is cancelled. The daemon-wide
 // analogue of WaitChatIdle — same six checks, plus `switching`
@@ -417,6 +510,7 @@ func (m *Manager) SetQuiescing(on bool) {
 // can start between the idle observation and whatever the caller
 // does next (the restart path re-execs the process).
 func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
+	lastLog := time.Now()
 	for {
 		m.busyMu.Lock()
 		idle := len(m.busy) == 0 && len(m.preparing) == 0 &&
@@ -448,9 +542,21 @@ func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
 		if idle {
 			return nil
 		}
+		// Surface WHAT is still blocking the drain every 30s. Two 15-min
+		// restarts aborted silently because WaitAllChatsIdle reported
+		// nothing while some counter/map had leaked; the blocker list
+		// makes the culprit visible in the logs long before the timeout.
+		if m.logger != nil && time.Since(lastLog) >= 30*time.Second {
+			m.logger.Warn("restart drain still waiting for chats to idle",
+				"blockers", strings.Join(m.DrainBlockers(), ", "))
+			lastLog = time.Now()
+		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// Wrap ctx.Err() with the final blocker list so the aborted
+			// restart is diagnosable from the returned error alone.
+			return fmt.Errorf("restart drain timed out; still blocked by [%s]: %w",
+				strings.Join(m.DrainBlockers(), ", "), ctx.Err())
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -474,7 +580,7 @@ func (m *Manager) acquirePreparing(agentID string) error {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	if m.quiescing {
-		return fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+		return ErrQuiescing
 	}
 	if m.switching != nil && m.switching[agentID] {
 		return fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
@@ -567,7 +673,7 @@ func (m *Manager) SetSwitching(agentID string, on bool) error {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	if on && m.quiescing {
-		return fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+		return ErrQuiescing
 	}
 	if m.switching == nil {
 		m.switching = make(map[string]bool)
@@ -608,7 +714,7 @@ func (m *Manager) AcquireMutation(agentID string) (func(), error) {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	if m.quiescing {
-		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+		return nil, ErrQuiescing
 	}
 	if m.switching != nil && m.switching[agentID] {
 		return nil, fmt.Errorf("%w: device switch in progress", ErrAgentBusy)
@@ -644,7 +750,7 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 	m.busyMu.Lock()
 	if m.quiescing {
 		m.busyMu.Unlock()
-		return nil, fmt.Errorf("%w: server restart in progress", ErrAgentBusy)
+		return nil, ErrQuiescing
 	}
 	if m.resetting[agentID] {
 		m.busyMu.Unlock()

@@ -1,11 +1,23 @@
 package agent
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors for the agent package.
 var (
 	ErrAgentNotFound  = errors.New("agent not found")
 	ErrAgentBusy      = errors.New("agent is busy")
+
+	// ErrQuiescing is returned by the chat/mutation admission gates
+	// (acquirePreparing / AcquireMutation / SetSwitching / acquireResetGuard)
+	// while a daemon-wide restart drain is quiescing the manager. It wraps
+	// ErrAgentBusy so existing errors.Is(err, ErrAgentBusy) checks (and the
+	// HTTP 409 mapping) keep working, while errors.Is(err, ErrQuiescing) lets
+	// callers distinguish "server is restarting" from a plain busy agent and
+	// surface the dedicated "quiescing" error code.
+	ErrQuiescing = fmt.Errorf("%w: server is restarting", ErrAgentBusy)
 	ErrAgentResetting = errors.New("agent is being reset")
 	ErrAgentArchived  = errors.New("agent is archived")
 

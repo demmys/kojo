@@ -172,6 +172,15 @@ func (m *Manager) ConsumeRestartWake(version string, bootTime time.Time) {
 // back to the agent's main conversation.
 var errWakeThreadGone = errors.New("restart wake: thread unavailable")
 
+// WakeChatThread delivers a system-role turn to the thread named by
+// sessionKey (falling back to the main conversation when the thread is
+// gone or sessionKey is empty), exactly like a restart-wake but with a
+// caller-supplied message. The restart handler uses it to surface a
+// drain-abort notice into the wake target's transcript.
+func (m *Manager) WakeChatThread(agentID, sessionKey, msg string) error {
+	return m.fireWake(agentID, sessionKey, msg)
+}
+
 // fireWake delivers the wake turn to the thread named by sessionKey, or
 // to the agent's main conversation when sessionKey is empty. A thread
 // that has gone away falls back to the main conversation so the wake is

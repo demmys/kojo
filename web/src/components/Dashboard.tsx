@@ -654,6 +654,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-baseline gap-2">
                           <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
+                          {agent.busy && !agent.awaitingAnswer && (
+                            <span
+                              className="h-2 w-2 shrink-0 animate-lamp-pulse rounded-full bg-copper"
+                              title="処理中"
+                              aria-label="処理中"
+                            />
+                          )}
                           {agent.awaitingAnswer && (
                             <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-warn/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-warn">
                               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-lamp-warn" />

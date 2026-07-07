@@ -59,17 +59,6 @@ export function AgentChat() {
   const inputRef = useRef(input);
   inputRef.current = input;
   const [streaming, setStreaming] = useState(false);
-  // Deferred steer fallback: a steer that raced the turn's natural end
-  // (409 not_busy) can't fall back to a normal send until the WS "done"
-  // arrives — streamAgentEvents ignores "message" frames mid-stream, so an
-  // immediate send would be silently dropped. The done handler drains this.
-  const steerFallbackRef = useRef<Array<() => void>>([]);
-  // Route change: queued fallbacks are already no-ops for a stale agent
-  // (sentForId guard), so just drop them instead of letting them linger
-  // until some unrelated terminal event drains them.
-  useEffect(() => {
-    steerFallbackRef.current = [];
-  }, [id]);
   // Live mirror of `streaming` for callbacks with narrow dep lists.
   const streamingRef = useRef(false);
   useEffect(() => {
@@ -423,20 +412,9 @@ export function AgentChat() {
     [id],
   );
 
-  // Fire exactly ONE queued steer fallback per terminal event: the first
-  // fallback starts a new turn, and any further sends would be ignored
-  // mid-stream — the rest stay queued until that turn's own done/error.
-  const drainOneSteerFallback = useCallback(() => {
-    const fb = steerFallbackRef.current.shift();
-    if (fb) setTimeout(fb, 0);
-  }, []);
-
   const resetStream = useCallback(() => {
     setStreaming(false);
-    // Synchronous mirror update: the useEffect sync lags a render, and a
-    // steer 409 landing between resetStream and that effect must see
-    // streaming=false so it sends immediately instead of queueing a
-    // fallback that no done/error handler will ever drain again.
+    // Synchronous mirror update: the useEffect sync lags a render.
     streamingRef.current = false;
     setStreamText("");
     setStreamThinking("");
@@ -587,10 +565,6 @@ export function AgentChat() {
             );
           }
           resetStream();
-          // Now that the stream is finished a queued steer-fallback send
-          // will be accepted as a fresh turn — fire it after this event
-          // settles so the streaming state is fully reset first.
-          drainOneSteerFallback();
           break;
         }
         case "error": {
@@ -600,27 +574,16 @@ export function AgentChat() {
             appendSystemErrorIfNew(prev, errorContent, Date.now, localRFC3339),
           );
           resetStream();
-          // A turn can terminate via "error" (e.g. process EPIPE) with
-          // steer fallbacks still queued — drain here too or they'd
-          // never fire.
-          drainOneSteerFallback();
           break;
         }
       }
     },
-    [id, resetStream, drainOneSteerFallback],
+    [id, resetStream],
   );
 
   const onDisconnect = useCallback(() => {
     abortedIdRef.current = null; // Finalize pending abort — "done" won't arrive on this connection
     resetStream();
-    // No done/error will arrive on this connection — fire the queued
-    // steer fallbacks now. Each one re-checks connectivity itself and
-    // rolls back (restoring its text) when the socket is still down.
-    if (steerFallbackRef.current.length > 0) {
-      const fb = steerFallbackRef.current.shift();
-      if (fb) setTimeout(fb, 0);
-    }
   }, [resetStream]);
 
   // Refetch the latest transcript page on every (re)connect. A reply that
@@ -668,13 +631,6 @@ export function AgentChat() {
     onConnected,
     onDisconnect,
   });
-  // Live mirror of `connected` for queued steer fallbacks: a fallback can
-  // fire seconds after it was queued, and the closure it was created in
-  // captured a stale `connected`. Read the ref at fire time instead.
-  const connectedRef = useRef(false);
-  useEffect(() => {
-    connectedRef.current = connected;
-  }, [connected]);
 
   const handleAbort = useCallback(() => {
     // Commit partial content immediately so it survives even if the
@@ -705,10 +661,18 @@ export function AgentChat() {
 
   // handleSteer injects the composer text into the currently running turn
   // instead of starting a new one. Renders optimistically like a normal
-  // send. Uses the REST endpoint (not the WS frame) so failures come back
-  // as status codes: 409 (turn just finished) falls back to a normal send,
-  // anything else rolls back the optimistic append and restores the
-  // composer so the text is never silently lost.
+  // send. Uses the REST endpoint (not the WS frame) so results come back as
+  // status codes / a JSON body.
+  //
+  // The server now resolves the turn-just-ended race itself: when the turn
+  // finished the instant the steer arrived, it starts a normal follow-up turn
+  // and answers 200 with { mode: "fallback_turn" } instead of 409 not_busy.
+  // That turn streams back over the agent WS automatically (resumeBackgroundChat
+  // via the chatStarted signal), so the client just treats it like a normal
+  // send. A rejection here is therefore a genuine refusal (non-steerable
+  // backend "unsupported", a busy agent, quiescing, or a server error) — never
+  // the common race — so the recovery just restores the text without the old
+  // deferred WS-terminal fallback machinery.
   const handleSteer = (text: string) => {
     if (!id) return;
     const pendingId = "pending_" + Date.now();
@@ -722,63 +686,36 @@ export function AgentChat() {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     const sentForId = id;
-    const rollback = () => {
-      if (sentForId !== idRef.current) return;
+    agentApi.steerAgent(id, text).then((r) => {
+      if (r?.mode === "fallback_turn") {
+        // The turn had just ended: the server started a fresh turn with this
+        // text. Reflect the new streaming turn (its events arrive over the
+        // agent WS) so the UI shows activity; keep the optimistic bubble.
+        if (sentForId !== idRef.current) return;
+        setStreaming(true);
+        setStreamText("");
+        setStreamThinking("");
+        setStreamTools([]);
+        setStreamStatus("thinking");
+        setStreamStartTime(Date.now());
+      }
+      // mode === "steer": injected into the running turn; nothing to do, the
+      // turn keeps streaming and the bubble stays.
+    }).catch(() => {
+      // Genuine refusal — never drop the text.
+      if (sentForId !== idRef.current) {
+        // The user navigated to a different agent: restoring the text into
+        // THIS composer would misattribute it. Post it to the ORIGINAL agent
+        // via the id-addressed HTTP endpoint so it isn't silently lost.
+        setMessages((prev) => prev.filter((m) => m.id !== pendingId));
+        agentApi.postAgentMessage(sentForId, text).catch(console.error);
+        return;
+      }
+      // Still on this agent: give the text back to the composer (append,
+      // newline-separated, when the user already typed something).
       setMessages((prev) => prev.filter((m) => m.id !== pendingId));
-      // Give the text back to the composer. Append (newline-separated)
-      // when the user already typed something — several queued steers
-      // rolling back must each survive, not just the first.
       const cur = textareaRef.current?.value ?? "";
       setInput(cur ? cur + "\n" + text : text);
-    };
-    const fallbackToNormalSend = () => {
-      if (sentForId !== idRef.current) return;
-      if (!connectedRef.current) {
-        // Can't stream a normal turn without the socket — give the text
-        // back to the composer instead of dropping it. Let the next queued
-        // fallback (if any) take its own rollback path too, so the queue
-        // can't wedge behind a dead connection.
-        rollback();
-        drainOneSteerFallback();
-        return;
-      }
-      if (!sendMessage(text)) {
-        // Socket raced shut between the connectedRef check and the send —
-        // nothing went out, so don't fake a streaming state; restore the
-        // text and let the next queued fallback take its own path.
-        rollback();
-        drainOneSteerFallback();
-        return;
-      }
-      setStreaming(true);
-      setStreamText("");
-      setStreamThinking("");
-      setStreamTools([]);
-      setStreamStatus("thinking");
-      setStreamStartTime(Date.now());
-    };
-
-    agentApi.steerAgent(id, text).catch((e: unknown) => {
-      const m = errMsg(e);
-      // Only the "not_busy" 409 means the turn already finished — a normal
-      // send will be accepted. An "unsupported" 409 arrives while the turn
-      // is STILL RUNNING (non-steerable backend / stdin not ready yet); a
-      // normal send would be rejected as busy and the text silently lost,
-      // so give it back to the composer instead.
-      if (/^409:/.test(m) && m.includes("not_busy")) {
-        // not_busy usually means the turn ended an instant ago, but the
-        // stdin can also close (result observed server-side) while our WS
-        // stream is still delivering — sending immediately then would be
-        // ignored mid-stream. Defer to the done handler when streaming;
-        // send right away otherwise.
-        if (streamingRef.current) {
-          steerFallbackRef.current.push(fallbackToNormalSend);
-        } else {
-          fallbackToNormalSend();
-        }
-      } else {
-        rollback();
-      }
     });
   };
 

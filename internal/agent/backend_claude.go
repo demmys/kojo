@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -108,6 +109,45 @@ func (s *claudeStdinWriter) close() {
 	}
 	s.closed = true
 	_ = s.w.Close()
+}
+
+// claudeTurnSteer gates steer writes to a SINGLE turn on a persistent claude
+// session. The session's stdin pipe stays open across turns, so
+// claudeStdinWriter.closed cannot distinguish "this turn is over" from "the
+// process is dead" — writeUserLine would happily inject a steer line into a
+// pipe the CLI has already stopped reading for the finished turn (the line
+// then either merges into the NEXT turn or is dropped), yet return nil so the
+// caller sees a false success. markOver, called at the result boundary before
+// any teardown bookkeeping, closes that window so a late steer returns
+// ErrAgentNotBusy and the Manager falls back to a fresh turn.
+type claudeTurnSteer struct {
+	stdinW *claudeStdinWriter
+	over   atomic.Bool
+}
+
+// writeUserLine is the per-turn SteerFunc. It refuses (ErrAgentNotBusy) once
+// the turn's result has been observed, otherwise delegates to the shared stdin
+// writer. `over` is atomic (not a mutex held across the write) so markOver —
+// called from the readLoop at the result boundary — never blocks behind an
+// in-flight stdin write, which would stall turn completion and leave the
+// agent stuck busy. The residual micro-race (over flips between the Load and
+// the write) is benign: a steer line is smaller than the pipe buffer so the
+// write can't wedge, and if the process already exited the write surfaces
+// EPIPE → ErrAgentNotBusy, the same fallback outcome.
+func (t *claudeTurnSteer) writeUserLine(text string) error {
+	if t.over.Load() {
+		return ErrAgentNotBusy
+	}
+	return t.stdinW.writeUserLine(text)
+}
+
+// markOver marks the turn finished so subsequent writeUserLine calls fail
+// with ErrAgentNotBusy. Idempotent, nil-safe, and non-blocking.
+func (t *claudeTurnSteer) markOver() {
+	if t == nil {
+		return
+	}
+	t.over.Store(true)
 }
 
 // controlRequestMsg is the CLI's can_use_tool permission prompt, emitted on

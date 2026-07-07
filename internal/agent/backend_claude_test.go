@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -211,6 +212,40 @@ func TestClaudeStdinWriter_WriteAndClose(t *testing.T) {
 	if len(parsed.Message.Content) != 1 || parsed.Message.Content[0].Type != "text" || parsed.Message.Content[0].Text != "steer this turn" {
 		t.Errorf("unexpected content: %+v", parsed.Message.Content)
 	}
+}
+
+// TestClaudeTurnSteer_MarkOver verifies the fire-and-forget-window fix: on a
+// persistent session the stdin pipe stays open across turns, so the per-turn
+// steer gate — not claudeStdinWriter.closed — is what refuses a steer once the
+// turn's result has been observed. Before markOver, writeUserLine delegates to
+// the still-open pipe; after markOver it returns ErrAgentNotBusy even though
+// the pipe is very much alive (proving the gate, not a dead pipe, does it).
+func TestClaudeTurnSteer_MarkOver(t *testing.T) {
+	r, w := io.Pipe()
+	sw := &claudeStdinWriter{w: w}
+	ts := &claudeTurnSteer{stdinW: sw}
+
+	// Drain the pipe so writes don't block.
+	go func() { _, _ = io.Copy(io.Discard, r) }()
+
+	if err := ts.writeUserLine("mid turn"); err != nil {
+		t.Fatalf("writeUserLine before markOver: %v", err)
+	}
+
+	ts.markOver()
+	ts.markOver() // idempotent
+
+	if err := ts.writeUserLine("after result"); !errors.Is(err, ErrAgentNotBusy) {
+		t.Fatalf("writeUserLine after markOver = %v, want ErrAgentNotBusy", err)
+	}
+	// The underlying pipe is still open — the refusal came from the gate, not
+	// a closed writer.
+	if sw.closed {
+		t.Error("stdin writer should still be open; the gate, not close(), refuses the steer")
+	}
+	// A nil gate is a no-op (defensive).
+	var nilGate *claudeTurnSteer
+	nilGate.markOver()
 }
 
 func TestBuildClaudeInvocation_BootstrapRecentContext(t *testing.T) {

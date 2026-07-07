@@ -104,6 +104,12 @@ type Manager struct {
 	busy   map[string]busyEntry
 	busyMu sync.Mutex
 
+	// steerFallbackChat starts a normal follow-up turn for a steer whose
+	// target turn just ended (the not_busy race). Defaults to Chat via
+	// fallbackChat(); overridable in tests to exercise Steer's fallback
+	// branch without a live backend.
+	steerFallbackChat func(ctx context.Context, agentID, text string) (<-chan ChatEvent, error)
+
 	// resetting tracks agents currently being reset (blocks new chats).
 	resetting map[string]bool
 

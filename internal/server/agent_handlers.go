@@ -1740,18 +1740,26 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.agents.Steer(r.Context(), id, body.Content); err != nil {
+	mode, err := s.agents.Steer(r.Context(), id, body.Content)
+	if err != nil {
 		switch {
+		// ErrQuiescing wraps ErrAgentBusy — test it first so a restart drain
+		// surfaces as a plain busy 409 (mirroring the Chat admission paths)
+		// rather than falling through to 500.
+		case errors.Is(err, agent.ErrQuiescing):
+			writeError(w, http.StatusConflict, "busy", "server is restarting")
 		case errors.Is(err, agent.ErrAgentNotBusy):
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
 		case errors.Is(err, agent.ErrSteerUnsupported):
 			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "busy", "agent is busy")
 		default:
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true, "mode": mode})
 }
 
 // handleAnswerAgentQuestion — POST /api/v1/agents/{id}/answer. Resolves a

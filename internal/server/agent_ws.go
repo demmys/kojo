@@ -295,7 +295,7 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 					})
 					continue
 				}
-				if err := s.agents.Steer(ctx, agentID, msg.Content); err != nil {
+				if _, err := s.agents.Steer(ctx, agentID, msg.Content); err != nil {
 					_ = writeJSON(ctx, conn, map[string]string{
 						"type":         "error",
 						"errorMessage": err.Error(),
@@ -393,7 +393,7 @@ func (s *Server) streamAgentEvents(
 					})
 					continue
 				}
-				if err := s.agents.Steer(ctx, agentID, msg.Content); err != nil {
+				if _, err := s.agents.Steer(ctx, agentID, msg.Content); err != nil {
 					_ = writeJSON(ctx, conn, map[string]string{
 						"type":         "error",
 						"errorMessage": err.Error(),

@@ -693,11 +693,14 @@ export const agentApi = {
     post<PostAgentMessageResult>(`/api/v1/agents/${agentId}/messages`, { content }),
 
   // steerAgent injects an additional user message into the agent's
-  // currently running turn. Rejects with an Error whose message starts
-  // with "409:" when there is no turn in flight, or the backend doesn't
-  // support steering — callers should fall back to a normal send.
+  // currently running turn. On success mode is "steer" (merged into the
+  // running turn) or "fallback_turn" (the turn had just ended, so the server
+  // started a normal follow-up turn with the text — treat like a normal send;
+  // its reply streams back over the agent WS). Rejects with an Error whose
+  // message starts with "409:" for a non-steerable backend ("unsupported") or
+  // a busy agent — callers should restore the text rather than drop it.
   steerAgent: (agentId: string, content: string) =>
-    post<{ ok: boolean }>(`/api/v1/agents/${agentId}/steer`, { content }),
+    post<{ ok: boolean; mode?: string }>(`/api/v1/agents/${agentId}/steer`, { content }),
 
   // answerQuestion resolves a pending interactive AskUserQuestion on the
   // agent's running turn. Pass answers (question → chosen answer) to allow, or

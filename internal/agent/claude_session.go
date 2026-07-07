@@ -81,7 +81,12 @@ type claudeSession struct {
 	unsolicited   bool            // true when the active turn is a background notification
 	turnCanAnswer bool            // true when a user can answer AskUserQuestion this turn
 	turnAutomated bool            // true when the active turn is automated (question held with a timeout)
-	turnDone    chan struct{}   // closed when the active turn's result is delivered
+	turnDone      chan struct{}   // closed when the active turn's result is delivered
+	// turnSteer gates steer writes to the current turn. Overwritten each
+	// startTurn and marked over at the turn's result boundary so a steer that
+	// races the turn end returns ErrAgentNotBusy instead of injecting into a
+	// pipe the CLI stopped reading (see claudeTurnSteer).
+	turnSteer *claudeTurnSteer
 }
 
 // sessionSend delivers e to the turn sink, but never blocks the shared
@@ -255,7 +260,7 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 	ch, err := sess.startTurn(ctx, agent, userMessage, canAnswer, opts.AutomatedTrigger)
 	if err == nil {
 		if opts.OnSteerReady != nil {
-			opts.OnSteerReady(sess.stdinW.writeUserLine)
+			opts.OnSteerReady(sess.turnSteerFunc())
 		}
 		// qstate is shared across every turn on this persistent process, so
 		// re-wire its resolved-callback each turn to whatever the current
@@ -463,6 +468,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	s.turnSink = sink
 	s.turnCtx = ctx
 	s.turnDone = done
+	s.turnSteer = &claudeTurnSteer{stdinW: s.stdinW}
 	s.lastActivity = time.Now()
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(ctx, sink, e)
@@ -531,6 +537,30 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	}()
 
 	return sink, nil
+}
+
+// turnSteerFunc returns the SteerFunc for the turn just started by startTurn.
+// It closes over the per-turn steer gate (turnSteer) rather than the raw
+// stdin writer so a steer racing the turn's result is refused instead of
+// silently writing to a pipe the CLI stopped reading for that turn.
+func (s *claudeSession) turnSteerFunc() SteerFunc {
+	s.mu.Lock()
+	ts := s.turnSteer
+	s.mu.Unlock()
+	if ts == nil {
+		return s.stdinW.writeUserLine
+	}
+	return ts.writeUserLine
+}
+
+// markTurnSteerOver closes the current turn's steer window. Called at the
+// earliest point the turn is known over (the result boundary and process
+// exit) so a late fire-and-forget steer maps to ErrAgentNotBusy.
+func (s *claudeSession) markTurnSteerOver() {
+	s.mu.Lock()
+	ts := s.turnSteer
+	s.mu.Unlock()
+	ts.markOver()
 }
 
 // interrupt sends the CLI interrupt control request to abort the running turn
@@ -657,6 +687,11 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 			unsolicited := s.unsolicited
 			s.mu.Unlock()
 			if unsolicited || acc.res.origin != "task-notification" {
+				// Close the steer window at the earliest point the turn is
+				// known over — BEFORE completeTurn's bookkeeping — so a steer
+				// racing this result returns ErrAgentNotBusy instead of
+				// injecting into a pipe the CLI stopped reading for this turn.
+				s.markTurnSteerOver()
 				s.completeTurn()
 			}
 		}
@@ -881,6 +916,9 @@ func (s *claudeSession) onEOF() {
 		s.reapTimer = nil
 	}
 	s.mu.Unlock()
+
+	// The process is gone: refuse any steer still racing this turn's end.
+	s.markTurnSteerOver()
 
 	// Process is gone; clear any pending question (writes fail harmlessly).
 	s.qstate.denyAllPending("session process exited")

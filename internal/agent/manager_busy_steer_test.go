@@ -14,7 +14,7 @@ func TestSteerIdleNotBusy(t *testing.T) {
 	m := newTestManager(t)
 	m.agents["ag_x"] = &Agent{ID: "ag_x", Name: "T", Tool: "claude"}
 
-	if err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
+	if _, err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Fatalf("Steer idle = %v, want ErrAgentNotBusy", err)
 	}
 }
@@ -48,7 +48,7 @@ func TestSteerWaitsForPreparingTurn(t *testing.T) {
 		m.busyMu.Unlock()
 	}()
 
-	if err := m.Steer(context.Background(), "ag_x", "mid-turn"); err != nil {
+	if _, err := m.Steer(context.Background(), "ag_x", "mid-turn"); err != nil {
 		t.Fatalf("Steer during prepare = %v, want nil", err)
 	}
 	if got, _ := steered.Load().(string); got != "mid-turn" {
@@ -81,7 +81,7 @@ func TestSteerWaitsForSteerHandle(t *testing.T) {
 		m.busyMu.Unlock()
 	}()
 
-	if err := m.Steer(context.Background(), "ag_x", "late-handle"); err != nil {
+	if _, err := m.Steer(context.Background(), "ag_x", "late-handle"); err != nil {
 		t.Fatalf("Steer before OnSteerReady = %v, want nil", err)
 	}
 	if got, _ := steered.Load().(string); got != "late-handle" {
@@ -106,7 +106,7 @@ func TestSteerUnsolicitedTurnFailsFastNotBusy(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
+	if _, err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Fatalf("Steer during background notification turn = %v, want ErrAgentNotBusy", err)
 	}
 	if time.Since(start) > 2*time.Second {
@@ -122,7 +122,7 @@ func TestSteerUnsupportedBackendFailsFast(t *testing.T) {
 	m.agents["ag_x"] = &Agent{ID: "ag_x", Tool: "grok"}
 
 	start := time.Now()
-	err := m.Steer(context.Background(), "ag_x", "hi")
+	_, err := m.Steer(context.Background(), "ag_x", "hi")
 	if !errors.Is(err, ErrSteerUnsupported) {
 		t.Fatalf("Steer on grok = %v, want ErrSteerUnsupported", err)
 	}
@@ -146,7 +146,7 @@ func TestSteerPrepareAbortedReturnsNotBusy(t *testing.T) {
 		m.busyMu.Unlock()
 	}()
 
-	if err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
+	if _, err := m.Steer(context.Background(), "ag_x", "hi"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Fatalf("Steer after aborted prepare = %v, want ErrAgentNotBusy", err)
 	}
 }
@@ -176,7 +176,7 @@ func TestSteerDoesNotCrossTurnGenerations(t *testing.T) {
 		m.busyMu.Unlock()
 	}()
 
-	if err := m.Steer(context.Background(), "ag_x", "for turn A"); !errors.Is(err, ErrAgentNotBusy) {
+	if _, err := m.Steer(context.Background(), "ag_x", "for turn A"); !errors.Is(err, ErrAgentNotBusy) {
 		t.Fatalf("Steer across turn generations = %v, want ErrAgentNotBusy", err)
 	}
 	if steeredB.Load() {
@@ -198,7 +198,7 @@ func TestSteerContextCancelUnblocks(t *testing.T) {
 	}()
 
 	start := time.Now()
-	if err := m.Steer(ctx, "ag_x", "hi"); !errors.Is(err, context.Canceled) {
+	if _, err := m.Steer(ctx, "ag_x", "hi"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Steer with cancelled ctx = %v, want context.Canceled", err)
 	}
 	if time.Since(start) > 2*time.Second {

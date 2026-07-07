@@ -86,11 +86,15 @@ func (m *Manager) Abort(agentID string) {
 
 // Steer injects an additional user message into the agent's currently
 // running turn (claude/codex backends only — see ChatOptions.OnSteerReady /
-// SteerFunc). Returns ErrAgentNotBusy if no turn is running, and
-// ErrSteerUnsupported if the running turn's backend cannot register a
-// steer handle (non-steerable backends). On success the steered text is
-// appended to the transcript as a plain user message, mirroring how the
-// turn-start message is persisted.
+// SteerFunc). It returns the mode used: SteerModeInjected when the text merged
+// into the running turn, or SteerModeFallbackTurn when the turn had just ended
+// and a normal follow-up turn was started with the text instead (so the
+// message is never dropped on the turn-just-ended race — the reply arrives as
+// a fresh turn). Returns ErrQuiescing during a restart drain (before any
+// persistence), ErrSteerUnsupported if the backend cannot steer, and any real
+// persist/backend failure otherwise. On the inject path the steered text is
+// appended to the transcript as a plain user message; on the fallback path
+// Chat persists it exactly once.
 //
 // A steer that arrives while the turn is still starting — prepareChat
 // (memory search, context assembly) runs BEFORE the busy entry exists,
@@ -98,36 +102,108 @@ func (m *Manager) Abort(agentID string) {
 // instead of bouncing 409 not_busy. Without the wait, a message sent in
 // that window falls back to a queued normal send and gets reordered
 // behind steers sent later in the same turn.
-func (m *Manager) Steer(ctx context.Context, agentID, text string) error {
-	// Wait for the steer handle, but do NOT hold the global lock across
-	// the wait, the pipe write, or the transcript append: a wedged claude
-	// process (stdin buffer full) or a slow disk would otherwise stall
-	// every agent in the daemon behind busyMu. The steer func itself is
-	// safe to call after the turn ends — the stdin writer returns
-	// ErrAgentNotBusy once closed.
+// Steer return modes (the first result value). SteerModeInjected means the
+// text was merged into the running turn; SteerModeFallbackTurn means the turn
+// had just ended and a normal follow-up turn was started with the text
+// instead — the caller/UI should treat it like an ordinary send whose reply
+// arrives as a fresh turn over the agent WS.
+const (
+	SteerModeInjected     = "steer"
+	SteerModeFallbackTurn = "fallback_turn"
+)
+
+func (m *Manager) Steer(ctx context.Context, agentID, text string) (string, error) {
+	// Refuse a steer during a restart drain BEFORE persisting anything
+	// (mirrors acquirePreparing). A steer accepted mid-quiesce would reserve a
+	// row against a turn about to be aborted and never processed — surface the
+	// same ErrQuiescing the Chat path does.
+	m.busyMu.Lock()
+	quiescing := m.quiescing
+	m.busyMu.Unlock()
+	if quiescing {
+		return "", ErrQuiescing
+	}
+
+	// Wait for the steer handle, but do NOT hold the global lock across the
+	// wait, the pipe write, or the transcript append: a wedged claude process
+	// (stdin buffer full) or a slow disk would otherwise stall every agent in
+	// the daemon behind busyMu. ErrAgentNotBusy here means no steerable turn
+	// exists (fully idle, an unsolicited background turn, a cross-generation
+	// wait, or an aborted prepare) — that's not the fire-and-forget race this
+	// fix targets, so propagate it and let the client fall back to a normal
+	// send. ErrSteerUnsupported / ctx errors likewise propagate unchanged.
 	entry, err := m.awaitSteerHandle(ctx, agentID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	// Persist FIRST (reserve the row), THEN inject into the live turn. If we
-	// injected first and the append failed, the model would have already
-	// consumed input that never persisted; the resulting 500 → client retry
-	// could then double-inject the same text. With persist-first, an injection
-	// failure rolls the reserved row back so the not_busy fallback (a normal
-	// send) doesn't leave a duplicate. Ordering is also correct: the steer
-	// user message lands before the assistant's continued output (persisted at
-	// turn end).
+
+	injectErr := m.injectSteer(agentID, entry, text)
+	if injectErr == nil {
+		return SteerModeInjected, nil
+	}
+	if !errors.Is(injectErr, ErrAgentNotBusy) {
+		// A genuine failure (persist error, backend error). The reserved row
+		// was already rolled back by injectSteer.
+		return "", injectErr
+	}
+
+	// The turn ended between the handle check and the injection — the exact
+	// fire-and-forget window this fix closes (claudeTurnSteer.markOver). The
+	// row injectSteer reserved was rolled back, so no duplicate exists. Its
+	// busy entry lingers until the done event drains, so a fresh Chat would
+	// bounce ErrAgentBusy — wait for the slot to clear, then start a normal
+	// follow-up turn with the same text (Chat re-persists it exactly once and
+	// streams it as a fresh turn the agent WS picks up).
+	if werr := m.waitBusyClear(agentID); werr != nil {
+		// A genuinely new turn took the slot within the grace window. Report
+		// not_busy so the client falls back to a normal send rather than
+		// silently landing this text in an unrelated turn.
+		return "", ErrAgentNotBusy
+	}
+	bch, cerr := m.fallbackChat(ctx, agentID, text)
+	if cerr != nil {
+		// Could not start the follow-up turn (e.g. a restart drain began, or
+		// the agent is busy again). Surface the real error — never a silent
+		// drop; the message was rolled back and never persisted.
+		return "", cerr
+	}
+	// Discard the caller channel — the turn is delivered to WS subscribers via
+	// the broadcaster. Drain so the per-sub forwarder never blocks.
+	go func() {
+		for range bch {
+		}
+	}()
+	return SteerModeFallbackTurn, nil
+}
+
+// fallbackChat starts a normal follow-up turn for the fallback path. Uses the
+// overridable seam (set in tests) when present, else the real Chat.
+func (m *Manager) fallbackChat(ctx context.Context, agentID, text string) (<-chan ChatEvent, error) {
+	if m.steerFallbackChat != nil {
+		return m.steerFallbackChat(ctx, agentID, text)
+	}
+	// Detach from the request context: the fallback turn must survive the
+	// HTTP 200 / WS disconnect that cancels ctx (the response is saved to the
+	// transcript regardless), exactly like the normal message paths that start
+	// Chat with a background context. Without this, returning success to the
+	// client would immediately cancel the turn we just started.
+	return m.Chat(context.WithoutCancel(ctx), agentID, text, "user", nil)
+}
+
+// injectSteer persists the steer row and injects the text into the running
+// turn behind entry. Persist-first reserves the row so an injection failure
+// can't leave the model having consumed input that never persisted (a retry
+// would then double-inject). On any injection error the reserved row is rolled
+// back and the error returned (notably ErrAgentNotBusy, which Steer maps to a
+// fallback turn). On success it pushes a live "message" event so subscribed
+// clients see the steered line inline.
+func (m *Manager) injectSteer(agentID string, entry busyEntry, text string) error {
 	msg := newUserMessage(text, nil)
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save steer message", "agent", agentID, "err", appendErr)
 		return fmt.Errorf("steer accepted but not persisted: %w", appendErr)
 	}
 	if err := entry.steer(text); err != nil {
-		// Injection failed — the turn ended between the handle check and this
-		// write, or the stdin pipe closed (ErrAgentNotBusy). Roll back the
-		// reserved row so the caller's normal-send fallback doesn't duplicate
-		// it, and propagate the original error (esp. ErrAgentNotBusy, which the
-		// contract requires for that fallback).
 		if delErr := deleteMessage(agentID, msg.ID, ""); delErr != nil &&
 			!errors.Is(delErr, ErrMessageNotFound) {
 			m.logger.Warn("failed to roll back steer message after injection failure",

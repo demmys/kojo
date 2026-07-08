@@ -166,7 +166,7 @@ const messages = {
   "chat.errorPrefix": { ja: "⚠️ エラー: {msg}", en: "⚠️ Error: {msg}" },
   "chat.errorGeneric": { ja: "エラーが発生した", en: "An error occurred" },
   "chat.hostOffline": { ja: "ホストがオフライン @ {peer}", en: "host offline @ {peer}" },
-  "chat.typing": { ja: "入力中…", en: "typing…" },
+  "chat.typing": { ja: "出力中…", en: "typing…" },
   "chat.online": { ja: "オンライン", en: "online" },
   "chat.connecting": { ja: "接続中…", en: "connecting…" },
   "chat.autoTtsOn": { ja: "自動読み上げ: ON", en: "Auto TTS: ON" },
@@ -290,8 +290,8 @@ const messages = {
     en: "Read assistant replies out loud via Gemini or xAI Grok TTS. Manual playback per message; auto playback toggled in the chat header.",
   },
   "settings.card.memory.desc": {
-    ja: "保存履歴を整理する。人格・MEMORY.md・ノート・認証情報は常に保持される。",
-    en: "Trim stored history. Persona, MEMORY.md, notes, and credentials are always kept.",
+    ja: "CLIセッションを仕切り直す。メモリファイルやチャット履歴は保持される。履歴の削除は危険ゾーンで。",
+    en: "Start a fresh CLI session. Memory files and chat history are kept. Destructive cleanup lives in the Danger Zone.",
   },
   "settings.card.danger": { ja: "危険ゾーン", en: "Danger Zone" },
 
@@ -997,7 +997,7 @@ const messages = {
 
   // ── App shell / file browser / misc ──
   "app.selectPane": {
-    ja: "エージェントかセッションを選んで",
+    ja: "一覧からエージェントやセッションを選択",
     en: "Select an agent or session",
   },
   "fb.workdir": { ja: "作業ディレクトリ", en: "Workdir" },

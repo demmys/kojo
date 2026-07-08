@@ -1672,6 +1672,24 @@ export function AgentSettings() {
           description={t("settings.card.memory.desc")}
         >
           <div className="space-y-4">
+            <div>
+              <Button
+                onClick={handleResetSession}
+                disabled={resettingSession}
+                className="w-full"
+              >
+                {resettingSession ? t("settings.resetting") : t("settings.resetCliSession")}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                {t("settings.resetCliSessionHelp")}
+              </p>
+            </div>
+          </div>
+        </SectionCard>
+
+        {/* ── Danger Zone ── */}
+        <SectionCard id="danger" title={t("settings.card.danger")} danger>
+          <div className="space-y-4">
             <Field
               label={t("settings.truncateLabel")}
               help={t("settings.truncateHelp")}
@@ -1718,24 +1736,6 @@ export function AgentSettings() {
               </Button>
               <p className="mt-1.5 text-[12px] text-ink-faint">
                 {t("settings.resetDataHelp")}
-              </p>
-            </div>
-          </div>
-        </SectionCard>
-
-        {/* ── Danger Zone ── */}
-        <SectionCard id="danger" title={t("settings.card.danger")} danger>
-          <div className="space-y-4">
-            <div>
-              <Button
-                onClick={handleResetSession}
-                disabled={resettingSession}
-                className="w-full"
-              >
-                {resettingSession ? t("settings.resetting") : t("settings.resetCliSession")}
-              </Button>
-              <p className="mt-1.5 text-[12px] text-ink-faint">
-                {t("settings.resetCliSessionHelp")}
               </p>
             </div>
             <div>

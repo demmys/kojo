@@ -832,6 +832,26 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 	a.CreatedAt = normalizeTimestamp(a.CreatedAt)
 	a.UpdatedAt = normalizeTimestamp(a.UpdatedAt)
 
+	// Migrate the retired "grok-build" model id → "grok-4.5" (the grok CLI
+	// 0.2.91 dropped grok-build; passing it now errors "unknown model id").
+	// After the model rewrite, clamp any effort the new model no longer
+	// accepts (e.g. legacy grok-build agents stored xhigh/max, but grok-4.5
+	// only advertises low/medium/high) back down to "high".
+	// This is a read-path rewrite (the row itself keeps the old value until
+	// the next save), so it runs on every hydration — log at Debug to avoid
+	// per-turn spam. The clamp is scoped to grok models: rewriting effort
+	// for every unknown/future model would silently downgrade custom
+	// configurations on their next save.
+	if a.Model == "grok-build" {
+		a.Model = "grok-4.5"
+		st.logger.Debug("migrated retired grok-build model → grok-4.5", "agent", a.ID)
+	}
+	if grokEffortModels[a.Model] && a.Effort != "" && !ValidModelEffort(a.Model, a.Effort) {
+		st.logger.Debug("stored effort no longer valid for grok model, clamping to high",
+			"agent", a.ID, "model", a.Model, "effort", a.Effort)
+		a.Effort = "high"
+	}
+
 	// Migrate legacy intervalMinutes → cronExpr. The transient
 	// LegacyIntervalMinutes field captures the old JSON key so a row
 	// written before the cutover can be rehydrated; intervalToCronExpr

@@ -34,8 +34,8 @@ func isGrokSessionID(s string) bool {
 	return grokSessionIDPattern.MatchString(s)
 }
 
-// GrokBackend implements ChatBackend for the Grok Build CLI
-// (https://x.ai/news/grok-build-cli). It drives `grok` headlessly via
+// GrokBackend implements ChatBackend for the Grok CLI
+// (https://github.com/xai-org/grok-cli). It drives `grok` headlessly via
 // --prompt-file plus --output-format streaming-json and parses the
 // resulting thought/text/end events into ChatEvents.
 //

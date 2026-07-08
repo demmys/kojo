@@ -21,8 +21,8 @@ export const toolModels: Record<string, ToolModelConfig> = {
     ],
   },
   grok: {
-    default: "grok-build",
-    models: ["grok-build", "grok-composer-2.5-fast"],
+    default: "grok-4.5",
+    models: ["grok-4.5", "grok-composer-2.5-fast"],
   },
   custom: {
     default: "",
@@ -49,18 +49,22 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "grok-build", "grok-composer-2.5-fast"]);
+const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
+// grok CLI 0.2.91 advertises only low/medium/high for its models
+// (grok-4.5 lists efforts [high,medium,low]; composer lists none), so
+// neither xhigh nor max is offered. Keep in sync with agent.go grokEffortModels.
+const grokEffortModels = new Set(toolModels.grok.models);
 
 /**
  * Models whose default effort is xhigh (rather than high).
  * Per https://code.claude.com/docs/en/model-config, Opus 4.8 supports xhigh but
  * defaults to high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated
- * as Opus 4.8, so it defaults to high. grok-build keeps xhigh default.
- * grok-composer-2.5-fast supports xhigh but defaults to high — it is the
- * "fast" tier, so maxing reasoning by default defeats the point.
+ * as Opus 4.8, so it defaults to high. grok-4.5 advertises low/medium/high
+ * (default high) and grok-composer-2.5-fast advertises an empty efforts list,
+ * so neither offers xhigh and both default to high.
  */
-const defaultXhighModels = new Set(["claude-opus-4-7", "grok-build"]);
+const defaultXhighModels = new Set(["claude-opus-4-7"]);
 
 export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex";
@@ -69,6 +73,7 @@ export function supportsEffort(tool: string): boolean {
 /** Return available effort levels for a given model. */
 export function effortLevelsForModel(model: string): readonly EffortLevel[] {
   if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
+  if (grokEffortModels.has(model)) return ["low", "medium", "high"] as const;
   if (xhighModels.has(model)) return effortLevels;
   return effortLevels.filter((e) => e !== "xhigh");
 }

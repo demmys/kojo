@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   defaultEffortForModel,
+  defaultModelForTool,
   effortLevelsForModel,
   modelsForTool,
 } from "./toolModels";
@@ -72,18 +73,19 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
   });
 
   it("lists both grok models", () => {
-    expect(modelsForTool("grok")).toEqual(["grok-build", "grok-composer-2.5-fast"]);
+    expect(modelsForTool("grok")).toEqual(["grok-4.5", "grok-composer-2.5-fast"]);
+    expect(defaultModelForTool("grok")).toBe("grok-4.5");
   });
 
-  it("grok-build supports xhigh and max and defaults to xhigh", () => {
-    expect(effortLevelsForModel("grok-build")).toContain("xhigh");
-    expect(effortLevelsForModel("grok-build")).toContain("max");
-    expect(defaultEffortForModel("grok-build")).toBe("xhigh");
+  it("grok-4.5 offers only low/medium/high and defaults to high", () => {
+    expect(effortLevelsForModel("grok-4.5")).not.toContain("xhigh");
+    expect(effortLevelsForModel("grok-4.5")).not.toContain("max");
+    expect(defaultEffortForModel("grok-4.5")).toBe("high");
   });
 
-  it("grok-composer-2.5-fast supports xhigh and max but defaults to high", () => {
-    expect(effortLevelsForModel("grok-composer-2.5-fast")).toContain("xhigh");
-    expect(effortLevelsForModel("grok-composer-2.5-fast")).toContain("max");
+  it("grok-composer-2.5-fast offers only low/medium/high and defaults to high", () => {
+    expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("xhigh");
+    expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("max");
     expect(defaultEffortForModel("grok-composer-2.5-fast")).toBe("high");
   });
 });

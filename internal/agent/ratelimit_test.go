@@ -55,10 +55,14 @@ func TestManagerRateLimit_RecordAndReload(t *testing.T) {
 		t.Fatalf("RateLimit on fresh agent = ok; want not present")
 	}
 
+	// ResetsAt must be in the future relative to the test run — RateLimit()
+	// treats a past ResetsAt as expired and reports the snapshot absent. A
+	// hardcoded epoch here turns into a time bomb the day it passes.
+	resetsAt := time.Now().Add(24 * time.Hour).Unix()
 	info := RateLimitInfo{
 		Status:        "allowed_warning",
 		RateLimitType: "seven_day",
-		ResetsAt:      1783526400,
+		ResetsAt:      resetsAt,
 		Utilization:   0.76,
 	}
 	m.recordRateLimit("ag", info)
@@ -95,7 +99,7 @@ func TestManagerRateLimit_RecordAndReload(t *testing.T) {
 	if !ok {
 		t.Fatalf("reload RateLimit = not present")
 	}
-	if snap2.Status != "allowed_warning" || snap2.ResetsAt != 1783526400 {
+	if snap2.Status != "allowed_warning" || snap2.ResetsAt != resetsAt {
 		t.Errorf("reloaded snapshot = %+v", snap2)
 	}
 }

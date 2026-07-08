@@ -20,7 +20,7 @@ describe("priceModel", () => {
   });
 
   it("returns undefined for unpriced / unknown models", () => {
-    expect(priceModel("grok-build")).toBeUndefined();
+    expect(priceModel("grok-4.5")).toBeUndefined();
     expect(priceModel("gpt-5.5")).toBeUndefined();
     expect(priceModel("fable-5")).toBeUndefined();
     expect(priceModel("")).toBeUndefined();
@@ -52,7 +52,7 @@ describe("estimateTurnCost", () => {
 
   it("returns undefined for unpriced models", () => {
     expect(
-      estimateTurnCost("grok-build", { inputTokens: 100, outputTokens: 100 }),
+      estimateTurnCost("grok-4.5", { inputTokens: 100, outputTokens: 100 }),
     ).toBeUndefined();
   });
 

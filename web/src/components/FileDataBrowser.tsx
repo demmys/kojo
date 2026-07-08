@@ -13,6 +13,7 @@ import {
 } from "../lib/browserPath";
 import { fileKind, FileGlyph, FolderIcon, isImage, KIND_STYLES } from "./fileIcons";
 import { MarkdownRenderer } from "./agent/MarkdownRenderer";
+import { useT } from "../lib/i18n";
 
 type SortKey = "name" | "size" | "modified";
 type SortDir = "asc" | "desc";
@@ -92,6 +93,7 @@ export function FileDataBrowser({
   ready = true,
   onExit,
 }: FileDataBrowserProps) {
+  const t = useT();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -315,7 +317,7 @@ export function FileDataBrowser({
           <button
             onClick={handleBack}
             className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
-            aria-label="Back"
+            aria-label={t("common.back")}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
               <path d="M12.5 15l-5-5 5-5" />
@@ -330,9 +332,9 @@ export function FileDataBrowser({
             onClick={() => copyFolderPath && copyText(copyFolderPath)}
             disabled={!copyFolderPath}
             className="rounded-[10px] border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink disabled:opacity-40"
-            title="Copy absolute path of current folder"
+            title={t("fdb.copyFolderTitle")}
           >
-            {copied ? "copied" : "copy path"}
+            {copied ? t("fdb.copiedLower") : t("fdb.copyPath")}
           </button>
         </header>
       )}
@@ -343,7 +345,7 @@ export function FileDataBrowser({
             onClick={handleBack}
             disabled={!canGoUp}
             className="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-faint transition-colors hover:text-ink-dim disabled:opacity-30 disabled:hover:text-ink-faint"
-            aria-label="Back"
+            aria-label={t("common.back")}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
               <path d="M12.5 15l-5-5 5-5" />
@@ -389,15 +391,15 @@ export function FileDataBrowser({
           </svg>
           <input
             type="text"
-            placeholder="Filter…"
+            placeholder={t("fdb.filterPlaceholder")}
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             className="w-full rounded-lg border border-hairline bg-raised py-1.5 pl-8 pr-2 text-[12px] text-ink placeholder:text-ink-faint transition-colors focus:border-copper focus:outline-none"
           />
         </div>
-        <SortButton label="Name" active={sortKey === "name"} dir={sortDir} onClick={() => toggleSort("name")} />
-        <SortButton label="Size" active={sortKey === "size"} dir={sortDir} onClick={() => toggleSort("size")} />
-        <SortButton label="Mod" active={sortKey === "modified"} dir={sortDir} onClick={() => toggleSort("modified")} />
+        <SortButton label={t("fdb.sortName")} active={sortKey === "name"} dir={sortDir} onClick={() => toggleSort("name")} />
+        <SortButton label={t("fdb.sortSize")} active={sortKey === "size"} dir={sortDir} onClick={() => toggleSort("size")} />
+        <SortButton label={t("fdb.sortMod")} active={sortKey === "modified"} dir={sortDir} onClick={() => toggleSort("modified")} />
         <button
           onClick={() => setShowHidden((h) => !h)}
           className={`shrink-0 rounded-lg border px-2 py-1 font-mono text-[11px] transition-colors ${
@@ -405,7 +407,7 @@ export function FileDataBrowser({
               ? "border-copper/40 bg-copper/10 text-copper"
               : "border-hairline bg-raised text-ink-faint hover:text-ink-dim"
           }`}
-          title="Toggle hidden files"
+          title={t("fdb.toggleHidden")}
         >
           .*
         </button>
@@ -415,10 +417,10 @@ export function FileDataBrowser({
         {error ? (
           <div className="px-4 py-8 text-center text-sm text-lamp-err">{error}</div>
         ) : (!ready || loading) && entries.length === 0 ? (
-          <div className="px-4 py-16 text-center text-sm text-ink-faint">Loading…</div>
+          <div className="px-4 py-16 text-center text-sm text-ink-faint">{t("fdb.loading")}</div>
         ) : sortedEntries.length === 0 ? (
           <div className="px-4 py-16 text-center text-sm text-ink-faint">
-            {filter ? "No matches." : "Empty folder."}
+            {filter ? t("fdb.noMatches") : t("fdb.emptyFolder")}
           </div>
         ) : (
           <ul className="divide-y divide-hairline">
@@ -572,6 +574,7 @@ function FileViewer({
   onCopyPath: () => void;
   copied: boolean;
 }) {
+  const t = useT();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -593,7 +596,7 @@ function FileViewer({
         <button
           onClick={onClose}
           className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
-          aria-label="Back"
+          aria-label={t("common.back")}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
             <path d="M12.5 15l-5-5 5-5" />
@@ -617,7 +620,7 @@ function FileViewer({
                   ? "bg-copper/10 text-copper"
                   : "bg-raised text-ink-faint hover:text-ink-dim"
               }`}
-              title="Render markdown"
+              title={t("fdb.renderMd")}
             >
               md
             </button>
@@ -628,7 +631,7 @@ function FileViewer({
                   ? "bg-copper/10 text-copper"
                   : "bg-raised text-ink-faint hover:text-ink-dim"
               }`}
-              title="Show raw source"
+              title={t("fdb.showRawSource")}
             >
               raw
             </button>
@@ -638,19 +641,19 @@ function FileViewer({
           onClick={onCopyPath}
           className="rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
         >
-          {copied ? "copied" : "copy path"}
+          {copied ? t("fdb.copiedLower") : t("fdb.copyPath")}
         </button>
         <a
           href={dataSource.rawUrl(path, true)}
           className="rounded-lg border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
-          title="Download"
+          title={t("media.download")}
         >
-          download
+          {t("fdb.downloadLower")}
         </a>
       </header>
       <div className="flex-1 overflow-auto">
         {loading ? (
-          <div className="px-4 py-16 text-center text-sm text-ink-faint">Loading…</div>
+          <div className="px-4 py-16 text-center text-sm text-ink-faint">{t("fdb.loading")}</div>
         ) : error ? (
           <div className="space-y-3 px-4 py-16 text-center text-sm">
             <div className="text-ink-dim">{error}</div>
@@ -658,7 +661,7 @@ function FileViewer({
               href={dataSource.rawUrl(path, true)}
               className="inline-block rounded-lg border border-hairline bg-raised px-3 py-1.5 text-xs text-ink-dim transition-colors hover:bg-hover hover:text-ink"
             >
-              Download instead
+              {t("fdb.downloadInstead")}
             </a>
           </div>
         ) : isMarkdown && mdView === "rendered" ? (

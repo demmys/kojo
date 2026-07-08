@@ -1,4 +1,5 @@
 import type { QueuedAgentMessage } from "../../lib/agentApi";
+import { useT } from "../../lib/i18n";
 
 const SNIPPET_LEN = 80;
 
@@ -26,6 +27,7 @@ export function QueuedMessages({
   holderPeerName: string;
   onCancel: (qid: string) => void;
 }) {
+  const t = useT();
   if (messages.length === 0) return null;
   return (
     <div
@@ -33,12 +35,10 @@ export function QueuedMessages({
       data-testid="queued-messages"
     >
       <div className="mb-1 font-medium">
-        {messages.length === 1
-          ? "1 message queued"
-          : `${messages.length} messages queued`}
-        {" — will deliver when device "}
+        {messages.length === 1 ? t("queued.one") : t("queued.many", { count: messages.length })}
+        {t("queued.deliverPre")}
         <span className="font-mono">{holderPeerName}</span>
-        {" reconnects"}
+        {t("queued.deliverPost")}
       </div>
       <ul className="space-y-1">
         {messages.map((m) => (
@@ -52,9 +52,9 @@ export function QueuedMessages({
             <button
               onClick={() => onCancel(m.id)}
               className="shrink-0 rounded-md border border-lamp-warn/40 px-1.5 py-0.5 transition-colors hover:bg-lamp-warn/20"
-              aria-label={`Cancel queued message ${m.id}`}
+              aria-label={t("queued.cancelAria", { id: m.id })}
             >
-              Cancel
+              {t("common.cancel")}
             </button>
           </li>
         ))}

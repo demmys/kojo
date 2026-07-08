@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import { errMsg } from "../../lib/utils";
 import { SectionCard } from "../ui/SectionCard";
 import { Button } from "../ui/Button";
+import { useT } from "../../lib/i18n";
 
 interface Props {
   setError: (msg: string) => void;
@@ -18,18 +19,19 @@ interface Props {
  * turns then re-execs the process), so each is guarded by a confirm.
  */
 export function SystemSection({ setError }: Props) {
+  const t = useT();
   const [busy, setBusy] = useState<"rebuild" | "restart" | null>(null);
   const [status, setStatus] = useState("");
   const [output, setOutput] = useState("");
 
   const doRestart = async () => {
-    setStatus("Restarting...");
+    setStatus(t("gs.restarting"));
     await api.system.restart();
-    setStatus("Restart requested. The server is re-execing; reload in a moment.");
+    setStatus(t("gs.restartRequested"));
   };
 
   const handleRestart = async () => {
-    if (!confirm("Restart the server now? In-flight agent turns will drain first.")) {
+    if (!confirm(t("gs.restartConfirm"))) {
       return;
     }
     setError("");
@@ -48,7 +50,7 @@ export function SystemSection({ setError }: Props) {
   const handleRebuild = async () => {
     if (
       !confirm(
-        "Rebuild the server (`make build`) and restart? This can take several minutes.",
+        t("gs.rebuildConfirm"),
       )
     ) {
       return;
@@ -56,7 +58,7 @@ export function SystemSection({ setError }: Props) {
     setError("");
     setOutput("");
     setBusy("rebuild");
-    setStatus("Building... (this can take several minutes)");
+    setStatus(t("gs.building"));
     try {
       const res = await api.system.rebuild();
       if (res.output) setOutput(res.output);
@@ -71,16 +73,16 @@ export function SystemSection({ setError }: Props) {
 
   return (
     <SectionCard
-      title="System"
-      description="Rebuild the server from source or restart the running daemon. Restart drains in-flight agent turns before re-execing, so it may take a moment."
+      title={t("gs.system")}
+      description={t("gs.systemDesc")}
       danger
     >
       <div className="flex flex-wrap gap-2">
         <Button variant="primary" onClick={handleRebuild} disabled={busy !== null}>
-          {busy === "rebuild" ? "Rebuilding..." : "Rebuild & Restart"}
+          {busy === "rebuild" ? t("gs.rebuilding") : t("gs.rebuildRestart")}
         </Button>
         <Button variant="danger" onClick={handleRestart} disabled={busy !== null}>
-          {busy === "restart" ? "Restarting..." : "Restart"}
+          {busy === "restart" ? t("gs.restarting") : t("gs.restart")}
         </Button>
       </div>
       {status && <p className="mt-3 text-[12px] text-ink-dim">{status}</p>}

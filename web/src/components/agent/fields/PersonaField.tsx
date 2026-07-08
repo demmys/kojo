@@ -2,6 +2,7 @@ import { Field } from "../../ui/Field";
 import { Textarea } from "../../ui/Textarea";
 import { Input } from "../../ui/Input";
 import { Button } from "../../ui/Button";
+import { useT } from "../../../lib/i18n";
 
 /**
  * The "Persona" field: a description textarea plus an inline "AI" prompt row
@@ -36,8 +37,9 @@ export function PersonaField({
   spinning: boolean;
   onGenerate: () => void;
 }) {
+  const t = useT();
   return (
-    <Field label="Persona">
+    <Field label={t("field.persona")}>
       <Textarea
         value={persona}
         onChange={(e) => setPersona(e.target.value)}
@@ -46,7 +48,7 @@ export function PersonaField({
       />
       <div className="mt-2 flex gap-2">
         <Input
-          aria-label="Persona generation prompt"
+          aria-label={t("field.personaGenPrompt")}
           value={personaPrompt}
           onChange={(e) => setPersonaPrompt(e.target.value)}
           onKeyDown={(e) => {

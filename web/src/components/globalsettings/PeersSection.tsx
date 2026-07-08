@@ -33,6 +33,7 @@ import { SectionCard } from "../ui/SectionCard";
 import { Input } from "../ui/Input";
 import { Textarea } from "../ui/Textarea";
 import { Button } from "../ui/Button";
+import { t as i18nT, useT } from "../../lib/i18n";
 
 interface Props {
   setError: (msg: string) => void;
@@ -46,13 +47,13 @@ const STATUS_COLOR: Record<PeerInfo["status"], string> = {
 };
 
 function formatLastSeen(ms?: number): string {
-  if (!ms) return "never";
+  if (!ms) return i18nT("peers.never");
   const d = new Date(ms);
-  if (Number.isNaN(d.getTime())) return "never";
+  if (Number.isNaN(d.getTime())) return i18nT("peers.never");
   const diff = Date.now() - ms;
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (diff < 60_000) return i18nT("peers.justNow");
+  if (diff < 3_600_000) return i18nT("peers.minAgo", { n: Math.floor(diff / 60_000) });
+  if (diff < 86_400_000) return i18nT("peers.hourAgo", { n: Math.floor(diff / 3_600_000) });
   return d.toLocaleString();
 }
 
@@ -65,6 +66,7 @@ function formatLastSeen(ms?: number): string {
 const REFRESH_INTERVAL_MS = 30_000;
 
 export function PeersSection({ setError, flashSuccess }: Props) {
+  const t = useT();
   const [items, setItems] = useState<PeerInfo[]>([]);
   const [pending, setPending] = useState<PeerPendingInfo[]>([]);
   const [selfId, setSelfId] = useState<string>("");
@@ -120,7 +122,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
           peersApi.pending().catch((e: unknown) => {
             const msg = errMsg(e);
             if (!/^404:|^503:/.test(msg) && !silent) {
-              setError(`Failed to load pending peers: ${msg}`);
+              setError(t("peers.loadPendingFailed", { msg }));
             }
             return { items: [] };
           }),
@@ -145,7 +147,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
         if (/^404:|^503:/.test(msg)) {
           setUnavailable(true);
         } else if (!silent) {
-          setError(`Failed to load peers: ${msg}`);
+          setError(t("peers.loadFailed", { msg }));
         }
       } finally {
         // Clear loading regardless of seq when this *was* the
@@ -193,11 +195,11 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     }
     const parts = s.split("|");
     if (parts.length !== 3) {
-      throw new Error(`expected 3 pipe-separated fields, got ${parts.length}`);
+      throw new Error(i18nT("peers.parseFieldCount", { count: parts.length }));
     }
     const [deviceId, name, url] = parts.map((p) => p.trim());
     if (!deviceId || !name || !url) {
-      throw new Error("every field (deviceId | name | url) must be non-empty");
+      throw new Error(i18nT("peers.parseFieldEmpty"));
     }
     return { deviceId, name, url };
   };
@@ -218,7 +220,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Register failed: ${errMsg(e)}`);
+      setError(t("peers.registerFailed", { msg: errMsg(e) }));
     } finally {
       setBusy(false);
     }
@@ -234,7 +236,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
     const name = editName.trim();
     const url = editURL.trim();
     if (!name || !url) {
-      setError("Edit: name と url を両方入力する必要がある");
+      setError(t("peers.editBothRequired"));
       return;
     }
     setBusy(true);
@@ -248,7 +250,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Edit failed: ${errMsg(e)}`);
+      setError(t("peers.editFailed", { msg: errMsg(e) }));
     } finally {
       setBusy(false);
     }
@@ -261,35 +263,35 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Approve failed: ${errMsg(e)}`);
+      setError(t("peers.approveFailed", { msg: errMsg(e) }));
     } finally {
       setBusy(false);
     }
   };
 
   const rejectPending = async (p: PeerPendingInfo) => {
-    if (!window.confirm(`Reject join request from "${p.name}"?`)) return;
+    if (!window.confirm(t("peers.rejectConfirm", { name: p.name }))) return;
     setBusy(true);
     try {
       await peersApi.rejectPending(p.deviceId);
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Reject failed: ${errMsg(e)}`);
+      setError(t("peers.rejectFailed", { msg: errMsg(e) }));
     } finally {
       setBusy(false);
     }
   };
 
   const remove = async (id: string, peerName: string) => {
-    if (!window.confirm(`Decommission peer "${peerName}"? This cannot be undone.`)) return;
+    if (!window.confirm(t("peers.removeConfirm", { name: peerName }))) return;
     setBusy(true);
     try {
       await peersApi.remove(id);
       flashSuccess();
       await refresh();
     } catch (e) {
-      setError(`Delete failed: ${errMsg(e)}`);
+      setError(t("peers.deleteFailed", { msg: errMsg(e) }));
     } finally {
       setBusy(false);
     }
@@ -297,10 +299,9 @@ export function PeersSection({ setError, flashSuccess }: Props) {
 
   if (unavailable) {
     return (
-      <SectionCard title="Peers">
+      <SectionCard title={t("peers.title")}>
         <div className="rounded-[10px] border border-hairline bg-raised p-3 text-[12px] text-ink-dim">
-          Peer registry is not available on this server. The local peer identity
-          has not been bootstrapped yet, or the server was started without one.
+          {t("peers.unavailable")}
         </div>
       </SectionCard>
     );
@@ -308,22 +309,21 @@ export function PeersSection({ setError, flashSuccess }: Props) {
 
   return (
     <SectionCard
-      title="Peers"
-      description="Known cluster members. A peer's NodeKey binding (what admits it on the privileged surface) is captured by its join-request: a request whose deviceId already has a row here is back-filled in place; an unregistered request waits in the Pending panel below until the operator Approves it. Manual Register pre-seeds a row but never captures a NodeKey on its own. The local device cannot be added or removed from this UI."
+      title={t("peers.title")}
+      description={t("peers.desc")}
       action={
         <Button onClick={() => setShowAdd((v) => !v)}>
-          {showAdd ? "Cancel" : "Register"}
+          {showAdd ? t("common.cancel") : t("peers.register")}
         </Button>
       }
     >
       {showAdd && (
         <div className="mb-2 space-y-2 rounded-[10px] border border-hairline bg-raised p-3">
           <p className="text-[11px] leading-snug text-ink-dim">
-            Paste the pairing spec the other peer prints on startup
-            (<code className="font-mono">kojo --peer-add</code> argument).
-            Format: <code className="font-mono">deviceId | name | url</code>.
-            Metadata only — the NodeKey binding is captured later when the
-            peer sends a join-request (back-filled into this row on contact).
+            {t("peers.pairingHelpPre")}
+            (<code className="font-mono">kojo --peer-add</code>{t("peers.pairingHelpArg")})
+            {t("peers.pairingHelpFormat")} <code className="font-mono">deviceId | name | url</code>.
+            {t("peers.pairingHelpPost")}
           </p>
           <Textarea
             mono
@@ -336,7 +336,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
             rows={3}
           />
           {parseError && (
-            <div className="text-[12px] text-lamp-err">Parse: {parseError}</div>
+            <div className="text-[12px] text-lamp-err">{t("peers.parsePrefix")}{parseError}</div>
           )}
           <Button
             variant="primary"
@@ -344,7 +344,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
             disabled={busy || !pairingSpec.trim()}
             className="w-full"
           >
-            {busy ? "Registering..." : "Register peer"}
+            {busy ? t("peers.registering") : t("peers.registerPeer")}
           </Button>
         </div>
       )}
@@ -352,13 +352,12 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       {pending.length > 0 && (
         <div className="mb-3">
           <h3 className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-lamp-warn">
-            Pending join requests
+            {t("peers.pendingTitle")}
           </h3>
           <p className="mb-2 text-[11px] leading-snug text-ink-dim">
-            Peers that auto-discovered this Hub via{" "}
-            <code className="font-mono">kojo --peer</code> and are waiting for
-            approval. Approve admits the peer to the privileged surface;
-            Reject drops the request — the peer may retry.
+            {t("peers.pendingHelpPre")}
+            <code className="font-mono">kojo --peer</code>
+            {t("peers.pendingHelpPost")}
           </p>
           {pending.map((p) => (
             <div
@@ -375,15 +374,15 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     {p.url}
                   </div>
                   <div className="mt-1 text-[12px] text-ink-dim">
-                    seen {formatLastSeen(p.lastSeen)}
+                    {t("peers.seen", { when: formatLastSeen(p.lastSeen) })}
                   </div>
                 </div>
                 <div className="flex shrink-0 flex-col gap-1">
                   <Button variant="primary" onClick={() => approvePending(p)} disabled={busy}>
-                    {busy ? "..." : "Approve"}
+                    {busy ? "..." : t("peers.approve")}
                   </Button>
                   <Button variant="danger" onClick={() => rejectPending(p)} disabled={busy}>
-                    Reject
+                    {t("peers.reject")}
                   </Button>
                 </div>
               </div>
@@ -393,9 +392,9 @@ export function PeersSection({ setError, flashSuccess }: Props) {
       )}
 
       {loading ? (
-        <div className="text-[12px] text-ink-faint">Loading...</div>
+        <div className="text-[12px] text-ink-faint">{t("gs.loading")}</div>
       ) : items.length === 0 ? (
-        <div className="text-[12px] text-ink-faint">No peers registered.</div>
+        <div className="text-[12px] text-ink-faint">{t("peers.none")}</div>
       ) : (
         items.map((p) => {
           const isSelf = p.isSelf || p.deviceId === selfId;
@@ -410,7 +409,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     <span className="truncate">{p.name}</span>
                     {isSelf && (
                       <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] text-ink-dim">
-                        this device
+                        {t("peers.thisDevice")}
                       </span>
                     )}
                   </div>
@@ -427,7 +426,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                       {p.status}
                     </span>
                     <span className="text-ink-faint">
-                      seen {formatLastSeen(p.lastSeen)}
+                      {t("peers.seen", { when: formatLastSeen(p.lastSeen) })}
                     </span>
                   </div>
                 </div>
@@ -435,16 +434,16 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                   <div className="flex shrink-0 flex-col gap-1">
                     <Button
                       onClick={() => openEdit(p)}
-                      title="Edit this peer's display name and dial URL"
+                      title={t("peers.editTitle")}
                     >
-                      {editFor === p.deviceId ? "Cancel" : "Edit"}
+                      {editFor === p.deviceId ? t("common.cancel") : t("peers.edit")}
                     </Button>
                     <Button
                       variant="danger"
                       onClick={() => remove(p.deviceId, p.name)}
-                      title="Remove this peer from the registry"
+                      title={t("peers.removeTitle")}
                     >
-                      Delete
+                      {t("gdm.delete")}
                     </Button>
                   </div>
                 )}
@@ -453,7 +452,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
               {!isSelf && editFor === p.deviceId && (
                 <div className="mt-3 space-y-2 border-t border-hairline pt-3">
                   <div className="text-[11px] text-ink-dim">
-                    Display name (free-form label; agents reference this peer by name):
+                    {t("peers.displayNameHelp")}
                   </div>
                   <Input
                     value={editName}
@@ -461,7 +460,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     placeholder="laptop"
                   />
                   <div className="text-[11px] text-ink-dim">
-                    Dial URL (host:port or http(s)://host:port):
+                    {t("peers.dialUrlHelp")}
                   </div>
                   <Input
                     mono
@@ -475,7 +474,7 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     disabled={busy || !editName.trim() || !editURL.trim()}
                     className="w-full"
                   >
-                    {busy ? "Saving..." : "Save changes"}
+                    {busy ? t("settings.saving") : t("settings.saveChanges")}
                   </Button>
                 </div>
               )}

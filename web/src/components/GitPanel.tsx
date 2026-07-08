@@ -4,6 +4,7 @@ import { api, type SessionInfo, type GitStatus, type GitLogEntry } from "../lib/
 import { errMsg, timeAgo } from "../lib/utils";
 import { Input } from "./ui/Input";
 import { Button } from "./ui/Button";
+import { useT } from "../lib/i18n";
 
 type Tab = "status" | "log" | "diff";
 
@@ -43,6 +44,7 @@ interface GitPanelProps {
 }
 
 export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelProps = {}) {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const navigateRef = useRef(navigate);
@@ -93,7 +95,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
     try {
       const d = await api.git.diff(effectiveWorkDir, ref, peerId);
       setDiff(d);
-      setDiffLabel(label ?? ref ?? "working tree");
+      setDiffLabel(label ?? ref ?? t("git.workingTree"));
       setPrevTab(tab);
       setTab("diff");
     } catch (e) {
@@ -105,7 +107,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
     if (!effectiveWorkDir || !cmdInput.trim()) return;
     const args = parseArgs(cmdInput.trim());
     if (DANGEROUS.some((p) => cmdInput.includes(p))) {
-      if (!window.confirm(`Destructive operation: git ${cmdInput}. Continue?`)) return;
+      if (!window.confirm(t("git.dangerConfirm", { cmd: cmdInput }))) return;
     }
     setCmdRunning(true);
     setCmdResult(null);
@@ -150,7 +152,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
         <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline px-3">
           <button
             onClick={() => navigate(`/session/${id}`)}
-            aria-label="Back"
+            aria-label={t("common.back")}
             className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
@@ -170,7 +172,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
             onClick={refresh}
             className="rounded-[10px] border border-hairline bg-raised px-2.5 py-1.5 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           >
-            Refresh
+            {t("git.refresh")}
           </button>
         </header>
       )}
@@ -190,7 +192,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
             onClick={refresh}
             className="rounded-[10px] border border-hairline bg-raised px-2 py-1 font-mono text-[11px] text-ink-dim transition-colors hover:bg-hover hover:text-ink"
           >
-            Refresh
+            {t("git.refresh")}
           </button>
         </div>
       )}
@@ -202,17 +204,17 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
 
       {/* Tabs */}
       <div className="flex shrink-0 border-b border-hairline">
-        {(["status", "log", "diff"] as Tab[]).map((t) => {
-          const active = tab === t;
+        {(["status", "log", "diff"] as Tab[]).map((tb) => {
+          const active = tab === tb;
           return (
             <button
-              key={t}
-              onClick={() => setTab(t)}
+              key={tb}
+              onClick={() => setTab(tb)}
               className={`relative flex h-11 flex-1 items-center justify-center font-mono text-[12px] transition-colors ${
                 active ? "text-ink" : "text-ink-faint hover:text-ink-dim"
               }`}
             >
-              {t.charAt(0).toUpperCase() + t.slice(1)}
+              {t(tb === "status" ? "git.tabStatus" : tb === "log" ? "git.tabLog" : "git.tabDiff")}
               {active && <span className="absolute inset-x-3 bottom-0 h-0.5 rounded-full bg-copper" />}
             </button>
           );
@@ -223,11 +225,11 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
       <div className="min-h-0 flex-1 overflow-y-auto">
         {tab === "status" && status && (
           <div className="space-y-4 p-3">
-            <FileGroup label="Staged" badge="A" tint="run" files={status.staged} onTap={showDiff} />
-            <FileGroup label="Modified" badge="M" tint="warn" files={status.modified} onTap={showDiff} />
-            <FileGroup label="Untracked" badge="U" tint="off" files={status.untracked} />
+            <FileGroup label={t("git.staged")} badge="A" tint="run" files={status.staged} onTap={showDiff} />
+            <FileGroup label={t("git.modified")} badge="M" tint="warn" files={status.modified} onTap={showDiff} />
+            <FileGroup label={t("git.untracked")} badge="U" tint="off" files={status.untracked} />
             {status.staged.length === 0 && status.modified.length === 0 && status.untracked.length === 0 && (
-              <p className="py-4 text-center text-sm text-ink-faint">Clean working tree</p>
+              <p className="py-4 text-center text-sm text-ink-faint">{t("git.cleanTree")}</p>
             )}
           </div>
         )}
@@ -250,7 +252,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
               </button>
             ))}
             {commits.length === 0 && (
-              <p className="py-4 text-center text-sm text-ink-faint">No commits</p>
+              <p className="py-4 text-center text-sm text-ink-faint">{t("git.noCommits")}</p>
             )}
             {hasMore && (
               <button
@@ -258,7 +260,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
                 disabled={loadingMore}
                 className="w-full py-3 font-mono text-[12px] text-ink-faint transition-colors hover:bg-hover hover:text-ink disabled:opacity-40"
               >
-                {loadingMore ? "Loading\u2026" : "Load more"}
+                {loadingMore ? t("git.loading") : t("git.loadMore")}
               </button>
             )}
           </div>
@@ -269,7 +271,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
             <div className="mb-2 flex items-center gap-2">
               <button
                 onClick={() => setTab(prevTab)}
-                aria-label="Back"
+                aria-label={t("common.back")}
                 className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-ink-dim transition-colors hover:text-ink"
               >
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
@@ -295,7 +297,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
                 ))}
               </pre>
             ) : (
-              <p className="py-4 text-center text-sm text-ink-faint">No diff</p>
+              <p className="py-4 text-center text-sm text-ink-faint">{t("git.noDiff")}</p>
             )}
           </div>
         )}
@@ -308,7 +310,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
             <span className="text-ink-faint">$ git {cmdInput || "..."}</span>
             {"\n"}
             <span className={cmdResult.exitCode === 0 ? "text-ink-dim" : "text-lamp-err"}>
-              {cmdResult.stdout || cmdResult.stderr || `(exit ${cmdResult.exitCode})`}
+              {cmdResult.stdout || cmdResult.stderr || t("dash.exitParen", { code: cmdResult.exitCode })}
             </span>
           </pre>
         </div>
@@ -335,7 +337,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
           value={cmdInput}
           onChange={(e) => setCmdInput(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing) runCmd(); }}
-          placeholder="command\u2026"
+          placeholder={t("git.commandPlaceholder")}
           className="flex-1"
         />
         <Button
@@ -343,7 +345,7 @@ export function GitPanel({ embedded, workDir: propWorkDir, peerId }: GitPanelPro
           onClick={runCmd}
           disabled={cmdRunning || !cmdInput.trim()}
         >
-          {cmdRunning ? "\u2026" : "Run"}
+          {cmdRunning ? "\u2026" : t("git.run")}
         </Button>
       </div>
     </div>

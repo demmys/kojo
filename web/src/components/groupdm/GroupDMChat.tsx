@@ -35,6 +35,7 @@ import { ThinkingBlock } from "../agent/StreamingMessage";
 import { Lamp } from "../ui/Lamp";
 import { agentApi } from "../../lib/agentApi";
 import { estimateTurnCost } from "../../lib/pricing";
+import { useT } from "../../lib/i18n";
 
 const PAGE_SIZE = 50;
 
@@ -43,6 +44,7 @@ const PAGE_SIZE = 50;
 const THREAD_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
 
 export function GroupDMChat() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -414,7 +416,7 @@ export function GroupDMChat() {
           return;
         } catch (e) {
           if (!/^409:/.test(e instanceof Error ? e.message : String(e))) {
-            setSendError(e instanceof Error ? e.message : "Failed to steer");
+            setSendError(e instanceof Error ? e.message : t("gdm.steerFailed"));
             return;
           }
           // 409: the turn already finished — fall through to a normal post.
@@ -481,7 +483,7 @@ export function GroupDMChat() {
         return [...prev, sent];
       });
     } catch (e) {
-      setSendError(e instanceof Error ? e.message : "Failed to send");
+      setSendError(e instanceof Error ? e.message : t("gdm.sendFailed"));
     } finally {
       setSending(false);
     }
@@ -498,12 +500,12 @@ export function GroupDMChat() {
   if (notFound) {
     return (
       <div className="flex min-h-full flex-col items-center justify-center gap-3 bg-app text-ink">
-        <p className="text-ink-faint">Group not found</p>
+        <p className="text-ink-faint">{t("gdm.notFound")}</p>
         <button
           onClick={() => navigate("/")}
           className="rounded-[10px] border border-hairline bg-surface px-4 py-2 text-sm text-ink-dim transition-colors hover:bg-hover hover:text-ink"
         >
-          Back
+          {t("common.back")}
         </button>
       </div>
     );
@@ -533,7 +535,7 @@ export function GroupDMChat() {
         <button
           onClick={() => navigate("/")}
           className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
-          aria-label="Back"
+          aria-label={t("common.back")}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
             <path d="M12.5 5l-5 5 5 5" />
@@ -575,7 +577,7 @@ export function GroupDMChat() {
                 }
               }}
               className="w-full rounded-[10px] border border-hairline bg-raised px-1.5 py-0.5 text-[15px] font-semibold text-ink focus:border-copper focus:outline-none"
-              aria-label="Group name"
+              aria-label={t("gdm.groupName")}
               maxLength={100}
             />
           ) : (
@@ -586,7 +588,7 @@ export function GroupDMChat() {
                 setNameInput(group.name);
                 setEditingName(true);
               }}
-              title="Click to rename"
+              title={t("gdm.clickToRename")}
             >
               {group.name}
             </button>
@@ -603,7 +605,7 @@ export function GroupDMChat() {
           <button
             onClick={() => setShowStyleMenu((v) => !v)}
             className="cursor-pointer rounded-[10px] px-1.5 py-1 text-base leading-none text-ink-faint transition-colors hover:bg-hover hover:text-ink"
-            title={`Style: ${group.style || "efficient"}`}
+            title={t("gdm.styleTitle", { style: (group.style || "efficient") === "efficient" ? t("gdm.styleEfficient") : t("gdm.styleExpressive") })}
           >
             {(group.style || "efficient") === "efficient" ? "⚡" : "💬"}
           </button>
@@ -611,7 +613,7 @@ export function GroupDMChat() {
             <>
               <div className="fixed inset-0 z-10" onClick={() => setShowStyleMenu(false)} />
               <div className="absolute right-0 top-full mt-1 z-20 min-w-[140px] rounded-[10px] border border-hairline bg-raised py-1 shadow-xl shadow-black/40">
-                {([["efficient", "⚡ Efficient"], ["expressive", "💬 Expressive"]] as const).map(([value, label]) => (
+                {([["efficient", `⚡ ${t("gdm.styleEfficient")}`], ["expressive", `💬 ${t("gdm.styleExpressive")}`]] as const).map(([value, label]) => (
                   <button
                     key={value}
                     onClick={async () => {
@@ -644,7 +646,7 @@ export function GroupDMChat() {
           <button
             onClick={() => setShowVenueMenu((v) => !v)}
             className="cursor-pointer rounded-[10px] px-1.5 py-1 text-base leading-none text-ink-faint transition-colors hover:bg-hover hover:text-ink"
-            title={`Venue: ${group.venue || DEFAULT_GROUPDM_VENUE}`}
+            title={t("gdm.venueTitle", { venue: (group.venue || DEFAULT_GROUPDM_VENUE) === "colocated" ? t("gdm.venueColocated") : t("gdm.venueChatroom") })}
           >
             {(group.venue || DEFAULT_GROUPDM_VENUE) === "colocated" ? "🏠" : "💻"}
           </button>
@@ -654,8 +656,8 @@ export function GroupDMChat() {
               <div className="absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-[10px] border border-hairline bg-raised py-1 shadow-xl shadow-black/40">
                 {(
                   [
-                    ["chatroom", "💻 Closed chat room", "Text-only, not co-present"],
-                    ["colocated", "🏠 Same physical space", "Members are co-present in real space"],
+                    ["chatroom", `💻 ${t("gdm.venueChatroom")}`, t("gdm.venueChatroomHint")],
+                    ["colocated", `🏠 ${t("gdm.venueColocated")}`, t("gdm.venueColocatedHint")],
                   ] as const
                 ).map(([value, label, hint]) => (
                   <button
@@ -720,7 +722,7 @@ export function GroupDMChat() {
                 setEditingCooldown(true);
               }}
               className="rounded-[10px] px-1.5 py-0.5 font-mono text-[10px] text-ink-faint transition-colors hover:text-ink"
-              title="Notification cooldown (seconds)"
+              title={t("gdm.cooldownTitle")}
             >
               {group.cooldown || 50}s
             </button>
@@ -755,12 +757,12 @@ export function GroupDMChat() {
                 value={maxHopsInput}
                 onChange={(e) => setMaxHopsInput(e.target.value)}
                 placeholder={String(DEFAULT_MAX_HOPS)}
-                aria-label="Max hops"
+                aria-label={t("gdm.maxHops")}
                 className="w-16 rounded-[10px] border border-hairline bg-raised px-1.5 py-0.5 text-center text-xs text-ink focus:border-copper focus:outline-none"
                 autoFocus
                 onBlur={() => setEditingMaxHops(false)}
               />
-              <span className="text-[10px] text-ink-faint">hops</span>
+              <span className="text-[10px] text-ink-faint">{t("gdm.hopsUnit")}</span>
             </form>
           ) : (
             <button
@@ -769,9 +771,9 @@ export function GroupDMChat() {
                 setEditingMaxHops(true);
               }}
               className="rounded-[10px] px-1.5 py-0.5 font-mono text-[10px] text-ink-faint transition-colors hover:text-ink"
-              title="Max relay hops (empty = default 4, max 20)"
+              title={t("gdm.maxHopsTitle")}
             >
-              {group.maxHops || DEFAULT_MAX_HOPS}hops
+              {group.maxHops || DEFAULT_MAX_HOPS}{t("gdm.hopsUnit")}
             </button>
           )}
         </div>
@@ -783,7 +785,7 @@ export function GroupDMChat() {
             setShowClearDialog(true);
           }}
           className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-warn"
-          title="Clear message history"
+          title={t("gdm.clearHistoryTitle")}
         >
           <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
             <path d="M5.25 3A2.25 2.25 0 003 5.25v9.5A2.25 2.25 0 005.25 17h5.378a2.25 2.25 0 001.591-.659l4.122-4.122A2.25 2.25 0 0017 10.628V5.25A2.25 2.25 0 0014.75 3h-9.5zM4.5 5.25c0-.414.336-.75.75-.75h9.5c.414 0 .75.336.75.75v4.5H12.25a2.5 2.5 0 00-2.5 2.5v3.25h-4.5a.75.75 0 01-.75-.75v-9.5zm6.75 10.06v-3.06c0-.552.448-1 1-1h3.06l-4.06 4.06z" />
@@ -798,8 +800,8 @@ export function GroupDMChat() {
               setShowArchiveDialog(true);
             }}
             className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
-            title="Archive thread"
-            aria-label="Archive thread"
+            title={t("gdm.archiveThread")}
+            aria-label={t("gdm.archiveThread")}
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
               <path d="M2 4.75A.75.75 0 012.75 4h14.5a.75.75 0 01.75.75v1.5a.75.75 0 01-.75.75H2.75A.75.75 0 012 6.25v-1.5z" />
@@ -814,7 +816,7 @@ export function GroupDMChat() {
               setShowDeleteDialog(true);
             }}
             className="rounded-[10px] p-2 text-ink-faint transition-colors hover:text-lamp-err"
-            title="Delete group"
+            title={t("gdm.deleteGroup")}
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-5 h-5">
               <path fillRule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.519.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clipRule="evenodd" />
@@ -831,7 +833,7 @@ export function GroupDMChat() {
         {messages.length === 0 && (
           <div className="py-16 text-center text-ink-faint">
             <p className="mb-1 text-lg text-ink-dim">{group.name}</p>
-            <p className="text-sm">No messages yet</p>
+            <p className="text-sm">{t("dash.noMessagesYet")}</p>
           </div>
         )}
 
@@ -876,7 +878,7 @@ export function GroupDMChat() {
                   {mentionsUser && (
                     <span
                       className="rounded-full bg-copper/15 px-1.5 font-mono text-[10px] text-copper"
-                      title="Mentions you"
+                      title={t("dash.mentionsYou")}
                     >
                       @you
                     </span>
@@ -919,7 +921,7 @@ export function GroupDMChat() {
                     <AgentAvatar agentId={replier.agentId} name={replier.agentName} size="xs" className="mt-0.5 shrink-0" />
                   )}
                 </div>
-                <span className="text-[13px] italic text-ink-faint">replying…</span>
+                <span className="text-[13px] italic text-ink-faint">{t("gdm.replying")}</span>
               </div>
             );
           }
@@ -933,7 +935,7 @@ export function GroupDMChat() {
                   <span className="text-[13px] font-semibold text-ink">{replier?.agentName}</span>
                   <span className="flex items-center gap-1.5 font-mono text-[11px] text-ink-faint">
                     <Lamp state="warn" pulse size={6} />
-                    {live!.status === "compacting" ? "compacting…" : "replying…"}
+                    {live!.status === "compacting" ? t("gdm.compacting") : t("gdm.replying")}
                   </span>
                 </div>
                 {live!.thinking && <ThinkingBlock text={live!.thinking} streaming={!live!.text} />}
@@ -987,8 +989,10 @@ export function GroupDMChat() {
               onKeyDown={handleKeyDown}
               placeholder={
                 awaitingReply
-                  ? `Steer the running reply… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
-                  : `${isThread ? "Message this thread" : "Message the group"}… (${enterSends ? "Enter" : "Ctrl+Enter"} to send)`
+                  ? t("gdm.steerPlaceholder", { key: enterSends ? "Enter" : "Ctrl+Enter" })
+                  : t(isThread ? "gdm.threadPlaceholder" : "gdm.groupPlaceholder", {
+                      key: enterSends ? "Enter" : "Ctrl+Enter",
+                    })
               }
               rows={1}
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
@@ -1013,10 +1017,10 @@ export function GroupDMChat() {
         >
           <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
             <h3 className="mb-2 text-sm font-medium text-ink">
-              Clear history?
+              {t("gdm.clearConfirmTitle")}
             </h3>
             <p className="mb-4 text-xs text-ink-dim">
-              Messages in &ldquo;{group.name}&rdquo; will be deleted. The group stays open.
+              {t("gdm.clearConfirmBody", { name: group.name })}
             </p>
             {clearError && (
               <p className="mb-3 text-xs text-lamp-err">{clearError}</p>
@@ -1027,7 +1031,7 @@ export function GroupDMChat() {
                 disabled={clearing}
                 className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <button
                 onClick={async () => {
@@ -1044,7 +1048,7 @@ export function GroupDMChat() {
                     suppressAutoScrollRef.current = false;
                     setShowClearDialog(false);
                   } catch (e) {
-                    setClearError(e instanceof Error ? e.message : "Failed to clear history");
+                    setClearError(e instanceof Error ? e.message : t("gdm.clearFailed"));
                   } finally {
                     setClearing(false);
                   }
@@ -1052,7 +1056,7 @@ export function GroupDMChat() {
                 disabled={clearing}
                 className="rounded-[10px] border border-lamp-warn/50 bg-lamp-warn/10 px-3 py-1.5 text-xs text-lamp-warn transition-colors hover:bg-lamp-warn/20 disabled:opacity-50"
               >
-                {clearing ? "Clearing…" : "Clear"}
+                {clearing ? t("gdm.clearing") : t("gdm.clear")}
               </button>
             </div>
           </div>
@@ -1070,7 +1074,7 @@ export function GroupDMChat() {
         >
           <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
             <h3 className="mb-3 text-sm font-medium text-ink">
-              Delete &ldquo;{group.name}&rdquo;?
+              {t("gdm.deleteConfirmTitle", { name: group.name })}
             </h3>
             <label className="mb-4 flex cursor-pointer select-none items-center gap-2 text-sm text-ink-dim">
               <input
@@ -1080,7 +1084,7 @@ export function GroupDMChat() {
                 disabled={deleting}
                 className="rounded border-hairline bg-surface accent-[color:var(--color-copper)]"
               />
-              Notify members
+              {t("dash.notifyMembers")}
             </label>
             {deleteError && (
               <p className="mb-3 text-xs text-lamp-err">{deleteError}</p>
@@ -1091,7 +1095,7 @@ export function GroupDMChat() {
                 disabled={deleting}
                 className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <button
                 onClick={async () => {
@@ -1101,7 +1105,7 @@ export function GroupDMChat() {
                     await groupdmApi.delete(group.id, deleteNotify);
                     navigate("/");
                   } catch (e) {
-                    setDeleteError(e instanceof Error ? e.message : "Failed to delete");
+                    setDeleteError(e instanceof Error ? e.message : t("gdm.deleteFailed"));
                   } finally {
                     setDeleting(false);
                   }
@@ -1109,7 +1113,7 @@ export function GroupDMChat() {
                 disabled={deleting}
                 className="rounded-[10px] border border-lamp-err/50 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err transition-colors hover:bg-lamp-err/20 disabled:opacity-50"
               >
-                {deleting ? "Deleting…" : "Delete"}
+                {deleting ? t("gdm.deleting") : t("gdm.delete")}
               </button>
             </div>
           </div>
@@ -1127,10 +1131,10 @@ export function GroupDMChat() {
         >
           <div className="w-80 rounded-[10px] border border-hairline bg-raised p-5 shadow-xl shadow-black/50">
             <h3 className="mb-2 text-sm font-medium text-ink">
-              Archive &ldquo;{group.name}&rdquo;?
+              {t("gdm.archiveConfirmTitle", { name: group.name })}
             </h3>
             <p className="mb-4 text-xs text-ink-dim">
-              This permanently closes the thread. It cannot be restored.
+              {t("gdm.archiveConfirmBody")}
             </p>
             {archiveError && (
               <p className="mb-3 text-xs text-lamp-err">{archiveError}</p>
@@ -1141,7 +1145,7 @@ export function GroupDMChat() {
                 disabled={archiving}
                 className="rounded-[10px] px-3 py-1.5 text-xs text-ink-dim transition-colors hover:text-ink disabled:opacity-50"
               >
-                Cancel
+                {t("common.cancel")}
               </button>
               <button
                 onClick={async () => {
@@ -1151,7 +1155,7 @@ export function GroupDMChat() {
                     await groupdmApi.archive(group.id);
                     navigate("/");
                   } catch (e) {
-                    setArchiveError(e instanceof Error ? e.message : "Failed to archive");
+                    setArchiveError(e instanceof Error ? e.message : t("gdm.archiveFailed"));
                   } finally {
                     setArchiving(false);
                   }
@@ -1159,7 +1163,7 @@ export function GroupDMChat() {
                 disabled={archiving}
                 className="rounded-[10px] border border-lamp-err/50 bg-lamp-err/10 px-3 py-1.5 text-xs text-lamp-err transition-colors hover:bg-lamp-err/20 disabled:opacity-50"
               >
-                {archiving ? "Archiving…" : "Archive"}
+                {archiving ? t("gdm.archiving") : t("gdm.archive")}
               </button>
             </div>
           </div>

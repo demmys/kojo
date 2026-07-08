@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, isThumbSupported } from "../../lib/api";
+import { useT } from "../../lib/i18n";
 
 export type MediaPreviewType = "image" | "video";
 
@@ -40,6 +41,7 @@ export function MediaOverlay({
   onClose: () => void;
   onNavigate?: (dir: -1 | 1) => void;
 }) {
+  const t = useT();
   // attachmentURL routes kojo:// → /api/v1/blob/... and falls back
   // to the file browser raw endpoint for legacy filesystem paths.
   const rawUrl = attachmentURL(path);
@@ -115,7 +117,7 @@ export function MediaOverlay({
           type="button"
           onClick={onClose}
           className="absolute -top-3 -right-3 w-8 h-8 bg-raised hover:bg-hover rounded-full flex items-center justify-center text-ink-dim hover:text-ink z-10 shadow-lg"
-          aria-label="Close preview"
+          aria-label={t("media.closePreview")}
         >
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -137,8 +139,8 @@ export function MediaOverlay({
                 onNavigate?.(-1);
               }}
               className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
-              aria-label="Previous preview"
-              title="Previous"
+              aria-label={t("media.prevPreview")}
+              title={t("media.prev")}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
@@ -151,8 +153,8 @@ export function MediaOverlay({
                 onNavigate?.(1);
               }}
               className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
-              aria-label="Next preview"
-              title="Next"
+              aria-label={t("media.nextPreview")}
+              title={t("media.next")}
             >
               <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
@@ -174,14 +176,14 @@ export function MediaOverlay({
               <svg className="w-12 h-12 text-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
               </svg>
-              <p className="text-sm text-ink-dim">This video format cannot be played in the browser.</p>
+              <p className="text-sm text-ink-dim">{t("media.videoUnplayable")}</p>
               <a
                 href={`${rawUrl}&download=1`}
                 download={fileName}
                 className="px-4 py-2 bg-copper hover:bg-copper-bright text-[#14100b] font-semibold text-sm rounded-[10px] transition-colors"
                 onClick={(e) => e.stopPropagation()}
               >
-                Download
+                {t("media.download")}
               </a>
             </div>
           ) : (

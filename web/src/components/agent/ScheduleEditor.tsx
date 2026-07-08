@@ -12,6 +12,7 @@ import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
 import { Textarea } from "../ui/Textarea";
 import { Toggle } from "../ui/Toggle";
+import { t as i18nT, useT, type MessageKey } from "../../lib/i18n";
 
 // Shared chip style for the preset / tab / day-of-week toggles.
 function chipClass(selected: boolean): string {
@@ -57,8 +58,6 @@ interface Props {
   checkingIn?: boolean;
 }
 
-const DEFAULT_CRON_MESSAGE_HINT =
-  "If there are recent events or observations, record them in memory/{date}.md, and execute any necessary tasks.";
 
 // CRON_MESSAGE_MAX_LEN matches the server-side workspaceFileBodyCap (1 MiB)
 // divided by 4 — UTF-8 worst-case is 4 bytes per code unit, so capping
@@ -100,16 +99,16 @@ function formatNextCron(
   now: number,
 ): { abs: string; rel: string } | null {
   if (!iso) return null;
-  const t = new Date(iso);
-  if (Number.isNaN(t.getTime())) return null;
-  const abs = t.toLocaleString(undefined, {
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return null;
+  const abs = dt.toLocaleString(undefined, {
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     timeZoneName: "short",
   });
-  const diffMs = t.getTime() - now;
+  const diffMs = dt.getTime() - now;
   const past = diffMs < 0;
   const mins = Math.max(1, Math.round(Math.abs(diffMs) / 60000));
   let amount: string;
@@ -123,20 +122,28 @@ function formatNextCron(
     const h = Math.floor((mins % (60 * 24)) / 60);
     amount = h === 0 ? `${d}d` : `${d}d${h}h`;
   }
-  return { abs, rel: past ? `${amount} ago` : `in ${amount}` };
+  return { abs, rel: past ? i18nT("sched.relAgo", { amount }) : i18nT("sched.relIn", { amount }) };
 }
 
 type TabId = "preset" | "hourly" | "daily" | "weekly" | "advanced";
 
-const TABS: { id: TabId; label: string }[] = [
-  { id: "preset", label: "Preset" },
-  { id: "hourly", label: "Hourly" },
-  { id: "daily", label: "Daily" },
-  { id: "weekly", label: "Weekly" },
-  { id: "advanced", label: "Advanced" },
+const TABS: { id: TabId; labelKey: MessageKey }[] = [
+  { id: "preset", labelKey: "sched.tabPreset" },
+  { id: "hourly", labelKey: "sched.tabHourly" },
+  { id: "daily", labelKey: "sched.tabDaily" },
+  { id: "weekly", labelKey: "sched.tabWeekly" },
+  { id: "advanced", labelKey: "sched.tabAdvanced" },
 ];
 
-const DOW_NAMES = ["日", "月", "火", "水", "木", "金", "土"];
+const DOW_KEYS: MessageKey[] = [
+  "sched.dowSun",
+  "sched.dowMon",
+  "sched.dowTue",
+  "sched.dowWed",
+  "sched.dowThu",
+  "sched.dowFri",
+  "sched.dowSat",
+];
 
 /**
  * Pick which tab to surface when the editor mounts (or the value changes
@@ -188,6 +195,7 @@ export function ScheduleEditor({
   onCheckin,
   checkingIn,
 }: Props) {
+  const t = useT();
   const showResumeIdle =
     onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
 
@@ -245,20 +253,20 @@ export function ScheduleEditor({
     <div className="space-y-4">
       {/* Mode tabs */}
       <div>
-        <label className="mb-2 block text-[12px] font-medium text-ink-dim">Schedule</label>
+        <label className="mb-2 block text-[12px] font-medium text-ink-dim">{t("settings.sec.schedule")}</label>
         <div className="mb-3 flex gap-1 rounded-lg border border-hairline bg-raised p-1">
-          {TABS.map((t) => (
+          {TABS.map((tb) => (
             <button
-              key={t.id}
+              key={tb.id}
               type="button"
-              onClick={() => setTab(t.id)}
+              onClick={() => setTab(tb.id)}
               className={`flex-1 rounded-md px-2 py-1 text-[12px] transition-colors ${
-                tab === t.id
+                tab === tb.id
                   ? "bg-copper/15 text-copper-bright"
                   : "text-ink-dim hover:text-ink"
               }`}
             >
-              {t.label}
+              {t(tb.labelKey)}
             </button>
           ))}
         </div>
@@ -277,7 +285,11 @@ export function ScheduleEditor({
                   onClick={() => onCronExprChange(opt.cron)}
                   className={chipClass(selected)}
                 >
-                  {opt.label}
+                  {opt.label === "Off"
+                    ? t("sched.presetOff")
+                    : opt.label === "Daily 09:00"
+                      ? t("sched.presetDaily9")
+                      : opt.label}
                 </button>
               );
             })}
@@ -336,7 +348,7 @@ export function ScheduleEditor({
 
       {/* Timeout */}
       {(enabled || onCheckin) && (
-        <Field label="Timeout" help="Max duration for each scheduled or manual check-in run.">
+        <Field label={t("sched.timeout")} help={t("sched.timeoutHelp")}>
           <div className="flex flex-wrap gap-1.5">
             {TIMEOUT_PRESETS.map((opt) => (
               <button
@@ -357,11 +369,11 @@ export function ScheduleEditor({
         <Field
           label={
             <>
-              Resume Window
-              <span className="ml-2 text-ink-faint">(claude session reset threshold)</span>
+              {t("sched.resumeWindow")}
+              <span className="ml-2 text-ink-faint">{t("sched.resumeWindowSub")}</span>
             </>
           }
-          help="How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Default matches Anthropic's prompt-cache TTL."
+          help={t("sched.resumeWindowHelp")}
         >
           <div className="flex flex-wrap gap-1.5">
             {RESUME_IDLE_PRESETS.map((opt) => (
@@ -371,7 +383,7 @@ export function ScheduleEditor({
                 onClick={() => onResumeIdleChange?.(opt.value)}
                 className={chipClass((resumeIdleMinutes ?? 0) === opt.value)}
               >
-                {opt.label}
+                {opt.value === 0 ? t("sched.resumeDefault") : opt.label}
               </button>
             ))}
           </div>
@@ -382,14 +394,14 @@ export function ScheduleEditor({
       {enabled && (
         <div>
           <div className="mb-2 flex items-center justify-between">
-            <label className="text-[12px] font-medium text-ink-dim">Silent Hours</label>
-            <Toggle checked={silentEnabled} onChange={toggleSilentHours} aria-label="Silent hours" />
+            <label className="text-[12px] font-medium text-ink-dim">{t("sched.silentHours")}</label>
+            <Toggle checked={silentEnabled} onChange={toggleSilentHours} aria-label={t("sched.silentHours")} />
           </div>
 
           {silentEnabled && (
             <div className="space-y-3">
               <div className="flex items-center gap-3">
-                <Field label="From" className="flex-1">
+                <Field label={t("sched.from")} className="flex-1">
                   <Input
                     type="time"
                     value={localStart}
@@ -397,7 +409,7 @@ export function ScheduleEditor({
                   />
                 </Field>
                 <span className="mt-6 text-ink-faint">—</span>
-                <Field label="To" className="flex-1">
+                <Field label={t("sched.to")} className="flex-1">
                   <Input
                     type="time"
                     value={localEnd}
@@ -423,15 +435,15 @@ export function ScheduleEditor({
 
               <p className="text-[11px] text-ink-faint">
                 {toMinutes(localStart) <= toMinutes(localEnd)
-                  ? `Silent ${localStart}–${localEnd}. Paused during this window. (server time)`
-                  : `Silent ${localStart}–24:00 & 0:00–${localEnd} (overnight, server time).`}
+                  ? t("sched.silentRange", { start: localStart, end: localEnd })
+                  : t("sched.silentRangeOvernight", { start: localStart, end: localEnd })}
               </p>
             </div>
           )}
 
           {!silentEnabled && (
             <p className="text-[11px] text-ink-faint">
-              Runs 24/7. Enable to set quiet hours.
+              {t("sched.runs247")}
             </p>
           )}
         </div>
@@ -451,14 +463,14 @@ export function ScheduleEditor({
             return (
               <div className="flex items-center justify-between gap-3">
                 <span className="text-[12px] text-ink-dim">
-                  Next check-in
+                  {t("sched.nextCheckin")}
                   {cronPausedGlobal && (
-                    <span className="ml-1.5 text-lamp-warn">(paused)</span>
+                    <span className="ml-1.5 text-lamp-warn">{t("sched.pausedSuffix")}</span>
                   )}
                 </span>
                 <span className="text-[12px] tabular-nums text-ink">
                   {scheduleDirty ? (
-                    <span className="text-ink-faint">save to update</span>
+                    <span className="text-ink-faint">{t("sched.saveToUpdate")}</span>
                   ) : next ? (
                     <>
                       {next.abs}
@@ -480,19 +492,19 @@ export function ScheduleEditor({
             disabled={checkingIn}
             className="w-full rounded-lg border border-copper/50 bg-copper/10 px-3 py-2 text-[13px] text-copper-bright transition-colors hover:bg-copper/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {checkingIn ? "Checking in…" : "Check in now"}
+            {checkingIn ? t("sched.checkingIn") : t("sched.checkinNow")}
           </button>
         </div>
       )}
 
       {/* Custom Check-in Message */}
       <Field
-        label="Check-in Message"
+        label={t("sched.checkinMessage")}
         help={
           <>
-            Replaces the trailing instruction in periodic and manual check-in
-            prompts. Use <code className="text-ink-dim">{"{date}"}</code> as a
-            placeholder for today (YYYY-MM-DD). Leave blank for the default.
+            {t("sched.checkinMessageHelpPre")}
+            <code className="text-ink-dim">{"{date}"}</code>
+            {t("sched.checkinMessageHelpPost")}
           </>
         }
       >
@@ -501,7 +513,7 @@ export function ScheduleEditor({
           onChange={(e) => onCronMessageChange(e.target.value)}
           rows={3}
           maxLength={CRON_MESSAGE_MAX_LEN}
-          placeholder={DEFAULT_CRON_MESSAGE_HINT}
+          placeholder={t("sched.checkinMessageHint")}
         />
       </Field>
     </div>
@@ -517,11 +529,12 @@ function HourlyEditor({
   initialMinute: number;
   onChange: (m: number) => void;
 }) {
+  const t = useT();
   const [m, setM] = useState(initialMinute);
   useEffect(() => setM(initialMinute), [initialMinute]);
   return (
     <div className="flex items-center gap-3">
-      <label className="text-[13px] text-ink-dim">毎時</label>
+      <label className="text-[13px] text-ink-dim">{t("sched.everyHourAt")}</label>
       <Input
         type="number"
         min={0}
@@ -534,7 +547,7 @@ function HourlyEditor({
         }}
         className="w-20"
       />
-      <span className="text-[13px] text-ink-dim">分</span>
+      <span className="text-[13px] text-ink-dim">{t("sched.minuteUnit")}</span>
     </div>
   );
 }
@@ -548,6 +561,7 @@ function DailyEditor({
   mm: number;
   onChange: (hh: number, mm: number) => void;
 }) {
+  const t = useT();
   const [h, setH] = useState(hh);
   const [m, setM] = useState(mm);
   useEffect(() => {
@@ -557,7 +571,7 @@ function DailyEditor({
   const value = `${pad(h)}:${pad(m)}`;
   return (
     <div className="flex items-center gap-3">
-      <label className="text-[13px] text-ink-dim">毎日</label>
+      <label className="text-[13px] text-ink-dim">{t("sched.everyDayAt")}</label>
       <Input
         type="time"
         value={value}
@@ -586,6 +600,7 @@ function WeeklyEditor({
   dows: number[];
   onChange: (hh: number, mm: number, dows: number[]) => void;
 }) {
+  const t = useT();
   const [h, setH] = useState(hh);
   const [m, setM] = useState(mm);
   const [d, setD] = useState<number[]>(dows);
@@ -604,7 +619,7 @@ function WeeklyEditor({
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5">
-        {DOW_NAMES.map((label, i) => {
+        {DOW_KEYS.map((key, i) => {
           const selected = d.includes(i);
           return (
             <button
@@ -613,7 +628,7 @@ function WeeklyEditor({
               onClick={() => toggleDow(i)}
               className={chipClass(selected)}
             >
-              {label}
+              {t(key)}
             </button>
           );
         })}
@@ -635,7 +650,7 @@ function WeeklyEditor({
       </div>
       {d.length === 0 && (
         <p className="text-[12px] text-lamp-warn">
-          曜日を 1 つ以上選んで。空のまま保存するとスケジュール無効になる。
+          {t("sched.weeklyNoDow")}
         </p>
       )}
     </div>
@@ -651,11 +666,12 @@ function AdvancedEditor({
   onLocalChange: (v: string) => void;
   onCommit: (v: string) => void;
 }) {
+  const t = useT();
   const valid = isCronExprSyntaxValid(value);
   return (
     <Field
-      help="5-field cron (minute hour day-of-month month day-of-week). Empty = off. Press Enter or tab away to apply."
-      error={!valid ? "Invalid syntax — must be 5 whitespace-separated fields." : undefined}
+      help={t("sched.advancedHelp")}
+      error={!valid ? t("sched.advancedInvalid") : undefined}
     >
       <Input
         mono

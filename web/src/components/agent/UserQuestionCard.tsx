@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { UserQuestion } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
+import { useT } from "../../lib/i18n";
 
 export interface PendingQuestion {
   requestId: string;
@@ -18,6 +19,7 @@ export function UserQuestionCard({
   pending: PendingQuestion;
   onSubmit: (answers: Record<string, string | string[]>) => Promise<void>;
 }) {
+  const t = useT();
   const { questions } = pending;
   // Per-question selected labels (multi) / single label, plus free text.
   const [selected, setSelected] = useState<Record<number, string[]>>({});
@@ -87,21 +89,21 @@ export function UserQuestionCard({
   if (done) {
     return (
       <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-ink-dim">
-        回答済み: {done}
+        {t("uq.answered", { answers: done })}
       </div>
     );
   }
   if (expired) {
     return (
       <div className="mx-auto max-w-[760px] rounded-[10px] border border-hairline bg-app/60 px-3 py-2 text-xs text-ink-dim">
-        この質問は期限切れ (ターンが終了した)。
+        {t("uq.expired")}
       </div>
     );
   }
 
   return (
     <div className="mx-auto max-w-[760px] rounded-[12px] border border-lamp-warn/40 bg-lamp-warn/5 px-4 py-3">
-      <div className="mb-2 text-xs font-medium text-lamp-warn">質問</div>
+      <div className="mb-2 text-xs font-medium text-lamp-warn">{t("uq.question")}</div>
       {questions.map((q, qi) => (
         <div key={qi} className="mb-3 last:mb-0">
           {q.header && <div className="mb-1 text-xs text-ink-dim">{q.header}</div>}
@@ -134,7 +136,7 @@ export function UserQuestionCard({
             type="text"
             value={custom[qi] ?? ""}
             onChange={(e) => setCustom((prev) => ({ ...prev, [qi]: e.target.value }))}
-            placeholder="その他 (自由入力)"
+            placeholder={t("uq.otherPlaceholder")}
             className="mt-2 w-full rounded-[8px] border border-hairline bg-app px-3 py-1.5 text-sm text-ink outline-none focus:border-copper"
           />
         </div>
@@ -146,7 +148,7 @@ export function UserQuestionCard({
         onClick={submit}
         className="rounded-[8px] bg-copper px-4 py-1.5 text-sm font-semibold text-[#14100b] transition-colors hover:bg-copper-bright disabled:opacity-40"
       >
-        {submitting ? "送信中…" : "回答する"}
+        {submitting ? t("uq.submitting") : t("uq.submit")}
       </button>
     </div>
   );

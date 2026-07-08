@@ -3,8 +3,10 @@ import { useNavigate, useParams } from "react-router";
 import { FileDataBrowser } from "../FileDataBrowser";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { AgentAvatar } from "./AgentAvatar";
+import { useT } from "../../lib/i18n";
 
 export function AgentDataBrowser() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const navigateRef = useRef(navigate);
@@ -45,9 +47,9 @@ export function AgentDataBrowser() {
       dataSource={dataSource}
       pathMode="relative"
       pathParam="sub"
-      rootLabel="Data"
+      rootLabel={t("adb.rootLabel")}
       title={agent?.name ?? " "}
-      subtitle="Data folder"
+      subtitle={t("chat.dataFolder")}
       leading={
         agent ? (
           <AgentAvatar agentId={agent.id} name={agent.name} size="sm" cacheBust={agent.avatarHash} />

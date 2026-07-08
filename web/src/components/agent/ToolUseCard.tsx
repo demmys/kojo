@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ToolUse } from "../../lib/agentApi";
+import { useT } from "../../lib/i18n";
 
 interface ToolUseCardProps {
   toolUse: ToolUse;
@@ -25,6 +26,7 @@ function extractPreview(input: string): string | undefined {
 }
 
 export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardProps) {
+  const t = useT();
   const [expanded, setExpanded] = useState(defaultExpanded);
   const preview = extractPreview(toolUse.input);
   const children = toolUse.children ?? [];
@@ -65,7 +67,7 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
         )}
         {children.length > 0 && (
           <span className="shrink-0 rounded-full bg-app/60 px-1.5 py-0.5 font-mono text-[10px] text-ink-faint">
-            {children.length} sub
+            {t("tool.subCount", { count: children.length })}
           </span>
         )}
         {isBackground && (
@@ -74,7 +76,7 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
               backgroundDone ? "bg-emerald-500/10 text-emerald-400" : "bg-amber-500/10 text-amber-400"
             }`}
           >
-            {backgroundDone ? "background done" : "background running"}
+            {backgroundDone ? t("tool.backgroundDone") : t("tool.backgroundRunning")}
           </span>
         )}
       </button>
@@ -82,7 +84,7 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
         <div className="space-y-2 border-t border-hairline bg-app/40 px-3 py-2">
           {toolUse.input && (
             <div>
-              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Input</div>
+              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">{t("tool.input")}</div>
               <pre className="max-h-60 overflow-x-auto overflow-y-auto whitespace-pre-wrap wrap-anywhere text-ink-dim">
                 {toolUse.input}
               </pre>
@@ -90,7 +92,7 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
           )}
           {toolUse.output && (
             <div>
-              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Output</div>
+              <div className="mb-0.5 font-mono text-[10px] uppercase tracking-wide text-ink-faint">{t("tool.output")}</div>
               <pre className="max-h-60 overflow-x-auto overflow-y-auto whitespace-pre-wrap wrap-anywhere text-ink-dim">
                 {toolUse.output}
               </pre>
@@ -98,7 +100,7 @@ export function ToolUseCard({ toolUse, defaultExpanded = false }: ToolUseCardPro
           )}
           {children.length > 0 && (
             <div className="border-l-2 border-hairline pl-2">
-              <div className="mb-1 font-mono text-[10px] uppercase tracking-wide text-ink-faint">Subagent</div>
+              <div className="mb-1 font-mono text-[10px] uppercase tracking-wide text-ink-faint">{t("tool.subagent")}</div>
               {children.map((child, i) =>
                 child.name ? (
                   <ToolUseCard key={i} toolUse={child} />

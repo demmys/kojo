@@ -7,6 +7,7 @@ import {
   MediaOverlay,
   type MediaPreviewType,
 } from "./MediaOverlay";
+import { useT } from "../../lib/i18n";
 
 // File extension categories
 const IMAGE_EXTS = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
@@ -53,6 +54,7 @@ function ImageAttachmentChip({
   url: string;
   onPreview: () => void;
 }) {
+  const t = useT();
   const [loaded, setLoaded] = useState(false);
   const [failed, setFailed] = useState(false);
   // Reset both load-state flags whenever the URL changes. Without
@@ -96,7 +98,7 @@ function ImageAttachmentChip({
                 <path strokeLinecap="round" strokeLinejoin="round" d="M3 3l18 18" />
               </svg>
               <span className="text-center break-all line-clamp-2">{att.name}</span>
-              <span className="opacity-60">image unavailable</span>
+              <span className="opacity-60">{t("attach.imageUnavailable")}</span>
             </>
           ) : (
             <div className="w-4 h-4 rounded-full border-2 border-ink-faint border-t-transparent animate-spin" />
@@ -109,6 +111,7 @@ function ImageAttachmentChip({
 
 /** Display file attachments on a message */
 export function AttachmentList({ attachments, isUser }: { attachments: AgentMessageAttachment[]; isUser: boolean }) {
+  const t = useT();
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const previewable = useMemo<MediaPreviewItem[]>(
     () =>
@@ -174,7 +177,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
               className={`flex items-center gap-1.5 px-2 py-1 rounded-[10px] text-xs hover:opacity-80 transition-opacity no-underline ${
                 isUser ? "bg-copper/20 text-ink" : "bg-surface text-ink-dim"
               }`}
-              title={`Download ${att.name}`}
+              title={t("attach.downloadTitle", { name: att.name })}
             >
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 opacity-60">
                 <path d="M3 3.5A1.5 1.5 0 014.5 2h6.879a1.5 1.5 0 011.06.44l4.122 4.12A1.5 1.5 0 0117 7.622V16.5a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 16.5v-13z" />

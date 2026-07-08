@@ -6,6 +6,7 @@ import { useTerminal } from "../hooks/useTerminal";
 import type { WSMessage } from "../hooks/useWebSocket";
 import { useSpecialKeys } from "../hooks/useSpecialKeys";
 import { SpecialKeysBar } from "./SpecialKeysBar";
+import { useT, type MessageKey } from "../lib/i18n";
 
 interface TerminalTabProps {
   parentSessionId: string;
@@ -17,20 +18,21 @@ interface TerminalTabProps {
   peerId?: string;
 }
 
-const TMUX_SHORTCUTS = [
-  { label: "+Win", action: "new-window" },
-  { label: "\u2190Win", action: "prev-window" },
-  { label: "Win\u2192", action: "next-window" },
-  { label: "\u2500", action: "split-h" },
-  { label: "\u2502", action: "split-v" },
-  { label: "Pane", action: "select-pane" },
-  { label: "Zoom", action: "resize-pane-z" },
-  { label: "List", action: "choose-tree" },
-  { label: "Copy", action: "copy-mode" },
-  { label: "Kill", action: "kill-pane" },
+const TMUX_SHORTCUTS: { labelKey: MessageKey; action: string }[] = [
+  { labelKey: "term.tmuxNewWin", action: "new-window" },
+  { labelKey: "term.tmuxPrevWin", action: "prev-window" },
+  { labelKey: "term.tmuxNextWin", action: "next-window" },
+  { labelKey: "term.tmuxSplitH", action: "split-h" },
+  { labelKey: "term.tmuxSplitV", action: "split-v" },
+  { labelKey: "term.tmuxPane", action: "select-pane" },
+  { labelKey: "term.tmuxZoom", action: "resize-pane-z" },
+  { labelKey: "term.tmuxList", action: "choose-tree" },
+  { labelKey: "term.tmuxCopy", action: "copy-mode" },
+  { labelKey: "term.tmuxKill", action: "kill-pane" },
 ];
 
 export function TerminalTab({ parentSessionId, workDir, visible, peerId }: TerminalTabProps) {
+  const t = useT();
   const termContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const outputBufRef = useRef<OutputBuffer | null>(null);
@@ -231,8 +233,8 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
         if (msg.includes("tool not found")) {
           setError(
             shellTool === "tmux" || shellTool === null
-              ? "tmux is not installed.\nInstall: brew install tmux"
-              : `${shellTool} is not available.`,
+              ? t("term.tmuxMissing")
+              : t("term.toolUnavailable", { tool: shellTool }),
           );
         } else {
           setError(msg);
@@ -280,7 +282,7 @@ export function TerminalTab({ parentSessionId, workDir, visible, peerId }: Termi
               }}
               className="whitespace-nowrap rounded-[10px] border border-hairline bg-raised px-3 py-2.5 font-mono text-xs text-ink-dim transition-colors active:bg-hover"
             >
-              {s.label}
+              {t(s.labelKey)}
             </button>
           ))}
         </div>

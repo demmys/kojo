@@ -7,8 +7,10 @@ import { Input } from "../ui/Input";
 import { Textarea } from "../ui/Textarea";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
+import { useT } from "../../lib/i18n";
 
 function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
+  const t = useT();
   const [code, setCode] = useState<string | null>(null);
   const [remaining, setRemaining] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -77,7 +79,7 @@ function TOTPDisplay({ agentId, credId }: { agentId: string; credId: string }) {
           copied ? "text-lamp-run" : "text-ink-faint hover:bg-hover hover:text-ink-dim"
         }`}
       >
-        {copied ? "OK" : "Copy"}
+        {copied ? "OK" : t("msg.copy")}
       </button>
     </div>
   );
@@ -93,6 +95,7 @@ function QRImportModal({
   onSelect: (entry: OTPEntry) => void;
   onClose: () => void;
 }) {
+  const t = useT();
   const [entries, setEntries] = useState<OTPEntry[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -139,8 +142,8 @@ function QRImportModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
       <div className="flex max-h-[80vh] w-full max-w-md flex-col rounded-[10px] border border-hairline bg-raised">
         <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
-          <h2 className="text-[14px] font-semibold text-ink">Import TOTP</h2>
-          <button onClick={onClose} className="text-ink-faint transition-colors hover:text-ink" aria-label="Close">
+          <h2 className="text-[14px] font-semibold text-ink">{t("cred.importTotp")}</h2>
+          <button onClick={onClose} className="text-ink-faint transition-colors hover:text-ink" aria-label={t("common.close")}>
             &times;
           </button>
         </div>
@@ -155,7 +158,7 @@ function QRImportModal({
                     mode === "upload" ? "bg-copper/15 text-copper-bright" : "text-ink-dim hover:text-ink"
                   }`}
                 >
-                  QR Image
+                  {t("cred.qrImage")}
                 </button>
                 <button
                   onClick={() => setMode("uri")}
@@ -163,7 +166,7 @@ function QRImportModal({
                     mode === "uri" ? "bg-copper/15 text-copper-bright" : "text-ink-dim hover:text-ink"
                   }`}
                 >
-                  URI Text
+                  {t("cred.uriText")}
                 </button>
               </div>
 
@@ -184,7 +187,7 @@ function QRImportModal({
                     disabled={loading}
                     className="w-full rounded-lg border-2 border-dashed border-hairline py-8 text-[14px] text-ink-faint transition-colors hover:border-ink-faint hover:text-ink-dim"
                   >
-                    {loading ? "Decoding..." : "Tap to select QR image"}
+                    {loading ? t("cred.decoding") : t("cred.tapSelectQr")}
                   </button>
                 </div>
               ) : (
@@ -202,7 +205,7 @@ function QRImportModal({
                     disabled={loading || !uri.trim()}
                     className="w-full"
                   >
-                    {loading ? "Parsing..." : "Parse"}
+                    {loading ? t("cred.parsing") : t("cred.parse")}
                   </Button>
                 </div>
               )}
@@ -210,7 +213,7 @@ function QRImportModal({
           ) : (
             <>
               <div className="text-[12px] text-ink-dim">
-                {entries.length} entries found &mdash; select one
+                {t("cred.entriesFound", { count: entries.length })}
               </div>
               {entries.map((entry, i) => (
                 <button
@@ -220,7 +223,7 @@ function QRImportModal({
                 >
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-[14px] font-medium text-ink">
-                      {entry.issuer || entry.label || "Unknown"}
+                      {entry.issuer || entry.label || t("cred.unknown")}
                     </div>
                     <div className="truncate font-mono text-[12px] text-ink-faint">{entry.username}</div>
                   </div>
@@ -250,6 +253,7 @@ function CredentialEdit({
   onSave: (updated: Credential) => void;
   onCancel: () => void;
 }) {
+  const t = useT();
   const [label, setLabel] = useState(credential.label);
   const [username, setUsername] = useState(credential.username);
   const [password, setPassword] = useState("");
@@ -305,26 +309,26 @@ function CredentialEdit({
       <Input
         value={label}
         onChange={(e) => setLabel(e.target.value)}
-        placeholder="Label"
+        placeholder={t("cred.label")}
         autoFocus
       />
       <Input
         value={username}
         onChange={(e) => setUsername(e.target.value)}
-        placeholder="Username / ID"
+        placeholder={t("cred.username")}
       />
       <Input
         type="password"
         value={password}
         onChange={(e) => setPassword(e.target.value)}
-        placeholder="New password (leave empty to keep)"
+        placeholder={t("cred.newPasswordKeep")}
       />
       <div className="flex gap-2">
         <Input
           type="password"
           value={totpSecret}
           onChange={(e) => setTotpSecret(e.target.value)}
-          placeholder={hasTOTP ? "New TOTP secret (leave empty to keep)" : "TOTP Secret (optional)"}
+          placeholder={hasTOTP ? t("cred.newTotpKeep") : t("cred.totpOptional")}
           className="flex-1"
         />
         <Button onClick={() => setShowQR(true)} disabled={isSwitching} className="shrink-0">
@@ -337,12 +341,12 @@ function CredentialEdit({
           variant="primary"
           onClick={handleSave}
           disabled={saving || isSwitching || !label.trim() || !username.trim()}
-          title={isSwitching ? "デバイス転移中。完了するまで保存できない。" : undefined}
+          title={isSwitching ? t("cred.switchingNoSave") : undefined}
           className="flex-1"
         >
-          {saving ? "Saving..." : "Save"}
+          {saving ? t("settings.saving") : t("gs.save")}
         </Button>
-        <Button onClick={onCancel}>Cancel</Button>
+        <Button onClick={onCancel}>{t("common.cancel")}</Button>
       </div>
 
       {showQR && (
@@ -357,6 +361,7 @@ function CredentialEdit({
 }
 
 export function AgentCredentials() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [credentials, setCredentials] = useState<Credential[]>([]);
@@ -404,9 +409,7 @@ export function AgentCredentials() {
           // sees that the isSwitching indicator is unknown (UI defaults
           // to enabled, which is wrong if a switch is actually running).
           const err = agentRes.reason;
-          setListError(
-            "agent record fetch failed: " + errMsg(err),
-          );
+          setListError(t("cred.agentFetchFailed", { msg: errMsg(err) }));
         }
         setLoading(false);
       },
@@ -498,7 +501,7 @@ export function AgentCredentials() {
   };
 
   const handleDelete = async (credId: string) => {
-    if (!id || !confirm("Delete this credential?")) return;
+    if (!id || !confirm(t("cred.deleteConfirm"))) return;
     try {
       await agentApi.credentials.delete(id, credId);
       setCredentials((prev) => prev.filter((c) => c.id !== credId));
@@ -534,20 +537,20 @@ export function AgentCredentials() {
 
   return (
     <div className="min-h-full bg-app text-ink">
-      <PageHeader title="Credentials" onBack={() => navigate(`/agents/${id}`, { replace: true })}>
+      <PageHeader title={t("chat.credentials")} onBack={() => navigate(`/agents/${id}`, { replace: true })}>
         <Button
           onClick={() => { setShowForm((v) => !v); setEditingId(null); }}
           disabled={isSwitching}
-          title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
+          title={isSwitching ? t("cred.switchingNoAdd") : undefined}
         >
-          {showForm ? "Cancel" : "+ Add"}
+          {showForm ? t("common.cancel") : t("cred.addButton")}
         </Button>
       </PageHeader>
 
       <main className="mx-auto max-w-[560px] space-y-3 px-4 py-6">
         {isSwitching && (
           <Banner tone="warn">
-            デバイス転移中。完了するまで credential は編集できない。
+            {t("cred.switchingBanner")}
           </Banner>
         )}
 
@@ -556,7 +559,7 @@ export function AgentCredentials() {
             tone="error"
             action={
               <Button onClick={reload} variant="danger" className="shrink-0">
-                Retry
+                {t("cred.retry")}
               </Button>
             }
           >
@@ -570,26 +573,26 @@ export function AgentCredentials() {
             <Input
               value={label}
               onChange={(e) => setLabel(e.target.value)}
-              placeholder="Label (e.g. GitHub)"
+              placeholder={t("cred.labelExample")}
               autoFocus
             />
             <Input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="Username / ID"
+              placeholder={t("cred.username")}
             />
             <Input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="Password"
+              placeholder={t("cred.password")}
             />
             <div className="flex gap-2">
               <Input
                 type="password"
                 value={totpSecret}
                 onChange={(e) => setTotpSecret(e.target.value)}
-                placeholder="TOTP Secret (optional)"
+                placeholder={t("cred.totpOptional")}
                 className="flex-1"
               />
               <Button onClick={() => setShowAddQR(true)} disabled={isSwitching} className="shrink-0">
@@ -602,10 +605,10 @@ export function AgentCredentials() {
               disabled={
                 adding || isSwitching || !label.trim() || !username.trim() || (!password && !totpSecret.trim())
               }
-              title={isSwitching ? "デバイス転移中。完了するまで追加できない。" : undefined}
+              title={isSwitching ? t("cred.switchingNoAdd") : undefined}
               className="w-full"
             >
-              {adding ? "Adding..." : "Add"}
+              {adding ? t("cred.adding") : t("cred.add")}
             </Button>
           </div>
         )}
@@ -645,23 +648,23 @@ export function AgentCredentials() {
                         : "text-ink-faint hover:bg-hover hover:text-ink-dim"
                     }`}
                   >
-                    {copied === cred.id ? "Copied" : "Copy PW"}
+                    {copied === cred.id ? t("msg.copied") : t("cred.copyPw")}
                   </button>
                   <button
                     onClick={() => { setEditingId(cred.id); setShowForm(false); }}
                     disabled={isSwitching}
-                    title={isSwitching ? "デバイス転移中。完了するまで編集できない。" : undefined}
+                    title={isSwitching ? t("cred.switchingNoEdit") : undefined}
                     className="rounded-md px-2 py-1 text-[12px] text-ink-faint transition-colors hover:bg-hover hover:text-ink-dim disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                   >
-                    Edit
+                    {t("msg.edit")}
                   </button>
                   <button
                     onClick={() => handleDelete(cred.id)}
                     disabled={isSwitching}
-                    title={isSwitching ? "デバイス転移中。完了するまで削除できない。" : undefined}
+                    title={isSwitching ? t("cred.switchingNoDelete") : undefined}
                     className="rounded-md px-2 py-1 text-[12px] text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                   >
-                    Delete
+                    {t("msg.delete")}
                   </button>
                 </div>
               </div>
@@ -676,7 +679,7 @@ export function AgentCredentials() {
 
         {!loading && !listError && credentials.length === 0 && !showForm && (
           <div className="py-12 text-center text-[14px] text-ink-faint">
-            No credentials registered
+            {t("cred.none")}
           </div>
         )}
 

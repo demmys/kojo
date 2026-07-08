@@ -6,6 +6,7 @@ import { Input } from "../ui/Input";
 import { Toggle } from "../ui/Toggle";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
+import { useT } from "../../lib/i18n";
 
 function CheckRow({
   checked,
@@ -30,6 +31,7 @@ function CheckRow({
 }
 
 export function SlackBotSettings({ agentId }: { agentId: string }) {
+  const t = useT();
   const [status, setStatus] = useState<SlackBotStatus | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [appToken, setAppToken] = useState("");
@@ -87,7 +89,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
         ...(appToken ? { appToken } : {}),
         ...(botToken ? { botToken } : {}),
       });
-      setTestResult(`Connected: team=${res.team}, bot=${res.botUser}`);
+      setTestResult(t("slack.connectedResult", { team: res.team, bot: res.botUser }));
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -96,7 +98,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
   };
 
   const handleDelete = async () => {
-    if (!confirm("Remove Slack bot configuration?")) return;
+    if (!confirm(t("slack.removeConfirm"))) return;
     setSaving(true);
     setError("");
     try {
@@ -121,9 +123,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
         <h3 className="text-[13px] font-semibold text-ink">Slack Bot</h3>
         <div className="flex items-center gap-2">
           {status?.connected && (
-            <span className="text-[12px] text-lamp-run">Connected</span>
+            <span className="text-[12px] text-lamp-run">{t("slack.connected")}</span>
           )}
-          <Toggle checked={enabled} onChange={setEnabled} aria-label="Enable Slack bot" />
+          <Toggle checked={enabled} onChange={setEnabled} aria-label={t("slack.enableAria")} />
         </div>
       </div>
 
@@ -133,9 +135,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
           <Field
             label={
               <>
-                App-Level Token (xapp-...)
+                {t("slack.appToken")}
                 {status?.hasAppToken && !appToken && (
-                  <span className="ml-1 text-lamp-run">configured</span>
+                  <span className="ml-1 text-lamp-run">{t("slack.configured")}</span>
                 )}
               </>
             }
@@ -152,9 +154,9 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
           <Field
             label={
               <>
-                Bot Token (xoxb-...)
+                {t("slack.botToken")}
                 {status?.hasBotToken && !botToken && (
-                  <span className="ml-1 text-lamp-run">configured</span>
+                  <span className="ml-1 text-lamp-run">{t("slack.configured")}</span>
                 )}
               </>
             }
@@ -169,21 +171,21 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
           </Field>
 
           <CheckRow checked={threadReplies} onChange={setThreadReplies}>
-            Always reply in thread
+            {t("slack.threadReplies")}
           </CheckRow>
 
           {/* Reaction patterns */}
           <div>
-            <div className="mb-1 text-[12px] font-medium text-ink-dim">Respond to</div>
+            <div className="mb-1 text-[12px] font-medium text-ink-dim">{t("slack.respondTo")}</div>
             <div className="ml-1">
               <CheckRow checked={respondDM} onChange={setRespondDM}>
-                Direct messages
+                {t("slack.respondDM")}
               </CheckRow>
               <CheckRow checked={respondMention} onChange={setRespondMention}>
-                @mentions in channels
+                {t("slack.respondMention")}
               </CheckRow>
               <CheckRow checked={respondThread} onChange={setRespondThread}>
-                Thread follow-ups (auto-reply without mention)
+                {t("slack.respondThread")}
               </CheckRow>
             </div>
           </div>
@@ -193,7 +195,7 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
 
           <div className="flex gap-2">
             <Button onClick={handleSave} disabled={saving} className="flex-1">
-              {saving ? "Saving..." : "Save"}
+              {saving ? t("settings.saving") : t("gs.save")}
             </Button>
             <Button
               onClick={handleTest}
@@ -203,19 +205,18 @@ export function SlackBotSettings({ agentId }: { agentId: string }) {
                 (!status?.hasBotToken && !botToken)
               }
             >
-              {testing ? "Testing..." : "Test Connection"}
+              {testing ? t("slack.testing") : t("slack.testConnection")}
             </Button>
           </div>
 
           {(status?.hasAppToken || status?.hasBotToken) && (
             <Button variant="danger" onClick={handleDelete} disabled={saving} className="w-full">
-              Remove Slack Bot
+              {t("slack.removeBot")}
             </Button>
           )}
 
           <p className="text-[12px] text-ink-faint">
-            Create a Slack App with Socket Mode enabled. Required scopes: chat:write, app_mentions:read, im:history.
-            Subscribe to events: message.im, app_mention.
+            {t("slack.setupHelp")}
           </p>
         </div>
       )}

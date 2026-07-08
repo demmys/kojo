@@ -4,6 +4,8 @@
 // server. Only matches cron forms that the simple-mode UI can faithfully
 // render; anything else falls back to "Advanced" + a verbatim string echo.
 
+import { getLocale } from "./i18n";
+
 export interface CronStruct {
   minute: string;
   hour: string;
@@ -153,23 +155,30 @@ export function isCronExprSyntaxValid(expr: string): boolean {
   return true;
 }
 
-const DOW_LABELS = ["日", "月", "火", "水", "木", "金", "土"];
+const DOW_LABELS_JA = ["日", "月", "火", "水", "木", "金", "土"];
+const DOW_LABELS_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 /**
- * Build a Japanese-language summary for the most common cron shapes. Falls
+ * Build a locale-aware (ja/en) summary for the most common cron shapes. Falls
  * back to the raw expression in backticks when nothing matches so the user
  * still sees what's about to be saved.
  */
 export function humanizeCron(expr: string): string {
-  if (!expr) return "スケジュールなし";
+  const ja = getLocale() === "ja";
+  const everyNMin = (n: number, offset: boolean) =>
+    (ja ? `${n} 分おき` : `every ${n} min`) + (offset ? " (per-agent offset)" : "");
+  const everyNHour = (n: number, offset: boolean) =>
+    (ja ? `${n} 時間おき` : n === 1 ? "every hour" : `every ${n} hours`) +
+    (offset ? " (per-agent offset)" : "");
+  if (!expr) return ja ? "スケジュールなし" : "No schedule";
   const presetN = parseCronPresetSentinel(expr);
   if (presetN !== null) {
-    if (presetN < 60) return `${presetN} 分おき (per-agent offset)`;
-    if (presetN === 1440) return `毎日 (per-agent offset)`;
+    if (presetN < 60) return everyNMin(presetN, true);
+    if (presetN === 1440) return (ja ? "毎日" : "daily") + " (per-agent offset)";
     if (presetN % 60 === 0 && presetN < 1440) {
-      return `${presetN / 60} 時間おき (per-agent offset)`;
+      return everyNHour(presetN / 60, true);
     }
-    return `${presetN} 分おき (per-agent offset)`;
+    return everyNMin(presetN, true);
   }
   const c = parseCronExpr(expr);
   if (!c) return `cron: \`${expr}\``;
@@ -180,7 +189,7 @@ export function humanizeCron(expr: string): string {
   // evenly spaced over a 60-minute period.
   if (c.hour === "*" && c.dom === "*" && c.month === "*" && c.dow === "*") {
     const stepMin = detectStepMinute(c.minute);
-    if (stepMin !== null) return `${stepMin} 分おき`;
+    if (stepMin !== null) return everyNMin(stepMin, false);
   }
 
   // Every-N hours at fixed minute: "M */N * * *" — likewise recognise
@@ -188,18 +197,22 @@ export function humanizeCron(expr: string): string {
   if (/^\d+$/.test(c.minute) && c.dom === "*" && c.month === "*" && c.dow === "*") {
     const stepHour = detectStepHour(c.hour);
     if (stepHour !== null) {
-      return `${stepHour} 時間おき (${pad2(parseInt(c.minute, 10))} 分)`;
+      return ja
+        ? `${stepHour} 時間おき (${pad2(parseInt(c.minute, 10))} 分)`
+        : `${everyNHour(stepHour, false)} (at :${pad2(parseInt(c.minute, 10))})`;
     }
   }
 
   // Hourly at minute M: "M * * * *"
   if (/^\d+$/.test(c.minute) && c.hour === "*" && c.dom === "*" && c.month === "*" && c.dow === "*") {
-    return `毎時 ${pad2(parseInt(c.minute, 10))} 分`;
+    return ja
+      ? `毎時 ${pad2(parseInt(c.minute, 10))} 分`
+      : `hourly at :${pad2(parseInt(c.minute, 10))}`;
   }
 
   // Daily at HH:MM (any DOW pattern restricted to *)
   if (/^\d+$/.test(c.minute) && /^\d+$/.test(c.hour) && c.dom === "*" && c.month === "*" && c.dow === "*") {
-    return `毎日 ${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
+    return `${ja ? "毎日" : "daily"} ${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
   }
 
   // Weekly at HH:MM on a list/range of DOWs.
@@ -207,7 +220,7 @@ export function humanizeCron(expr: string): string {
     const dows = expandDowField(c.dow);
     if (dows && dows.length > 0) {
       const label = formatDowList(dows);
-      return `毎週 ${label} ${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
+      return `${ja ? "毎週" : "weekly"} ${label} ${pad2(parseInt(c.hour, 10))}:${pad2(parseInt(c.minute, 10))}`;
     }
   }
 
@@ -427,7 +440,9 @@ function expandDowField(field: string): number[] | null {
  * output doesn't read as "Sun-Sat" when the user actually picked all days.
  */
 function formatDowList(dows: number[]): string {
-  if (dows.length === 7) return "毎日";
+  const ja = getLocale() === "ja";
+  const labels = ja ? DOW_LABELS_JA : DOW_LABELS_EN;
+  if (dows.length === 7) return ja ? "毎日" : "every day";
   if (dows.length === 0) return "";
   // detect contiguous
   let contiguous = true;
@@ -438,7 +453,7 @@ function formatDowList(dows: number[]): string {
     }
   }
   if (contiguous && dows.length > 1) {
-    return `${DOW_LABELS[dows[0]]}-${DOW_LABELS[dows[dows.length - 1]]}`;
+    return `${labels[dows[0]]}-${labels[dows[dows.length - 1]]}`;
   }
-  return dows.map((d) => DOW_LABELS[d]).join(",");
+  return dows.map((d) => labels[d]).join(",");
 }

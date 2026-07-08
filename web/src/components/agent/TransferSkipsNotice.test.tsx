@@ -1,9 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TransferSkipsNotice } from "./TransferSkipsNotice";
+import { setLocale } from "../../lib/i18n";
 
 describe("TransferSkipsNotice", () => {
+  beforeAll(() => {
+    setLocale("en");
+  });
+
   it("renders nothing for a clean transfer", () => {
     const { container: empty } = render(<TransferSkipsNotice skips={[]} />);
     expect(empty).toBeEmptyDOMElement();
@@ -21,7 +26,7 @@ describe("TransferSkipsNotice", () => {
         ]}
       />,
     );
-    expect(screen.getByText(/転移時にスキップされたファイル: 2件/)).toBeInTheDocument();
+    expect(screen.getByText(/Files skipped during transfer: 2/)).toBeInTheDocument();
     // Detail hidden until expanded.
     expect(screen.queryByText(/big\.jsonl/)).not.toBeInTheDocument();
 

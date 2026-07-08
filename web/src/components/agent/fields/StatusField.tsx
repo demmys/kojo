@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Input } from "../../ui/Input";
 import { Textarea } from "../../ui/Textarea";
+import { useT } from "../../../lib/i18n";
 
 type Entry = {
   key: string;
@@ -84,6 +85,7 @@ interface StatusFieldProps {
  * back to a raw JSON textarea rather than destroying the document.
  */
 export function StatusField({ initialContent, onChange }: StatusFieldProps) {
+  const t = useT();
   const [entries, setEntries] = useState<Entry[] | null>(() =>
     parseFlat(initialContent),
   );
@@ -115,8 +117,8 @@ export function StatusField({ initialContent, onChange }: StatusFieldProps) {
           <Input
             mono
             value={e.key}
-            placeholder="key"
-            aria-label={`status key ${i + 1}`}
+            placeholder={t("field.statusKey")}
+            aria-label={t("field.statusKeyAria", { n: i + 1 })}
             className="basis-2/5"
             onChange={(ev) =>
               update(entries.map((x, j) => (j === i ? { ...x, key: ev.target.value } : x)))
@@ -124,8 +126,8 @@ export function StatusField({ initialContent, onChange }: StatusFieldProps) {
           />
           <Input
             value={e.value}
-            placeholder="value"
-            aria-label={`status value ${i + 1}`}
+            placeholder={t("field.statusValue")}
+            aria-label={t("field.statusValueAria", { n: i + 1 })}
             className="flex-1"
             onChange={(ev) =>
               update(entries.map((x, j) => (j === i ? { ...x, value: ev.target.value } : x)))
@@ -133,7 +135,7 @@ export function StatusField({ initialContent, onChange }: StatusFieldProps) {
           />
           <button
             type="button"
-            aria-label={`remove status row ${i + 1}`}
+            aria-label={t("field.statusRemoveAria", { n: i + 1 })}
             className="shrink-0 rounded-md px-2 py-1.5 text-[13px] text-ink-dim transition-colors hover:bg-raised hover:text-lamp-err"
             onClick={() => update(entries.filter((_, j) => j !== i))}
           >
@@ -148,7 +150,7 @@ export function StatusField({ initialContent, onChange }: StatusFieldProps) {
           update([...entries, { key: "", value: "", wasString: false, fromDoc: false }])
         }
       >
-        + Add entry
+        {t("field.addEntry")}
       </button>
     </div>
   );

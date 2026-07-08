@@ -6,6 +6,7 @@ import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
 import { Select } from "../ui/Select";
 import { Button } from "../ui/Button";
+import { useT } from "../../lib/i18n";
 
 interface Props {
   gemini: GeminiApiKeyHook;
@@ -15,10 +16,11 @@ interface Props {
 
 /** API Keys section — Gemini API key + embedding model selector. */
 export function ApiKeysSection({ gemini, embedding, xai }: Props) {
+  const t = useT();
   return (
     <SectionCard
-      title="API Keys"
-      description="Encrypted storage for API keys. Used for embedding, image generation, and voice input."
+      title={t("gs.apiKeys")}
+      description={t("gs.apiKeysDesc")}
     >
       <div className="rounded-[10px] border border-hairline bg-raised p-3">
         <div className="flex items-center justify-between gap-2">
@@ -26,22 +28,22 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
             <div className="text-[13px] font-medium text-ink">Gemini API</div>
             <div className="mt-0.5 text-[12px]">
               {gemini.configured ? (
-                <span className="text-lamp-run">Configured</span>
+                <span className="text-lamp-run">{t("gs.configured")}</span>
               ) : gemini.hasFallback ? (
-                <span className="text-lamp-warn">Using fallback</span>
+                <span className="text-lamp-warn">{t("gs.usingFallback")}</span>
               ) : (
-                <span className="text-ink-faint">Not configured</span>
+                <span className="text-ink-faint">{t("gs.notConfigured")}</span>
               )}
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Button onClick={gemini.toggleEditing}>
-              {gemini.editing ? "Cancel" : gemini.configured ? "Update" : "Configure"}
+              {gemini.editing ? t("common.cancel") : gemini.configured ? t("gs.update") : t("gs.configure")}
             </Button>
             {gemini.configured && (
               <button
                 onClick={gemini.remove}
-                aria-label="Remove Gemini API key"
+                aria-label={t("gs.removeGeminiKey")}
                 className="rounded-md px-1.5 text-ink-faint transition-colors hover:text-lamp-err"
               >
                 &times;
@@ -65,15 +67,15 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
               disabled={gemini.saving || !gemini.input.trim()}
               className="w-full"
             >
-              {gemini.saving ? "Saving..." : "Save"}
+              {gemini.saving ? t("settings.saving") : t("gs.save")}
             </Button>
           </div>
         )}
 
         <div className="mt-3 border-t border-hairline pt-3">
-          <Field label="Embedding Model">
+          <Field label={t("gs.embeddingModel")}>
             {embedding.loading ? (
-              <div className="text-[12px] text-ink-faint">Loading models...</div>
+              <div className="text-[12px] text-ink-faint">{t("gs.loadingModels")}</div>
             ) : embedding.available.length > 0 ? (
               <Select
                 mono
@@ -82,7 +84,7 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
                 disabled={embedding.saving}
               >
                 {!embedding.available.includes(embedding.model) && embedding.model && (
-                  <option value={embedding.model}>{embedding.model} (unavailable)</option>
+                  <option value={embedding.model}>{t("gs.modelUnavailable", { model: embedding.model })}</option>
                 )}
                 {embedding.available.map((m) => (
                   <option key={m} value={m}>
@@ -92,7 +94,7 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
               </Select>
             ) : (
               <div className="text-[12px] text-ink-faint">
-                {gemini.configured ? "Failed to load models" : "Configure API key to see available models"}
+                {gemini.configured ? t("gs.loadModelsFailed") : t("gs.configureKeyForModels")}
               </div>
             )}
           </Field>
@@ -105,23 +107,23 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
             <div className="text-[13px] font-medium text-ink">xAI (Grok) API</div>
             <div className="mt-0.5 text-[12px]">
               {xai.configured ? (
-                <span className="text-lamp-run">Configured</span>
+                <span className="text-lamp-run">{t("gs.configured")}</span>
               ) : xai.hasFallback ? (
-                <span className="text-lamp-warn">Using fallback</span>
+                <span className="text-lamp-warn">{t("gs.usingFallback")}</span>
               ) : (
-                <span className="text-ink-faint">Not configured</span>
+                <span className="text-ink-faint">{t("gs.notConfigured")}</span>
               )}
             </div>
-            <div className="mt-0.5 text-[11px] text-ink-faint">Voice input (speech-to-text)</div>
+            <div className="mt-0.5 text-[11px] text-ink-faint">{t("gs.voiceInputStt")}</div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Button onClick={xai.toggleEditing}>
-              {xai.editing ? "Cancel" : xai.configured ? "Update" : "Configure"}
+              {xai.editing ? t("common.cancel") : xai.configured ? t("gs.update") : t("gs.configure")}
             </Button>
             {xai.configured && (
               <button
                 onClick={xai.remove}
-                aria-label="Remove xAI API key"
+                aria-label={t("gs.removeXaiKey")}
                 className="rounded-md px-1.5 text-ink-faint transition-colors hover:text-lamp-err"
               >
                 &times;
@@ -145,7 +147,7 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
               disabled={xai.saving || !xai.input.trim()}
               className="w-full"
             >
-              {xai.saving ? "Saving..." : "Save"}
+              {xai.saving ? t("settings.saving") : t("gs.save")}
             </Button>
           </div>
         )}

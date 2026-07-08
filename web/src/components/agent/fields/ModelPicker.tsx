@@ -2,6 +2,7 @@ import { effortLevelsForModel, type EffortLevel } from "../../../lib/toolModels"
 import { Field } from "../../ui/Field";
 import { Select } from "../../ui/Select";
 import { Input } from "../../ui/Input";
+import { useT } from "../../../lib/i18n";
 
 /**
  * The "Model" field: a <select> when the backend has a known model list,
@@ -22,12 +23,13 @@ export function ModelPicker({
   setEffort: (e: EffortLevel | "") => void;
   models: string[];
 }) {
+  const t = useT();
   const onChange = (m: string) => {
     setModel(m);
     if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
   };
   return (
-    <Field label="Model">
+    <Field label={t("settings.model")}>
       {models.length > 0 ? (
         <Select value={model} onChange={(e) => onChange(e.target.value)}>
           {model && !models.includes(model) && (
@@ -44,7 +46,7 @@ export function ModelPicker({
           mono
           value={model}
           onChange={(e) => onChange(e.target.value)}
-          placeholder="model name"
+          placeholder={t("field.modelName")}
         />
       )}
     </Field>

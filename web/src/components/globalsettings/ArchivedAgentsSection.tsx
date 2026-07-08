@@ -4,6 +4,7 @@ import { AgentAvatar } from "../agent/AgentAvatar";
 import { errMsg } from "../../lib/utils";
 import { SectionCard } from "../ui/SectionCard";
 import { Button } from "../ui/Button";
+import { useT } from "../../lib/i18n";
 
 interface Props {
   setError: (msg: string) => void;
@@ -19,6 +20,7 @@ interface Props {
  * users still need a place to recover or finally clear out archived agents.
  */
 export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
+  const t = useT();
   const [agents, setAgents] = useState<AgentInfo[] | null>(null);
   const [busy, setBusy] = useState<Record<string, "unarchive" | "delete" | undefined>>({});
 
@@ -53,7 +55,7 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
   const handleDelete = async (a: AgentInfo) => {
     if (
       !confirm(
-        `Permanently delete "${a.name}" and all of its data? This cannot be undone.`,
+        t("gs.deleteArchivedConfirm", { name: a.name }),
       )
     ) {
       return;
@@ -72,15 +74,15 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
 
   return (
     <SectionCard
-      title="Archived Agents"
-      description="Archived agents are hidden from the main list and have no runtime activity. The agent's own data (1:1 chat history, memory, persona, credentials, notify tokens) is preserved. Group DM memberships are not — the agent was removed from every group on archive (2-person groups were dissolved and their transcripts deleted), and memberships are NOT restored on unarchive. Delete wipes everything permanently."
+      title={t("gs.archivedAgents")}
+      description={t("gs.archivedAgentsDesc")}
     >
       {agents === null && (
-        <p className="py-4 text-center text-[12px] text-ink-faint">Loading...</p>
+        <p className="py-4 text-center text-[12px] text-ink-faint">{t("gs.loading")}</p>
       )}
       {agents !== null && agents.length === 0 && (
         <p className="py-4 text-center text-[12px] text-ink-faint">
-          No archived agents
+          {t("gs.noArchivedAgents")}
         </p>
       )}
 
@@ -102,19 +104,19 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
                 <div className="truncate text-[13px] font-medium text-ink">{a.name}</div>
                 <div className="truncate font-mono text-[10px] text-ink-faint">
                   {a.tool}
-                  {a.archivedAt ? ` · archived ${a.archivedAt.slice(0, 10)}` : ""}
+                  {a.archivedAt ? ` · ${t("gs.archivedOn", { date: a.archivedAt.slice(0, 10) })}` : ""}
                 </div>
               </div>
               <div className="flex shrink-0 gap-2">
                 <Button onClick={() => handleUnarchive(a)} disabled={op !== undefined}>
-                  {op === "unarchive" ? "..." : "Restore"}
+                  {op === "unarchive" ? "..." : t("gs.restore")}
                 </Button>
                 <Button
                   variant="danger"
                   onClick={() => handleDelete(a)}
                   disabled={op !== undefined}
                 >
-                  {op === "delete" ? "..." : "Delete"}
+                  {op === "delete" ? "..." : t("gdm.delete")}
                 </Button>
               </div>
             </div>

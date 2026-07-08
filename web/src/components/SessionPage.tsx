@@ -14,18 +14,20 @@ import { enterToSend } from "./chatComposer";
 import { AttachmentsTab } from "./AttachmentsTab";
 import { Lamp, type LampState } from "./ui/Lamp";
 import { Button } from "./ui/Button";
+import { useT, type MessageKey } from "../lib/i18n";
 
 type SessionTab = "cli" | "terminal" | "files" | "git" | "attachments";
 
-const TABS: { key: SessionTab; label: string }[] = [
-  { key: "cli", label: "CLI" },
-  { key: "terminal", label: "Terminal" },
-  { key: "files", label: "Files" },
-  { key: "git", label: "Git" },
-  { key: "attachments", label: "Attach" },
+const TABS: { key: SessionTab; labelKey: MessageKey }[] = [
+  { key: "cli", labelKey: "sess.tabCli" },
+  { key: "terminal", labelKey: "sess.tabTerminal" },
+  { key: "files", labelKey: "sess.tabFiles" },
+  { key: "git", labelKey: "sess.tabGit" },
+  { key: "attachments", labelKey: "sess.tabAttach" },
 ];
 
 export function SessionPage() {
+  const t = useT();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   // BrowserRouter's useNavigate returns an unstable reference (recreated
@@ -313,7 +315,7 @@ export function SessionPage() {
       <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-hairline bg-app px-3">
         <button
           onClick={goBackOrHome}
-          aria-label="Back"
+          aria-label={t("common.back")}
           className="-ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-[10px] text-ink-dim transition-colors hover:bg-hover hover:text-ink lg:hidden"
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
@@ -330,16 +332,16 @@ export function SessionPage() {
         </div>
         {exited ? (
           session?.exitCode !== undefined && (
-            <span className="shrink-0 font-mono text-[11px] text-ink-faint">exit {session.exitCode}</span>
+            <span className="shrink-0 font-mono text-[11px] text-ink-faint">{t("dash.exit", { code: session.exitCode })}</span>
           )
         ) : (
           <>
             {isClaude && (
               <button
                 onClick={handleYoloToggle}
-                aria-label="Yolo Mode"
+                aria-label={t("ns.yoloMode")}
                 aria-pressed={session?.yoloMode}
-                title="Yolo Mode"
+                title={t("ns.yoloMode")}
                 className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] transition-colors hover:bg-hover ${
                   session?.yoloMode ? "text-lamp-warn" : "text-ink-faint hover:text-ink"
                 }`}
@@ -351,8 +353,8 @@ export function SessionPage() {
             )}
             <button
               onClick={handleStop}
-              aria-label="Stop session"
-              title="Stop session"
+              aria-label={t("sess.stopSession")}
+              title={t("sess.stopSession")}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-lamp-err"
             >
               <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
@@ -366,17 +368,17 @@ export function SessionPage() {
       {/* Tab bar — hidden when exited */}
       {!exited && (
         <div className="flex shrink-0 overflow-x-auto border-b border-hairline">
-          {TABS.map((t) => {
-            const active = activeTab === t.key;
+          {TABS.map((tb) => {
+            const active = activeTab === tb.key;
             return (
               <button
-                key={t.key}
-                onClick={() => switchTab(t.key)}
+                key={tb.key}
+                onClick={() => switchTab(tb.key)}
                 className={`relative flex h-11 shrink-0 items-center justify-center px-4 font-mono text-[12px] transition-colors ${
                   active ? "text-ink" : "text-ink-faint hover:text-ink-dim"
                 }`}
               >
-                {t.label}
+                {t(tb.labelKey)}
                 {active && <span className="absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-copper" />}
               </button>
             );
@@ -387,7 +389,7 @@ export function SessionPage() {
       {/* Connection indicator */}
       {!exited && !connected && (
         <div className="shrink-0 bg-lamp-warn/10 px-3 py-1 text-center font-mono text-[11px] text-lamp-warn">
-          Reconnecting…
+          {t("sess.reconnecting")}
         </div>
       )}
 
@@ -414,9 +416,9 @@ export function SessionPage() {
                 }}
                 className="absolute inset-x-0 top-0 z-10 border-b border-hairline bg-surface/95 px-3 py-2 text-left font-mono text-[11px] text-copper backdrop-blur active:bg-hover"
               >
-                <span className="text-copper-deep">yolo tail</span>{" "}
+                <span className="text-copper-deep">{t("sess.yoloTail")}</span>{" "}
                 <span data-yolo-text className="block truncate text-ink-dim" />
-                <span className="text-[10px] text-ink-faint">tap to copy</span>
+                <span className="text-[10px] text-ink-faint">{t("sess.tapToCopy")}</span>
               </button>
             )}
           </div>
@@ -428,8 +430,8 @@ export function SessionPage() {
               <div className="flex shrink-0 items-end gap-2 border-t border-hairline bg-app px-3 py-2.5">
                 <button
                   onClick={handleFileAttach}
-                  title="Attach file"
-                  aria-label="Attach file"
+                  title={t("sess.attachFile")}
+                  aria-label={t("sess.attachFile")}
                   className="shrink-0 rounded-[10px] p-2 text-ink-faint transition-colors hover:text-ink"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
@@ -441,7 +443,7 @@ export function SessionPage() {
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={(e) => enterToSend(e, enterSends, handleSend)}
-                    placeholder={enterSends ? "Message… (Enter to send)" : "Message… (Ctrl+Enter to send)"}
+                    placeholder={t("chat.messagePlaceholder", { key: enterSends ? "Enter" : "Ctrl+Enter" })}
                     rows={Math.min(input.split("\n").length, 5)}
                     className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
                   />
@@ -449,8 +451,8 @@ export function SessionPage() {
                 <button
                   onPointerDown={(e) => e.preventDefault()}
                   onClick={handleSend}
-                  title="Send"
-                  aria-label="Send"
+                  title={t("composer.send")}
+                  aria-label={t("composer.send")}
                   className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-copper text-[#14100b] transition-colors hover:bg-copper-bright"
                 >
                   <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
@@ -520,7 +522,7 @@ export function SessionPage() {
         <div className="flex shrink-0 flex-col gap-2 border-t border-hairline bg-app px-4 py-3">
           <div className="flex items-center gap-2">
             <Button variant="primary" onClick={handleResume} className="flex-1 py-2.5">
-              Resume
+              {t("sess.resume")}
             </Button>
             <Button
               variant="secondary"
@@ -532,14 +534,14 @@ export function SessionPage() {
               }}
               className="flex-1 py-2.5"
             >
-              New session
+              {t("dash.newSession")}
             </Button>
           </div>
           <button
             onClick={goBackOrHome}
             className="rounded-[10px] py-1.5 text-[13px] text-ink-dim transition-colors hover:text-ink lg:hidden"
           >
-            Back
+            {t("common.back")}
           </button>
         </div>
       )}

@@ -2,6 +2,7 @@ import { Outlet, useLocation } from "react-router";
 import { Dashboard } from "./Dashboard";
 import { Wordmark } from "./ui/Wordmark";
 import { useMediaQuery } from "../hooks/useMediaQuery";
+import { useT } from "../lib/i18n";
 
 /**
  * AppLayout is the messenger-style shell for the primary 2-pane routes
@@ -69,10 +70,11 @@ export function AppLayout() {
  * lg — the parent <main> is `hidden lg:block` at the index route.
  */
 export function EmptyPane() {
+  const t = useT();
   return (
     <div className="flex h-full flex-col items-center justify-center gap-2 bg-app px-6 text-center">
       <Wordmark className="text-2xl opacity-70" />
-      <p className="font-mono text-[13px] text-ink-faint">Select an agent or session</p>
+      <p className="font-mono text-[13px] text-ink-faint">{t("app.selectPane")}</p>
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { useNavigate } from "react-router";
 import { api } from "../lib/api";
 import { FileDataBrowser } from "./FileDataBrowser";
+import { useT } from "../lib/i18n";
 
 interface FileBrowserProps {
   embedded?: boolean;
@@ -13,6 +14,7 @@ interface FileBrowserProps {
 }
 
 export function FileBrowser({ embedded, initialPath, peerId }: FileBrowserProps = {}) {
+  const t = useT();
   const navigate = useNavigate();
   const dataSource = useMemo(() => ({
     list: (path: string, hidden: boolean) =>
@@ -32,9 +34,9 @@ export function FileBrowser({ embedded, initialPath, peerId }: FileBrowserProps 
       pathMode="absolute"
       pathParam="path"
       rootPath={embedded ? initialPath : undefined}
-      rootLabel={embedded ? "Workdir" : "Files"}
-      title="Files"
-      subtitle={embedded ? undefined : "Local filesystem"}
+      rootLabel={embedded ? t("fb.workdir") : t("fb.files")}
+      title={t("fb.files")}
+      subtitle={embedded ? undefined : t("fb.localFs")}
       showHeader={!embedded}
       ready={!embedded || Boolean(initialPath)}
       onExit={() => navigate("/")}

@@ -2,15 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, isThumbSupported, type Attachment } from "../lib/api";
 import { authHeaders } from "../lib/auth";
 import { formatSize } from "../lib/utils";
+import { useT, type MessageKey } from "../lib/i18n";
 
 type SortField = "modTime" | "createdAt" | "name" | "size";
 type SortDir = "asc" | "desc";
 
-const SORT_OPTIONS: { key: SortField; label: string }[] = [
-  { key: "modTime", label: "Modified" },
-  { key: "createdAt", label: "Created" },
-  { key: "name", label: "Name" },
-  { key: "size", label: "Size" },
+const SORT_OPTIONS: { key: SortField; labelKey: MessageKey }[] = [
+  { key: "modTime", labelKey: "att.sortModified" },
+  { key: "createdAt", labelKey: "att.sortCreated" },
+  { key: "name", labelKey: "att.sortName" },
+  { key: "size", labelKey: "att.sortSize" },
 ];
 
 interface Props {
@@ -23,6 +24,7 @@ interface Props {
 }
 
 export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Props) {
+  const t = useT();
   const [sortField, setSortField] = useState<SortField>("modTime");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [previewPath, setPreviewPath] = useState<string | null>(null);
@@ -62,7 +64,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
   const handleCopyPath = async (path: string) => {
     try {
       await navigator.clipboard.writeText(path);
-      showFeedback(path, "Path copied");
+      showFeedback(path, t("att.pathCopied"));
     } catch {
       // clipboard API may fail on insecure contexts
     }
@@ -77,7 +79,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
         headers: authHeaders(),
       });
       if (!res.ok) {
-        showFeedback(att.path, "Failed");
+        showFeedback(att.path, t("att.failed"));
         return;
       }
       const blob = await res.blob();
@@ -108,14 +110,14 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
           canvas.toBlob((b) => resolve(b), "image/png"),
         );
         if (!pngBlob) {
-          showFeedback(att.path, "Failed");
+          showFeedback(att.path, t("att.failed"));
           return;
         }
         await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
       }
-      showFeedback(att.path, "Copied");
+      showFeedback(att.path, t("msg.copied"));
     } catch {
-      showFeedback(att.path, "Failed");
+      showFeedback(att.path, t("att.failed"));
     } finally {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     }
@@ -182,7 +184,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
   if (attachments.length === 0) {
     return (
       <div className="flex h-full items-center justify-center bg-app text-sm text-ink-faint">
-        No attachments detected
+        {t("att.none")}
       </div>
     );
   }
@@ -201,7 +203,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
                 : "text-ink-faint hover:text-ink-dim"
             }`}
           >
-            {opt.label}
+            {t(opt.labelKey)}
             {sortField === opt.key && (
               <span className="ml-0.5">{sortDir === "desc" ? "\u2193" : "\u2191"}</span>
             )}
@@ -264,14 +266,14 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
                     onClick={() => handleCopyImage(att)}
                     className="flex-1 py-1.5 font-mono text-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-ink"
                   >
-                    Copy
+                    {t("msg.copy")}
                   </button>
                 )}
                 <button
                   onClick={() => handleCopyPath(att.path)}
                   className="flex-1 py-1.5 font-mono text-[10px] text-ink-faint transition-colors hover:bg-hover hover:text-ink"
                 >
-                  Path
+                  {t("att.path")}
                 </button>
                 <button
                   onClick={() => handleDelete(att.path)}
@@ -281,7 +283,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
                       : "text-ink-faint hover:bg-lamp-err/10 hover:text-lamp-err"
                   }`}
                 >
-                  {confirmDelete === att.path ? "OK?" : "Del"}
+                  {confirmDelete === att.path ? t("att.confirmDel") : t("att.del")}
                 </button>
               </div>
             </div>
@@ -306,7 +308,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
           {/* Close */}
           <button
             onClick={() => setPreviewPath(null)}
-            aria-label="Close preview"
+            aria-label={t("media.closePreview")}
             className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-raised text-ink-dim shadow-lg transition-colors hover:bg-hover hover:text-ink"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4">
@@ -326,7 +328,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
             <>
               <button
                 onClick={(e) => { e.stopPropagation(); navigatePreview(-1); }}
-                aria-label="Previous"
+                aria-label={t("media.prev")}
                 className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">
@@ -335,7 +337,7 @@ export function AttachmentsTab({ sessionId, attachments, peerId, onDelete }: Pro
               </button>
               <button
                 onClick={(e) => { e.stopPropagation(); navigatePreview(1); }}
-                aria-label="Next"
+                aria-label={t("media.next")}
                 className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-ink-dim transition-colors hover:bg-black/60 hover:text-ink"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-5 w-5">

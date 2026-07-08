@@ -18,10 +18,12 @@ import { Input } from "../ui/Input";
 import { Select } from "../ui/Select";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
+import { useT } from "../../lib/i18n";
 
 type GenPhase = "idle" | "persona" | "name" | "avatar" | "all-name" | "all-avatar";
 
 export function AgentCreate() {
+  const t = useT();
   const navigate = useNavigate();
   const [info, setInfo] = useState<ServerInfo>();
   const [name, setName] = useState("");
@@ -83,7 +85,7 @@ export function AgentCreate() {
 
   const handleGeneratePersona = async () => {
     if (!personaPrompt.trim()) {
-      setError("Enter a prompt to generate persona");
+      setError(t("create.personaPromptRequired"));
       return;
     }
     setGenPhase("persona");
@@ -104,7 +106,7 @@ export function AgentCreate() {
 
   const handleGenerateName = async () => {
     if (!persona.trim()) {
-      setError("Write a persona description first");
+      setError(t("create.personaRequired"));
       return;
     }
     setGenPhase("name");
@@ -127,7 +129,7 @@ export function AgentCreate() {
   const handleGenerateAvatar = async (nameOverride?: string) => {
     const n = nameOverride || name.trim();
     if (!persona.trim()) {
-      setError("Write a persona description first");
+      setError(t("create.personaRequired"));
       return;
     }
     setGenPhase("avatar");
@@ -160,7 +162,7 @@ export function AgentCreate() {
 
   const handleGenerateAll = async () => {
     if (!persona.trim()) {
-      setError("Write a persona description first");
+      setError(t("create.personaRequired"));
       return;
     }
     setError("");
@@ -226,7 +228,7 @@ export function AgentCreate() {
 
   const handleCreate = async () => {
     if (!name.trim()) {
-      setError("Name is required");
+      setError(t("settings.nameRequired"));
       return;
     }
     setLoading(true);
@@ -269,29 +271,29 @@ export function AgentCreate() {
 
   const genStatusText =
     genPhase === "persona"
-      ? "Generating persona..."
+      ? t("create.generatingPersona")
       : genPhase === "all-name" || genPhase === "name"
-        ? "Generating name..."
+        ? t("create.generatingName")
         : genPhase === "all-avatar" || genPhase === "avatar"
-          ? "Generating avatar..."
+          ? t("create.generatingAvatar")
           : "";
 
   return (
     <div className="h-full overflow-y-auto bg-app text-ink">
-      <PageHeader title="New Agent" onBack={() => navigate("/")} hideBackAtLg />
+      <PageHeader title={t("create.newAgent")} onBack={() => navigate("/")} hideBackAtLg />
 
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
         {/* ── Identity ── */}
-        <SectionCard id="identity" title="Identity">
+        <SectionCard id="identity" title={t("settings.sec.identity")}>
           <div className="space-y-5">
             <PersonaField
               persona={persona}
               setPersona={setPersona}
               textareaRows={5}
-              textareaPlaceholder="Describe the agent's personality, speaking style, interests..."
+              textareaPlaceholder={t("create.personaPlaceholder")}
               personaPrompt={personaPrompt}
               setPersonaPrompt={setPersonaPrompt}
-              promptPlaceholder="e.g. ツンデレな女の子にして"
+              promptPlaceholder={t("create.personaPromptPlaceholder")}
               busy={isGenerating}
               spinning={genPhase === "persona"}
               onGenerate={handleGeneratePersona}
@@ -306,12 +308,12 @@ export function AgentCreate() {
                   onClick={handleAvatarClick}
                   disabled={isGenerating}
                   className="flex h-24 w-24 items-center justify-center overflow-hidden rounded-full border border-hairline bg-raised transition-colors hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-60"
-                  title="Click to upload avatar"
+                  title={t("create.uploadAvatarTitle")}
                 >
                   {avatarPreviewUrl ? (
                     <img
                       src={avatarPreviewUrl}
-                      alt="Avatar"
+                      alt={t("create.avatarAlt")}
                       className="h-full w-full object-cover"
                     />
                   ) : (
@@ -337,7 +339,7 @@ export function AgentCreate() {
                     onClick={() => handleGenerateAvatar()}
                     disabled={isGenerating || !persona.trim()}
                     className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border border-hairline bg-raised text-xs transition-colors hover:bg-hover disabled:opacity-40"
-                    title="Regenerate avatar"
+                    title={t("create.regenAvatarTitle")}
                   >
                     {genPhase === "avatar" ? <span className="animate-spin">↻</span> : "✨"}
                   </button>
@@ -353,18 +355,18 @@ export function AgentCreate() {
 
               {/* Name + Hint */}
               <div className="flex-1 space-y-2">
-                <Field label="Name">
+                <Field label={t("dash.name")}>
                   <div className="flex gap-2">
                     <Input
                       value={name}
                       onChange={(e) => setName(e.target.value)}
-                      placeholder="Name"
+                      placeholder={t("dash.name")}
                       className="flex-1"
                     />
                     <Button
                       onClick={() => handleGenerateName()}
                       disabled={isGenerating || !persona.trim()}
-                      title="Generate name from persona"
+                      title={t("create.genNameTitle")}
                       className="shrink-0"
                     >
                       {genPhase === "name" ? (
@@ -376,10 +378,10 @@ export function AgentCreate() {
                   </div>
                 </Field>
                 <Input
-                  aria-label="Generation hint"
+                  aria-label={t("create.genHintAria")}
                   value={genPrompt}
                   onChange={(e) => setGenPrompt(e.target.value)}
-                  placeholder="Generation hint (optional)"
+                  placeholder={t("create.genHintPlaceholder")}
                 />
               </div>
             </div>
@@ -397,22 +399,22 @@ export function AgentCreate() {
                     {genStatusText}
                   </>
                 ) : (
-                  <>✨ Name & Avatar</>
+                  <>✨ {t("create.nameAndAvatar")}</>
                 )}
               </Button>
               <Button
                 onClick={() => handleGenerateAvatar()}
                 disabled={isGenerating || !persona.trim() || !name.trim()}
                 className="flex items-center justify-center gap-2"
-                title={!name.trim() ? "Set a name first" : "Generate avatar only"}
+                title={!name.trim() ? t("create.setNameFirst") : t("create.genAvatarOnly")}
               >
                 {genPhase === "avatar" ? (
                   <>
                     <span className="animate-spin">↻</span>
-                    Avatar...
+                    {t("create.avatarProgress")}
                   </>
                 ) : (
-                  <>✨ Avatar</>
+                  <>✨ {t("create.avatar")}</>
                 )}
               </Button>
             </div>
@@ -420,7 +422,7 @@ export function AgentCreate() {
         </SectionCard>
 
         {/* ── Model & Tools ── */}
-        <SectionCard id="model" title="Model & Tools">
+        <SectionCard id="model" title={t("settings.sec.model")}>
           <div className="space-y-4">
             <ToolPicker
               tool={tool}
@@ -428,11 +430,11 @@ export function AgentCreate() {
               setModel={setModel}
               effort={effort}
               setEffort={setEffort}
-              isDisabled={(t) => (info ? !(info.tools[t]?.available || info.agentBackends?.[t]) : false)}
+              isDisabled={(toolName) => (info ? !(info.tools[toolName]?.available || info.agentBackends?.[toolName]) : false)}
             />
 
             {needsCustomURL && (
-              <Field label="API Base URL">
+              <Field label={t("create.apiBaseUrl")}>
                 <Input
                   mono
                   value={customBaseURL}
@@ -453,9 +455,9 @@ export function AgentCreate() {
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
             {tool === "llama.cpp" && (
-              <Field label="Thinking">
+              <Field label={t("settings.thinking")}>
                 <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
-                  <option value="">auto (server default)</option>
+                  <option value="">{t("settings.thinkingAuto")}</option>
                   <option value="on">on</option>
                   <option value="off">off</option>
                 </Select>
@@ -467,7 +469,7 @@ export function AgentCreate() {
         </SectionCard>
 
         {/* ── Schedule ── */}
-        <SectionCard id="schedule" title="Schedule">
+        <SectionCard id="schedule" title={t("settings.sec.schedule")}>
           <ScheduleEditor
             cronExpr={cronExpr}
             onCronExprChange={(v) => {
@@ -498,7 +500,7 @@ export function AgentCreate() {
             disabled={loading || !name.trim()}
             className="w-full py-3"
           >
-            {loading ? "Creating..." : "Create agent"}
+            {loading ? t("dash.creating") : t("create.createAgent")}
           </Button>
         </div>
       </main>

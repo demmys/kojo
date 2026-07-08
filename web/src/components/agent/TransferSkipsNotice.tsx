@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { TransferSkip } from "../../lib/agentApi";
+import { useT } from "../../lib/i18n";
 
 // TransferSkipsNotice renders the owner-facing "skipped during
 // transfer" warning for an agent whose most recent §3.7 device-switch
@@ -11,6 +12,7 @@ import type { TransferSkip } from "../../lib/agentApi";
 // Collapsed by default to a one-line summary; click to expand the
 // per-file detail (path, reason, size).
 export function TransferSkipsNotice({ skips }: { skips?: TransferSkip[] }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   if (!skips || skips.length === 0) return null;
   return (
@@ -22,10 +24,10 @@ export function TransferSkipsNotice({ skips }: { skips?: TransferSkip[] }) {
           setOpen((v) => !v);
         }}
         className="flex w-full items-center gap-1 text-left"
-        title="直前のデバイス転移でスキップされたセッションファイルがある"
+        title={t("skips.title")}
       >
         <span aria-hidden>⚠</span>
-        <span>転移時にスキップされたファイル: {skips.length}件</span>
+        <span>{t("skips.summary", { count: skips.length })}</span>
         <span className="ml-auto" aria-hidden>{open ? "▾" : "▸"}</span>
       </button>
       {open && (

@@ -12,8 +12,10 @@ import { Select } from "./ui/Select";
 import { Button } from "./ui/Button";
 import { Banner } from "./ui/Banner";
 import { Toggle } from "./ui/Toggle";
+import { useT } from "../lib/i18n";
 
 export function NewSession() {
+  const t = useT();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const [info, setInfo] = useState<ServerInfo>();
@@ -82,7 +84,7 @@ export function NewSession() {
       if (paramTool && info.tools?.[paramTool]?.available) {
         setTool(paramTool);
       } else if (info.tools) {
-        const available = Object.entries(info.tools).find(([, t]) => t.available);
+        const available = Object.entries(info.tools).find(([, toolInfo]) => toolInfo.available);
         if (available) setTool(available[0]);
         else setTool("");
       }
@@ -93,7 +95,7 @@ export function NewSession() {
       console.error(err);
       setInfoLoading(false);
       if (selectedPeerId && selectedPeerId !== selfPeerId) {
-        setError("Peer info unavailable. Is the peer online and paired with this host?");
+        setError(t("ns.peerInfoUnavailable"));
       }
     });
   }, [searchParams, selectedPeerId, selfPeerId]);
@@ -173,7 +175,7 @@ export function NewSession() {
   return (
     <div className="h-full overflow-y-auto bg-app text-ink">
       <PageHeader
-        title="New Session"
+        title={t("ns.title")}
         onBack={() => navigate("/", { replace: true })}
         hideBackAtLg
       />
@@ -183,7 +185,7 @@ export function NewSession() {
           <div className="space-y-5">
             {/* Peer selection (only when 2+ peers are registered) */}
             {peers.length > 1 && (
-              <Field label="Host">
+              <Field label={t("ns.host")}>
                 <Select
                   value={selectedPeerId || selfPeerId}
                   onChange={(e) => setSelectedPeerId(e.target.value)}
@@ -201,8 +203,8 @@ export function NewSession() {
                     return (
                       <option key={p.deviceId} value={p.deviceId} disabled={disabled}>
                         {p.name}
-                        {isSelf ? " (this device)" : ""}
-                        {offline && !isSelf ? " — offline" : ""}
+                        {isSelf ? ` (${t("peers.thisDevice")})` : ""}
+                        {offline && !isSelf ? ` — ${t("ns.offline")}` : ""}
                       </option>
                     );
                   })}
@@ -211,24 +213,24 @@ export function NewSession() {
             )}
 
             {/* Tool selection */}
-            <Field label="Tool">
+            <Field label={t("field.tool")}>
               <div className="space-y-2">
                 {info &&
-                  Object.entries(info.tools).map(([name, t]) => (
+                  Object.entries(info.tools).map(([name, toolInfo]) => (
                     <label
                       key={name}
                       className={`flex cursor-pointer items-center gap-3 rounded-[10px] border p-3 transition-colors ${
                         tool === name
                           ? "border-copper/50 bg-copper/10"
                           : "border-hairline bg-raised hover:bg-hover"
-                      } ${!t.available ? "cursor-not-allowed opacity-40" : ""}`}
+                      } ${!toolInfo.available ? "cursor-not-allowed opacity-40" : ""}`}
                     >
                       <input
                         type="radio"
                         name="tool"
                         value={name}
                         checked={tool === name}
-                        disabled={!t.available}
+                        disabled={!toolInfo.available}
                         onChange={() => {
                           setTool(name);
                           setModel("");
@@ -236,8 +238,8 @@ export function NewSession() {
                         className="accent-[color:var(--color-copper)]"
                       />
                       <span className="font-mono text-[14px] text-ink">{name}</span>
-                      {!t.available && (
-                        <span className="text-[11px] text-ink-faint">(not available)</span>
+                      {!toolInfo.available && (
+                        <span className="text-[11px] text-ink-faint">{t("ns.notAvailable")}</span>
                       )}
                     </label>
                   ))}
@@ -246,9 +248,9 @@ export function NewSession() {
 
             {/* Model (tools with a known whitelist) */}
             {modelsForTool(tool).length > 0 && (
-              <Field label="Model">
+              <Field label={t("settings.model")}>
                 <Select value={model} onChange={(e) => setModel(e.target.value)} mono>
-                  <option value="">(default)</option>
+                  <option value="">{t("ns.defaultOption")}</option>
                   {modelsForTool(tool).map((m) => (
                     <option key={m} value={m}>
                       {m}
@@ -259,7 +261,7 @@ export function NewSession() {
             )}
 
             {/* Working directory */}
-            <Field label="Working directory">
+            <Field label={t("ns.workingDirectory")}>
               <div ref={wrapperRef} className="relative">
                 <Input
                   mono
@@ -288,7 +290,7 @@ export function NewSession() {
             </Field>
 
             {/* Additional arguments */}
-            <Field label="Additional arguments">
+            <Field label={t("ns.additionalArgs")}>
               <Input
                 mono
                 type="text"
@@ -304,17 +306,17 @@ export function NewSession() {
               className="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-hairline bg-raised px-3 py-2.5"
             >
               <div className="min-w-0">
-                <div className="text-[13px] text-ink">Yolo Mode</div>
+                <div className="text-[13px] text-ink">{t("ns.yoloMode")}</div>
                 <div className="text-[11px] text-ink-faint">
                   {tool === "claude"
-                    ? "Launches with --dangerously-skip-permissions"
+                    ? t("ns.yoloClaude")
                     : tool === "codex"
-                      ? "Launches with --dangerously-bypass-approvals-and-sandbox"
-                      : "Skip permission prompts"}
+                      ? t("ns.yoloCodex")
+                      : t("ns.yoloOther")}
                 </div>
               </div>
               <span onClick={(e) => e.stopPropagation()}>
-                <Toggle checked={yoloMode} onChange={setYoloMode} aria-label="Yolo Mode" />
+                <Toggle checked={yoloMode} onChange={setYoloMode} aria-label={t("ns.yoloMode")} />
               </span>
             </div>
 
@@ -325,16 +327,16 @@ export function NewSession() {
                 className="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-hairline bg-raised px-3 py-2.5"
               >
                 <div className="min-w-0">
-                  <div className="text-[13px] text-ink">Minimal system prompt</div>
+                  <div className="text-[13px] text-ink">{t("ns.minimalPrompt")}</div>
                   <div className="text-[11px] text-ink-faint">
-                    Replace the default prompt with just a working-directory note (<code>--system-prompt</code>).
+                    {t("ns.minimalPromptHelp")} (<code>--system-prompt</code>)
                   </div>
                 </div>
                 <span onClick={(e) => e.stopPropagation()}>
                   <Toggle
                     checked={simpleSystemPrompt}
                     onChange={setSimpleSystemPrompt}
-                    aria-label="Minimal system prompt"
+                    aria-label={t("ns.minimalPrompt")}
                   />
                 </span>
               </div>
@@ -348,7 +350,7 @@ export function NewSession() {
               disabled={loading || infoLoading || !tool || !workDir}
               className="w-full py-2.5"
             >
-              {loading ? "Creating…" : "Create session"}
+              {loading ? t("dash.creating") : t("ns.createSession")}
             </Button>
           </div>
         </SectionCard>

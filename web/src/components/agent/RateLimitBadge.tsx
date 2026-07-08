@@ -1,4 +1,5 @@
 import type { RateLimitInfo } from "../../lib/agentApi";
+import { useT } from "../../lib/i18n";
 
 // RateLimitBadge renders a compact usage-window indicator in the chat header.
 //
@@ -12,6 +13,7 @@ import type { RateLimitInfo } from "../../lib/agentApi";
 // The tooltip carries the rate-limit window type and the reset time in the
 // viewer's local timezone.
 export function RateLimitBadge({ info }: { info: RateLimitInfo | null }) {
+  const t = useT();
   if (!info) return null;
 
   const util = info.utilization ?? 0;
@@ -29,14 +31,27 @@ export function RateLimitBadge({ info }: { info: RateLimitInfo | null }) {
   }[tint];
 
   const pct = Math.round(util * 100);
-  const windowLabel = formatWindow(info.rateLimitType);
+  const statusLabel =
+    info.status === "rejected"
+      ? t("rate.statusRejected")
+      : info.status === "allowed_warning"
+        ? t("rate.statusWarning")
+        : info.status === "allowed"
+          ? t("rate.statusAllowed")
+          : info.status;
+  const windowLabel =
+    info.rateLimitType === "seven_day"
+      ? t("rate.window7d")
+      : info.rateLimitType === "five_hour"
+        ? t("rate.window5h")
+        : info.rateLimitType ?? "";
   const resetLabel = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleString() : "";
 
   const tooltip = [
-    `Rate limit: ${info.status}`,
-    windowLabel ? `Window: ${windowLabel}` : "",
-    `Utilization: ${pct}%`,
-    resetLabel ? `Resets: ${resetLabel}` : "",
+    t("rate.status", { status: statusLabel }),
+    windowLabel ? t("rate.window", { window: windowLabel }) : "",
+    t("rate.utilization", { pct }),
+    resetLabel ? t("rate.resets", { time: resetLabel }) : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -46,18 +61,7 @@ export function RateLimitBadge({ info }: { info: RateLimitInfo | null }) {
       title={tooltip}
       className={`shrink-0 rounded-[10px] border px-2 py-1 font-mono text-[11px] ${cls}`}
     >
-      {rejected ? `limit ${pct}%` : `${pct}%`}
+      {rejected ? t("rate.limitPct", { pct }) : `${pct}%`}
     </span>
   );
-}
-
-function formatWindow(t?: string): string {
-  switch (t) {
-    case "seven_day":
-      return "7-day";
-    case "five_hour":
-      return "5-hour";
-    default:
-      return t ?? "";
-  }
 }

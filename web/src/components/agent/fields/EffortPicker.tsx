@@ -6,6 +6,7 @@ import {
 } from "../../../lib/toolModels";
 import { Field } from "../../ui/Field";
 import { Select } from "../../ui/Select";
+import { useT } from "../../../lib/i18n";
 
 /**
  * The "Effort" field. Rendered only for backends that support an effort
@@ -23,14 +24,15 @@ export function EffortPicker({
   setEffort: (e: EffortLevel | "") => void;
   model: string;
 }) {
+  const t = useT();
   if (!supportsEffort(tool)) return null;
   return (
-    <Field label="Effort">
+    <Field label={t("field.effort")}>
       <Select
         value={effort}
         onChange={(e) => setEffort(e.target.value as EffortLevel | "")}
       >
-        <option value="">default ({defaultEffortForModel(model)})</option>
+        <option value="">{t("field.effortDefault", { level: defaultEffortForModel(model) })}</option>
         {effortLevelsForModel(model).map((e) => (
           <option key={e} value={e}>
             {e}

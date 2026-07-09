@@ -19,8 +19,17 @@ describe("priceModel", () => {
     expect(priceModel("claude-sonnet-4-6")?.output).toBe(15);
   });
 
+  it("prices xAI grok-4.5 with explicit cache-read rate", () => {
+    expect(priceModel("grok-4.5")).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.5,
+      cacheWrite: 2, // no cache-write surcharge — plain input rate
+    });
+  });
+
   it("returns undefined for unpriced / unknown models", () => {
-    expect(priceModel("grok-4.5")).toBeUndefined();
+    expect(priceModel("grok-composer-2.5-fast")).toBeUndefined();
     expect(priceModel("gpt-5.5")).toBeUndefined();
     expect(priceModel("fable-5")).toBeUndefined();
     expect(priceModel("")).toBeUndefined();
@@ -50,9 +59,24 @@ describe("estimateTurnCost", () => {
     expect(cost).toBeCloseTo(0.3 + 3.0, 6);
   });
 
+  it("estimates grok-4.5 with xAI cache rates", () => {
+    // grok-4.5: input 2, output 6, cacheRead 0.5, cacheWrite 2 per 1M.
+    // 1M in, 1M out, 1M cacheRead, 1M cacheWrite = 2 + 6 + 0.5 + 2 = 10.5
+    const cost = estimateTurnCost("grok-4.5", {
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheReadInputTokens: 1_000_000,
+      cacheCreationInputTokens: 1_000_000,
+    });
+    expect(cost).toBeCloseTo(10.5, 6);
+  });
+
   it("returns undefined for unpriced models", () => {
     expect(
-      estimateTurnCost("grok-4.5", { inputTokens: 100, outputTokens: 100 }),
+      estimateTurnCost("grok-composer-2.5-fast", {
+        inputTokens: 100,
+        outputTokens: 100,
+      }),
     ).toBeUndefined();
   });
 

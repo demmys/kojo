@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"log/slog"
 	"mime"
 	"net"
@@ -53,6 +54,33 @@ func init() {
 	} {
 		mime.AddExtensionType(ext, ct)
 	}
+}
+
+// httpErrorLogWriter routes net/http's internal error lines onto slog.
+// "TLS handshake error" lines are demoted to Debug: on the tsnet-TLS
+// public listener a single misbehaving tailnet device with a broken
+// TLS stack retries forever and would otherwise spam a line per
+// attempt into the default logger. Everything else (aborted handlers,
+// hijack failures, …) stays visible at Warn.
+type httpErrorLogWriter struct {
+	logger *slog.Logger
+}
+
+func (w *httpErrorLogWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	if strings.Contains(msg, "TLS handshake error") {
+		w.logger.Debug(msg)
+	} else {
+		w.logger.Warn(msg)
+	}
+	return len(p), nil
+}
+
+// httpServerErrorLog wraps httpErrorLogWriter in the *log.Logger shape
+// http.Server.ErrorLog expects. No prefix / flags — slog adds its own
+// timestamp and level.
+func httpServerErrorLog(logger *slog.Logger) *log.Logger {
+	return log.New(&httpErrorLogWriter{logger: logger}, "", 0)
 }
 
 // wsOriginPatterns lists allowed WebSocket origins for both session and agent endpoints.
@@ -586,6 +614,10 @@ func New(cfg Config) *Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
+		// This is the listener that terminates TLS (tsnet ListenTLS /
+		// ServeTLS), so it's the one that can emit "TLS handshake
+		// error" spam — route it through slog and demote those lines.
+		ErrorLog: httpServerErrorLog(logger),
 	}
 
 	return s
@@ -1147,6 +1179,10 @@ func (s *Server) ensureAuthServer(resolver *auth.Resolver) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		// Loopback listener, no TLS — the adapter here just keeps
+		// net/http's occasional error lines on slog instead of the
+		// default logger.
+		ErrorLog: httpServerErrorLog(s.logger),
 	}
 	return s.authSrv
 }
@@ -1232,6 +1268,10 @@ func (s *Server) ensureAuthTsnetServer(resolver *auth.Resolver) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
+		// Plain-TCP listener today (peer mode borrows the host's
+		// tailscaled; no TLS termination here), but keep error lines
+		// on slog for consistency with the public listener.
+		ErrorLog: httpServerErrorLog(s.logger),
 	}
 	return s.authTsnetSrv
 }

@@ -44,6 +44,13 @@ func runCLIGenerateTimeout(parent context.Context, toolName string, args []strin
 	cmd.Stdin = strings.NewReader(prompt)
 	output, err := cmd.Output()
 	if err != nil {
+		// exec reports a deadline kill as an opaque "signal: killed";
+		// join in the context error so callers can errors.Is a timeout
+		// apart from a genuine CLI failure — without losing the
+		// *exec.ExitError (stderr / exit status) for errors.As.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", fmt.Errorf("%s: %w", toolName, errors.Join(ctxErr, err))
+		}
 		return "", fmt.Errorf("%s: %w", toolName, err)
 	}
 	return stripCodeFence(string(output)), nil
@@ -55,11 +62,15 @@ func runCLIGenerateTimeout(parent context.Context, toolName string, args []strin
 // answer fired on every interactive turn, so latency and cost dominate.
 const effortClassifierModel = "haiku"
 
-// effortClassifierTimeout is a dedicated tight deadline for the effort
-// classifier — it runs concurrently with prepareChat, and anything
-// slower than this would start adding user-visible latency; the caller
-// falls back to a heuristic on expiry.
-const effortClassifierTimeout = 8 * time.Second
+// effortClassifierTimeout is a dedicated deadline for the effort
+// classifier — it runs concurrently with prepareChat, so much of it is
+// hidden, but a turn whose prepareChat finishes early still waits on
+// the classifier, so this IS a user-visible latency ceiling on slow
+// turns; the caller falls back to a heuristic on expiry. 8s proved too
+// tight in practice (the haiku one-word call regularly got killed
+// mid-flight), so 15s trades a rarer, slightly longer worst case for
+// far fewer wasted classifier runs.
+const effortClassifierTimeout = 15 * time.Second
 
 // runClaudeEffortClassifier executes the one-shot effort-classification
 // prompt via claude CLI pinned to effortClassifierModel at low effort,

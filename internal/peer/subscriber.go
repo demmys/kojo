@@ -227,6 +227,12 @@ func (s *Subscriber) runOne(ctx context.Context, t SubscriberTarget) {
 	const minBackoff = 1 * time.Second
 	const maxBackoff = 60 * time.Second
 	backoff := minBackoff
+	// consecutiveFailures counts connectOnce returns since the last
+	// healthy connection. Only the FIRST drop after a healthy stretch
+	// is Warn-worthy; an unreachable peer retrying at the 60s backoff
+	// ceiling would otherwise emit a Warn per minute per peer forever,
+	// so subsequent drops in the same streak log at Debug.
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -235,21 +241,56 @@ func (s *Subscriber) runOne(ctx context.Context, t SubscriberTarget) {
 			return
 		default:
 		}
-		err := s.connectOnce(ctx, t)
+		started := time.Now()
+		established, err := s.connectOnce(ctx, t)
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		if err != nil && s.logger != nil {
-			switch websocket.CloseStatus(err) {
-			case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+		// connectOnce only ever returns on error (a dropped connection
+		// included), so "success" is signalled by a completed WS upgrade
+		// plus duration: a connection that stayed up for at least
+		// maxBackoff was plainly established and healthy. (The upgrade
+		// check keeps a pathologically slow dial failure — e.g. a full
+		// TCP timeout — from masquerading as a healthy stretch.) Reset
+		// both the failure streak (the next drop is a fresh Warn) and
+		// the backoff — without the latter a peer that was connected for
+		// hours would resume reconnecting at whatever backoff its last
+		// outage left behind.
+		if established && time.Since(started) >= maxBackoff {
+			if consecutiveFailures > 0 && s.logger != nil {
+				s.logger.Info("peer.Subscriber: reconnected",
+					"target", t.DeviceID, "addr", t.Address,
+					"after_failures", consecutiveFailures)
+			}
+			consecutiveFailures = 0
+			backoff = minBackoff
+		}
+		switch websocket.CloseStatus(err) {
+		case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+			// Orderly shutdown by the peer — not a failure, so it
+			// must not consume the streak's one Warn slot (the next
+			// genuine drop still deserves it).
+			if s.logger != nil {
 				s.logger.Debug("peer.Subscriber: connection closed by peer",
 					"target", t.DeviceID, "addr", t.Address,
 					"backoff", backoff.String(), "err", err)
-			default:
-				s.logger.Warn("peer.Subscriber: connection dropped",
-					"target", t.DeviceID, "addr", t.Address,
-					"backoff", backoff.String(), "err", err)
 			}
+		default:
+			if s.logger != nil {
+				if consecutiveFailures == 0 {
+					// First drop after a healthy connection (or since
+					// startup) — the state transition worth a Warn.
+					s.logger.Warn("peer.Subscriber: connection dropped",
+						"target", t.DeviceID, "addr", t.Address,
+						"backoff", backoff.String(), "err", err)
+				} else {
+					s.logger.Debug("peer.Subscriber: still disconnected",
+						"target", t.DeviceID, "addr", t.Address,
+						"backoff", backoff.String(),
+						"failures", consecutiveFailures+1, "err", err)
+				}
+			}
+			consecutiveFailures++
 		}
 		// Backoff with jitter (±25%).
 		jittered := jitter(backoff)
@@ -269,11 +310,14 @@ func (s *Subscriber) runOne(ctx context.Context, t SubscriberTarget) {
 
 // connectOnce performs a single WS dial + read loop. Returns when
 // the connection drops (or the ctx fires); the caller wraps the
-// call in the reconnect loop.
-func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error {
+// call in the reconnect loop. established reports whether the WS
+// upgrade completed, so the caller can tell "held a connection, then
+// dropped" apart from "never got connected at all" (a slow dial
+// failure can burn as much wall-clock as a healthy stretch).
+func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) (established bool, _ error) {
 	target, err := url.Parse(t.Address)
 	if err != nil {
-		return fmt.Errorf("parse target url: %w", err)
+		return false, fmt.Errorf("parse target url: %w", err)
 	}
 	// Convert https → wss / http → ws so the dial chooses TLS
 	// correctly. The peer-auth headers are added below.
@@ -291,7 +335,7 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 	// way the dialer's identity travels in the WireGuard tunnel.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return false, fmt.Errorf("build request: %w", err)
 	}
 
 	dialOpts := &websocket.DialOptions{
@@ -318,12 +362,12 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 			body, rErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
 			resp.Body.Close()
 			if rErr == nil && len(body) > 0 {
-				return fmt.Errorf("dial: %w: status=%d body=%+q",
+				return false, fmt.Errorf("dial: %w: status=%d body=%+q",
 					err, resp.StatusCode, string(body))
 			}
-			return fmt.Errorf("dial: %w: status=%d", err, resp.StatusCode)
+			return false, fmt.Errorf("dial: %w: status=%d", err, resp.StatusCode)
 		}
-		return fmt.Errorf("dial: %w", err)
+		return false, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
@@ -332,7 +376,7 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) error 
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			return true, fmt.Errorf("read: %w", err)
 		}
 		s.handleFrame(t.DeviceID, data)
 	}

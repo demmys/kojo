@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -154,8 +155,18 @@ func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, system
 	}
 	out, err := classifyEffort(ctx, buildEffortClassifierPrompt(recentDiary, userMessage))
 	if err != nil {
-		logger.Warn("effort classifier failed; using heuristic",
-			"agent", a.ID, "err", err)
+		// Our own deadline killing the CLI is expected degradation
+		// (the heuristic covers it), not an operational fault — log
+		// it at Info. runCLIGenerateTimeout wraps the deadline kill
+		// in context.DeadlineExceeded so it's distinguishable from a
+		// genuine CLI failure, which stays at Warn.
+		if errors.Is(err, context.DeadlineExceeded) {
+			logger.Info("effort classifier timed out; using heuristic",
+				"agent", a.ID, "err", err)
+		} else {
+			logger.Warn("effort classifier failed; using heuristic",
+				"agent", a.ID, "err", err)
+		}
 		return heuristicOrStatic(a, userMessage)
 	}
 	tier := strings.ToLower(strings.TrimSpace(out))

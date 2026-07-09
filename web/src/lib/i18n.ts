@@ -1173,6 +1173,11 @@ const messages = {
   "gdm.deleteGroup": { ja: "グループを削除", en: "Delete group" },
   "gdm.replying": { ja: "返信中…", en: "replying…" },
   "gdm.compacting": { ja: "整理中…", en: "compacting…" },
+  "gdm.interrupted": { ja: "中断", en: "interrupted" },
+  "gdm.interruptedTitle": {
+    ja: "この返信は途中で中断された (部分的な出力)",
+    en: "This reply was interrupted (partial output)",
+  },
   "gdm.steerPlaceholder": {
     ja: "実行中の返信に割り込む… ({key} で送信)",
     en: "Steer the running reply… ({key} to send)",

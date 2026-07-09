@@ -27,6 +27,7 @@ import {
   LoadMoreButton,
   AttachButton,
   SendButton,
+  StopButton,
   enterToSend,
 } from "../chatComposer";
 import { AgentAvatar } from "../agent/AgentAvatar";
@@ -39,9 +40,10 @@ import { useT } from "../../lib/i18n";
 
 const PAGE_SIZE = 50;
 
-// Mirrors the server-side thread turn cap (notifyTimeout): after this long
-// without a reply the "replying…" indicator and the send lockout both clear.
-const THREAD_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
+// Mirrors the server-side thread turn cap (threadTurnTimeout, 60m): after
+// this long without a reply the "replying…" indicator and the send lockout
+// both clear.
+const THREAD_REPLY_TIMEOUT_MS = 60 * 60 * 1000;
 
 export function GroupDMChat() {
   const t = useT();
@@ -348,6 +350,13 @@ export function GroupDMChat() {
     lastMsg.agentId === USER_SENDER_ID &&
     Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
 
+  // Snapshot of the turn being awaited (the pending user message's id), kept
+  // in a ref so delayed async callbacks (handleStop's 409 retry) can check
+  // whether the SAME turn is still pending — not the render they closed over.
+  // Null when no reply is being awaited.
+  const awaitingHeadRef = useRef<string | null>(null);
+  awaitingHeadRef.current = awaitingReply && lastMsg ? lastMsg.id : null;
+
   // Live progress for the in-flight turn: polled while awaitingReply so
   // thinking / tool calls / partial text render in place of a static
   // "replying…" placeholder. Cleared whenever awaitingReply flips false (the
@@ -488,6 +497,37 @@ export function GroupDMChat() {
       setSending(false);
     }
   }, [id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
+
+  // Stop the in-flight thread turn. The partial reply lands through the
+  // normal message poll (server persists it with interrupted=true), so no
+  // client-side message is fabricated here — polling keeps running until the
+  // live snapshot goes inactive and the transcript refreshes.
+  //
+  // 409 (not_busy) race: right after a send the backend may not have
+  // registered the turn yet, so the first stop can miss. Retry once after
+  // ~1s — but only if the SAME turn is still pending (same awaited user
+  // message id): an unconditional retry could abort a NEW turn that started
+  // after the previous one finished. A second 409 means the turn really
+  // isn't running — give up silently.
+  const handleStop = useCallback(() => {
+    if (!id) return;
+    const is409 = (e: unknown) =>
+      /^409:/.test(e instanceof Error ? e.message : String(e));
+    const head = awaitingHeadRef.current;
+    groupdmApi.stopThread(id).catch((e) => {
+      if (!is409(e)) {
+        console.error("Failed to stop thread turn", e);
+        return;
+      }
+      setTimeout(() => {
+        // Skip if the awaited turn changed or completed in the meantime.
+        if (head === null || awaitingHeadRef.current !== head) return;
+        groupdmApi.stopThread(id).catch((e2) => {
+          if (!is409(e2)) console.error("Failed to stop thread turn", e2);
+        });
+      }, 1000);
+    });
+  }, [id]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => enterToSend(e, enterSends, () => void handleSend()),
@@ -875,6 +915,20 @@ export function GroupDMChat() {
                     {msg.agentName}
                   </span>
                   <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
+                  {msg.model && (
+                    <span className="font-mono text-[10px] text-ink-faint">
+                      {msg.model}
+                      {msg.effort ? ` · ${msg.effort}` : ""}
+                    </span>
+                  )}
+                  {msg.interrupted && (
+                    <span
+                      className="rounded-full border border-hairline px-1.5 font-mono text-[10px] text-ink-faint"
+                      title={t("gdm.interruptedTitle")}
+                    >
+                      {t("gdm.interrupted")}
+                    </span>
+                  )}
                   {mentionsUser && (
                     <span
                       className="rounded-full bg-copper/15 px-1.5 font-mono text-[10px] text-copper"
@@ -888,20 +942,28 @@ export function GroupDMChat() {
                 {msg.attachments && msg.attachments.length > 0 && (
                   <AttachmentList attachments={msg.attachments} isUser={false} />
                 )}
-                <div className="text-[14px] text-ink">
-                  <MessageContent
-                    messageId={msg.id}
-                    content={msg.content}
-                    isUser={false}
-                    timestamp={msg.timestamp}
-                    showTime={false}
-                  />
-                </div>
+                {/* An interrupted reply can have empty content (only thinking
+                    or toolUses were produced before the stop) — skip the
+                    empty text block instead of rendering a hollow row. */}
+                {msg.content && (
+                  <div className="text-[14px] text-ink">
+                    <MessageContent
+                      messageId={msg.id}
+                      content={msg.content}
+                      isUser={false}
+                      timestamp={msg.timestamp}
+                      showTime={false}
+                    />
+                  </div>
+                )}
                 {msg.toolUses && msg.toolUses.length > 0 && (
                   <CollapsedToolUses toolUses={msg.toolUses} />
                 )}
+                {/* Prefer the model persisted on the message — the agent's
+                    CURRENT model may differ from the one that actually
+                    produced (and prices) this past reply. */}
                 {msg.usage && msg.usage.inputTokens != null && (
-                  <ThreadUsageLine usage={msg.usage} model={threadAgentModel} />
+                  <ThreadUsageLine usage={msg.usage} model={msg.model || threadAgentModel} />
                 )}
               </div>
             </div>
@@ -922,6 +984,12 @@ export function GroupDMChat() {
                   )}
                 </div>
                 <span className="text-[13px] italic text-ink-faint">{t("gdm.replying")}</span>
+                {live?.model && (
+                  <span className="font-mono text-[10px] text-ink-faint">
+                    {live.model}
+                    {live.effort ? ` · ${live.effort}` : ""}
+                  </span>
+                )}
               </div>
             );
           }
@@ -937,6 +1005,12 @@ export function GroupDMChat() {
                     <Lamp state="warn" pulse size={6} />
                     {live!.status === "compacting" ? t("gdm.compacting") : t("gdm.replying")}
                   </span>
+                  {live!.model && (
+                    <span className="font-mono text-[10px] text-ink-faint">
+                      {live!.model}
+                      {live!.effort ? ` · ${live!.effort}` : ""}
+                    </span>
+                  )}
                 </div>
                 {live!.thinking && <ThinkingBlock text={live!.thinking} streaming={!live!.text} />}
                 {live!.text && (
@@ -998,6 +1072,7 @@ export function GroupDMChat() {
               className="max-h-[150px] w-full resize-none bg-transparent px-3 py-2 text-[14px] text-ink placeholder:text-ink-faint focus:outline-none"
             />
           </div>
+          {awaitingReply && !isDraft && <StopButton onClick={handleStop} />}
           <SendButton
             onClick={() => void handleSend()}
             disabled={(!input.trim() && pendingFiles.length === 0) || sending}

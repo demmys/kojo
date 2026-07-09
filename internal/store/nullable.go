@@ -54,6 +54,16 @@ func nullableInt64Ptr(p *int64) any {
 	return sql.NullInt64{Int64: *p, Valid: true}
 }
 
+// nullableBool returns SQL NULL for false and 1 for true — preserves the
+// schema's "missing" semantic for flag columns that are NULL on rows
+// written before the column existed (groupdm_messages.interrupted).
+func nullableBool(v bool) any {
+	if !v {
+		return nil
+	}
+	return 1
+}
+
 // nullableJSON converts an empty / nil json.RawMessage to a SQL NULL.
 // Mirrors nullableText for raw-JSON columns (tool_uses, attachments,
 // usage on agent_messages) so a missing field round-trips as NULL

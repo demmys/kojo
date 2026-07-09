@@ -591,6 +591,26 @@ func (s *Server) handleSteerGroupDM(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, msg)
 }
 
+// handleStopGroupDMTurn — POST /api/v1/groupdms/{id}/stop. Aborts the room's
+// currently in-flight thread turn on the operator's behalf; the turn's
+// partial output is preserved as an interrupted reply (see
+// GroupDMManager.StopThreadTurn). Auth mirrors GET .../live.
+func (s *Server) handleStopGroupDMTurn(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireMemberOrOwner(w, r, id) {
+		return
+	}
+	if _, ok := s.groupdms.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "not_found", "group not found: "+id)
+		return
+	}
+	if !s.groupdms.StopThreadTurn(id) {
+		writeError(w, http.StatusConflict, "not_busy", "no thread turn in progress")
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"stopped": true})
+}
+
 func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req struct {

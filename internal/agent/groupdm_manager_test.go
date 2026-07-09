@@ -1698,7 +1698,7 @@ func TestGroupDMManager_Steer_InjectsWithoutNewTurn(t *testing.T) {
 	}
 	mgr.oneShotSteersMu.Unlock()
 
-	gdm.startThreadLive(g.ID)
+	gdm.startThreadLive(g.ID, "", "")
 	defer gdm.endThreadLive(g.ID)
 
 	msg, err := gdm.Steer(context.Background(), g.ID, "steer this turn")
@@ -1751,10 +1751,86 @@ func TestGroupDMManager_Steer_UnsupportedBackend(t *testing.T) {
 	mgr.oneShotSteers[sessionKey] = nil
 	mgr.oneShotSteersMu.Unlock()
 
-	gdm.startThreadLive(g.ID)
+	gdm.startThreadLive(g.ID, "", "")
 	defer gdm.endThreadLive(g.ID)
 
 	if _, err := gdm.Steer(context.Background(), g.ID, "steer text"); !errors.Is(err, ErrSteerUnsupported) {
 		t.Errorf("err = %v, want ErrSteerUnsupported", err)
+	}
+}
+
+// TestGroupDMManager_StopThreadTurn_PreservesPartialOutput verifies that an
+// operator stop (StopThreadTurn) cancels the in-flight turn but posts the
+// partial output accumulated so far as an interrupted reply, instead of
+// discarding it like the archive-cancel path.
+func TestGroupDMManager_StopThreadTurn_PreservesPartialOutput(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		ch := make(chan ChatEvent)
+		go func() {
+			defer close(ch)
+			ch <- ChatEvent{Type: "text", Delta: "partial answer"}
+			close(started)
+			<-ctx.Done()
+		}()
+		return ch, nil
+	})
+
+	msg := newGroupMessage(UserSenderID, UserSenderName, "question", nil)
+	done := make(chan struct{})
+	go func() {
+		gdm.runThreadTurn("ag_alice", g.ID, "G", msg)
+		close(done)
+	}()
+
+	<-started
+	stopped := false
+	for i := 0; i < 500; i++ {
+		if gdm.StopThreadTurn(g.ID) {
+			stopped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stopped {
+		t.Fatal("StopThreadTurn never found an in-flight turn")
+	}
+	<-done
+
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) == 0 {
+		t.Fatal("no messages in room")
+	}
+	last := msgs[len(msgs)-1]
+	if last.AgentID != "ag_alice" {
+		t.Fatalf("last message sender = %q, want ag_alice", last.AgentID)
+	}
+	if !last.Interrupted {
+		t.Error("last message Interrupted = false, want true")
+	}
+	if last.Content != "partial answer" {
+		t.Errorf("last message content = %q, want partial output preserved", last.Content)
+	}
+}
+
+// TestGroupDMManager_StopThreadTurn_Idle verifies that stopping a room with
+// no in-flight turn reports false (surfaced as 409 by the HTTP layer).
+func TestGroupDMManager_StopThreadTurn_Idle(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gdm.StopThreadTurn(g.ID) {
+		t.Error("StopThreadTurn on idle room = true, want false")
 	}
 }

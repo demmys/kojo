@@ -140,7 +140,11 @@ func (s *thinkingToolUsesThreadStub) fn(ctx context.Context, agentID, userMessag
 // assembled message Thinking and ToolUses are attached to the agent's thread
 // reply and survive a reload from the store.
 func TestThreadTurn_PersistsThinkingAndToolUses(t *testing.T) {
-	gdm, _ := setupGroupDMTest(t)
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.mu.Lock()
+	mgr.agents["ag_alice"].Model = "opus"
+	mgr.agents["ag_alice"].Effort = "high"
+	mgr.mu.Unlock()
 	stub := &thinkingToolUsesThreadStub{
 		reply:    "answer",
 		thinking: "let me consider this carefully",
@@ -182,6 +186,12 @@ func TestThreadTurn_PersistsThinkingAndToolUses(t *testing.T) {
 	}
 	if len(reloaded.ToolUses) != 1 || reloaded.ToolUses[0].Name != "shell" || reloaded.ToolUses[0].Input != "ls -la" {
 		t.Errorf("reloaded toolUses = %+v, want [{shell ls -la}]", reloaded.ToolUses)
+	}
+	if reloaded.Model != "opus" || reloaded.Effort != "high" {
+		t.Errorf("reloaded (model, effort) = (%q, %q), want (opus, high)", reloaded.Model, reloaded.Effort)
+	}
+	if reloaded.Interrupted {
+		t.Errorf("reloaded interrupted = true, want false for a completed turn")
 	}
 }
 

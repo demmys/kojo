@@ -77,6 +77,14 @@ export interface GroupMessage {
   thinking?: string;
   /** Tool-call trace for an agent thread reply (absent otherwise). */
   toolUses?: ToolUse[];
+  /** Model that produced an agent thread reply (absent otherwise). */
+  model?: string;
+  /** Reasoning effort of an agent thread reply (absent otherwise). */
+  effort?: string;
+  /** True when the turn ended early (stop/error/timeout) — content is the
+   * partial output, possibly even an empty string with only thinking or
+   * toolUses. */
+  interrupted?: boolean;
 }
 
 export interface UnreadInfo {
@@ -95,6 +103,8 @@ export interface ThreadLive {
   thinking?: string;
   text?: string;
   toolUses?: ToolUse[];
+  model?: string;
+  effort?: string;
 }
 
 /** localStorage key for the last-read message id of a room. */
@@ -171,6 +181,12 @@ export const groupdmApi = {
     post<GroupDMInfo>("/api/v1/threads", { agentId }),
 
   threadLive: (id: string) => get<ThreadLive>(`/api/v1/groupdms/${id}/live`),
+
+  // stopThread aborts a thread room's in-flight turn. Rejects with an Error
+  // whose message starts with "409:" when no turn is in flight — callers
+  // should treat that as already-stopped and ignore it.
+  stopThread: (id: string) =>
+    post<{ stopped: boolean }>(`/api/v1/groupdms/${id}/stop`, {}),
 
   unread: (id: string, after?: string | null) =>
     get<UnreadInfo>(

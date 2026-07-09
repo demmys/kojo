@@ -15,6 +15,12 @@ import (
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
 const notifyTimeout = 10 * time.Minute
 
+// threadTurnTimeout is the maximum time allowed for a thread-room turn.
+// Deliberately much longer than notifyTimeout: thread turns are interactive
+// operator conversations that may involve long autonomous work, and the
+// operator has an explicit stop control (StopThreadTurn) to end them early.
+const threadTurnTimeout = 60 * time.Minute
+
 // defaultMaxHops is the default agent-to-agent notification relay depth per
 // room. A message whose hop reaches the room's effective max is still stored
 // (humans see it) but is not fanned out to agents — structural loop
@@ -203,6 +209,11 @@ type GroupDMManager struct {
 	// threadCancelMu.
 	threadCancelMu sync.Mutex
 	threadCancels  map[string]context.CancelFunc
+	// threadStopped marks rooms whose in-flight turn was cancelled by an
+	// explicit operator stop (StopThreadTurn) rather than by archive —
+	// the stop path preserves partial output, the archive path discards
+	// it. Guarded by threadCancelMu.
+	threadStopped map[string]bool
 
 	// oneShot runs a one-shot agent turn for thread rooms. Defaults to
 	// agentMgr.ChatOneShot; overridable in tests to stub the agent turn.
@@ -227,6 +238,8 @@ type threadLiveState struct {
 	Thinking  string
 	Text      string
 	ToolUses  []ToolUse
+	Model     string
+	Effort    string
 	UpdatedAt time.Time
 }
 
@@ -238,6 +251,8 @@ type ThreadLiveSnapshot struct {
 	Thinking string    `json:"thinking,omitempty"`
 	Text     string    `json:"text,omitempty"`
 	ToolUses []ToolUse `json:"toolUses,omitempty"`
+	Model    string    `json:"model,omitempty"`
+	Effort   string    `json:"effort,omitempty"`
 }
 
 // ThreadLive returns the live snapshot for a thread room's in-flight turn.
@@ -286,6 +301,8 @@ func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot Threa
 		Thinking: st.Thinking,
 		Text:     st.Text,
 		ToolUses: toolUses,
+		Model:    st.Model,
+		Effort:   st.Effort,
 	}
 }
 
@@ -300,9 +317,9 @@ func (m *GroupDMManager) SetOneShotForTesting(fn func(ctx context.Context, agent
 
 // startThreadLive creates (or replaces) the live-state entry for groupID at
 // the start of a thread turn.
-func (m *GroupDMManager) startThreadLive(groupID string) {
+func (m *GroupDMManager) startThreadLive(groupID, model, effort string) {
 	m.threadLiveMu.Lock()
-	m.threadLive[groupID] = &threadLiveState{UpdatedAt: time.Now()}
+	m.threadLive[groupID] = &threadLiveState{Model: model, Effort: effort, UpdatedAt: time.Now()}
 	m.threadLiveMu.Unlock()
 }
 
@@ -442,6 +459,7 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		deleting:      make(map[string]bool),
 		persistGen:    make(map[string]int64),
 		threadCancels: make(map[string]context.CancelFunc),
+		threadStopped: make(map[string]bool),
 		threadLive:    make(map[string]*threadLiveState),
 	}
 	m.load()
@@ -1394,16 +1412,19 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), threadTurnTimeout)
 	defer cancel()
 
-	// Register the cancel so archive (Delete) can abort a running turn.
+	// Register the cancel so archive (Delete) and the operator stop
+	// control (StopThreadTurn) can abort a running turn.
 	m.threadCancelMu.Lock()
 	m.threadCancels[groupID] = cancel
+	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()
 	defer func() {
 		m.threadCancelMu.Lock()
 		delete(m.threadCancels, groupID)
+		delete(m.threadStopped, groupID)
 		m.threadCancelMu.Unlock()
 	}()
 
@@ -1416,7 +1437,12 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// moment the turn is about to stream events until the reply is posted
 	// (or the turn errors/times out/is cancelled) — deferred cleanup covers
 	// every one of those exits uniformly.
-	m.startThreadLive(groupID)
+	var agentModel, agentEffort string
+	if a, ok := m.agentMgr.Get(agentID); ok {
+		agentModel = a.Model
+		agentEffort = a.Effort
+	}
+	m.startThreadLive(groupID, agentModel, agentEffort)
 	defer m.endThreadLive(groupID)
 
 	payload := m.renderThreadPayload(groupName, msg)
@@ -1425,6 +1451,23 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		SystemPromptExtra: threadSystemPromptExtra,
 	})
 	if err != nil {
+		// Unregister the cancel before handling the error so a /stop
+		// racing this failure can't return 200 for a turn that never
+		// started streaming. The defer's delete is idempotent. Read the
+		// stop flag in the same critical section: a stop that landed
+		// during oneShot setup already returned 200, so resolve it with
+		// an (empty) interrupted reply rather than silently dropping it.
+		m.threadCancelMu.Lock()
+		earlyStopped := m.threadStopped[groupID]
+		delete(m.threadCancels, groupID)
+		delete(m.threadStopped, groupID)
+		m.threadCancelMu.Unlock()
+		if earlyStopped && errors.Is(err, context.Canceled) {
+			if _, perr := m.postThreadReply(groupID, agentID, "", agentModel, agentEffort, nil, "", nil, true); perr != nil {
+				m.logger.Warn("failed to post stopped thread reply", "group", groupID, "agent", agentID, "err", perr)
+			}
+			return
+		}
 		m.handleThreadTurnError(groupID, agentID, payload, err)
 		return
 	}
@@ -1490,27 +1533,66 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 			}
 		}
 	}
-	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		streamErr = fmt.Sprintf("thread turn timed out after %s", notifyTimeout)
-	}
-	if streamErr != "" {
-		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
-		return
-	}
-
+	// Assemble the reply text; the partial live snapshot fills in
+	// thinking/toolUses when the turn never reached its "done" event
+	// (error, timeout, operator stop) so partial output survives.
 	text := strings.TrimSpace(doneText)
 	if text == "" {
 		text = strings.TrimSpace(reply.String())
 	}
-	if text == "" {
-		return // nothing substantive to post
+	_, snap := m.ThreadLive(groupID)
+	if thinking == "" {
+		thinking = snap.Thinking
+	}
+	if len(toolUses) == 0 {
+		toolUses = snap.ToolUses
+	}
+
+	// The stream has ended — unregister the cancel now (not in the defer)
+	// and read the stop flag in the same critical section, so a stop
+	// arriving after completion can neither mislabel a finished reply as
+	// interrupted nor return 200 for a turn that already ended.
+	stopped := false
+	m.threadCancelMu.Lock()
+	stopped = m.threadStopped[groupID]
+	delete(m.threadCancels, groupID)
+	delete(m.threadStopped, groupID)
+	m.threadCancelMu.Unlock()
+
+	// An operator stop cancels the context; treat it separately from
+	// archive-cancel (room going away — discard) and real errors.
+	if errors.Is(ctx.Err(), context.Canceled) {
+		if !stopped {
+			return // archive path: room is being torn down
+		}
+		streamErr = ""
+	}
+	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		streamErr = fmt.Sprintf("thread turn timed out after %s", threadTurnTimeout)
+	}
+	if streamErr != "" {
+		// Preserve whatever the turn produced before failing, then post
+		// the visible failure notice / dead-letter as before.
+		if text != "" || thinking != "" || len(toolUses) > 0 {
+			if _, err := m.postThreadReply(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true); err != nil {
+				m.logger.Warn("failed to post partial thread reply", "group", groupID, "agent", agentID, "err", err)
+			}
+		}
+		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
+		return
+	}
+	if text == "" && thinking == "" && len(toolUses) == 0 && !stopped {
+		// Nothing substantive to post. A stopped turn still posts an
+		// (empty) interrupted reply so the UI's "replying…" wait resolves
+		// with a visible outcome instead of hanging on the user's post.
+		return
 	}
 	// Auto-title BEFORE posting the reply: the reply advances the transcript
 	// head, and a client that refreshes the room info on head change would
 	// otherwise race the rename and pin the stale default title. No-op after
 	// the first rename; empty replies (above) still skip titling entirely.
 	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
-	if _, err := m.postThreadReply(groupID, agentID, text, usage, thinking, toolUses); err != nil {
+	if _, err := m.postThreadReply(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
 }
@@ -1539,7 +1621,7 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 // postThreadReply appends an agent-authored message to a thread room on the
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
-func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage *Usage, thinking string, toolUses []ToolUse) (*GroupMessage, error) {
+func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -1558,6 +1640,9 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content string, usage
 	msg.Usage = usage
 	msg.Thinking = thinking
 	msg.ToolUses = toolUses
+	msg.Model = model
+	msg.Effort = effort
+	msg.Interrupted = interrupted
 	msg.Mentions = m.parseMentions(content, memberIDs)
 	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
 		m.mu.Unlock()
@@ -1581,7 +1666,7 @@ func (m *GroupDMManager) handleThreadTurnError(groupID, agentID, payload string,
 	}
 	m.logger.Warn("thread turn failed", "group", groupID, "agent", agentID, "err", err)
 	m.recordDeadLetter(groupID, agentID, "thread turn: "+err.Error(), payload, 1)
-	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error(), nil, "", nil); perr != nil {
+	if _, perr := m.postThreadReply(groupID, agentID, "⚠️ Thread reply failed: "+err.Error(), "", "", nil, "", nil, false); perr != nil {
 		m.logger.Warn("failed to post thread failure notice", "group", groupID, "agent", agentID, "err", perr)
 	}
 }
@@ -1674,12 +1759,30 @@ func deriveThreadTitle(content string) string {
 }
 
 // cancelThreadTurn aborts the in-flight thread turn for a room, if any.
+// Archive path: partial output is discarded (the room is going away).
 func (m *GroupDMManager) cancelThreadTurn(groupID string) {
 	m.threadCancelMu.Lock()
 	if cancel := m.threadCancels[groupID]; cancel != nil {
 		cancel()
 	}
 	m.threadCancelMu.Unlock()
+}
+
+// StopThreadTurn aborts the in-flight thread turn for a room on behalf of
+// the operator (the thread UI's stop button). Unlike the archive-driven
+// cancelThreadTurn, the turn's partial output is preserved: runThreadTurn
+// posts whatever text/thinking/tool calls accumulated before the stop as an
+// interrupted reply. Returns false when no turn is in flight.
+func (m *GroupDMManager) StopThreadTurn(groupID string) bool {
+	m.threadCancelMu.Lock()
+	defer m.threadCancelMu.Unlock()
+	cancel := m.threadCancels[groupID]
+	if cancel == nil {
+		return false
+	}
+	m.threadStopped[groupID] = true
+	cancel()
+	return true
 }
 
 // Messages returns paginated messages for a group plus the current head ID

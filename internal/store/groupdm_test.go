@@ -134,6 +134,25 @@ func TestAppendGroupDMMessage(t *testing.T) {
 		}
 	}
 
+	// Thread-reply metadata (model/effort/interrupted) round-trips; the
+	// plain posts above stay at their zero values.
+	if _, err := s.AppendGroupDMMessage(ctx, &GroupDMMessageRecord{
+		ID: "D", GroupDMID: "g", AgentID: "a1", Content: "reply",
+		Model: "opus", Effort: "high", Interrupted: true,
+	}, GroupDMMessageInsertOptions{}); err != nil {
+		t.Fatalf("append with model/effort/interrupted: %v", err)
+	}
+	list, err = s.ListGroupDMMessages(ctx, "g", GroupDMMessageListOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if got := list[len(list)-1]; got.Model != "opus" || got.Effort != "high" || !got.Interrupted {
+		t.Errorf("reloaded (model, effort, interrupted) = (%q, %q, %v), want (opus, high, true)", got.Model, got.Effort, got.Interrupted)
+	}
+	if got := list[0]; got.Model != "" || got.Effort != "" || got.Interrupted {
+		t.Errorf("plain post carries thread metadata: (%q, %q, %v)", got.Model, got.Effort, got.Interrupted)
+	}
+
 	// Group tombstone hides children.
 	if err := s.SoftDeleteGroupDM(ctx, "g"); err != nil {
 		t.Fatalf("delete group: %v", err)

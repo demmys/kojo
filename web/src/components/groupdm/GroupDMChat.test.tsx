@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   postUserMessage: vi.fn(),
   steer: vi.fn(),
   threadLive: vi.fn(),
+  stopThread: vi.fn(),
 }));
 
 vi.mock("../../lib/agentApi", () => ({
@@ -44,6 +45,7 @@ vi.mock("../../lib/groupdmApi", () => ({
     archive: mocks.archive,
     steer: mocks.steer,
     threadLive: mocks.threadLive,
+    stopThread: mocks.stopThread,
   },
 }));
 
@@ -255,6 +257,70 @@ describe("GroupDMChat thread room", () => {
     expect(await screen.findByText("here you go")).toBeInTheDocument();
     // "1,200→340 tokens" (locale-formatted). Match on the arrow-joined counts.
     expect(await screen.findByText(/1,200.*340 tokens/)).toBeInTheDocument();
+  });
+
+  it("shows a model/effort label and an interrupted chip on an agent reply", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "ag_alice",
+          agentName: "Alice",
+          content: "partial answer",
+          model: "opus",
+          effort: "high",
+          interrupted: true,
+          timestamp: "2026-06-15T00:00:01Z",
+        },
+        {
+          // Empty-content interrupted reply (stop landed before any text):
+          // the chip must still render without a broken empty bubble.
+          id: "m2",
+          agentId: "ag_alice",
+          agentName: "Alice",
+          content: "",
+          model: "opus",
+          interrupted: true,
+          timestamp: "2026-06-15T00:00:02Z",
+        },
+        {
+          id: "m3",
+          agentId: "user",
+          agentName: "User",
+          content: "a user message",
+          timestamp: "2026-06-15T00:00:03Z",
+        },
+      ],
+      hasMore: false,
+    });
+    renderGroup();
+
+    expect(await screen.findByText("partial answer")).toBeInTheDocument();
+    expect(screen.getByText("opus · high")).toBeInTheDocument();
+    expect(screen.getAllByText("interrupted")).toHaveLength(2);
+  });
+
+  it("stops the in-flight turn from the composer stop button", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "user",
+          agentName: "User",
+          content: "hi there",
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      hasMore: false,
+    });
+    mocks.stopThread.mockResolvedValue({ stopped: true });
+    renderGroup();
+
+    const stopBtn = await screen.findByRole("button", { name: "Stop" });
+    fireEvent.click(stopBtn);
+    await waitFor(() => expect(mocks.stopThread).toHaveBeenCalledWith("g1"));
   });
 });
 

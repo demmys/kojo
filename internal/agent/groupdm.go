@@ -168,6 +168,13 @@ type GroupMessage struct {
 	// ToolUses is the tool-call trace of an agent thread reply (nil
 	// otherwise).
 	ToolUses []ToolUse `json:"toolUses,omitempty"`
+	// Model/Effort record the agent's configured model and effort level at
+	// the time of an agent thread reply ("" otherwise).
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	// Interrupted marks a thread reply whose turn ended before completion
+	// (operator stop, error, or timeout) — the content is partial output.
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 func generateGroupID() string {
@@ -229,6 +236,9 @@ func appendGroupMessage(groupID string, msg *GroupMessage, expectedLatestSeq int
 		}
 		rec.ToolUses = buf
 	}
+	rec.Model = msg.Model
+	rec.Effort = msg.Effort
+	rec.Interrupted = msg.Interrupted
 	ts := parseAgentRFC3339Millis(msg.Timestamp)
 	if ts == 0 {
 		ts = store.NowMillis()
@@ -527,6 +537,9 @@ func groupRecordToMessage(rec *store.GroupDMMessageRecord) *GroupMessage {
 			out.ToolUses = tu
 		}
 	}
+	out.Model = rec.Model
+	out.Effort = rec.Effort
+	out.Interrupted = rec.Interrupted
 	return out
 }
 

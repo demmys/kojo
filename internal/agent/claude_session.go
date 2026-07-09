@@ -833,6 +833,16 @@ func (s *claudeSession) openUnsolicitedLocked() {
 			select {
 			case <-abortTurn:
 			case <-time.After(10 * time.Second):
+				// Re-check identity before the kill: when the timer and
+				// the turn's completion race, select picks arbitrarily —
+				// a process-group kill must never land after the turn
+				// already ended (it would take out a successor turn).
+				s.mu.Lock()
+				stale := s.turnDone != abortTurn || s.state != sessInTurn
+				s.mu.Unlock()
+				if stale {
+					return
+				}
 				s.logger.Warn("claude interrupt unanswered on unsolicited turn; killing session process", "agent", s.agentID)
 				s.forceKill()
 			}

@@ -4,6 +4,7 @@ import {
   defaultModelForTool,
   effortLevelsForModel,
   modelsForTool,
+  sessionEffortLevelsForModel,
 } from "./toolModels";
 
 describe("toolModels — Opus 4.8 / effort defaults", () => {
@@ -107,5 +108,24 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("xhigh");
     expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("max");
     expect(defaultEffortForModel("grok-composer-2.5-fast")).toBe("high");
+  });
+});
+
+describe("sessionEffortLevelsForModel — ultra is session-only", () => {
+  it("adds ultra for gpt-5.6-sol and gpt-5.6-terra", () => {
+    expect(sessionEffortLevelsForModel("gpt-5.6-sol")).toContain("ultra");
+    expect(sessionEffortLevelsForModel("gpt-5.6-terra")).toContain("ultra");
+  });
+
+  it("does not add ultra for gpt-5.6-luna or other models", () => {
+    expect(sessionEffortLevelsForModel("gpt-5.6-luna")).not.toContain("ultra");
+    expect(sessionEffortLevelsForModel("gpt-5.5")).not.toContain("ultra");
+    expect(sessionEffortLevelsForModel("claude-fable-5")).not.toContain("ultra");
+  });
+
+  it("agent-facing effortLevelsForModel never offers ultra", () => {
+    for (const m of ["gpt-5.6-sol", "gpt-5.6-terra"]) {
+      expect(effortLevelsForModel(m)).not.toContain("ultra" as never);
+    }
   });
 });

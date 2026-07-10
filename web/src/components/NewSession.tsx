@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { api, type ServerInfo } from "../lib/api";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
-import { modelsForTool } from "../lib/toolModels";
+import { modelsForTool, sessionEffortLevelsForModel, supportsEffort } from "../lib/toolModels";
 import { errMsg } from "../lib/utils";
 import { PageHeader } from "./ui/PageHeader";
 import { SectionCard } from "./ui/SectionCard";
@@ -21,6 +21,10 @@ export function NewSession() {
   const [info, setInfo] = useState<ServerInfo>();
   const [tool, setTool] = useState("claude");
   const [model, setModel] = useState("");
+  // Per-session effort. "" = CLI default. Unlike agent settings this may
+  // include "ultra" for codex models that advertise it (see
+  // sessionEffortLevelsForModel) — ultra is a session-scoped choice only.
+  const [effort, setEffort] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [args, setArgs] = useState("");
   const [yoloMode, setYoloMode] = useState(false);
@@ -74,6 +78,7 @@ export function NewSession() {
     setInfo(undefined);
     setTool("");
     setModel("");
+    setEffort("");
     setWorkDir("");
     setInfoLoading(true);
     api.info(peerId).then((info) => {
@@ -152,6 +157,26 @@ export function NewSession() {
       );
       if (model && !hasModelArg) {
         parsedArgs = ["--model", model, ...parsedArgs];
+      }
+      // Effort flag differs per CLI: claude/grok take --effort, codex takes
+      // a -c config override. Skip when the user already passed their own,
+      // and when a manual --model/-m overrides the dropdown model — the
+      // selected effort was validated against the dropdown model's ladder,
+      // which may not apply to the manually-typed one.
+      if (effort && model && !hasModelArg && supportsEffort(tool)) {
+        const hasEffortArg = parsedArgs.some(
+          (a) =>
+            a === "--effort" ||
+            a.startsWith("--effort=") ||
+            // any -c / --config form, split or joined
+            a.includes("model_reasoning_effort"),
+        );
+        if (!hasEffortArg) {
+          parsedArgs =
+            tool === "codex"
+              ? ["-c", `model_reasoning_effort=${effort}`, ...parsedArgs]
+              : ["--effort", effort, ...parsedArgs];
+        }
       }
       const peerId = selectedPeerId && selectedPeerId !== selfPeerId ? selectedPeerId : undefined;
       const session = await api.sessions.create({
@@ -234,6 +259,7 @@ export function NewSession() {
                         onChange={() => {
                           setTool(name);
                           setModel("");
+                          setEffort("");
                         }}
                         className="accent-[color:var(--color-copper)]"
                       />
@@ -249,11 +275,36 @@ export function NewSession() {
             {/* Model (tools with a known whitelist) */}
             {modelsForTool(tool).length > 0 && (
               <Field label={t("settings.model")}>
-                <Select value={model} onChange={(e) => setModel(e.target.value)} mono>
+                <Select
+                  value={model}
+                  onChange={(e) => {
+                    const m = e.target.value;
+                    setModel(m);
+                    if (effort && !sessionEffortLevelsForModel(m).includes(effort)) setEffort("");
+                  }}
+                  mono
+                >
                   <option value="">{t("ns.defaultOption")}</option>
                   {modelsForTool(tool).map((m) => (
                     <option key={m} value={m}>
                       {m}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            )}
+
+            {/* Effort (explicit model only — with the CLI-default model the
+                valid ladder is unknowable, so both stay CLI default). May
+                include "ultra" for codex models that advertise it; ultra is
+                intentionally NOT offered in agent settings. */}
+            {model && supportsEffort(tool) && (
+              <Field label={t("field.effort")}>
+                <Select value={effort} onChange={(e) => setEffort(e.target.value)} mono>
+                  <option value="">{t("ns.defaultOption")}</option>
+                  {sessionEffortLevelsForModel(model).map((lv) => (
+                    <option key={lv} value={lv}>
+                      {lv}
                     </option>
                   ))}
                 </Select>

@@ -81,6 +81,24 @@ export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex";
 }
 
+// codex CLI 0.144.1: gpt-5.6-sol and gpt-5.6-terra additionally advertise
+// the "ultra" reasoning level (multi-agent orchestration mode). It is a
+// different beast from the plain effort ladder — long-running and
+// expensive — so kojo's per-agent effort scale intentionally stops at
+// "max"; ultra is offered ONLY as a per-session choice in NewSession.
+const codexUltraModels = new Set(["gpt-5.6-sol", "gpt-5.6-terra"]);
+
+/**
+ * Effort levels offered when starting an ad-hoc session for the given
+ * model: the model's regular ladder plus "ultra" where the codex CLI
+ * advertises it. NOT used for agent settings.
+ */
+export function sessionEffortLevelsForModel(model: string): string[] {
+  const levels: string[] = [...effortLevelsForModel(model)];
+  if (codexUltraModels.has(model)) levels.push("ultra");
+  return levels;
+}
+
 /** Return available effort levels for a given model. */
 export function effortLevelsForModel(model: string): readonly EffortLevel[] {
   if (codexMaxModels.has(model)) return effortLevels;

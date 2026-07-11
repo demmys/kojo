@@ -112,6 +112,22 @@ func TestNormalizeTimestamp(t *testing.T) {
 	}
 }
 
+func TestValidTimeout(t *testing.T) {
+	valid := []int{0, 5, 10, 15, 20, 30, 45, 60, 120, 24 * 60, 72 * 60, int(maxTimeoutMinutes / 60 * 60)}
+	for _, minutes := range valid {
+		if !ValidTimeout(minutes) {
+			t.Errorf("expected %d minutes to be valid", minutes)
+		}
+	}
+
+	invalid := []int{-60, -1, 1, 4, 6, 25, 59, 61, 90, 121, int(maxTimeoutMinutes/60*60 + 60)}
+	for _, minutes := range invalid {
+		if ValidTimeout(minutes) {
+			t.Errorf("expected %d minutes to be invalid", minutes)
+		}
+	}
+}
+
 func TestValidSilentHours(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -28,6 +28,11 @@ const (
 	// BusySourceNotification is an automated notification (group DM, etc.)
 	// that should not surface as "busy" in member status displays.
 	BusySourceNotification
+	// BusySourceBackground is an unsolicited turn continuing the agent's own
+	// work (a background-task notification waking the persistent session).
+	// Unlike group-DM notifications it IS real solo work, so it surfaces as
+	// "busy" in status displays.
+	BusySourceBackground
 )
 
 // String renders the busy source as a short lowercase tag, used in
@@ -40,6 +45,8 @@ func (s BusySource) String() string {
 		return "cron"
 	case BusySourceNotification:
 		return "notification"
+	case BusySourceBackground:
+		return "background"
 	default:
 		return fmt.Sprintf("source(%d)", int(s))
 	}
@@ -2562,7 +2569,7 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 			}
 			// answer lets a watching human resolve an AskUserQuestion raised on
 			// this automated turn (surfaced as a card, held with a timeout).
-			m.busy[agentID] = busyEntry{cancel: entryCancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceNotification, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
+			m.busy[agentID] = busyEntry{cancel: entryCancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceBackground, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
 			// Count this in-flight unsolicited turn so drains (waitChatIdle /
 			// WaitAllChatsIdle) don't observe idle while it is writing.
 			m.notifying[agentID]++

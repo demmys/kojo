@@ -1271,7 +1271,11 @@ func chatWithArrivalRetry(ctx context.Context, m *Manager, agentID, prompt, opID
 			}
 			continue
 		}
-		events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceNotification)
+		// BusySourceBackground: the arrival turn is the agent's own work
+		// (post-switch orientation), so it should read as busy in status
+		// displays — the Notification source is reserved for group-DM style
+		// broadcasts where fanned-out replies would be noise.
+		events, err := m.Chat(ctx, agentID, prompt, "system", nil, BusySourceBackground)
 		if err == nil {
 			if attempt > 0 && m.logger != nil {
 				m.logger.Info("device-switch arrival chat: succeeded after retry",

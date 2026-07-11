@@ -20,9 +20,9 @@ func (m *Manager) IsBusy(agentID string) bool {
 }
 
 // IsBusyForStatus returns true only when the agent is busy with a user
-// chat or cron job — automated notifications (group DM replies etc.) are
-// excluded so that members don't all appear "busy" when responding to a
-// broadcast notification.
+// chat, cron job, or a background turn continuing its own work — automated
+// notifications (group DM replies etc.) are excluded so that members don't
+// all appear "busy" when responding to a broadcast notification.
 func (m *Manager) IsBusyForStatus(agentID string) bool {
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
@@ -30,7 +30,7 @@ func (m *Manager) IsBusyForStatus(agentID string) bool {
 	if !ok {
 		return false
 	}
-	return entry.source == BusySourceUser || entry.source == BusySourceCron
+	return entry.source == BusySourceUser || entry.source == BusySourceCron || entry.source == BusySourceBackground
 }
 
 // BusySince returns the time when the agent started its current chat.

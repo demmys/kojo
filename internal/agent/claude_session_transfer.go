@@ -139,6 +139,31 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []SkippedSessi
 	return out, skipped, nil
 }
 
+// mkdirAllReplacingDanglingSymlink is MkdirAll that first clears a
+// dangling symlink sitting at path. The v0→v1 migration's
+// --migrate-external-cli step symlinked the encoded claude project
+// dirs at the v1 paths; a later `--clean v0` deleted the link
+// targets, leaving dangling symlinks that make MkdirAll fail with
+// EEXIST (Stat follows the link and ENOENTs, Mkdir sees the link) —
+// which 500'd the whole agent-sync and stranded a device switch.
+// A VALID symlink is left alone: MkdirAll resolves it to the target
+// dir and succeeds, preserving the migration-era indirection.
+func mkdirAllReplacingDanglingSymlink(path string) error {
+	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		// ENOENT-only: a transient Stat failure (EACCES, ELOOP,
+		// I/O error) must NOT count as dangling — removing the
+		// link on those would destroy a possibly-valid
+		// indirection. Only a target that provably doesn't
+		// exist qualifies.
+		if _, serr := os.Stat(path); os.IsNotExist(serr) {
+			if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("remove dangling symlink: %w", rerr)
+			}
+		}
+	}
+	return os.MkdirAll(path, 0o755)
+}
+
 // StageClaudeSessionFiles materialises the source-captured JSONLs
 // into target's claude project dir, computed from target's own
 // AgentDir. The encoded path differs from source's (AgentDir is
@@ -169,11 +194,11 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 	if aerr != nil {
 		return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: abs path: %w", aerr)
 	}
-	if merr := os.MkdirAll(targetAgentDir, 0o755); merr != nil {
+	if merr := mkdirAllReplacingDanglingSymlink(targetAgentDir); merr != nil {
 		return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: mkdir agent dir %s: %w", targetAgentDir, merr)
 	}
 	projectDir := claudeProjectDir(targetAgentDir)
-	if merr := os.MkdirAll(projectDir, 0o755); merr != nil {
+	if merr := mkdirAllReplacingDanglingSymlink(projectDir); merr != nil {
 		return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: mkdir %s: %w", projectDir, merr)
 	}
 

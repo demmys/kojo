@@ -489,6 +489,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			} else {
 				s.logger.Error("switch-device: pre-sync disk→DB flush failed; refusing switch to avoid shipping stale memory state",
 					"agent", agentID, "err", err)
+				s.noteSwitchFailure(agentID, "memory_flush_failed: "+err.Error())
 				writeError(w, http.StatusInternalServerError, "memory_flush_failed",
 					"disk→DB memory flush failed; switch aborted to avoid shipping stale state (retry with \"degraded\":true to proceed transcript-only): "+err.Error())
 				return
@@ -508,6 +509,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			} else {
 				s.logger.Error("switch-device: pre-sync persona disk→DB flush failed; refusing switch to avoid shipping stale persona state",
 					"agent", agentID, "err", err)
+				s.noteSwitchFailure(agentID, "persona_flush_failed: "+err.Error())
 				writeError(w, http.StatusInternalServerError, "persona_flush_failed",
 					"disk→DB persona flush failed; switch aborted to avoid shipping stale state (retry with \"degraded\":true to proceed transcript-only): "+err.Error())
 				return
@@ -543,6 +545,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		s.logger.Info("switch-device: target lacks /agent-sync/state endpoint; falling back to full sync",
 			"agent", agentID, "target", req.TargetPeerID)
 	default:
+		s.noteSwitchFailure(agentID, "state_probe_failed: "+perr.Error())
 		writeError(w, http.StatusBadGateway, "state_probe_failed",
 			"agent-sync state probe failed; refusing to switch: "+perr.Error())
 		return
@@ -561,6 +564,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// handoff_pending so no rollback is needed.
 	syncReq, serr := s.buildAgentSyncRequest(ctx, agentID, targetState)
 	if serr != nil {
+		s.noteSwitchFailure(agentID, "build agent-sync payload: "+serr.Error())
 		writeError(w, http.StatusInternalServerError, "internal",
 			"build agent-sync payload: "+serr.Error())
 		return
@@ -640,6 +644,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// holds the full payload in memory at once.
 	estimateRaw, estErr := estimateAgentSyncRawSize(syncReq)
 	if estErr != nil {
+		s.noteSwitchFailure(agentID, "estimate agent-sync size: "+estErr.Error())
 		writeError(w, http.StatusInternalServerError, "internal",
 			"estimate agent-sync size: "+estErr.Error())
 		return
@@ -661,6 +666,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		var werr error
 		syncWireBody, syncRawLen, werr = encodeAgentSyncWire(syncReq)
 		if werr != nil {
+			s.noteSwitchFailure(agentID, "encode agent-sync wire: "+werr.Error())
 			writeError(w, http.StatusInternalServerError, "internal",
 				"encode agent-sync wire: "+werr.Error())
 			return
@@ -678,6 +684,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// Step 1: begin.
 	beginResp, err := s.runHandoffOp(ctx, agentID, "begin", req.TargetPeerID)
 	if err != nil {
+		s.noteSwitchFailure(agentID, "handoff begin: "+err.Error())
 		var hoe *handoffOpError
 		if errors.As(err, &hoe) {
 			writeError(w, hoe.Status, hoe.Code, hoe.Message)
@@ -812,6 +819,15 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			return
 		}
 		resp.Outcome = "complete_failed"
+		// No direct note here: whether the agent is still local
+		// is unknown until the lock reconciliation below. Case
+		// (b) (lock stayed local) notes via orchestrateAbort;
+		// case (a) (lock at target) intentionally gets NO note —
+		// source has released the agent and a post-snapshot
+		// local row would diverge from the transcript target
+		// committed. Same reasoning for the released paths
+		// further down (blob row non-ok / post-complete drain
+		// failure).
 		if errors.As(cerr, &hoe) {
 			resp.Reason = "complete: " + hoe.Code + ": " + hoe.Message
 			s.logger.Warn("switch-device complete failed",
@@ -1287,6 +1303,25 @@ func (s *Server) dispatchPeerAgentSyncPhase2Body(ctx context.Context, targetAddr
 // op_id matches the one stamped on the agent-sync dispatch so
 // target's pendingAgentSyncs map can identify the exact entry
 // to remove.
+// noteSwitchFailure leaves a system message with the failure reason
+// in the agent's transcript. Every post-quiesce failure exit calls
+// this: the quiesce/drain of Step -1 tears the calling turn on the
+// self-call path (the backend process dies mid-response), so the
+// turn ends with no visible output and this note is the only place
+// the outcome surfaces to the user. Harmless on owner-driven
+// switches too — the operator gets the reason in the chat instead
+// of only in stderr. Best-effort: an append failure is logged and
+// never masks the switch result.
+func (s *Server) noteSwitchFailure(agentID, reason string) {
+	if s.agents == nil {
+		return
+	}
+	if err := s.agents.AppendSystemNote(agentID, "⚠️ デバイス移行を中断した: "+reason); err != nil {
+		s.logger.Warn("switch-device: failed to append failure note to transcript",
+			"agent", agentID, "err", err)
+	}
+}
+
 func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targetDeviceID, opID string, resp *switchDeviceResponse, reason string) {
 	// Stamp the upstream reason BEFORE abortAfterFailure runs so
 	// it survives even when abort itself succeeds (the success
@@ -1296,6 +1331,11 @@ func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targ
 	// already populated resp.Reason fold that detail into the
 	// `reason` argument they pass.
 	resp.Reason = reason
+	// Note FIRST: the reason is already final, and abort + the
+	// target drop below can take up to two handoff timeouts when
+	// the target is unreachable — the user shouldn't wait on
+	// those to learn the switch died.
+	s.noteSwitchFailure(agentID, reason)
 	s.abortAfterFailure(ctx, agentID, resp, reason)
 	if resp.AgentSynced && targetAddr != "" && targetDeviceID != "" && opID != "" {
 		dropCtx, cancel := context.WithTimeout(context.Background(), handoffOpTimeout)

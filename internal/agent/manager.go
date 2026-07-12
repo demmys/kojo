@@ -3393,6 +3393,18 @@ func (m *Manager) notifyChatStart(agentID string) {
 	m.chatWatchersMu.Unlock()
 }
 
+// AppendSystemNote persists a system-role message into the agent's
+// transcript. Used by the device-switch handler to leave the switch
+// outcome visible in the chat: a self-call switch tears the calling
+// turn (the quiesce/drain kills the backend process mid-response),
+// so without this note an aborted switch ends the turn with no
+// output at all and the operator has to dig through server logs.
+// DB-only write — reconnecting/polling clients pick it up on the
+// next transcript read, same as the turn-timeout system message.
+func (m *Manager) AppendSystemNote(agentID, content string) error {
+	return appendMessage(agentID, newSystemMessage(content))
+}
+
 // Messages returns recent messages for an agent.
 func (m *Manager) Messages(agentID string, limit int) ([]*Message, error) {
 	return loadMessages(agentID, limit)

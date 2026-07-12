@@ -237,3 +237,54 @@ func TestPendingSyncEntry_CarriesTransferNotes(t *testing.T) {
 		t.Errorf("transfer skips = %+v", got.TransferSkips)
 	}
 }
+
+// TestSwitchDevice_AbortLeavesSystemNote pins the abort-visibility
+// contract: a switch that fails at the agent-sync dispatch leg must
+// leave a system message with the abort reason in the agent's
+// transcript. The self-call path tears the calling turn (quiesce
+// kills the backend mid-response), so this note is the only place
+// the outcome surfaces to the user.
+func TestSwitchDevice_AbortLeavesSystemNote(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/peers/agent-sync/state", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(store.AgentSyncState{Known: false})
+	})
+	mux.HandleFunc("/api/v1/peers/agent-sync", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"code":"internal","message":"stage failed"}}`, http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/api/v1/peers/agent-sync/drop", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"agent_id": "ok"})
+	})
+	target := httptest.NewServer(mux)
+	defer target.Close()
+	srv, agentID := newSwitchTestServer(t, target.URL)
+
+	rec := postSwitch(t, srv, agentID, `{"target_peer_id":"tgt"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var resp switchDeviceResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Outcome != "aborted" {
+		t.Fatalf("outcome = %q; want aborted (reason: %s)", resp.Outcome, resp.Reason)
+	}
+
+	msgs, err := srv.agents.Messages(agentID, 10)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	found := false
+	for _, m := range msgs {
+		if m.Role == "system" && strings.Contains(m.Content, "デバイス移行を中断した") {
+			found = true
+			if !strings.Contains(m.Content, "agent-sync dispatch") {
+				t.Errorf("note should carry the abort reason, got: %s", m.Content)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no abort system note in transcript; messages: %d", len(msgs))
+	}
+}

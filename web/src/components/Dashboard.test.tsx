@@ -26,7 +26,10 @@ vi.mock("../lib/api", () => ({
   api: { sessions: { list: vi.fn().mockResolvedValue([]) } },
 }));
 
-vi.mock("../lib/agentApi", () => ({
+// Partial mock: keep the real module (pure helpers like
+// isTurnErrorPreview) and replace only the network-touching agentApi.
+vi.mock("../lib/agentApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/agentApi")>()),
   agentApi: {
     list: mocks.agentList,
     cronPaused: vi.fn().mockResolvedValue(false),
@@ -141,5 +144,69 @@ describe("Dashboard room list", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/groupdms/new"));
     expect(router.state.location.search).toBe("?agent=ag_a");
     expect(mocks.createThread).not.toHaveBeenCalled();
+  });
+});
+
+describe("Dashboard agent error badge", () => {
+  const erroredAgent = (over: Record<string, unknown> = {}) => ({
+    id: "ag_err",
+    name: "Broken",
+    tool: "claude",
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+    lastMessage: {
+      role: "system",
+      content: "⚠️ Error: API error (status 402 Payment Required): balance exhausted",
+      timestamp: "2026-06-15T01:00:00Z",
+    },
+    lastMessageAt: 1750000000000,
+    ...over,
+  });
+
+  it("badges an agent whose last transcript entry is a turn error", async () => {
+    mocks.agentList.mockResolvedValue([erroredAgent()]);
+    renderDashboard();
+    expect(await screen.findByText("Error")).toBeInTheDocument();
+  });
+
+  it("suppresses the badge while a retry turn is in flight (busy)", async () => {
+    mocks.agentList.mockResolvedValue([erroredAgent({ busy: true })]);
+    renderDashboard();
+    await screen.findAllByText("Broken");
+    expect(screen.queryByText("Error")).not.toBeInTheDocument();
+  });
+
+  it("does not badge a healthy last message", async () => {
+    mocks.agentList.mockResolvedValue([
+      erroredAgent({
+        lastMessage: { role: "assistant", content: "done", timestamp: "2026-06-15T01:00:00Z" },
+      }),
+    ]);
+    renderDashboard();
+    await screen.findAllByText("Broken");
+    expect(screen.queryByText("Error")).not.toBeInTheDocument();
+  });
+
+  it("ranks an errored agent above idle agents regardless of recency", async () => {
+    mocks.agentList.mockResolvedValue([
+      {
+        id: "ag_ok",
+        name: "Healthy",
+        tool: "claude",
+        createdAt: "2026-06-15T00:00:00Z",
+        updatedAt: "2026-06-15T00:00:00Z",
+        lastMessage: { role: "assistant", content: "hi", timestamp: "2026-06-16T00:00:00Z" },
+        lastMessageAt: 1760000000000, // newer than the errored agent
+      },
+      erroredAgent(),
+    ]);
+    renderDashboard();
+    await screen.findByText("Error");
+    const names = screen
+      .getAllByText(/^(Broken|Healthy)$/)
+      .map((el) => el.textContent)
+      // AgentAvatar mock also renders the name; keep first occurrence order.
+      .filter((v, i, arr) => arr.indexOf(v) === i);
+    expect(names).toEqual(["Broken", "Healthy"]);
   });
 });

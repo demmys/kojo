@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
-import { agentApi, type AgentInfo } from "../lib/agentApi";
+import { agentApi, isTurnErrorPreview, type AgentInfo } from "../lib/agentApi";
 import { groupdmApi, getLastRead, type GroupDMInfo, type UnreadInfo } from "../lib/groupdmApi";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
@@ -454,10 +454,16 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   // else, so a turn blocked on AskUserQuestion (and, one tier down, any
   // in-flight chat) floats to the top regardless of recency. Lower rank
   // sorts first.
+  // agentErrored: the agent's most recent transcript entry is a turn-failure
+  // marker and no new turn is in flight. Busy suppresses it — a retry is
+  // already running, so the stale error would just be noise.
+  const agentErrored = (a: AgentInfo) =>
+    !a.busy && !a.awaitingAnswer && !a.holderPeer && isTurnErrorPreview(a.lastMessage);
   const agentRank = (a: AgentInfo) => {
     if (a.awaitingAnswer) return 0;
     if (a.busy) return 1;
-    return 2;
+    if (agentErrored(a)) return 2;
+    return 3;
   };
   // Order by most-recent activity: newest last message first. lastMessageAt
   // is epoch-millis (server-derived from the message row's created_at), so
@@ -635,6 +641,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
             <div className="divide-y divide-hairline overflow-hidden rounded-[10px] border border-hairline bg-surface">
               {sortedAgents.map((agent) => {
                 const open = !collapsedAgents.has(agent.id);
+                const errored = agentErrored(agent);
                 const ts = agent.lastMessage ? agent.lastMessage.timestamp : agent.createdAt;
                 const preview = agent.holderPeer
                   ? t("dash.transferringPreview", {
@@ -649,7 +656,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                   <div
                     key={agent.id}
                     className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}${
-                      agent.awaitingAnswer ? " bg-lamp-warn/10" : ""
+                      agent.awaitingAnswer ? " bg-lamp-warn/10" : errored ? " bg-lamp-err/10" : ""
                     }`}
                   >
                     <button
@@ -675,6 +682,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                               {t("dash.awaitingAnswer")}
                             </span>
                           )}
+                          {errored && (
+                            <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-err/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-err">
+                              <span className="h-1.5 w-1.5 rounded-full bg-lamp-err" />
+                              {t("dash.turnError")}
+                            </span>
+                          )}
                           {agent.holderPeer && (
                             <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
                               {t("dash.transferring", {
@@ -686,7 +699,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                         </div>
                         {open && (
                           <>
-                            <div className="mt-0.5 truncate text-[13px] text-ink-dim">{preview}</div>
+                            <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
                             <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
                               <Chip className="shrink-0">{agent.tool}</Chip>
                               {agent.model && <Chip className="min-w-0 max-w-[45%]">{agent.model}</Chip>}

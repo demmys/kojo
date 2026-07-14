@@ -142,6 +142,7 @@ const messages = {
   "dash.expand": { ja: "展開", en: "Expand" },
   "dash.processing": { ja: "処理中", en: "Processing" },
   "dash.awaitingAnswer": { ja: "回答待ち", en: "Awaiting answer" },
+  "dash.turnError": { ja: "エラー", en: "Error" },
   "dash.transferring": { ja: "転移中 @ {peer}", en: "Transferring @ {peer}" },
   "dash.transferringPreview": {
     ja: "転移中 @ {peer} — 最新発言はこの端末では未反映",

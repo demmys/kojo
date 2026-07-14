@@ -2167,8 +2167,10 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	} else {
 		inputMsg = newUserMessage(userMessage, attachments)
 	}
+	inputSaved := true
 	if err := appendMessage(agentID, inputMsg); err != nil {
 		m.logger.Warn("failed to save input message", "err", err)
+		inputSaved = false
 	}
 	// Stream the system message to WebSocket clients so it appears before
 	// the assistant response. User messages are added optimistically by the
@@ -2220,6 +2222,29 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		},
 	})
 	if err != nil {
+		// Persist the failure like processChatEvents does for mid-stream
+		// errors: the input message already landed in the transcript
+		// above, so a backend that refuses to even start would otherwise
+		// leave a question with no visible answer — and the dashboard
+		// preview pointing at the stale pre-error message. Gated on
+		// inputSaved so a transcript-write outage doesn't produce an
+		// orphan error row, and on the §3.7 release guard so a
+		// device-switch eviction doesn't strand the row on the old peer
+		// (same pattern as processChatEvents' handleTerminal). Aborts
+		// are not failures; skip those.
+		if inputSaved && !errors.Is(err, context.Canceled) && chatCtx.Err() == nil {
+			m.mu.Lock()
+			_, stillHere := m.agents[agentID]
+			m.mu.Unlock()
+			if stillHere {
+				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
+					m.logger.Warn("failed to persist chat start error", "err", appendErr)
+				} else {
+					m.updateLastMessagePreview(agentID, errMsg)
+				}
+			}
+		}
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		m.clearBusy(agentID)
@@ -2854,6 +2879,8 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save error message", "err", err)
+				} else {
+					m.updateLastMessagePreview(agentID, errMsg)
 				}
 			}
 		}
@@ -2944,7 +2971,17 @@ func (m *Manager) persistDoneEvent(agentID string, msg *Message) {
 	// Sync persona.md → Agent.Persona (agent may have edited it)
 	m.syncPersona(agentID)
 
-	// Update last message preview
+	m.updateLastMessagePreview(agentID, msg)
+}
+
+// updateLastMessagePreview refreshes the in-memory LastMessage preview
+// (plus LastMessageAt/UpdatedAt) from msg and persists the snapshot.
+// Called after every appended terminal message — including the
+// "⚠️ Error: …" system message a failed turn leaves behind — so the
+// dashboard list preview never lags the transcript. Before this, error
+// turns updated only the DB row and the list kept showing the stale
+// pre-error preview, making failed agents invisible at a glance.
+func (m *Manager) updateLastMessagePreview(agentID string, msg *Message) {
 	m.mu.Lock()
 	if ag, ok := m.agents[agentID]; ok {
 		ag.LastMessage = &MessagePreview{
@@ -3777,10 +3814,20 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 				return
 			}
 			// Persist as a system message and fan out via the
-			// broadcaster so subscribers see the failure.
-			errMsg := newSystemMessage("⚠️ Error: " + err.Error())
-			if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
-				m.logger.Warn("failed to persist regenerate error", "err", appendErr)
+			// broadcaster so subscribers see the failure. §3.7
+			// release guard: skip the transcript write if a
+			// device-switch evicted the agent mid-prepare (see
+			// processChatEvents' handleTerminal for rationale).
+			m.mu.Lock()
+			_, stillHere := m.agents[agentID]
+			m.mu.Unlock()
+			if stillHere {
+				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
+					m.logger.Warn("failed to persist regenerate error", "err", appendErr)
+				} else {
+					m.updateLastMessagePreview(agentID, errMsg)
+				}
 			}
 			select {
 			case outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}:

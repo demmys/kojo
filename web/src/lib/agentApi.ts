@@ -159,6 +159,22 @@ export interface AgentInfo {
   awaitingAnswer?: boolean;
 }
 
+// TURN_ERROR_PREFIX is the marker the server stamps onto the system
+// message a failed turn leaves in the transcript (manager.go:
+// newSystemMessage("⚠️ Error: " + …)). agent_ws.go relies on the same
+// prefix to reconstruct error events on WS resume, so it is a stable
+// wire convention, and truncatePreview keeps the first 100 chars so the
+// prefix always survives into lastMessage.content.
+const TURN_ERROR_PREFIX = "⚠️ Error: ";
+
+// isTurnErrorPreview reports whether an agent's most recent transcript
+// message is a turn-failure marker — i.e. the last thing that happened
+// to this agent was an error. Used by the dashboard to badge failed
+// agents in the list.
+export function isTurnErrorPreview(m?: { role: string; content: string }): boolean {
+  return !!m && m.role === "system" && m.content.startsWith(TURN_ERROR_PREFIX);
+}
+
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
 // disabledInjections. Unknown keys are rejected by the server with 400,
 // so this list must stay in sync with the backend's validation.

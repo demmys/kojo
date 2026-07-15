@@ -148,3 +148,87 @@ func TestDeletePeerIdempotent(t *testing.T) {
 		t.Errorf("get after delete: %v", err)
 	}
 }
+
+func TestPeerVersionColumn(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	// Upsert with a version stamps it.
+	first, err := s.UpsertPeer(ctx, &PeerRecord{
+		DeviceID: "dev-1",
+		Name:     "alice",
+		Status:   PeerStatusOnline,
+		Version:  "v0.119.1",
+	})
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if first.Version != "v0.119.1" {
+		t.Errorf("version not stamped: %q", first.Version)
+	}
+
+	// Upsert with an EMPTY version preserves the existing value
+	// (same no-change rule as node_key).
+	second, err := s.UpsertPeer(ctx, &PeerRecord{
+		DeviceID: "dev-1",
+		Name:     "alice",
+		Status:   PeerStatusOnline,
+	})
+	if err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if second.Version != "v0.119.1" {
+		t.Errorf("empty version blanked the column: %q", second.Version)
+	}
+
+	// Upsert with a NEW version overwrites.
+	third, err := s.UpsertPeer(ctx, &PeerRecord{
+		DeviceID: "dev-1",
+		Name:     "alice",
+		Status:   PeerStatusOnline,
+		Version:  "v0.120.0",
+	})
+	if err != nil {
+		t.Fatalf("version-bump upsert: %v", err)
+	}
+	if third.Version != "v0.120.0" {
+		t.Errorf("version not updated: %q", third.Version)
+	}
+
+	// ListPeers carries the column too.
+	rows, err := s.ListPeers(ctx, ListPeersOptions{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Version != "v0.120.0" {
+		t.Errorf("list version mismatch: %+v", rows)
+	}
+}
+
+func TestSetPeerVersion(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	seedPeer(t, s, "dev-1", "alice")
+
+	if err := s.SetPeerVersion(ctx, "dev-1", "v0.119.1-3-g07d4e24c"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, _ := s.GetPeer(ctx, "dev-1")
+	if got.Version != "v0.119.1-3-g07d4e24c" {
+		t.Errorf("version: %q", got.Version)
+	}
+	// Other columns untouched.
+	if got.Name != "alice" || got.Status != PeerStatusOnline {
+		t.Errorf("unrelated columns changed: %+v", got)
+	}
+
+	if err := s.SetPeerVersion(ctx, "ghost", "v1.0.0"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing peer: got %v want ErrNotFound", err)
+	}
+	if err := s.SetPeerVersion(ctx, "dev-1", ""); err == nil {
+		t.Error("empty version accepted")
+	}
+	if err := s.SetPeerVersion(ctx, "", "v1.0.0"); err == nil {
+		t.Error("empty device_id accepted")
+	}
+}

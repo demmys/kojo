@@ -216,6 +216,18 @@ func (s *Server) handlePeerEventsWS(w http.ResponseWriter, r *http.Request) {
 	var touchTick <-chan time.Time
 	var pingTick <-chan time.Time
 	if p.PeerID != "" {
+		// Record the dialing peer's binary version if it advertised
+		// one on the upgrade (X-Kojo-Peer-Version). AFTER Accept so
+		// a failed handshake never mutates the row; best-effort and
+		// once per connection — versions only change across process
+		// restarts, and every restart redials. ErrNotFound (row
+		// deleted mid-dial) and DB blips are non-fatal: the column
+		// is informational.
+		if v := peer.SanitizePeerVersion(r.Header.Get(peer.PeerVersionHeader)); v != "" {
+			verCtx, verCancel := context.WithTimeout(ctx, 2*time.Second)
+			_ = s.agents.Store().SetPeerVersion(verCtx, p.PeerID, v)
+			verCancel()
+		}
 		if s.peerPresence != nil {
 			release = s.peerPresence.AddConn(p.PeerID)
 		}

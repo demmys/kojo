@@ -239,7 +239,7 @@ ON CONFLICT(device_id) DO UPDATE SET
 
 	rec, err := scanPeerRow(tx.QueryRowContext(ctx, `
 SELECT device_id, name, url, COALESCE(node_key,''),
-       COALESCE(last_seen,0), status
+       COALESCE(last_seen,0), status, version
   FROM peer_registry WHERE device_id = ?`, deviceID))
 	if err != nil {
 		return nil, fmt.Errorf("store.ApprovePeerPending: re-read: %w", err)

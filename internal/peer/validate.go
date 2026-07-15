@@ -39,6 +39,39 @@ func ValidateDeviceID(id string) error {
 	return nil
 }
 
+// PeerVersionHeader carries the dialing peer's binary version string
+// on the /api/v1/peers/events WS upgrade so the receiving peer can
+// stamp peer_registry.version. Informational only — it plays no part
+// in auth or the auto-update decision (which reads hub-info, not
+// this header).
+const PeerVersionHeader = "X-Kojo-Peer-Version"
+
+// PeerVersionMaxBytes bounds a reported version string. git-describe
+// output ("v0.119.1-3-g07d4e24c-dirty") is well under this; anything
+// longer is garbage or hostile.
+const PeerVersionMaxBytes = 64
+
+// SanitizePeerVersion returns the version string a peer reported if
+// it is storable, or "" when it should be ignored. Printable ASCII
+// only (0x21–0x7E) — git-describe output never leaves that range,
+// and rejecting the rest kills control chars AND Unicode formatting
+// tricks (bidi overrides, zero-width joiners) that could spoof the
+// rendered value in a UI. Hard length cap on top. Leading/trailing
+// whitespace is trimmed rather than rejected — proxies love to pad
+// header values.
+func SanitizePeerVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || len(v) > PeerVersionMaxBytes {
+		return ""
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x21 || v[i] > 0x7e {
+			return ""
+		}
+	}
+	return v
+}
+
 // ValidateName checks the human-readable peer name. Trimmed
 // length > 0 and ≤ PeerNameMaxBytes; all Unicode control
 // characters rejected so a UI rendering the value can't be

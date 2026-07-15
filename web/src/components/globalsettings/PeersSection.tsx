@@ -425,6 +425,14 @@ export function PeersSection({ setError, flashSuccess }: Props) {
                     <span className={STATUS_COLOR[p.status] ?? "text-ink-faint"}>
                       {p.status}
                     </span>
+                    {p.version && (
+                      <span
+                        className="min-w-0 truncate font-mono text-ink-faint"
+                        title={t("peers.versionTitle")}
+                      >
+                        {p.version}
+                      </span>
+                    )}
                     <span className="text-ink-faint">
                       {t("peers.seen", { when: formatLastSeen(p.lastSeen) })}
                     </span>

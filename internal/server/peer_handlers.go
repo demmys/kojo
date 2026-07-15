@@ -76,6 +76,11 @@ type peerResponse struct {
 	LastSeen int64  `json:"lastSeen,omitempty"`
 	Status   string `json:"status"`
 	IsSelf   bool   `json:"isSelf"`
+	// Version is the kojo build the peer last reported ("v0.119.1",
+	// git-describe forms included). Omitted when the peer has never
+	// reported one (row predates the version column, or the peer
+	// runs a build older than the X-Kojo-Peer-Version header).
+	Version string `json:"version,omitempty"`
 }
 
 type peerListResponse struct {
@@ -129,6 +134,7 @@ func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
 		URL:      rec.URL,
 		LastSeen: rec.LastSeen,
 		Status:   rec.Status,
+		Version:  rec.Version,
 	}
 	if s.peerID != nil && rec.DeviceID == s.peerID.DeviceID {
 		out.IsSelf = true

@@ -1,0 +1,13 @@
+-- peer_registry.version: the kojo binary version string
+-- ("v0.119.1" / "v0.119.1-3-g07d4e24c-dirty") the peer last reported.
+--
+-- Writers:
+--   - peer.Registrar stamps the local build's version on the self-row
+--     at Start / RefreshPublicName / heartbeat reseed;
+--   - the /api/v1/peers/events WS handler records the dialing peer's
+--     version from the X-Kojo-Peer-Version upgrade header.
+--
+-- '' means "never reported" — rows written by peers older than this
+-- migration (they send no header) simply stay blank and the UI shows
+-- nothing rather than a lie.
+ALTER TABLE peer_registry ADD COLUMN version TEXT NOT NULL DEFAULT '';

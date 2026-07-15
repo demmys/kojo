@@ -58,6 +58,11 @@ type Subscriber struct {
 	live    map[string]map[string]StatusEvent // target → (deviceID → event)
 	targets map[string]*subTarget
 	stopped bool
+	// selfVersion is this binary's version string, sent as the
+	// X-Kojo-Peer-Version header on every WS upgrade so the remote
+	// peer can stamp our registry row's version column. Set once
+	// via SetSelfVersion before SetTargets; "" sends no header.
+	selfVersion string
 
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
@@ -109,6 +114,18 @@ func NewSubscriber(id *Identity, st *store.Store, logger *slog.Logger) *Subscrib
 		// connect loop retries.
 		httpClient: NoKeepAliveHTTPClient(10 * time.Second),
 	}
+}
+
+// SetSelfVersion records this binary's version string to advertise
+// on WS upgrades (X-Kojo-Peer-Version). Call once before SetTargets;
+// empty disables the header.
+func (s *Subscriber) SetSelfVersion(v string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.selfVersion = v
+	s.mu.Unlock()
 }
 
 // SetTargets reconciles the connect set: any target in `targets`
@@ -336,6 +353,16 @@ func (s *Subscriber) connectOnce(ctx context.Context, t SubscriberTarget) (estab
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return false, fmt.Errorf("build request: %w", err)
+	}
+	// Advertise our build so the remote peer can stamp our registry
+	// row's version column (rendered in its peers UI). Purely
+	// informational — the remote validates and length-caps the value
+	// before storing it.
+	s.mu.RLock()
+	selfVersion := s.selfVersion
+	s.mu.RUnlock()
+	if selfVersion != "" {
+		req.Header.Set(PeerVersionHeader, selfVersion)
 	}
 
 	dialOpts := &websocket.DialOptions{

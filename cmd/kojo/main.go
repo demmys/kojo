@@ -584,6 +584,9 @@ func main() {
 			peerPresence = peer.NewPresence()
 			peerRegistrar = peer.NewRegistrar(st, peerIdentity, logger)
 			peerRegistrar.SetEventBus(peerEvents)
+			// Stamp this binary's version on the self-row so peer
+			// listings (local and remote) can render it.
+			peerRegistrar.SetSelfVersion(version)
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			if err := peerRegistrar.Start(startCtx); err != nil {
 				logger.Warn("peer registrar: start failed; cross-peer listings will not see this binary",
@@ -662,6 +665,9 @@ func main() {
 			// empty.
 			if peerRegistrar != nil {
 				peerSubscriber = peer.NewSubscriber(peerIdentity, st, logger)
+				// Advertise our build on every WS upgrade so the
+				// remote peer stamps our row's version column.
+				peerSubscriber.SetSelfVersion(version)
 				peerSubscriberTargetsCtx, peerSubscriberTargetsCancel = context.WithCancel(context.Background())
 				go peerSubscriberTargetsLoop(peerSubscriberTargetsCtx, st, peerIdentity, peerSubscriber, logger)
 			}

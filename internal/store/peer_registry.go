@@ -38,6 +38,13 @@ type PeerRecord struct {
 	NodeKey  string
 	LastSeen int64 // unix millis, 0 = NULL
 	Status   string
+	// Version is the kojo binary version string the peer last
+	// reported ("v0.119.1-3-g07d4e24c"). Stamped by the local
+	// registrar for the self-row and by the peer-events WS handler
+	// (X-Kojo-Peer-Version upgrade header) for remote rows. ""
+	// means the peer never reported one (pre-0030 rows, or a peer
+	// running a build older than the header).
+	Version string
 }
 
 // PeerStatus values accepted by the schema's CHECK constraint.
@@ -89,9 +96,13 @@ func (s *Store) UpsertPeer(ctx context.Context, rec *PeerRecord) (*PeerRecord, e
 	// cleanly. NodeKey "" is treated as "no change" so a status-only
 	// touch from a code path that doesn't carry the NodeKey doesn't
 	// blank out the identity column.
+	// Version "" is treated as "no change" (same pattern as
+	// node_key) so code paths that don't carry the version — the
+	// operator metadata flows, older callers — can't blank a value
+	// a live peer previously reported.
 	const q = `
-INSERT INTO peer_registry (device_id, name, url, node_key, last_seen, status)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO peer_registry (device_id, name, url, node_key, last_seen, status, version)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id) DO UPDATE SET
   name      = excluded.name,
   url       = excluded.url,
@@ -99,13 +110,17 @@ ON CONFLICT(device_id) DO UPDATE SET
                    THEN peer_registry.node_key
                    ELSE excluded.node_key END,
   last_seen = excluded.last_seen,
-  status    = excluded.status
+  status    = excluded.status,
+  version   = CASE WHEN excluded.version = ''
+                   THEN peer_registry.version
+                   ELSE excluded.version END
 `
 	if _, err := s.db.ExecContext(ctx, q,
 		rec.DeviceID, rec.Name, rec.URL,
 		nullableText(rec.NodeKey),
 		nullableInt64(rec.LastSeen),
 		rec.Status,
+		rec.Version,
 	); err != nil {
 		return nil, fmt.Errorf("store.UpsertPeer: %w", err)
 	}
@@ -244,7 +259,7 @@ func (s *Store) ClearPeerNodeKey(ctx context.Context, deviceID string) error {
 func (s *Store) GetPeer(ctx context.Context, deviceID string) (*PeerRecord, error) {
 	const q = `
 SELECT device_id, name, url, COALESCE(node_key, ''),
-       COALESCE(last_seen,0), status
+       COALESCE(last_seen,0), status, version
   FROM peer_registry WHERE device_id = ?`
 	rec, err := scanPeerRow(s.db.QueryRowContext(ctx, q, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -267,7 +282,7 @@ type ListPeersOptions struct {
 func (s *Store) ListPeers(ctx context.Context, opts ListPeersOptions) ([]*PeerRecord, error) {
 	q := `
 SELECT device_id, name, url, COALESCE(node_key, ''),
-       COALESCE(last_seen,0), status
+       COALESCE(last_seen,0), status, version
   FROM peer_registry
  WHERE 1=1`
 	args := []any{}
@@ -334,6 +349,36 @@ func (s *Store) TouchPeer(ctx context.Context, deviceID, status string, lastSeen
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("store.TouchPeer: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetPeerVersion stamps the version column for an existing row.
+// Called by the peer-events WS handler when a dialing peer reports
+// its build via the X-Kojo-Peer-Version upgrade header. Empty
+// version is rejected — callers gate on the header being present,
+// and an empty write here could only erase real information.
+//
+// Returns ErrNotFound when device_id is not registered; rows are
+// never auto-created from a version report.
+func (s *Store) SetPeerVersion(ctx context.Context, deviceID, version string) error {
+	if deviceID == "" {
+		return errors.New("store.SetPeerVersion: device_id required")
+	}
+	if version == "" {
+		return errors.New("store.SetPeerVersion: version required")
+	}
+	const q = `UPDATE peer_registry SET version = ? WHERE device_id = ?`
+	res, err := s.db.ExecContext(ctx, q, version, deviceID)
+	if err != nil {
+		return fmt.Errorf("store.SetPeerVersion: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store.SetPeerVersion: rows affected: %w", err)
 	}
 	if n == 0 {
 		return ErrNotFound
@@ -487,7 +532,7 @@ func scanPeerRow(r rowScanner) (*PeerRecord, error) {
 	var rec PeerRecord
 	if err := r.Scan(
 		&rec.DeviceID, &rec.Name, &rec.URL, &rec.NodeKey,
-		&rec.LastSeen, &rec.Status,
+		&rec.LastSeen, &rec.Status, &rec.Version,
 	); err != nil {
 		return nil, err
 	}
@@ -505,7 +550,7 @@ func (s *Store) GetPeerByNodeKey(ctx context.Context, nodeKey string) (*PeerReco
 	}
 	const q = `
 SELECT device_id, name, url, COALESCE(node_key, ''),
-       COALESCE(last_seen,0), status
+       COALESCE(last_seen,0), status, version
   FROM peer_registry
  WHERE node_key = ?
  LIMIT 1`

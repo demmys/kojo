@@ -1003,6 +1003,10 @@ const messages = {
     en: " and are waiting for approval. Approve admits the peer to the privileged surface; Reject drops the request — the peer may retry.",
   },
   "peers.seen": { ja: "最終確認 {when}", en: "seen {when}" },
+  "peers.versionTitle": {
+    ja: "このピアが最後に報告した kojo のバージョン",
+    en: "kojo version this peer last reported",
+  },
   "peers.approve": { ja: "承認", en: "Approve" },
   "peers.reject": { ja: "却下", en: "Reject" },
   "peers.none": { ja: "登録済みのピアはない。", en: "No peers registered." },

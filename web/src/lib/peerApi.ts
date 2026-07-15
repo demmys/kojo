@@ -19,6 +19,9 @@ export interface PeerInfo {
   lastSeen?: number; // unix millis
   status: "online" | "offline" | "degraded";
   isSelf: boolean;
+  // kojo build the peer last reported ("v0.119.1", git-describe
+  // forms included). Absent when never reported (old builds).
+  version?: string;
 }
 
 export interface PeerListResponse {

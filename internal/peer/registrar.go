@@ -47,6 +47,12 @@ type Registrar struct {
 	publicMu    sync.RWMutex
 	publicURL   string
 	selfNodeKey string
+	// selfVersion is this binary's version string, stamped on the
+	// self-row's version column by every UpsertPeer this registrar
+	// emits. Set once via SetSelfVersion before Start; "" leaves
+	// the column untouched (UpsertPeer's empty-means-no-change
+	// rule).
+	selfVersion string
 	stopped     bool
 
 	stopCh   chan struct{}
@@ -75,6 +81,18 @@ func (r *Registrar) SetEventBus(bus *EventBus) {
 		return
 	}
 	r.events = bus
+}
+
+// SetSelfVersion records this binary's version string ("v0.119.1",
+// git-describe forms included) to stamp on the self-row. Call once
+// before Start; empty is a no-op on the column.
+func (r *Registrar) SetSelfVersion(v string) {
+	if r == nil {
+		return
+	}
+	r.publicMu.Lock()
+	r.selfVersion = v
+	r.publicMu.Unlock()
 }
 
 // SetPublicURL stamps the dial address other peers reach this row
@@ -169,6 +187,7 @@ func (r *Registrar) RefreshPublicName(ctx context.Context) error {
 		NodeKey:  r.selfNodeKey,
 		LastSeen: nowMs,
 		Status:   store.PeerStatusOnline,
+		Version:  r.selfVersion,
 	})
 	if err != nil {
 		return fmt.Errorf("peer.Registrar.RefreshPublicName: upsert: %w", err)
@@ -212,13 +231,13 @@ func (r *Registrar) selfURL() string {
 // stamping the empty value at Start is a safe no-op on the column,
 // while a later reseed — after SetSelfNodeKey has populated it —
 // correctly restamps the real NodeKey.
-func (r *Registrar) selfIdentity() (url, nodeKey string) {
+func (r *Registrar) selfIdentity() (url, nodeKey, version string) {
 	if r == nil {
-		return "", ""
+		return "", "", ""
 	}
 	r.publicMu.RLock()
 	defer r.publicMu.RUnlock()
-	return r.publicURL, r.selfNodeKey
+	return r.publicURL, r.selfNodeKey, r.selfVersion
 }
 
 // Start performs the initial peer_registry upsert (online + last_seen
@@ -231,7 +250,7 @@ func (r *Registrar) Start(ctx context.Context) error {
 		return errors.New("peer.Registrar.Start: nil deps")
 	}
 	nowMs := store.NowMillis()
-	url, nodeKey := r.selfIdentity()
+	url, nodeKey, version := r.selfIdentity()
 	if _, err := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID: r.id.DeviceID,
 		Name:     r.id.Name,
@@ -239,6 +258,7 @@ func (r *Registrar) Start(ctx context.Context) error {
 		NodeKey:  nodeKey,
 		LastSeen: nowMs,
 		Status:   store.PeerStatusOnline,
+		Version:  version,
 	}); err != nil {
 		return fmt.Errorf("peer.Registrar.Start: upsert: %w", err)
 	}
@@ -378,7 +398,7 @@ func (r *Registrar) tickOnce() {
 	// the row quarantined (inbound peer requests 403) until the next
 	// RefreshPublicName. By this point SetSelfNodeKey has usually run,
 	// so selfIdentity carries the real NodeKey.
-	url, nodeKey := r.selfIdentity()
+	url, nodeKey, version := r.selfIdentity()
 	if _, upErr := r.st.UpsertPeer(ctx, &store.PeerRecord{
 		DeviceID: r.id.DeviceID,
 		Name:     r.id.Name,
@@ -386,6 +406,7 @@ func (r *Registrar) tickOnce() {
 		NodeKey:  nodeKey,
 		LastSeen: nowMs,
 		Status:   store.PeerStatusOnline,
+		Version:  version,
 	}); upErr != nil {
 		if r.logger != nil {
 			r.logger.Warn("peer.Registrar: heartbeat reseed failed",

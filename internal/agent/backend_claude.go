@@ -763,11 +763,20 @@ func (b *ClaudeBackend) buildClaudeInvocation(agent *Agent, systemPrompt string,
 		//   - CronCreate / CronDelete / CronList / ScheduleWakeup: the
 		//     scheduled job would fire against the user's claude, not
 		//     this agent's session.
+		//   - TaskCreate / TaskUpdate / TaskList / TaskGet: Claude Code's
+		//     persistent todo list. It's keyed by session UUID under
+		//     ~/.claude/tasks/, so kojo's session reset/rotation strands
+		//     it, the kojo UI can't see it, and agents end up splitting
+		//     task state across it, kojo todos, and MEMORY.md. Agents
+		//     must use the kojo todo API (guides/todos.md) — that list
+		//     is injected into every turn's volatile context and shown
+		//     in the Web UI. TaskOutput / TaskStop stay allowed: they
+		//     control background shells/monitors, not the todo list.
 		// AskUserQuestion is NOT disallowed — it's routed through the
 		// control_request/control_response protocol so the Web UI can render
 		// the prompt (interactive turns) or the backend auto-denies it
 		// (automated turns). See --permission-prompt-tool below.
-		"--disallowedTools", "EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup",
+		"--disallowedTools", "EnterPlanMode,ExitPlanMode,CronCreate,CronDelete,CronList,ScheduleWakeup,TaskCreate,TaskUpdate,TaskList,TaskGet",
 		// Route interactive-tool permission decisions (AskUserQuestion) to
 		// stdout control_request lines we answer on stdin, even under
 		// bypassPermissions. Without this the CLI never surfaces the prompt.

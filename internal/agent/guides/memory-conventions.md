@@ -7,7 +7,7 @@ Placeholders (values are shown in your system prompt):
 
 MEMORY.md is read at the start of EVERY session. It must stay small and scannable.
 Aim for ~200 lines. Structure as an index of short sections: Identity, Active Projects,
-User Context, Known People, Recurring Tasks, etc.
+User Context, Known People, Recurring Procedures, etc.
 
 Core rules:
 1. (MEMORY.md only) Things you must always remember: one terse bullet per entry. No prose, no examples. Detail files under memory/ may be as long as needed.
@@ -18,6 +18,7 @@ Core rules:
    Exempt: the daily diary. Its `## YYYY-MM-DD` header and `HH:MM` timestamps are required and not affected by rules 3 and 4.
 
 Other constraints:
+- Do NOT keep task/todo lists in MEMORY.md or memory/ files. In-flight tasks belong in the kojo todo API (see the todos guide) — it is injected into every turn and visible in the Web UI. Memory holds diary entries, knowledge, and context; todos hold work to be done.
 - When MEMORY.md exceeds ~300 lines, move the oldest / bulkiest sections to memory/archive/ and leave a one-line pointer.
 - Don't dump long narratives, transcripts, error logs, or research notes into MEMORY.md — park them under memory/topics/ or memory/projects/ and link.
 - Don't duplicate the daily diary's blow-by-blow. The daily diary holds turn-level detail; MEMORY.md holds what persists across days.

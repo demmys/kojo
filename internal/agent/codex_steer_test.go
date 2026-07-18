@@ -163,7 +163,7 @@ func TestParseCodexStream_CapturesTurnIDFromResponse(t *testing.T) {
 		`{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"turn-abc","status":"completed"}}}`,
 	}
 	scanner := newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n") + "\n"))
-	result := parseCodexStream(scanner, 3, s, testLogger(), func(ChatEvent) bool { return true })
+	result := parseCodexStream(scanner, 3, s, nil, testLogger(), func(ChatEvent) bool { return true })
 	if !result.turnCompleted {
 		t.Fatal("turn should complete")
 	}
@@ -182,7 +182,7 @@ func TestParseCodexStream_CapturesTurnIDFromTurnStarted(t *testing.T) {
 		`{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"turn-def","status":"completed"}}}`,
 	}
 	scanner := newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n") + "\n"))
-	parseCodexStream(scanner, 3, s, testLogger(), func(ChatEvent) bool { return true })
+	parseCodexStream(scanner, 3, s, nil, testLogger(), func(ChatEvent) bool { return true })
 	s.mu.Lock()
 	got := s.turnID
 	s.mu.Unlock()
@@ -219,7 +219,7 @@ func TestParseCodexStream_SteerErrorResponseNotTurnError(t *testing.T) {
 	}
 	scanner := newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 	var errEvents int
-	result := parseCodexStream(scanner, 3, s, testLogger(), func(e ChatEvent) bool {
+	result := parseCodexStream(scanner, 3, s, nil, testLogger(), func(e ChatEvent) bool {
 		if e.Type == "error" {
 			errEvents++
 		}

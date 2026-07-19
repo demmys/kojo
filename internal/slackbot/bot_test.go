@@ -14,6 +14,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
@@ -39,6 +40,7 @@ func newTestBot(t *testing.T, cfg agent.SlackBotConfig) *Bot {
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
 		userCache:    make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentChats),
 	}
@@ -214,6 +216,138 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 	}
 }
 
+// --- Slack stop command tests ---
+
+func TestIsStopCommandExactMatchOnly(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"!stop", true},
+		{" !STOP \n", true},
+		{"!cancel", true},
+		{"!stop please", false},
+		{"please !stop", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isStopCommand(tc.in); got != tc.want {
+			t.Errorf("isStopCommand(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestActiveTurnCancelIsThreadScoped(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel1()
+	defer cancel2()
+
+	turn1 := bot.registerActiveTurn("C1", "thread.1", cancel1)
+	turn2 := bot.registerActiveTurn("C1", "thread.2", cancel2)
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn1)
+	defer bot.unregisterActiveTurn("C1", "thread.2", turn2)
+
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("cancelActiveTurn returned false for a registered turn")
+	}
+
+	select {
+	case <-ctx1.Done():
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("thread.1 context was not cancelled")
+	}
+	if !turn1.stopRequested() {
+		t.Fatal("thread.1 should be marked as user-stopped")
+	}
+	select {
+	case <-ctx2.Done():
+		t.Fatal("thread.2 must not be cancelled when stopping thread.1")
+	default:
+		// expected
+	}
+	if turn2.stopRequested() {
+		t.Fatal("thread.2 must not be marked stopped")
+	}
+}
+
+func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
+	var postCalls atomic.Int32
+	var gotThread, gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+			_ = r.ParseForm()
+			gotThread = r.FormValue("thread_ts")
+			gotMarkdown = r.FormValue("markdown_text")
+		}
+		fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID:      "test-agent",
+		agentDataDir: t.TempDir(),
+		config:       agent.SlackBotConfig{Enabled: true, ThreadReplies: true},
+		api:          api,
+		mgr:          &mockMgr{},
+		logger:       testLogger,
+		botUserID:    "UBOTTEST",
+		ctx:          ctx,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
+		userCache:    make(map[string]string),
+		sem:          make(chan struct{}, maxConcurrentChats),
+	}
+
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	// ReactThread is false, and there is no chat_history entry. A normal
+	// thread reply would be ignored by shouldAutoReply, but the command must
+	// still cancel the in-flight turn immediately.
+	bot.config.ThreadReplies = false
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User:            "U123",
+		Channel:         "C1",
+		ChannelType:     "channel",
+		ThreadTimeStamp: "thread.123",
+		TimeStamp:       "msg.456",
+		Text:            "!stop",
+	})
+
+	select {
+	case <-turnCtx.Done():
+		// expected
+	case <-time.After(time.Second):
+		t.Fatal("active turn was not cancelled")
+	}
+	if !turn.stopRequested() {
+		t.Fatal("active turn should be marked as user-stopped")
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("chat.postMessage calls = %d, want 1", got)
+	}
+	if gotThread != "thread.123" {
+		t.Errorf("stop ack thread_ts = %q, want %q", gotThread, "thread.123")
+	}
+	if gotMarkdown != stopCommandAck {
+		t.Errorf("stop ack markdown_text = %q, want %q", gotMarkdown, stopCommandAck)
+	}
+}
+
 // --- postMessage / chat.update markdown_text tests ---
 
 // TestBotPostMessageSendsMarkdownTextOnly verifies that postMessage emits
@@ -265,6 +399,107 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 	}
 	if got.text != "" {
 		t.Errorf("text must be empty to avoid markdown_text_conflict, got %q", got.text)
+	}
+}
+
+func TestBotPostMessageFallsBackToLegacyTextOnMarkdownTextErrors(t *testing.T) {
+	for _, slackError := range []string{"invalid_blocks_format", "markdown_text_conflict"} {
+		t.Run(slackError, func(t *testing.T) {
+			type captured struct {
+				text         string
+				markdownText string
+				threadTS     string
+			}
+			var calls []captured
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/chat.postMessage":
+					_ = r.ParseForm()
+					calls = append(calls, captured{
+						text:         r.FormValue("text"),
+						markdownText: r.FormValue("markdown_text"),
+						threadTS:     r.FormValue("thread_ts"),
+					})
+					if len(calls) == 1 {
+						fmt.Fprintf(w, `{"ok":false,"error":%q}`, slackError)
+						return
+					}
+					fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+				default:
+					fmt.Fprintf(w, `{"ok":true}`)
+				}
+			}))
+			defer srv.Close()
+
+			api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			bot := &Bot{
+				api:    api,
+				logger: testLogger,
+				ctx:    ctx,
+			}
+
+			body := "## Heading\n\n**bold** and [link](https://example.com)"
+			if !bot.postMessage(context.Background(), "C1", "thread.999", body) {
+				t.Fatal("postMessage should succeed via legacy text fallback")
+			}
+			if len(calls) != 2 {
+				t.Fatalf("chat.postMessage called %d times, want 2", len(calls))
+			}
+			if calls[0].markdownText != body {
+				t.Errorf("first call markdown_text = %q, want %q", calls[0].markdownText, body)
+			}
+			if calls[0].text != "" {
+				t.Errorf("first call text must be empty, got %q", calls[0].text)
+			}
+			if calls[1].markdownText != "" {
+				t.Errorf("fallback call markdown_text must be empty, got %q", calls[1].markdownText)
+			}
+			wantText := PlainToSlack(body)
+			if calls[1].text != wantText {
+				t.Errorf("fallback text = %q, want %q", calls[1].text, wantText)
+			}
+			for i, call := range calls {
+				if call.threadTS != "thread.999" {
+					t.Errorf("call %d thread_ts = %q, want thread.999", i+1, call.threadTS)
+				}
+			}
+		})
+	}
+}
+
+func TestBotPostMessageDoesNotFallbackToLegacyTextOnUnrelatedSlackError(t *testing.T) {
+	var called int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			called++
+			fmt.Fprintf(w, `{"ok":false,"error":"invalid_auth"}`)
+		default:
+			fmt.Fprintf(w, `{"ok":true}`)
+		}
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+	}
+
+	if bot.postMessage(context.Background(), "C1", "", "hello") {
+		t.Fatal("postMessage should fail on invalid_auth")
+	}
+	if called != 1 {
+		t.Fatalf("chat.postMessage called %d times, want 1", called)
 	}
 }
 
@@ -422,6 +657,55 @@ func TestPostMessageRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
 	}
 }
 
+func TestPostMessageLegacyFallbackRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			n := calls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			if n == 1 {
+				fmt.Fprintf(w, `{"ok":false,"error":"invalid_blocks_format"}`)
+				return
+			}
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sleeps atomic.Int32
+	bot := &Bot{
+		api:    api,
+		logger: testLogger,
+		ctx:    ctx,
+		rateLimitSleep: func(d time.Duration) <-chan time.Time {
+			sleeps.Add(1)
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+
+	if bot.postMessage(context.Background(), "C1", "", "hello") {
+		t.Fatal("postMessage should fail when legacy fallback exhausts rate-limit retries")
+	}
+
+	// One markdown_text attempt, then the legacy fallback retry chain.
+	if got := calls.Load(); got != int32(maxRateLimitRetry+2) {
+		t.Errorf("PostMessage call count = %d, want %d (1 markdown + maxRateLimitRetry+1 legacy)", got, maxRateLimitRetry+2)
+	}
+	if got := sleeps.Load(); got != int32(maxRateLimitRetry) {
+		t.Errorf("rateLimitSleep invocations = %d, want %d (legacy fallback only; no sleep after final attempt)", got, maxRateLimitRetry)
+	}
+}
+
 // scriptedMgr returns a pre-canned event stream from ChatOneShot so
 // sendToAgent's event loop can be driven deterministically in tests.
 type scriptedMgr struct {
@@ -456,23 +740,29 @@ func (m *scriptedMgr) CanResumeSession(_, _ string) bool { return false }
 // and the issued/stopped lists are mutated from the HTTP handler
 // goroutine; the test reads them only after sendToAgent returns.
 type streamScript struct {
-	streamTSs  []string // returned by chat.startStream, in order
-	killAt     []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
-	failUpdate bool     // chat.update returns an error (simulate finalize replacement failure)
-	failPost   bool     // chat.postMessage returns an error (simulate batch/fallback delivery failure)
+	streamTSs    []string // returned by chat.startStream, in order
+	killAt       []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
+	failUpdate   bool     // chat.update returns an error (simulate finalize replacement failure)
+	updateErrors []string // per-call chat.update Slack error codes; empty string means success
+	failPost     bool     // chat.postMessage returns an error (simulate batch/fallback delivery failure)
+	postErrors   []string // per-call chat.postMessage Slack error codes; empty string means success
+	delete429s   int      // first N chat.delete calls return 429 with Retry-After: 1
 
-	startCalls   int
-	appendCalls  int
-	stopCalls    int
-	updateCalls  int
-	postCalls    int
-	deleteCalls  int
-	issuedTS     []string // ts values returned by chat.startStream
-	stoppedTS    []string // ts values seen by chat.stopStream
-	deletedTS    []string // ts values seen by chat.delete (dead-stream cleanup)
-	appendOnTS   []string // ts the bot tried to append to (in order)
-	lastUpdateTS string
-	lastUpdateMD string
+	startCalls     int
+	appendCalls    int
+	stopCalls      int
+	updateCalls    int
+	postCalls      int
+	deleteCalls    int
+	issuedTS       []string // ts values returned by chat.startStream
+	stoppedTS      []string // ts values seen by chat.stopStream
+	deletedTS      []string // ts values seen by chat.delete (dead-stream cleanup)
+	appendOnTS     []string // ts the bot tried to append to (in order)
+	lastUpdateTS   string
+	lastUpdateMD   string
+	lastUpdateText string
+	lastPostMD     string
+	lastPostText   string
 }
 
 // newStreamServer returns a mock Slack server that delegates streaming
@@ -509,16 +799,29 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			script.stoppedTS = append(script.stoppedTS, r.FormValue("ts"))
 			fmt.Fprintf(w, `{"ok":true}`)
 		case "/chat.update":
+			idx := script.updateCalls
 			script.updateCalls++
 			script.lastUpdateTS = r.FormValue("ts")
 			script.lastUpdateMD = r.FormValue("markdown_text")
+			script.lastUpdateText = r.FormValue("text")
+			if idx < len(script.updateErrors) && script.updateErrors[idx] != "" {
+				fmt.Fprintf(w, `{"ok":false,"error":%q}`, script.updateErrors[idx])
+				return
+			}
 			if script.failUpdate {
 				fmt.Fprintf(w, `{"ok":false,"error":"message_not_found"}`)
 				return
 			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/chat.postMessage":
+			idx := script.postCalls
 			script.postCalls++
+			script.lastPostText = r.FormValue("text")
+			script.lastPostMD = r.FormValue("markdown_text")
+			if idx < len(script.postErrors) && script.postErrors[idx] != "" {
+				fmt.Fprintf(w, `{"ok":false,"error":%q}`, script.postErrors[idx])
+				return
+			}
 			if script.failPost {
 				fmt.Fprintf(w, `{"ok":false,"error":"channel_not_found"}`)
 				return
@@ -526,6 +829,11 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.999"}`)
 		case "/chat.delete":
 			script.deleteCalls++
+			if script.deleteCalls <= script.delete429s {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
 			script.deletedTS = append(script.deletedTS, r.FormValue("ts"))
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/conversations.history", "/conversations.replies":
@@ -561,6 +869,7 @@ func newBotWithStream(t *testing.T, mgr ChatManager, srv *httptest.Server) *Bot 
 		cancel:       cancel,
 		done:         make(chan struct{}),
 		threadLocks:  make(map[string]*threadLock),
+		activeTurns:  make(map[string]*activeTurn),
 		userCache:    make(map[string]string),
 		sem:          make(chan struct{}, maxConcurrentChats),
 		// Run the dead-stream cleanup goroutine synchronously so the
@@ -687,6 +996,66 @@ func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
 	}
 }
 
+func TestSendToAgentFreshPostsAndDeletesStreamOnMarkdownTextUpdateError(t *testing.T) {
+	script := &streamScript{
+		streamTSs:    []string{"stream.1"},
+		updateErrors: []string{"invalid_blocks_format"},
+		postErrors:   []string{"invalid_blocks_format", ""},
+		delete429s:   1,
+	}
+	srv := newStreamServer(t, script)
+
+	body := "## Heading\n\n**bold** and [link](https://example.com)"
+	mgr := &scriptedMgr{events: []agent.ChatEvent{{Type: "text", Delta: body}}}
+	bot := newBotWithStream(t, mgr, srv)
+	bot.rateLimitSleep = func(d time.Duration) <-chan time.Time {
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.updateCalls != 1 {
+		t.Fatalf("chat.update calls = %d, want 1 (do not retry text-only update)", script.updateCalls)
+	}
+	if script.postCalls != 2 {
+		t.Fatalf("chat.postMessage calls = %d, want 2 (markdown_text then legacy text fallback)", script.postCalls)
+	}
+	if script.lastPostMD != "" {
+		t.Errorf("legacy fallback markdown_text = %q, want empty", script.lastPostMD)
+	}
+	if want := PlainToSlack(body); script.lastPostText != want {
+		t.Errorf("legacy fallback text = %q, want %q", script.lastPostText, want)
+	}
+	if script.deleteCalls != 2 {
+		t.Errorf("chat.delete calls = %d, want 2 (one 429 then retry success)", script.deleteCalls)
+	}
+	if !containsString(script.deletedTS, "stream.1") {
+		t.Errorf("stale live stream was not deleted after fresh post fallback; deletedTS=%v", script.deletedTS)
+	}
+}
+
+func TestSendToAgentDeletesStreamWhenUpdateFailsAndFreshPostSucceeds(t *testing.T) {
+	script := &streamScript{
+		streamTSs:    []string{"stream.1"},
+		updateErrors: []string{"message_not_found"},
+	}
+	srv := newStreamServer(t, script)
+
+	mgr := &scriptedMgr{events: []agent.ChatEvent{{Type: "text", Delta: "hello world"}}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.postCalls == 0 {
+		t.Fatal("expected fresh post fallback after chat.update failure")
+	}
+	if !containsString(script.deletedTS, "stream.1") {
+		t.Errorf("stale live stream was not deleted after fresh post fallback; deletedTS=%v", script.deletedTS)
+	}
+}
+
 // TestSendToAgentKeepsDeadStreamWhenDeliveryFails verifies the safety net:
 // if the final reply could NOT be delivered (chat.update fails AND the
 // chat.postMessage fallback fails), the dead partial is preserved as a
@@ -717,6 +1086,30 @@ func TestSendToAgentKeepsDeadStreamWhenDeliveryFails(t *testing.T) {
 	}
 	if !containsString(script.stoppedTS, "stream.1") {
 		t.Errorf("dead stream.1 should be StopStream'd as a retry artifact; stoppedTS=%v", script.stoppedTS)
+	}
+}
+
+func TestSendToAgentPreservesCancelledDoneContent(t *testing.T) {
+	script := &streamScript{}
+	srv := newStreamServer(t, script)
+
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "partial"},
+		{
+			Type:         "done",
+			Message:      &agent.Message{Content: "partial work completed before stop"},
+			ErrorMessage: agent.ErrMsgCancelled,
+		},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.postCalls == 0 {
+		t.Fatal("expected cancelled done content to be delivered via chat.postMessage")
+	}
+	if !strings.Contains(script.lastPostMD, "partial work completed before stop") {
+		t.Errorf("last post markdown_text = %q, want partial done content", script.lastPostMD)
 	}
 }
 

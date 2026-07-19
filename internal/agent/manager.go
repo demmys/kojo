@@ -2518,9 +2518,27 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				if event.Type == "done" {
 					m.syncPersona(agentID)
 				}
+				// Prefer delivering a terminal event when the caller is
+				// still draining outCh, even if ctx was cancelled at the
+				// same instant. This preserves partial cancellation results
+				// for one-shot callers such as Slack !stop.
+				select {
+				case outCh <- event:
+					continue
+				default:
+				}
+				if ctx.Err() != nil {
+					forwardOneShotTerminalAfterCancel(outCh, event)
+					for range backendCh {
+					}
+					return
+				}
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
+					forwardOneShotTerminalAfterCancel(outCh, event)
+					for range backendCh {
+					}
 					return
 				}
 			} else {
@@ -2530,7 +2548,24 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				}
 			}
 		case <-ctx.Done():
-			for range backendCh {
+			for event := range backendCh {
+				if event.Type != "done" && event.Type != "error" {
+					continue
+				}
+				// The caller cancelled the turn (e.g. Slack !stop), but
+				// backends may still emit a terminal partial "done" while
+				// unwinding. Forward it if the caller is still draining the
+				// one-shot event stream so external platforms can preserve
+				// the work completed up to the stop point. Use a
+				// non-blocking send because cancellation also means the
+				// original caller may already have disengaged.
+				if event.Type == "done" {
+					m.syncPersona(agentID)
+				}
+				forwardOneShotTerminalAfterCancel(outCh, event)
+				for range backendCh {
+				}
+				return
 			}
 			return
 		}
@@ -2630,7 +2665,17 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 	m.processChatEvents(ctx, agentID, events, outCh)
 	m.updatePostChatIndex(agentID)
 }
+func forwardOneShotTerminalAfterCancel(outCh chan<- ChatEvent, event ChatEvent) {
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case outCh <- event:
+	case <-timer.C:
+	}
+}
 
+// processChatEvents reads events from the backend channel, persists messages,
+// and forwards events to outCh for the broadcaster.
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
 	// Safety net: whatever happens to this turn (normal done, error, abort,
 	// or the backend process dying outright), drop every AskUserQuestion

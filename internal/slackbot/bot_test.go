@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -631,14 +632,15 @@ func TestSendToAgentRestartsOnDeadStream(t *testing.T) {
 	}
 }
 
-// TestSendToAgentRestartCapFallsBackToBatchPost forces every appendStream
-// to die so the bot exhausts its maxStreamRestarts budget. After the cap
-// trips, the remaining text must reach the user via chat.postMessage
-// (batch fallback) rather than being silently dropped. Also asserts that
-// every dead streamTS gets chat.delete'd during finalize cleanup (the
-// full reply landed via batch post, so the N frozen partials are
-// duplicates) so the channel doesn't render N stuck streaming messages.
-func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
+// TestSendToAgentRestartBurstCapFallsBackToBatchPost forces every
+// appendStream to die in a tight burst so the bot exhausts its
+// maxStreamRestarts budget inside streamRestartWindow. After the circuit
+// breaker trips, the remaining text must reach the user via
+// chat.postMessage (batch fallback) rather than being silently dropped.
+// Also asserts that every dead streamTS gets chat.delete'd during finalize
+// cleanup (the full reply landed via batch post, so the N frozen partials
+// are duplicates) so the channel doesn't render N stuck streaming messages.
+func TestSendToAgentRestartBurstCapFallsBackToBatchPost(t *testing.T) {
 	// Generate maxStreamRestarts+2 stream TSs so the bot has more
 	// inventory than it can possibly use. The cap check must trip
 	// before the inventory runs out.
@@ -690,6 +692,159 @@ func TestSendToAgentRestartCapFallsBackToBatchPost(t *testing.T) {
 	// Fallback path: at least one chat.postMessage for the final text.
 	if script.postCalls == 0 {
 		t.Error("expected at least one chat.postMessage as batch-fallback after cap, got 0")
+	}
+}
+
+func TestTrimStreamDeathsOutsideWindowBoundariesAndRollback(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	cutoff := now.Add(-streamRestartWindow)
+	cases := []struct {
+		name   string
+		deaths []time.Time
+		want   []time.Time
+	}{
+		{
+			name: "before cutoff is expired",
+			deaths: []time.Time{
+				cutoff.Add(-time.Nanosecond),
+			},
+			want: nil,
+		},
+		{
+			name: "cutoff is inclusive",
+			deaths: []time.Time{
+				cutoff,
+			},
+			want: []time.Time{cutoff},
+		},
+		{
+			name: "after cutoff is recent",
+			deaths: []time.Time{
+				cutoff.Add(time.Nanosecond),
+			},
+			want: []time.Time{cutoff.Add(time.Nanosecond)},
+		},
+		{
+			name: "clock rollback retains future deaths conservatively",
+			deaths: []time.Time{
+				now.Add(time.Second),
+				now.Add(-2 * streamRestartWindow),
+			},
+			want: []time.Time{now.Add(time.Second)},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trimStreamDeathsOutsideWindow(append([]time.Time(nil), tc.deaths...), now)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("trimStreamDeathsOutsideWindow() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSendToAgentAllowsSlowStreamRotation verifies that the restart cap is
+// a burst circuit breaker, not a lifetime limit. Slack regularly expires an
+// otherwise healthy stream after roughly five minutes. A long-running turn
+// may therefore need more than maxStreamRestarts replacements, provided the
+// deaths are spaced outside streamRestartWindow. The final live stream must
+// still receive chat.update rather than forcing a batch post after ~30 min.
+func TestSendToAgentAllowsSlowStreamRotation(t *testing.T) {
+	const extraRotations = 2
+	rotations := maxStreamRestarts + extraRotations
+	streams := make([]string, rotations+1) // one live stream after all rotations
+	for i := range streams {
+		streams[i] = fmt.Sprintf("stream.%d", i+1)
+	}
+	killRotations := make([]int, rotations)
+	for i := range killRotations {
+		killRotations[i] = i
+	}
+	script := &streamScript{streamTSs: streams, killAt: killRotations}
+	srv := newStreamServer(t, script)
+
+	events := make([]agent.ChatEvent, rotations)
+	for i := range events {
+		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
+	}
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+
+	mgr := &scriptedMgr{events: events}
+	bot := newBotWithStream(t, mgr, srv)
+	var clock atomic.Int64
+	bot.streamNow = func() time.Time {
+		// startStream and dropStream both consult the clock. Advancing by
+		// more than the whole window on each observation guarantees that
+		// the preceding death is outside the next start's rolling window.
+		ns := clock.Add(int64(streamRestartWindow + time.Second))
+		return time.Unix(0, ns)
+	}
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.startCalls != rotations+1 {
+		t.Errorf("chat.startStream called %d times, want %d slow rotations plus final live stream",
+			script.startCalls, rotations+1)
+	}
+	if script.postCalls != 0 {
+		t.Errorf("chat.postMessage calls = %d, want 0; slow rotation must not trip batch fallback", script.postCalls)
+	}
+	if script.lastUpdateTS != streams[len(streams)-1] {
+		t.Errorf("final chat.update targeted %q, want final live stream %q",
+			script.lastUpdateTS, streams[len(streams)-1])
+	}
+	if len(script.deletedTS) != rotations {
+		t.Errorf("chat.delete called on %d streams, want %d dead rotations", len(script.deletedTS), rotations)
+	}
+}
+
+func TestSendToAgentBoundsDeadStreamArtifactsDuringSlowRotation(t *testing.T) {
+	rotations := maxRetainedDeadStreams + 2
+	streams := make([]string, rotations+1)
+	for i := range streams {
+		streams[i] = fmt.Sprintf("stream.%d", i+1)
+	}
+	killRotations := make([]int, rotations)
+	for i := range killRotations {
+		killRotations[i] = i
+	}
+	script := &streamScript{
+		streamTSs:  streams,
+		killAt:     killRotations,
+		failUpdate: true,
+		failPost:   true,
+	}
+	srv := newStreamServer(t, script)
+
+	events := make([]agent.ChatEvent, rotations)
+	for i := range events {
+		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
+	}
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+	mgr := &scriptedMgr{events: events}
+	bot := newBotWithStream(t, mgr, srv)
+	var clock atomic.Int64
+	bot.streamNow = func() time.Time {
+		ns := clock.Add(int64(streamRestartWindow + time.Second))
+		return time.Unix(0, ns)
+	}
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	eagerDeletes := rotations - maxRetainedDeadStreams
+	if len(script.deletedTS) != eagerDeletes {
+		t.Fatalf("chat.delete called on %d streams, want %d superseded artifacts", len(script.deletedTS), eagerDeletes)
+	}
+	for _, ts := range streams[:eagerDeletes] {
+		if !containsString(script.deletedTS, ts) {
+			t.Errorf("superseded stream %q was not deleted; deletedTS=%v", ts, script.deletedTS)
+		}
+	}
+	for _, ts := range streams[eagerDeletes:rotations] {
+		if !containsString(script.stoppedTS, ts) {
+			t.Errorf("retained failure artifact %q was not stopped; stoppedTS=%v", ts, script.stoppedTS)
+		}
 	}
 }
 

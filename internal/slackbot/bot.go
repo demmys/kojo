@@ -88,6 +88,11 @@ type Bot struct {
 	// resulting Slack API calls. nil in production, where the default
 	// `go fn()` semantics are used.
 	runAsync func(func())
+
+	// streamNow, when non-nil, replaces time.Now for the stream-restart
+	// circuit breaker. Tests advance it without sleeping. nil in
+	// production.
+	streamNow func() time.Time
 }
 
 const (
@@ -141,15 +146,37 @@ const (
 	// seeing live progress instead of a silently truncated reply.
 	slackErrNotStreaming = "message_not_in_streaming_state"
 
-	// maxStreamRestarts caps how many times sendToAgent will open a new
-	// streaming message in a single turn after the previous one died.
-	// Each restart leaves an orphaned partial-content message in the
-	// thread, so we don't want an unbounded chain of them if Slack is
-	// closing streams faster than we can append. Past this cap the bot
-	// stops trying to stream and relies on the finalize-time chat.update
-	// / postMessage fallback to deliver the full reply.
-	maxStreamRestarts = 5
+	// maxStreamRestarts caps how many dead streams may be observed inside
+	// streamRestartWindow before sendToAgent trips its circuit breaker.
+	// Slack appears to impose an absolute stream lifetime of roughly five
+	// minutes even when heartbeats keep the stream active. A lifetime cap
+	// therefore disabled progress after about 30 minutes on healthy long
+	// turns. The rolling window still protects against a rapid open/fail
+	// loop while allowing low-frequency TTL rotation indefinitely.
+	maxStreamRestarts   = 5
+	streamRestartWindow = time.Minute
+
+	// maxRetainedDeadStreams bounds the partial messages retained as
+	// failure artifacts until final delivery succeeds. Older partials are
+	// deleted as soon as a newer stream supersedes them.
+	maxRetainedDeadStreams = maxStreamRestarts + 1
 )
+
+// trimStreamDeathsOutsideWindow retains timestamps in the inclusive
+// [now-streamRestartWindow, now] window. A timestamp later than now is also
+// retained: production time.Now values carry a monotonic clock, but treating
+// a backwards test/custom clock conservatively avoids weakening the burst
+// circuit breaker.
+func trimStreamDeathsOutsideWindow(deaths []time.Time, now time.Time) []time.Time {
+	cutoff := now.Add(-streamRestartWindow)
+	recent := deaths[:0]
+	for _, death := range deaths {
+		if !death.Before(cutoff) {
+			recent = append(recent, death)
+		}
+	}
+	return recent
+}
 
 // NewBot creates a new Bot instance. Call Run() to start it.
 // agentDataDir is the agent's data directory used for storing conversation history files.
@@ -603,13 +630,25 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		return
 	}
 
-	var response strings.Builder     // full response text
-	var pendingDelta strings.Builder // text not yet flushed via AppendStream
-	var streamTS string              // ts of the streaming message (empty = not started, dead, or fallback)
-	var deadStreams []string         // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
+	var response strings.Builder       // full response text
+	var pendingDelta strings.Builder   // text not yet flushed via AppendStream
+	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
+	var deadStreams []string           // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
+	var recentStreamDeaths []time.Time // deaths inside streamRestartWindow; drives the rapid-failure circuit breaker
 	var lastAppend time.Time
 	hasError := false
 	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
+	streamNow := time.Now
+	if b.streamNow != nil {
+		streamNow = b.streamNow
+	}
+	runAsync := func(fn func()) {
+		if b.runAsync != nil {
+			b.runAsync(fn)
+		} else {
+			go fn()
+		}
+	}
 
 	// dropStream parks the current streamTS in deadStreams and clears
 	// streamTS so the next startStream() opens a fresh streaming
@@ -623,15 +662,36 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 			return
 		}
 		deadStreams = append(deadStreams, streamTS)
+		recentStreamDeaths = append(recentStreamDeaths, streamNow())
+		// Keep only a bounded set of recent partials as failure artifacts.
+		// Low-frequency TTL rotation is intentionally unlimited, so retaining
+		// every dead stream until a multi-hour turn ends would otherwise grow
+		// memory, visible Slack messages, and finalize-time API work without
+		// bound. Older partials are superseded by the newer progress stream.
+		if len(deadStreams) > maxRetainedDeadStreams {
+			oldest := deadStreams[0]
+			deadStreams = deadStreams[1:]
+			runAsync(func() {
+				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				defer deleteCancel()
+				if _, _, err := b.api.DeleteMessageContext(deleteCtx, channel, oldest); err != nil {
+					b.logger.Debug("failed to delete superseded slack stream",
+						"channel", channel, "streamTS", oldest, "err", err)
+				}
+			})
+		}
 		streamTS = ""
 	}
 
 	// startStream initializes the Slack stream lazily on the first text
 	// or tool_use event, AND re-initializes it after a previous stream
 	// died (deadStreams non-empty, streamTS == ""). Returns true if the
-	// stream is active. After maxStreamRestarts orphaned streams the
-	// turn gives up on streaming entirely and falls back to the
-	// chat.update / batch-post finalize paths.
+	// stream is active. A burst above maxStreamRestarts inside
+	// streamRestartWindow gives up on streaming and falls back to the
+	// chat.update / batch-post finalize paths. Deaths outside the rolling
+	// window do not count: Slack regularly expires otherwise healthy
+	// streams after roughly five minutes, and long turns must be allowed
+	// to rotate through those streams for as long as the backend runs.
 	startStream := func() bool {
 		if streamTS != "" {
 			return true
@@ -639,16 +699,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if streamFailed {
 			return false
 		}
-		// deadStreams holds every streamTS that died this turn — its
-		// length equals the number of completed restart attempts so far
-		// (the initial open is not counted as a restart). Allow up to
-		// maxStreamRestarts further restart attempts: opening when
-		// len(deadStreams) == maxStreamRestarts is the maxStreamRestarts-th
-		// restart and is permitted; the next attempt (len == maxStreamRestarts+1)
-		// trips the cap and falls back to batch post.
-		if len(deadStreams) > maxStreamRestarts {
-			b.logger.Warn("slack stream restart limit reached, falling back to batch post for remainder",
-				"channel", channel, "deadStreams", len(deadStreams))
+		recentStreamDeaths = trimStreamDeathsOutsideWindow(recentStreamDeaths, streamNow())
+		// The initial stream plus maxStreamRestarts replacements may fail
+		// within the window. The following start attempt trips the breaker,
+		// preserving the previous rapid-failure cap semantics.
+		if len(recentStreamDeaths) > maxStreamRestarts {
+			b.logger.Warn("slack stream restart burst limit reached, falling back to batch post for remainder",
+				"channel", channel, "recentDeaths", len(recentStreamDeaths),
+				"window", streamRestartWindow, "deadStreams", len(deadStreams))
 			streamFailed = true
 			return false
 		}
@@ -966,14 +1024,15 @@ streamLoop:
 	clearCancel()
 
 	// Cleanup orphaned streams from earlier restarts — async because
-	// sendToAgent still holds the per-thread mutex at this point, and up
-	// to maxStreamRestarts cleanup calls (each with its own 5s timeout)
-	// would otherwise stall the next message in the same thread for tens
-	// of seconds. The goroutine uses context.Background() so it survives
+	// sendToAgent still holds the per-thread mutex at this point. A long
+	// turn may accumulate more than maxStreamRestarts low-frequency TTL
+	// rotations, and cleanup calls (each with its own 5s timeout) must not
+	// stall the next message in the same thread. The goroutine uses
+	// context.Background() so it survives
 	// sendToAgent returning; per-call timeouts cap the total wall time.
 	//
-	// When the final reply was delivered (finalDelivered), each dead
-	// partial is a duplicate frozen on a stale progress indicator, so we
+	// When the final reply was delivered (finalDelivered), each retained
+	// dead partial is a duplicate frozen on a stale progress indicator, so we
 	// chat.delete it outright — that is what restores the "one clean
 	// reply" behavior after a mid-response stream restart. When delivery
 	// failed (or produced no text) we keep the partial as an artifact and
@@ -1000,11 +1059,7 @@ streamLoop:
 				opCancel()
 			}
 		}
-		if b.runAsync != nil {
-			b.runAsync(cleanup)
-		} else {
-			go cleanup()
-		}
+		runAsync(cleanup)
 	}
 
 	// Save bot response to thread history so shouldAutoReply can detect

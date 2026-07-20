@@ -425,7 +425,8 @@ func TestPostMessageRateLimitNoExtraSleepOnFinalAttempt(t *testing.T) {
 // scriptedMgr returns a pre-canned event stream from ChatOneShot so
 // sendToAgent's event loop can be driven deterministically in tests.
 type scriptedMgr struct {
-	events []agent.ChatEvent
+	events          []agent.ChatEvent
+	lastOneShotOpts agent.OneShotOpts
 }
 
 func (m *scriptedMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
@@ -437,7 +438,8 @@ func (m *scriptedMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageA
 	return ch, nil
 }
 
-func (m *scriptedMgr) ChatOneShot(_ context.Context, _, _ string, _ agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+func (m *scriptedMgr) ChatOneShot(_ context.Context, _, _ string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	m.lastOneShotOpts = opts
 	ch := make(chan agent.ChatEvent, len(m.events)+1)
 	for _, e := range m.events {
 		ch <- e
@@ -604,6 +606,10 @@ func TestSendToAgentRestartsOnDeadStream(t *testing.T) {
 	bot := newBotWithStream(t, mgr, srv)
 
 	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if !mgr.lastOneShotOpts.DisableKojoAttachmentInstructions {
+		t.Error("Slack ChatOneShot must disable Kojo response-attachment instructions")
+	}
 
 	if script.startCalls != 2 {
 		t.Errorf("chat.startStream calls = %d, want 2 (initial + 1 restart)", script.startCalls)

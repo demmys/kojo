@@ -592,8 +592,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	b.setStatus(ctx, channel, threadTS, typingStatus)
 
 	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
-		SessionKey:        sessionKey,
-		SystemPromptExtra: systemPromptExtra,
+		SessionKey:                        sessionKey,
+		SystemPromptExtra:                 systemPromptExtra,
+		DisableKojoAttachmentInstructions: true,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)

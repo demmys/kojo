@@ -165,9 +165,9 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 // codex-native skills via Sync*SkillForTool dispatchers. llama.cpp
 // has no skill loader.
 //
-// Used to gate SyncAttachSkill installation: writing the SKILL.md
-// into an agentDir whose backend never reads it just leaves dead
-// bytes on disk.
+// Kept as the loader half of the device-switch invariant below: every
+// backend that supports handoff must also have a compatible project-skill
+// delivery path (Codex is handled separately by its .codex/skills loader).
 //
 // NOTE: kojo-switch-device has a STRICTER gate — see
 // backendSupportsDeviceSwitch. Loading the skill is necessary but

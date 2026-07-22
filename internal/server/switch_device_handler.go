@@ -69,7 +69,7 @@ import (
 //
 //	{
 //	  "agent_id": "...",
-//	  "outcome":  "completed" | "completed_with_lock_failure"
+//	  "outcome":  "completed" | "completed_finalize_failed"
 //	              | "aborted" | "abort_failed" | "complete_failed",
 //	  "target_peer_id": "...",
 //	  "begin":  { ... handoffResponse ... },
@@ -141,8 +141,8 @@ type switchDeviceResponse struct {
 	AbortFailureReason string `json:"abort_failure_reason,omitempty"`
 	// Reason carries the per-step failure detail for non-success
 	// outcomes (aborted / abort_failed / complete_failed /
-	// source_drain_failed / complete_errored_lock_at_target /
-	// completed_with_lock_failure). Without this the caller —
+	// source_drain_failed / complete_errored_lock_at_target).
+	// Without this the caller —
 	// typically the agent driving the kojo-switch-device skill —
 	// sees only "outcome=aborted" and has no diagnostic to report
 	// to the user. Best-effort prose, not a stable code.
@@ -308,12 +308,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//       not part of the switch payload and intentionally do not
 	//       gate the handoff.
 	//
-	//   (b) The agent_lock (if it exists) must be held by the
-	//       local peer. Without this check, an agent with zero
-	//       blobs could trigger a lock migration even when the
-	//       lock currently sits on a third peer. The lock-first
-	//       complete reorder relies on the orchestrator owning
-	//       the lock to begin with.
+	//   (b) The agent_lock must exist and be held by the local
+	//       peer. Without this check, an agent with zero blobs
+	//       could trigger a lock migration even when the lock
+	//       currently sits on a third peer — or, worse, complete
+	//       could switch blob_refs with no fencing authority to
+	//       transfer. The lock-first complete reorder relies on
+	//       the orchestrator owning the lock to begin with.
 	refs, err := s.listHandoffBlobRefs(ctx, agentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -329,12 +330,16 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if cur, lerr := s.agents.Store().GetAgentLock(ctx, agentID); lerr == nil {
-		if cur.HolderPeer != "" && cur.HolderPeer != s.peerID.DeviceID {
+		if cur.HolderPeer != s.peerID.DeviceID {
 			writeError(w, http.StatusConflict, "wrong_source",
 				fmt.Sprintf("agent_lock holder is %s, not the local peer; orchestrate the switch from that peer",
 					cur.HolderPeer))
 			return
 		}
+	} else if errors.Is(lerr, store.ErrNotFound) {
+		writeError(w, http.StatusConflict, "lock_missing",
+			"agent_lock row is missing; local runtime is not fenced, so device-switch cannot safely transfer ownership")
+		return
 	} else if !errors.Is(lerr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"agent_lock read: "+lerr.Error())
@@ -874,6 +879,43 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		return
 	}
 	resp.Complete = completeResp
+	if !completeResp.LockTransferred {
+		resp.Outcome = "complete_failed"
+		resp.Reason = "complete: agent_lock did not transfer; restored source ownership to avoid a blob-only migration"
+		if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+			reclaimCtx, reclaimCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			rec, rerr := s.agents.Store().ForceReclaimAgentToLocal(
+				reclaimCtx, agentID, s.peerID.DeviceID,
+				store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
+			)
+			if rerr != nil {
+				resp.Reason += "; automatic source restore failed: " + rerr.Error()
+				s.logger.Error("switch-device: complete returned no lock transfer and source restore failed",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "err", rerr)
+			} else {
+				if s.onAgentForceReclaimed != nil {
+					s.onAgentForceReclaimed(reclaimCtx, agentID)
+				}
+				s.logger.Error("switch-device: complete returned no lock transfer; source ownership restored",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "fencing_token", rec.FencingToken)
+			}
+			reclaimCancel()
+		}
+		if resp.AgentSynced && targetAddr != "" && req.TargetPeerID != "" && syncReq.OpID != "" {
+			dropCtx, dropCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			if derr := s.dispatchPeerAgentSyncDrop(dropCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID); derr != nil {
+				s.logger.Warn("switch-device: no-lock repair could not drop target pending sync",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "err", derr)
+				resp.Reason += "; target pending-sync drop failed: " + derr.Error()
+			}
+			dropCancel()
+		}
+		writeJSONResponse(w, http.StatusOK, resp)
+		return
+	}
 	// Per-blob failures inside a "successful" complete (lock
 	// moved, but some SwitchBlobRefHome rows errored): surface
 	// as complete_failed so the operator knows blobs are
@@ -985,11 +1027,11 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// Defer finalize: response returns to claude immediately
 		// (curl unblocks → claude continues turn → done event
 		// fires → goroutine ships finalize with tail). Outcome is
-		// forced to "completed" (or completed_with_lock_failure)
-		// because the orchestrator no longer synchronously knows
-		// the finalize result; the SKILL.md tells claude to stay
-		// silent on completed so a missing finalize_error surface
-		// here doesn't leak to the user.
+		// forced to "completed" because the orchestrator no
+		// longer synchronously knows the finalize result; the
+		// SKILL.md tells claude to stay silent on completed so a
+		// missing finalize_error surface here doesn't leak to the
+		// user.
 		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
 	} else {
 		// Uses a fresh background ctx so a wedged target doesn't
@@ -1078,13 +1120,11 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	case completeResp.LockTransferred:
 		resp.Outcome = "completed"
 	default:
-		// LockTransferred=false in handoff_handler.go is collapsed
-		// to true when Lock.HolderPeer already equals target, so
-		// reaching this default means there was NO agent_lock row
-		// to migrate. blob_refs flipped to target on this complete
-		// but no fencing authority follows.
-		resp.Outcome = "completed_with_lock_failure"
-		resp.Reason = "complete: blob_refs flipped to target but no agent_lock row existed to migrate. Inspect agent_locks on target — issue a manual Acquire if the agent should be locked."
+		// Defensive fallback: the post-complete guard above should
+		// have already caught LockTransferred=false, restored source
+		// ownership, and returned before source release / finalize.
+		resp.Outcome = "complete_failed"
+		resp.Reason = "complete: agent_lock did not transfer"
 	}
 
 	// (Source drain + finalize already happened above before

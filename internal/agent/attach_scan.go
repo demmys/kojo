@@ -29,6 +29,21 @@ func httpDetectContentType(body []byte) string {
 	return http.DetectContentType(body)
 }
 
+// contextReader stops a blob-store copy promptly when the owning turn is
+// cancelled. blob.Store.Put intentionally accepts an io.Reader rather than a
+// context, so cancellation has to be expressed at the read boundary.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
 // AttachmentForwarder is the callback Manager invokes when the
 // daemon is running as a non-hub peer and the bytes for an
 // agent-attached file must also be pushed to the hub blob store
@@ -83,6 +98,22 @@ const attachMaxBytes int64 = 10 << 30
 // (nil, nil) — the assistant message goes out with no attachments,
 // which is strictly better than refusing to persist the reply.
 func (m *Manager) scanAndIngestAttachments(ctx context.Context, agentID string, messageID string) []MessageAttachment {
+	return m.scanAndIngestAttachmentsFromDir(ctx, agentID, messageID,
+		filepath.Join(agentDir(agentID), attachStagingSubpath))
+}
+
+// scanAndIngestAttachmentsFromDir is the directory-selectable form used by
+// parallel WebUI threads. Each thread gets an isolated staging directory so
+// concurrent turns for the same agent cannot consume each other's files.
+func (m *Manager) scanAndIngestAttachmentsFromDir(ctx context.Context, agentID string, messageID string, requestedStageDir string) []MessageAttachment {
+	return m.scanAndIngestAttachmentsFromDirReserved(ctx, agentID, messageID, requestedStageDir, nil)
+}
+
+// scanAndIngestAttachmentsFromDirReserved additionally reserves the names of
+// files already consumed by the live watcher. A same-named file recreated
+// just before completion is retained with a numeric suffix instead of
+// overwriting the first blob and producing duplicate metadata.
+func (m *Manager) scanAndIngestAttachmentsFromDirReserved(ctx context.Context, agentID string, messageID string, requestedStageDir string, reserved []MessageAttachment) []MessageAttachment {
 	if m.blobStore == nil {
 		return nil
 	}
@@ -90,7 +121,7 @@ func (m *Manager) scanAndIngestAttachments(ctx context.Context, agentID string, 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	stageDir, ok := safeStageDir(agentID, logger)
+	stageDir, ok := safeStageDirAt(agentID, requestedStageDir, logger)
 	if !ok {
 		return nil
 	}
@@ -119,8 +150,16 @@ func (m *Manager) scanAndIngestAttachments(ctx context.Context, agentID string, 
 	out := make([]MessageAttachment, 0, len(entries))
 	forwarder := m.attachmentForwarder()
 	used := map[string]struct{}{}
+	for _, att := range reserved {
+		if att.Name != "" {
+			used[att.Name] = struct{}{}
+		}
+	}
 
 	for _, name := range sortedNames {
+		if ctx.Err() != nil {
+			break
+		}
 		full := filepath.Join(stageDir, name)
 		att, ok := m.ingestOneAttachment(ctx, logger, agentID, messageID, full, name, used, forwarder)
 		if ok {
@@ -132,13 +171,38 @@ func (m *Manager) scanAndIngestAttachments(ctx context.Context, agentID string, 
 	// rejected, dotfiles, and any subdirectories the agent
 	// accidentally created). RemoveAll on a real directory is
 	// scoped — Lstat above proved stageDir is not a symlink, so
-	// this only walks inside agentDir/.kojo/attach. Ignore
+	// this only walks inside the validated staging directory. Ignore
 	// errors; leaving residue is harmless and only makes the next
 	// scan a no-op.
 	if err := os.RemoveAll(stageDir); err != nil {
 		logger.Warn("attach scan: cleanup stage dir", "agent", agentID, "err", err)
 	}
 	return out
+}
+
+// deleteIngestedAttachments removes attachment blobs whose reply could not be
+// persisted (startup failure, archived room, or DB append failure). This
+// removes the authoritative local copy and ref row. In peer mode a copy may
+// already have reached the hub; the current forwarder API has no remote-delete
+// operation, so that copy remains an orphan for operator cleanup.
+func (m *Manager) deleteIngestedAttachments(attachments []MessageAttachment) {
+	if m.blobStore == nil {
+		return
+	}
+	logger := m.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	for _, att := range attachments {
+		scope, path, err := blob.ParseURI(att.Path)
+		if err != nil {
+			logger.Warn("attach cleanup: parse URI", "uri", att.Path, "err", err)
+			continue
+		}
+		if err := m.blobStore.Delete(scope, path, blob.DeleteOptions{}); err != nil && !errors.Is(err, blob.ErrNotFound) {
+			logger.Warn("attach cleanup: delete orphan", "uri", att.Path, "err", err)
+		}
+	}
 }
 
 // ingestOneAttachment processes a single staged file. Returns the
@@ -216,7 +280,7 @@ func (m *Manager) ingestOneAttachment(
 	// truncated to the validated ceiling (and does not bypass the
 	// 10 GiB cap). The +1 sentinel lets us detect the growth case
 	// after the fact.
-	capped := &io.LimitedReader{R: f, N: info.Size() + 1}
+	capped := &io.LimitedReader{R: &contextReader{ctx: ctx, r: f}, N: info.Size() + 1}
 	obj, err := m.blobStore.Put(scope, blobPath, capped, blob.PutOptions{})
 	if err != nil {
 		if !errors.Is(err, blob.ErrDurabilityDegraded) || obj == nil {
@@ -331,8 +395,8 @@ func forwardTimeoutFor(size int64) time.Duration {
 	return d
 }
 
-// safeStageDir resolves <agentDir>/.kojo/attach to a real path and
-// verifies it sits inside agentDir. Refuses any of:
+// safeStageDirAt resolves a daemon-selected staging directory to a real path
+// and verifies it sits inside agentDir. Refuses any of:
 //   - the path does not exist (no work to do)
 //   - the path lstat's to a non-directory (symlink / FIFO / file)
 //   - EvalSymlinks resolves it to a location OUTSIDE agentDir
@@ -345,8 +409,7 @@ func forwardTimeoutFor(size int64) time.Duration {
 // On out-of-tree resolution we leave the path alone — RemoveAll
 // would walk the resolved target and that's exactly the
 // exfiltration risk we are refusing.
-func safeStageDir(agentID string, logger *slog.Logger) (string, bool) {
-	stageDir := filepath.Join(agentDir(agentID), attachStagingSubpath)
+func safeStageDirAt(agentID string, stageDir string, logger *slog.Logger) (string, bool) {
 
 	st, err := os.Lstat(stageDir)
 	if err != nil {
@@ -526,6 +589,14 @@ const attachDebounce = 150 * time.Millisecond
 // correct way to obtain the definitive attachment list — the
 // channel is for real-time UI notification only.
 func (m *Manager) watchAndStreamAttachments(ctx context.Context, agentID string, messageID string) *attachWatcher {
+	return m.watchAndStreamAttachmentsFromDir(ctx, agentID, messageID,
+		filepath.Join(agentDir(agentID), attachStagingSubpath))
+}
+
+// watchAndStreamAttachmentsFromDir is the directory-selectable watcher used
+// by WebUI threads. requestedStageDir must be a direct child of .kojo; this
+// keeps creation from traversing an agent-controlled intermediate symlink.
+func (m *Manager) watchAndStreamAttachmentsFromDir(ctx context.Context, agentID string, messageID string, requestedStageDir string) *attachWatcher {
 	wCtx, wCancel := context.WithCancel(ctx)
 
 	w := &attachWatcher{
@@ -538,7 +609,7 @@ func (m *Manager) watchAndStreamAttachments(ctx context.Context, agentID string,
 		retries: map[string]int{},
 	}
 
-	go w.run(m, wCtx, agentID, messageID)
+	go w.run(m, wCtx, agentID, messageID, requestedStageDir)
 	return w
 }
 
@@ -578,7 +649,7 @@ func (w *attachWatcher) StopAndDrain() []MessageAttachment {
 	return append([]MessageAttachment(nil), w.pending...)
 }
 
-func (w *attachWatcher) run(m *Manager, ctx context.Context, agentID, messageID string) {
+func (w *attachWatcher) run(m *Manager, ctx context.Context, agentID, messageID, requestedStageDir string) {
 	defer close(w.out)
 	defer close(w.exited)
 	defer w.stopTimers()
@@ -596,19 +667,23 @@ func (w *attachWatcher) run(m *Manager, ctx context.Context, agentID, messageID 
 	// When absent, validate the parent (.kojo) is not a symlink
 	// before MkdirAll so we never create attach/ inside a
 	// symlink target.
-	stageDir, ok := safeStageDir(agentID, logger)
+	stageDir, ok := safeStageDirAt(agentID, requestedStageDir, logger)
 	if !ok {
 		kojoDir := filepath.Join(agentDir(agentID), ".kojo")
+		if filepath.Clean(filepath.Dir(requestedStageDir)) != filepath.Clean(kojoDir) {
+			logger.Warn("attach stream: stage dir must be a direct child of .kojo",
+				"agent", agentID, "path", requestedStageDir)
+			return
+		}
 		if st, err := os.Lstat(kojoDir); err == nil && st.Mode()&os.ModeSymlink != 0 {
 			logger.Warn("attach stream: .kojo is a symlink, refusing", "agent", agentID)
 			return
 		}
-		raw := filepath.Join(kojoDir, "attach")
-		if err := os.MkdirAll(raw, 0o755); err != nil {
+		if err := os.MkdirAll(requestedStageDir, 0o755); err != nil {
 			logger.Warn("attach stream: mkdir stage dir", "err", err)
 			return
 		}
-		stageDir, ok = safeStageDir(agentID, logger)
+		stageDir, ok = safeStageDirAt(agentID, requestedStageDir, logger)
 		if !ok {
 			return
 		}

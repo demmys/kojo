@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,6 +12,17 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/blob"
 )
+
+func TestContextReaderStopsAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := &contextReader{ctx: ctx, r: bytes.NewBufferString("body")}
+	buf := make([]byte, 4)
+	n, err := r.Read(buf)
+	if n != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Read after cancel = (%d, %v), want (0, context.Canceled)", n, err)
+	}
+}
 
 // TestSanitizeAttachBasename pins the rejection table: dotfiles,
 // path traversal, control chars, separators, oversize names. The
@@ -203,6 +215,35 @@ func TestScanAndIngestAttachments_HappyPath(t *testing.T) {
 	}
 	if string(gotBody) != string(pngBytes) {
 		t.Errorf("chart body mismatch: got %d bytes, want %d", len(gotBody), len(pngBytes))
+	}
+}
+
+func TestScanAndIngestAttachmentsFromDirReserved_AvoidsOverwrite(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", "")
+
+	bs := newWiredBlob(t)
+	agentID := "ag_attach_reserved"
+	stageDir := filepath.Join(agentDir(agentID), ".kojo", "thread-attach-gd_test")
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		t.Fatalf("mkdir stage: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "report.txt"), []byte("second"), 0o644); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+
+	m := &Manager{blobStore: bs}
+	out := m.scanAndIngestAttachmentsFromDirReserved(context.Background(), agentID, "gm_reply", stageDir,
+		[]MessageAttachment{{Name: "report.txt"}})
+	if len(out) != 1 {
+		t.Fatalf("got %d attachments, want 1", len(out))
+	}
+	if out[0].Name != "report-1.txt" {
+		t.Errorf("reserved name = %q, want report-1.txt", out[0].Name)
+	}
+	if out[0].Path != "kojo://global/agents/ag_attach_reserved/attach/gm_reply/report-1.txt" {
+		t.Errorf("reserved path = %q", out[0].Path)
 	}
 }
 

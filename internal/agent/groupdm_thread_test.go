@@ -2,12 +2,17 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/blob"
 )
 
 // threadStub records one-shot invocations and drives the reply stream. It
@@ -104,6 +109,214 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	if exists {
 		t.Errorf("thread post should not create notify state")
 	}
+}
+
+func TestThreadPost_AttachesStagedFile(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.blobStore = newWiredBlob(t)
+
+	const body = "thread attachment body"
+	stub := &threadStub{reply: "attached"}
+	stubFn := stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageDir := threadAttachmentStageDir("ag_alice", g.ID)
+	gdm.oneShot = func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		if err := os.MkdirAll(stageDir, 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(stageDir, "report.xlsx"), []byte(body), 0o644); err != nil {
+			return nil, err
+		}
+		return stubFn(ctx, agentID, userMessage, opts)
+	}
+
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "make a report", nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := waitForMessage(t, gdm, g.ID, "attached")
+	if len(reply.Attachments) != 1 {
+		t.Fatalf("reply attachments = %d, want 1", len(reply.Attachments))
+	}
+	att := reply.Attachments[0]
+	if att.Name != "report.xlsx" {
+		t.Errorf("attachment name = %q, want report.xlsx", att.Name)
+	}
+	wantPath := "kojo://global/agents/ag_alice/attach/" + reply.ID + "/report.xlsx"
+	if att.Path != wantPath {
+		t.Errorf("attachment path = %q, want %q", att.Path, wantPath)
+	}
+
+	r, _, err := mgr.blobStore.Open(blob.ScopeGlobal,
+		"agents/ag_alice/attach/"+reply.ID+"/report.xlsx")
+	if err != nil {
+		t.Fatalf("open attachment blob: %v", err)
+	}
+	defer r.Close()
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read attachment blob: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("attachment body = %q, want %q", got, body)
+	}
+	if _, err := os.Stat(filepath.Join(stageDir, "report.xlsx")); !os.IsNotExist(err) {
+		t.Errorf("staged file still exists after reply: %v", err)
+	}
+	opts := stub.lastOpts()
+	if !opts.DisableKojoAttachmentInstructions {
+		t.Error("thread one-shot must hide the shared .kojo/attach instructions")
+	}
+	if !strings.Contains(opts.SystemPromptExtra, stageDir) {
+		t.Errorf("thread prompt does not contain isolated stage dir %q", stageDir)
+	}
+}
+
+func TestThreadPost_NoAttachmentRemovesStageDir(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.blobStore = newWiredBlob(t)
+	stub := &threadStub{reply: "no file"}
+	gdm.oneShot = stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "plain reply", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	waitForMessage(t, gdm, g.ID, "no file")
+	stageDir := threadAttachmentStageDir("ag_alice", g.ID)
+	if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+		t.Errorf("empty thread stage dir still exists: %v", err)
+	}
+}
+
+func TestParallelThreadPosts_IsolateStagedFiles(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.blobStore = newWiredBlob(t)
+
+	g1, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g2, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var started atomic.Int32
+	var releaseOnce sync.Once
+	release := make(chan struct{})
+	gdm.oneShot = func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		groupID := strings.TrimPrefix(opts.SessionKey, "groupdm:")
+		stageDir := threadAttachmentStageDir(agentID, groupID)
+		if err := os.MkdirAll(stageDir, 0o755); err != nil {
+			return nil, err
+		}
+		name := groupID + ".txt"
+		if err := os.WriteFile(filepath.Join(stageDir, name), []byte(groupID), 0o644); err != nil {
+			return nil, err
+		}
+		if started.Add(1) == 2 {
+			releaseOnce.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		ch := make(chan ChatEvent, 1)
+		ch <- ChatEvent{Type: "text", Delta: groupID}
+		close(ch)
+		return ch, nil
+	}
+
+	if _, err := gdm.PostUserMessage(context.Background(), g1.ID, "first", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.PostUserMessage(context.Background(), g2.ID, "second", nil, true); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, g := range []*GroupDM{g1, g2} {
+		reply := waitForMessage(t, gdm, g.ID, g.ID)
+		if len(reply.Attachments) != 1 {
+			t.Fatalf("thread %s attachments = %d, want 1", g.ID, len(reply.Attachments))
+		}
+		wantName := g.ID + ".txt"
+		if reply.Attachments[0].Name != wantName {
+			t.Errorf("thread %s attachment = %q, want %q", g.ID, reply.Attachments[0].Name, wantName)
+		}
+		if !strings.Contains(reply.Attachments[0].Path, "/attach/"+reply.ID+"/"+wantName) {
+			t.Errorf("thread %s attachment path mismatched reply ID: %q", g.ID, reply.Attachments[0].Path)
+		}
+	}
+}
+
+func TestThreadArchive_CancelsAttachmentFinalization(t *testing.T) {
+	gdm, mgr := setupGroupDMTest(t)
+	mgr.blobStore = newWiredBlob(t)
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageDir := threadAttachmentStageDir("ag_alice", g.ID)
+	gdm.oneShot = func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		if err := os.MkdirAll(stageDir, 0o755); err != nil {
+			return nil, err
+		}
+		path := filepath.Join(stageDir, "large.bin")
+		if err := os.WriteFile(path, []byte("body"), 0o644); err != nil {
+			return nil, err
+		}
+		// Keep the live watcher's mtime-stability check re-debouncing until
+		// the event stream closes. The final scan then owns the forward below,
+		// making the archive-cancel assertion deterministic.
+		future := time.Now().Add(time.Hour)
+		if err := os.Chtimes(path, future, future); err != nil {
+			return nil, err
+		}
+		ch := make(chan ChatEvent, 1)
+		ch <- ChatEvent{Type: "text", Delta: "done"}
+		close(ch)
+		return ch, nil
+	}
+
+	forwardStarted := make(chan string, 1)
+	mgr.SetAttachmentForwarder(func(ctx context.Context, scope blob.Scope, path, sha string, r io.Reader, size int64) error {
+		forwardStarted <- path
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "attach", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	var blobPath string
+	select {
+	case blobPath = <-forwardStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("attachment finalization did not start")
+	}
+	if err := gdm.Delete(g.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := mgr.blobStore.Head(blob.ScopeGlobal, blobPath)
+		if errors.Is(err, blob.ErrNotFound) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("orphaned attachment blob still exists after archive: %s", blobPath)
 }
 
 func TestThreadPost_EmptyReplyPostsNothing(t *testing.T) {

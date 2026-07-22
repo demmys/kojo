@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -203,6 +205,11 @@ type GroupDMManager struct {
 	// threadCancelMu.
 	threadCancelMu sync.Mutex
 	threadCancels  map[string]context.CancelFunc
+	// threadFinalizeCancels aborts attachment finalization when Delete archives
+	// a room after its model stream has ended. StopThreadTurn intentionally
+	// ignores this map: once the stream ends, operator stop must return false
+	// rather than relabel a completed reply as interrupted.
+	threadFinalizeCancels map[string]context.CancelFunc
 	// threadStopped marks rooms whose in-flight turn was cancelled by an
 	// explicit operator stop (StopThreadTurn) rather than by archive —
 	// the stop path preserves partial output, the archive path discards
@@ -444,17 +451,18 @@ func (m *GroupDMManager) appendThreadLiveChildText(groupID, parentID, delta stri
 // NewGroupDMManager creates a new GroupDMManager.
 func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 	m := &GroupDMManager{
-		groups:        make(map[string]*GroupDM),
-		agentMgr:      agentMgr,
-		logger:        logger,
-		notify:        make(map[string]*notifyState),
-		triggerHop:    make(map[string]triggerHopEntry),
-		latestMsgID:   make(map[string]string),
-		deleting:      make(map[string]bool),
-		persistGen:    make(map[string]int64),
-		threadCancels: make(map[string]context.CancelFunc),
-		threadStopped: make(map[string]bool),
-		threadLive:    make(map[string]*threadLiveState),
+		groups:                make(map[string]*GroupDM),
+		agentMgr:              agentMgr,
+		logger:                logger,
+		notify:                make(map[string]*notifyState),
+		triggerHop:            make(map[string]triggerHopEntry),
+		latestMsgID:           make(map[string]string),
+		deleting:              make(map[string]bool),
+		persistGen:            make(map[string]int64),
+		threadCancels:         make(map[string]context.CancelFunc),
+		threadFinalizeCancels: make(map[string]context.CancelFunc),
+		threadStopped:         make(map[string]bool),
+		threadLive:            make(map[string]*threadLiveState),
 	}
 	m.load()
 	return m
@@ -1382,6 +1390,17 @@ func (m *GroupDMManager) postUserMessage(ctx context.Context, groupID, content s
 // isolated from its main chat, and that no curl/API call is needed to reply.
 const threadSystemPromptExtra = "You are in a temporary side-thread with the human operator — a parallel, throwaway conversation. It is fully isolated from your main conversation and from every other room: nothing said here appears in your main chat, and your main chat's context is not carried into this thread. Always answer the operator's message — directly and concisely; a brief acknowledgement is fine when there is nothing more to add. Do NOT use curl or any API call to reply — just write your reply as your normal response and it will be posted into the thread automatically."
 
+func threadAttachmentStageDir(agentID, groupID string) string {
+	// groupID is daemon-generated (gd_<hex>). Keep the per-room directory a
+	// direct child of .kojo so the attachment watcher can create it without
+	// traversing an agent-controlled intermediate symlink.
+	return filepath.Join(agentDir(agentID), ".kojo", "thread-attach-"+groupID)
+}
+
+func threadSystemPrompt(stageDir string) string {
+	return threadSystemPromptExtra + fmt.Sprintf("\n\nFor file attachments in this thread, stage each file as `%s/<basename>` (`mkdir -p` first). Use this exact thread-specific directory, not `.kojo/attach`; Kojo ingests files from it while the reply is in progress and attaches them to this thread reply.", stageDir)
+}
+
 // runThreadTurn executes one temporary side-thread turn for a thread room
 // (kind "dm", single agent member). It resumes a per-thread Claude session so
 // successive posts share context, but stays isolated from the agent's main
@@ -1442,11 +1461,19 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	defer m.endThreadLive(groupID)
 
 	payload := m.renderThreadPayload(groupName, msg)
+	replyMessageID := generateGroupMessageID()
+	attachmentStageDir := threadAttachmentStageDir(agentID, groupID)
+	attachmentWatcher := m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
 	events, err := oneShot(ctx, agentID, payload, OneShotOpts{
-		SessionKey:        "groupdm:" + groupID,
-		SystemPromptExtra: threadSystemPromptExtra,
+		SessionKey:                        "groupdm:" + groupID,
+		SystemPromptExtra:                 threadSystemPrompt(attachmentStageDir),
+		DisableKojoAttachmentInstructions: true,
 	})
 	if err != nil {
+		m.agentMgr.deleteIngestedAttachments(attachmentWatcher.StopAndDrain())
+		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
+			_ = os.RemoveAll(stageDir)
+		}
 		// Unregister the cancel before handling the error so a /stop
 		// racing this failure can't return 200 for a turn that never
 		// started streaming. The defer's delete is idempotent. Read the
@@ -1543,7 +1570,6 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	if len(toolUses) == 0 {
 		toolUses = snap.ToolUses
 	}
-
 	// The stream has ended — unregister the cancel now (not in the defer)
 	// and read the stop flag in the same critical section, so a stop
 	// arriving after completion can neither mislabel a finished reply as
@@ -1555,26 +1581,83 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()
 
+	// Stop live capture only after unregistering the completed turn. A large
+	// attachment may take time to finish forwarding; a stop request during
+	// that drain must not relabel an already-finished response as interrupted.
+	replyAttachments := attachmentWatcher.StopAndDrain()
+
 	// An operator stop cancels the context; treat it separately from
 	// archive-cancel (room going away — discard) and real errors.
 	if errors.Is(ctx.Err(), context.Canceled) {
 		if !stopped {
+			// Archive path: discard staged files rather than forwarding them
+			// into blobs that can no longer be referenced by a room message.
+			m.agentMgr.deleteIngestedAttachments(replyAttachments)
+			if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
+				_ = os.RemoveAll(stageDir)
+			}
 			return // archive path: room is being torn down
 		}
 		streamErr = ""
 	}
+
+	// Catch files written immediately before the terminal event, while the
+	// watcher's debounce timer was still pending. The thread is no longer
+	// advertised as stoppable, so a slow peer-forward cannot relabel a
+	// completed response as interrupted. Delete still gets a dedicated cancel
+	// handle so archiving the room aborts a slow final forward.
+	archiveCtx, archiveCancel := context.WithCancel(context.Background())
+	scanCtx, scanCancel := context.WithTimeout(archiveCtx, attachScanCeiling)
+	m.mu.Lock()
+	_, liveErr := m.liveGroupLocked(groupID)
+	if liveErr == nil {
+		m.threadCancelMu.Lock()
+		m.threadFinalizeCancels[groupID] = archiveCancel
+		m.threadCancelMu.Unlock()
+	}
+	m.mu.Unlock()
+	if liveErr != nil {
+		scanCancel()
+		archiveCancel()
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
+			_ = os.RemoveAll(stageDir)
+		}
+		return
+	}
+	replyAttachments = append(replyAttachments,
+		m.agentMgr.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, replyMessageID, attachmentStageDir, replyAttachments)...)
+	scanCancel()
+	// The generic scan keeps an already-empty directory for the next normal
+	// chat turn. Thread directories are per-room and must not accumulate after
+	// successful turns, including replies that attached no files.
+	if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
+		_ = os.RemoveAll(stageDir)
+	}
+	m.threadCancelMu.Lock()
+	delete(m.threadFinalizeCancels, groupID)
+	archiveCancelled := archiveCtx.Err() != nil
+	m.threadCancelMu.Unlock()
+	archiveCancel()
+	if archiveCancelled {
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
+			_ = os.RemoveAll(stageDir)
+		}
+		return
+	}
 	if streamErr != "" {
 		// Preserve whatever the turn produced before failing, then post
 		// the visible failure notice / dead-letter as before.
-		if text != "" || thinking != "" || len(toolUses) > 0 {
-			if _, err := m.postThreadReply(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true); err != nil {
+		if text != "" || thinking != "" || len(toolUses) > 0 || len(replyAttachments) > 0 {
+			if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true, replyMessageID, replyAttachments); err != nil {
 				m.logger.Warn("failed to post partial thread reply", "group", groupID, "agent", agentID, "err", err)
 			}
 		}
 		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
 		return
 	}
-	if text == "" && thinking == "" && len(toolUses) == 0 && !stopped {
+	if text == "" && thinking == "" && len(toolUses) == 0 && len(replyAttachments) == 0 && !stopped {
 		// Nothing substantive to post. A stopped turn still posts an
 		// (empty) interrupted reply so the UI's "replying…" wait resolves
 		// with a visible outcome instead of hanging on the user's post.
@@ -1585,7 +1668,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// otherwise race the rename and pin the stale default title. No-op after
 	// the first rename; empty replies (above) still skip titling entirely.
 	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
-	if _, err := m.postThreadReply(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped); err != nil {
+	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
 }
@@ -1615,10 +1698,18 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
 func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool) (*GroupMessage, error) {
+	return m.postThreadReplyWithAttachments(groupID, agentID, content, model, effort, usage, thinking, toolUses, interrupted, "", nil)
+}
+
+// postThreadReplyWithAttachments is the attachment-aware thread reply path.
+// messageID is allocated before the one-shot stream starts so attachment blob
+// ownership and the persisted group message use the same stable ID.
+func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
 		m.mu.Unlock()
+		m.agentMgr.deleteIngestedAttachments(attachments)
 		return nil, err
 	}
 	var senderName string
@@ -1629,7 +1720,10 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effor
 	for _, mem := range g.Members {
 		memberIDs = append(memberIDs, mem.AgentID)
 	}
-	msg := newGroupMessage(agentID, senderName, content, nil)
+	msg := newGroupMessage(agentID, senderName, content, attachments)
+	if messageID != "" {
+		msg.ID = messageID
+	}
 	msg.Usage = usage
 	msg.Thinking = thinking
 	msg.ToolUses = toolUses
@@ -1639,6 +1733,7 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effor
 	msg.Mentions = m.parseMentions(content, memberIDs)
 	if err := appendGroupMessage(groupID, msg, 0, false); err != nil {
 		m.mu.Unlock()
+		m.agentMgr.deleteIngestedAttachments(attachments)
 		return nil, fmt.Errorf("store message: %w", err)
 	}
 	m.latestMsgID[groupID] = msg.ID
@@ -1756,6 +1851,9 @@ func deriveThreadTitle(content string) string {
 func (m *GroupDMManager) cancelThreadTurn(groupID string) {
 	m.threadCancelMu.Lock()
 	if cancel := m.threadCancels[groupID]; cancel != nil {
+		cancel()
+	}
+	if cancel := m.threadFinalizeCancels[groupID]; cancel != nil {
 		cancel()
 	}
 	m.threadCancelMu.Unlock()

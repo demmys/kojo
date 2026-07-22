@@ -15,12 +15,6 @@ import (
 // notifyTimeout is the maximum time allowed for a notification-triggered chat.
 const notifyTimeout = 10 * time.Minute
 
-// threadTurnTimeout is the maximum time allowed for a thread-room turn.
-// Deliberately much longer than notifyTimeout: thread turns are interactive
-// operator conversations that may involve long autonomous work, and the
-// operator has an explicit stop control (StopThreadTurn) to end them early.
-const threadTurnTimeout = 60 * time.Minute
-
 // defaultMaxHops is the default agent-to-agent notification relay depth per
 // room. A message whose hop reaches the room's effective max is still stored
 // (humans see it) but is not fanned out to agents — structural loop
@@ -323,8 +317,8 @@ func (m *GroupDMManager) startThreadLive(groupID, model, effort string) {
 	m.threadLiveMu.Unlock()
 }
 
-// endThreadLive removes the live-state entry for groupID, e.g. after the
-// turn's reply has been posted or the turn failed/timed out/was cancelled.
+// endThreadLive removes the live-state entry for groupID after the turn's
+// reply has been posted, or when the turn fails or is cancelled.
 func (m *GroupDMManager) endThreadLive(groupID string) {
 	m.threadLiveMu.Lock()
 	delete(m.threadLive, groupID)
@@ -1412,7 +1406,9 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), threadTurnTimeout)
+	// Match the main WebUI chat: an interactive turn has no fixed deadline.
+	// It remains cancellable via StopThreadTurn or room archival.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Register the cancel so archive (Delete) and the operator stop
@@ -1435,7 +1431,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 
 	// The live snapshot is visible to GET /groupdms/{id}/live from the
 	// moment the turn is about to stream events until the reply is posted
-	// (or the turn errors/times out/is cancelled) — deferred cleanup covers
+	// (or the turn fails or is cancelled) — deferred cleanup covers
 	// every one of those exits uniformly.
 	var agentModel, agentEffort string
 	if a, ok := m.agentMgr.Get(agentID); ok {
@@ -1535,7 +1531,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	}
 	// Assemble the reply text; the partial live snapshot fills in
 	// thinking/toolUses when the turn never reached its "done" event
-	// (error, timeout, operator stop) so partial output survives.
+	// (error or operator stop) so partial output survives.
 	text := strings.TrimSpace(doneText)
 	if text == "" {
 		text = strings.TrimSpace(reply.String())
@@ -1566,9 +1562,6 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 			return // archive path: room is being torn down
 		}
 		streamErr = ""
-	}
-	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		streamErr = fmt.Sprintf("thread turn timed out after %s", threadTurnTimeout)
 	}
 	if streamErr != "" {
 		// Preserve whatever the turn produced before failing, then post

@@ -216,6 +216,27 @@ func TestThreadTurn_ProceedsWhileMainChatBusy(t *testing.T) {
 	waitForMessage(t, gdm, g.ID, "still-here")
 }
 
+func TestThreadTurn_HasNoDeadline(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hasDeadline := true
+	gdm.oneShot = func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		_, hasDeadline = ctx.Deadline()
+		ch := make(chan ChatEvent)
+		close(ch)
+		return ch, nil
+	}
+
+	gdm.runThreadTurn("ag_alice", g.ID, "G", newGroupMessage(UserSenderID, UserSenderName, "ping", nil))
+	if hasDeadline {
+		t.Fatal("thread turn context has a deadline, want none")
+	}
+}
+
 func TestThreadTurn_SerializesConcurrentPosts(t *testing.T) {
 	gdm, _ := setupGroupDMTest(t)
 	stub := &threadStub{reply: "ok", turnDelay: 80 * time.Millisecond}

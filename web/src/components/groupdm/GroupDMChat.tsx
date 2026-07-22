@@ -40,11 +40,6 @@ import { useT } from "../../lib/i18n";
 
 const PAGE_SIZE = 50;
 
-// Mirrors the server-side thread turn cap (threadTurnTimeout, 60m): after
-// this long without a reply the "replying…" indicator and the send lockout
-// both clear.
-const THREAD_REPLY_TIMEOUT_MS = 60 * 60 * 1000;
-
 export function GroupDMChat() {
   const t = useT();
   const { id } = useParams<{ id: string }>();
@@ -337,18 +332,19 @@ export function GroupDMChat() {
 
   // In a thread, the newest message being the user's own post means the
   // agent's turn is still running (polling will append the reply and flip
-  // this off). Safety: the server-side thread turn is capped at 10 minutes
-  // (notifyTimeout), so this also clears once the last user message is older
-  // than that — it must not persist forever across reloads or on a rare
-  // empty reply. Recomputed on every 3s poll re-render. Drives both the
-  // "replying…" indicator and the send lockout: posting mid-turn would queue
-  // a second turn that replies without seeing the first answer.
+  // this off). Interactive thread turns have no fixed deadline, matching the
+  // main WebUI chat, so the pending state must not expire based on message
+  // age. It drives the "replying…", steer, and stop affordances.
   const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+  const pendingThreadHead = isThread && lastMsg?.agentId === USER_SENDER_ID ? lastMsg.id : null;
+  // A successful turn can legitimately produce no text, in which case the
+  // server stores no agent message to replace the user message at the head.
+  // Remember that the corresponding live turn ended so the UI does not stay
+  // pending forever. This is completion detection, not a response timeout.
+  const [settledThreadHead, setSettledThreadHead] = useState<string | null>(null);
   const awaitingReply =
-    isThread &&
-    lastMsg !== null &&
-    lastMsg.agentId === USER_SENDER_ID &&
-    Date.now() - new Date(lastMsg.timestamp).getTime() < THREAD_REPLY_TIMEOUT_MS;
+    pendingThreadHead !== null && pendingThreadHead !== settledThreadHead;
+  useEffect(() => setSettledThreadHead(null), [id]);
 
   // Snapshot of the turn being awaited (the pending user message's id), kept
   // in a ref so delayed async callbacks (handleStop's 409 retry) can check
@@ -359,9 +355,8 @@ export function GroupDMChat() {
 
   // Live progress for the in-flight turn: polled while awaitingReply so
   // thinking / tool calls / partial text render in place of a static
-  // "replying…" placeholder. Cleared whenever awaitingReply flips false (the
-  // reply landed, or the timeout window closed) so a stale snapshot never
-  // lingers into the next turn.
+  // "replying…" placeholder. Cleared whenever the reply lands so a stale
+  // snapshot never lingers into the next turn.
   const [threadLive, setThreadLive] = useState<ThreadLive | null>(null);
   useEffect(() => {
     // Reset unconditionally on every id/awaitingReply change — otherwise a
@@ -371,6 +366,9 @@ export function GroupDMChat() {
     if (!id || !awaitingReply) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let sawActive = false;
+    let inactivePolls = 0;
+    const awaitedHead = pendingThreadHead;
     // Serialize polls — schedule the next one only after the current request
     // settles, rather than a fixed setInterval. A fixed interval would keep
     // firing on schedule even while a request is still in flight (e.g. a
@@ -380,7 +378,21 @@ export function GroupDMChat() {
     const poll = () => {
       groupdmApi.threadLive(id).then(
         (live) => {
-          if (!cancelled) setThreadLive(live);
+          if (cancelled) return;
+          setThreadLive(live);
+          if (live.active) {
+            sawActive = true;
+            inactivePolls = 0;
+          } else {
+            inactivePolls++;
+            // The first inactive result may race the goroutine that registers
+            // a just-posted turn. Once active was observed, or two serialized
+            // polls agree it is inactive, the turn has safely settled even if
+            // it produced no reply message.
+            if (sawActive || inactivePolls >= 2) {
+              setSettledThreadHead(awaitedHead);
+            }
+          }
         },
         () => {/* transient poll failure — keep showing the last snapshot */},
       ).finally(() => {
@@ -392,7 +404,7 @@ export function GroupDMChat() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [id, awaitingReply]);
+  }, [id, awaitingReply, pendingThreadHead]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();

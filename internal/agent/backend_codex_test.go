@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -257,6 +258,27 @@ func TestParseCodexStream_TextDelta(t *testing.T) {
 	}
 	if textEvents != 2 {
 		t.Errorf("expected 2 text events, got %d", textEvents)
+	}
+}
+
+func TestParseCodexStream_AgentMessageCompletedSnapshotFallback(t *testing.T) {
+	events, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "i1", "type": "agentMessage", "phase": "final_answer"},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "i1", "type": "agentMessage", "text": "snapshot answer"},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if got := result.fullText.String(); got != "snapshot answer" {
+		t.Fatalf("fullText = %q, want completed-item snapshot", got)
+	}
+	if len(events) != 1 || events[0].Type != "text" || events[0].Delta != "snapshot answer" {
+		t.Fatalf("events = %+v, want one snapshot text event", events)
 	}
 }
 
@@ -522,6 +544,232 @@ func TestParseCodexStream_TurnInterrupted(t *testing.T) {
 
 	if result.processError != "codex turn interrupted" {
 		t.Errorf("processError = %q, want %q", result.processError, "codex turn interrupted")
+	}
+}
+
+func TestRunCodexTurns_RetriesEmptyCompletionAndPreservesWork(t *testing.T) {
+	input := strings.Join([]string{
+		rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "turn-1"}}, nil),
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "first thought;"}),
+		rpcLine("thread/tokenUsage/updated", map[string]any{
+			"tokenUsage": map[string]any{"last": map[string]int{"inputTokens": 10, "outputTokens": 2}},
+		}),
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "cmd-1", "type": "commandExecution", "command": "touch result.txt"},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "cmd-1", "type": "commandExecution", "aggregatedOutput": "done", "exitCode": 0},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"id": "turn-1", "status": "completed"},
+		}),
+		rpcResponseLine(2, map[string]any{"turn": map[string]any{"id": "turn-2"}}, nil),
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "second thought"}),
+		rpcLine("thread/tokenUsage/updated", map[string]any{
+			"tokenUsage": map[string]any{"last": map[string]int{"inputTokens": 20, "outputTokens": 3}},
+		}),
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "msg-2", "type": "agentMessage", "phase": "final_answer"},
+		}),
+		rpcLine("item/agentMessage/delta", map[string]any{
+			"itemId": "msg-2", "delta": "Recovered final answer",
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"id": "turn-2", "status": "completed"},
+		}),
+	}, "\n") + "\n"
+
+	var starts []string
+	startTurn := func(turnInput string) (int64, error) {
+		starts = append(starts, turnInput)
+		return int64(len(starts)), nil
+	}
+	var events []ChatEvent
+	result := runCodexTurns(
+		context.Background(),
+		newCodexLineScanner(strings.NewReader(input)),
+		"original request",
+		codexEmptyCompletionMaxRetries,
+		startTurn,
+		nil,
+		nil,
+		testLogger(),
+		func(event ChatEvent) bool {
+			events = append(events, event)
+			return true
+		},
+	)
+
+	if len(starts) != 2 {
+		t.Fatalf("turn starts = %d, want 2", len(starts))
+	}
+	if starts[0] != "original request" || starts[1] != codexEmptyCompletionRetryPrompt {
+		t.Fatalf("turn inputs = %#v, want original then recovery prompt", starts)
+	}
+	if !result.turnCompleted || result.processError != "" || result.cancelled {
+		t.Fatalf("result terminal state = %+v, want clean completion", result)
+	}
+	if got := result.fullText.String(); got != "Recovered final answer" {
+		t.Errorf("fullText = %q, want recovered answer", got)
+	}
+	if len(result.toolUses) != 1 || result.toolUses[0].Input != "touch result.txt" || result.toolUses[0].Output != "done" {
+		t.Errorf("preserved tool uses = %+v, want first-turn command", result.toolUses)
+	}
+	if got := result.thinking.String(); got != "first thought;second thought" {
+		t.Errorf("thinking = %q, want both attempts", got)
+	}
+	if result.usage == nil || result.usage.InputTokens != 30 || result.usage.OutputTokens != 5 {
+		t.Errorf("usage = %+v, want sum across attempts", result.usage)
+	}
+	var textEvents int
+	for _, event := range events {
+		if event.Type == "text" {
+			textEvents++
+		}
+	}
+	if textEvents != 1 {
+		t.Errorf("text events = %d, want only the recovered final answer", textEvents)
+	}
+}
+
+func TestRunCodexTurns_StopsAfterBoundedEmptyCompletionRetries(t *testing.T) {
+	var lines []string
+	for i := int64(1); i <= codexEmptyCompletionMaxRetries+1; i++ {
+		lines = append(lines,
+			rpcResponseLine(i, map[string]any{"turn": map[string]any{"id": "empty"}}, nil),
+			rpcLine("turn/completed", map[string]any{
+				"turn": map[string]any{"id": "empty", "status": "completed"},
+			}),
+		)
+	}
+
+	var starts int
+	result := runCodexTurns(
+		context.Background(),
+		newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n")+"\n")),
+		"original request",
+		codexEmptyCompletionMaxRetries,
+		func(string) (int64, error) {
+			starts++
+			return int64(starts), nil
+		},
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return true },
+	)
+
+	wantStarts := codexEmptyCompletionMaxRetries + 1
+	if starts != wantStarts {
+		t.Fatalf("turn starts = %d, want %d", starts, wantStarts)
+	}
+	if !result.turnCompleted || result.processError != codexEmptyCompletionError {
+		t.Fatalf("result = %+v, want completed with bounded-retry error", result)
+	}
+}
+
+func TestRunCodexTurns_DoesNotRetryFailedOrAnsweredTurn(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    []string
+		wantText string
+		wantErr  string
+	}{
+		{
+			name: "failed",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "failed"}}, nil),
+				rpcLine("turn/completed", map[string]any{
+					"turn": map[string]any{"id": "failed", "status": "failed", "error": map[string]any{"message": "service failed"}},
+				}),
+			},
+			wantErr: "service failed",
+		},
+		{
+			name: "answered",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "answered"}}, nil),
+				rpcLine("item/started", map[string]any{
+					"item": map[string]any{"id": "msg", "type": "agentMessage", "phase": "final_answer"},
+				}),
+				rpcLine("item/agentMessage/delta", map[string]any{"itemId": "msg", "delta": "done"}),
+				rpcLine("turn/completed", map[string]any{
+					"turn": map[string]any{"id": "answered", "status": "completed"},
+				}),
+			},
+			wantText: "done",
+		},
+		{
+			name: "missing status is not retryable",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "unknown"}}, nil),
+				rpcLine("turn/completed", map[string]any{"turn": map[string]any{"id": "unknown"}}),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var starts int
+			result := runCodexTurns(
+				context.Background(),
+				newCodexLineScanner(strings.NewReader(strings.Join(tt.lines, "\n")+"\n")),
+				"original",
+				codexEmptyCompletionMaxRetries,
+				func(string) (int64, error) { starts++; return 1, nil },
+				nil,
+				nil,
+				testLogger(),
+				func(ChatEvent) bool { return true },
+			)
+			if starts != 1 {
+				t.Fatalf("turn starts = %d, want no retry", starts)
+			}
+			if got := result.fullText.String(); got != tt.wantText {
+				t.Errorf("fullText = %q, want %q", got, tt.wantText)
+			}
+			if result.processError != tt.wantErr {
+				t.Errorf("processError = %q, want %q", result.processError, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunCodexTurns_ContextCancelledBeforeRetryStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var starts int
+	result := runCodexTurns(
+		ctx,
+		newCodexLineScanner(strings.NewReader("")),
+		"original",
+		codexEmptyCompletionMaxRetries,
+		func(string) (int64, error) { starts++; return 1, nil },
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return true },
+	)
+	if starts != 0 || !result.cancelled || result.turnCompleted {
+		t.Fatalf("starts=%d result=%+v, want cancellation before turn/start", starts, result)
+	}
+}
+
+func TestParseCodexStream_ReasoningSendCancellationStops(t *testing.T) {
+	input := strings.Join([]string{
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "reasoning"}),
+		rpcLine("turn/completed", map[string]any{"turn": map[string]any{"status": "completed"}}),
+	}, "\n") + "\n"
+	result := parseCodexStream(
+		newCodexLineScanner(strings.NewReader(input)),
+		1,
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return false },
+	)
+	if !result.cancelled || result.turnCompleted {
+		t.Fatalf("result = %+v, want immediate cancellation on rejected reasoning event", result)
 	}
 }
 

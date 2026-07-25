@@ -23,6 +23,12 @@ import (
 // is broken and continuing is unsafe, so it surfaces as a fatal
 // chathistory.ErrLineTooLarge (rendered by codexReadErrorMessage).
 
+const codexEmptyCompletionMaxRetries = 2
+
+const codexEmptyCompletionRetryPrompt = "[automatic recovery] The previous Codex turn reported successful completion without producing a final assistant response. Continue the original request from the current thread and filesystem state. Do not repeat work that is already complete. Finish the remaining work, then provide a non-empty final response."
+
+const codexEmptyCompletionError = "codex turn completed without a final assistant response after automatic retries"
+
 func codexReadErrorMessage(err error) string {
 	if err == nil {
 		return ""
@@ -180,7 +186,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		scanner := newCodexLineScanner(stdout)
 
 		// Wait for initialize response
-		var threadStartID, turnStartID int64
+		var threadStartID int64
 		var threadID string
 		initDone := false
 		for scanner.Scan() {
@@ -332,19 +338,23 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through
 		// baseInstructions above so the prompt cache stays warm across turns.
-		turnParams := map[string]any{
-			"threadId": threadID,
-			"input": []map[string]any{
-				{"type": "text", "text": userMessage},
-			},
-		}
-		if effort := codexEffortForProtocol(agent.Model, agent.Effort); effort != "" {
-			turnParams["effort"] = effort
-		} else if agent.Effort != "" {
+		effort := codexEffortForProtocol(agent.Model, agent.Effort)
+		if effort == "" && agent.Effort != "" {
 			b.logger.Warn("codex: unsupported effort value; using CLI default",
 				"agent", agent.ID, "effort", agent.Effort)
 		}
-		turnStartID = sendRPC("turn/start", turnParams)
+		startTurn := func(input string) (int64, error) {
+			turnParams := map[string]any{
+				"threadId": threadID,
+				"input": []map[string]any{
+					{"type": "text", "text": input},
+				},
+			}
+			if effort != "" {
+				turnParams["effort"] = effort
+			}
+			return sendRPCErr("turn/start", turnParams)
+		}
 
 		// Steering: turn/steer injects extra user input into the running
 		// turn. It needs the active turn id (captured from the turn/start
@@ -362,8 +372,23 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 
-		// Step 5: Process streaming events
-		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, b.logger, send)
+		// Step 5: Process streaming events. A successful turn/completed with
+		// no final assistant text is not a usable completion: Codex occasionally
+		// emits exactly that after a long tool-heavy turn. Continue the same
+		// thread automatically (bounded to avoid an infinite retry loop), so the
+		// filesystem work and model context survive and the caller receives a
+		// real final response instead of a generic empty-result error.
+		result := runCodexTurns(
+			ctx,
+			scanner,
+			userMessage,
+			codexEmptyCompletionMaxRetries,
+			startTurn,
+			steerer,
+			respondServerRequest,
+			b.logger.With("agent", agent.ID, "sessionKey", opts.SessionKey),
+			send,
+		)
 		if steerer != nil {
 			// The turn is over (or the stream broke) — refuse further
 			// steers now rather than at goroutine exit, so a late steer
@@ -434,8 +459,105 @@ type codexStreamResult struct {
 	toolUses      []ToolUse
 	usage         *Usage
 	processError  string // non-empty if turn/completed reported an error
+	turnStatus    string // status reported by the newest turn/completed
 	turnCompleted bool   // true if turn/completed was received
 	cancelled     bool   // true if send returned false (context cancelled)
+}
+
+// codexTurnStarter writes turn/start and returns its JSON-RPC request id.
+// Keeping this as a small function type makes the empty-completion recovery
+// loop testable without spawning a real app-server process.
+type codexTurnStarter func(input string) (int64, error)
+
+// runCodexTurns processes one logical user request, automatically continuing
+// the same Codex thread when app-server reports a successful completion but
+// supplies no final assistant response. Tool/thinking state from each attempt
+// is retained in the terminal Message; live events are already emitted by
+// parseCodexStream as each attempt runs.
+func runCodexTurns(
+	ctx context.Context,
+	scanner *jsonlLineScanner,
+	initialInput string,
+	maxEmptyRetries int,
+	startTurn codexTurnStarter,
+	steerer *codexSteerer,
+	respondServerRequest codexServerRequestResponder,
+	logger *slog.Logger,
+	send func(ChatEvent) bool,
+) *codexStreamResult {
+	combined := &codexStreamResult{}
+	input := initialInput
+
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			combined.cancelled = true
+			combined.turnCompleted = false
+			return combined
+		}
+
+		turnStartID, err := startTurn(input)
+		if err != nil {
+			send(ChatEvent{Type: "error", ErrorMessage: "codex turn/start failed: " + err.Error()})
+			combined.cancelled = true
+			combined.turnCompleted = false
+			return combined
+		}
+
+		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send)
+		combined.absorb(result)
+
+		// Only a clean, successful completion with no final answer is
+		// recoverable here. Failed/interrupted turns, cancellation, and broken
+		// streams keep their existing error paths.
+		if result.cancelled || !result.turnCompleted || result.turnStatus != "completed" || result.processError != "" || result.hasFinalResponse() {
+			return combined
+		}
+		if attempt >= maxEmptyRetries {
+			combined.processError = codexEmptyCompletionError
+			logger.Warn("codex turn completed without final response; automatic retries exhausted",
+				"retries", maxEmptyRetries)
+			return combined
+		}
+
+		logger.Warn("codex turn completed without final response; starting automatic continuation",
+			"retry", attempt+1, "maxRetries", maxEmptyRetries)
+		input = codexEmptyCompletionRetryPrompt
+	}
+}
+
+// absorb folds one continuation attempt into the logical request result. The
+// terminal flags belong to the newest attempt, while narrative/tool history is
+// cumulative so persistence retains the work performed before recovery.
+func (r *codexStreamResult) absorb(next *codexStreamResult) {
+	if next == nil {
+		return
+	}
+	r.fullText.WriteString(next.fullText.String())
+	r.thinking.WriteString(next.thinking.String())
+	r.toolUses = append(r.toolUses, next.toolUses...)
+	if next.usage != nil {
+		if r.usage == nil {
+			usage := *next.usage
+			r.usage = &usage
+		} else {
+			r.usage.InputTokens += next.usage.InputTokens
+			r.usage.OutputTokens += next.usage.OutputTokens
+			r.usage.CacheReadInputTokens += next.usage.CacheReadInputTokens
+			r.usage.CacheCreationInputTokens += next.usage.CacheCreationInputTokens
+			r.usage.CostUSD += next.usage.CostUSD
+		}
+	}
+	r.processError = next.processError
+	r.turnStatus = next.turnStatus
+	r.turnCompleted = next.turnCompleted
+	r.cancelled = next.cancelled
+}
+
+// hasFinalResponse deliberately checks assistant text rather than hasOutput:
+// tool calls and reasoning prove work happened, but they are not a response to
+// the user. Whitespace-only model output is likewise not a usable completion.
+func (r *codexStreamResult) hasFinalResponse() bool {
+	return strings.TrimSpace(r.fullText.String()) != ""
 }
 
 // buildMessage creates a Message from accumulated stream data.
@@ -516,6 +638,12 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 			json.Unmarshal(*msg.Params, &params)
 			steer.setTurnID(params.Turn.ID)
 		}
+		if steer != nil && msg.Method == "turn/completed" {
+			// Atomically retire the completed turn id before any caller can
+			// steer into it. finishTurn installs the readiness channel that an
+			// automatic continuation (if needed) will satisfy with its new id.
+			steer.finishTurn()
+		}
 
 		if res.handleNotification(&msg, itemPhases, logger, send) {
 			return res
@@ -564,12 +692,15 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 		json.Unmarshal(*msg.Params, &params)
 		if params.Delta != "" {
 			res.thinking.WriteString(params.Delta)
-			send(ChatEvent{Type: "thinking", Delta: params.Delta})
+			if !send(ChatEvent{Type: "thinking", Delta: params.Delta}) {
+				res.cancelled = true
+				return true
+			}
 		}
 		return false
 
 	case "item/completed":
-		return res.handleItemCompleted(msg, send)
+		return res.handleItemCompleted(msg, itemPhases, send)
 
 	case "thread/tokenUsage/updated":
 		if msg.Params == nil {
@@ -602,6 +733,7 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 				} `json:"turn"`
 			}
 			json.Unmarshal(*msg.Params, &params)
+			res.turnStatus = params.Turn.Status
 			if params.Turn.Status == "failed" || params.Turn.Status == "interrupted" {
 				res.processError = "codex turn " + params.Turn.Status
 				if params.Turn.Error != nil {
@@ -696,7 +828,7 @@ func (res *codexStreamResult) handleAgentMessageDelta(msg *rpcMessage, itemPhase
 	return false
 }
 
-func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, send func(ChatEvent) bool) bool {
+func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases map[string]string, send func(ChatEvent) bool) bool {
 	if msg.Params == nil {
 		return false
 	}
@@ -722,6 +854,29 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, send func(Cha
 	json.Unmarshal(*msg.Params, &params)
 
 	switch params.Item.Type {
+	case "agentMessage":
+		// app-server normally streams agentMessage deltas, but the completed
+		// item is the authoritative snapshot. If no delta arrived at all, use
+		// its text as a fallback so a valid final answer is not mistaken for an
+		// empty completion and re-run.
+		if params.Item.Text == "" {
+			return false
+		}
+		if itemPhases[params.Item.ID] == "commentary" {
+			if res.thinking.Len() == 0 {
+				res.thinking.WriteString(params.Item.Text)
+				if !send(ChatEvent{Type: "thinking", Delta: params.Item.Text}) {
+					res.cancelled = true
+					return true
+				}
+			}
+		} else if res.fullText.Len() == 0 {
+			res.fullText.WriteString(params.Item.Text)
+			if !send(ChatEvent{Type: "text", Delta: params.Item.Text}) {
+				res.cancelled = true
+				return true
+			}
+		}
 	case "commandExecution":
 		output := params.Item.AggregatedOutput
 		if output == "" && params.Item.ExitCode != nil && *params.Item.ExitCode != 0 {

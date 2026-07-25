@@ -143,6 +143,71 @@ func TestCodexSteerer_CloseFailsPendingWaiter(t *testing.T) {
 	}
 }
 
+func TestCodexSteerer_FinishTurnWaitsForReplacementTurnID(t *testing.T) {
+	s, sent := newTestSteerer(t)
+	s.setTurnID("turn-1")
+	s.finishTurn()
+
+	done := steerAsync(s, "during recovery")
+	select {
+	case err := <-done:
+		t.Fatalf("steer returned before replacement turn id was known: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("steer used completed turn id: sent = %v", *sent)
+	}
+
+	s.setTurnID("turn-2")
+	waitPending(t, s, 42)
+	s.resolve(42, nil)
+	if err := <-done; err != nil {
+		t.Fatalf("steer into replacement turn: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0], "turn-2") || strings.Contains((*sent)[0], "turn-1") {
+		t.Fatalf("steer RPC = %v, want replacement turn-2 only", *sent)
+	}
+}
+
+func TestCodexSteerer_FinishTurnWakesWaiterOnPreviousReadyChannel(t *testing.T) {
+	s, _ := newTestSteerer(t)
+	done := steerAsync(s, "waiting before transition")
+	select {
+	case err := <-done:
+		t.Fatalf("steer returned before a turn id existed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	s.finishTurn()
+	select {
+	case err := <-done:
+		t.Fatalf("steer returned during transition: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	s.setTurnID("turn-2")
+	waitPending(t, s, 42)
+	s.resolve(42, nil)
+	if err := <-done; err != nil {
+		t.Fatalf("steer after transition: %v", err)
+	}
+}
+
+func TestCodexSteerer_FinishTurnKeepsPendingAcknowledgement(t *testing.T) {
+	s, _ := newTestSteerer(t)
+	s.setTurnID("turn-1")
+	done := steerAsync(s, "accepted near completion")
+	waitPending(t, s, 42)
+
+	s.finishTurn()
+	if !s.resolve(42, nil) {
+		t.Fatal("late acknowledgement was discarded at turn boundary")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("pending steer failed across turn boundary: %v", err)
+	}
+}
+
 func TestCodexSteerer_WriteErrorPropagates(t *testing.T) {
 	s := newCodexSteerer("thread-1", func(method string, params any) (int64, error) {
 		return 7, errors.New("pipe broken")
@@ -160,12 +225,11 @@ func TestParseCodexStream_CapturesTurnIDFromResponse(t *testing.T) {
 	s, _ := newTestSteerer(t)
 	lines := []string{
 		`{"id":3,"result":{"turn":{"id":"turn-abc","status":"inProgress"}}}`,
-		`{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"turn-abc","status":"completed"}}}`,
 	}
 	scanner := newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 	result := parseCodexStream(scanner, 3, s, nil, testLogger(), func(ChatEvent) bool { return true })
-	if !result.turnCompleted {
-		t.Fatal("turn should complete")
+	if result.turnCompleted {
+		t.Fatal("turn should remain active at end of fixture")
 	}
 	s.mu.Lock()
 	got := s.turnID
@@ -179,7 +243,6 @@ func TestParseCodexStream_CapturesTurnIDFromTurnStarted(t *testing.T) {
 	s, _ := newTestSteerer(t)
 	lines := []string{
 		`{"method":"turn/started","params":{"threadId":"t","turn":{"id":"turn-def","status":"inProgress"}}}`,
-		`{"method":"turn/completed","params":{"threadId":"t","turn":{"id":"turn-def","status":"completed"}}}`,
 	}
 	scanner := newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 	parseCodexStream(scanner, 3, s, nil, testLogger(), func(ChatEvent) bool { return true })

@@ -35,8 +35,8 @@ type codexSteerer struct {
 	mu        sync.Mutex
 	turnID    string
 	closed    bool
-	readyOnce sync.Once
-	ready     chan struct{}        // closed once turnID is set or the steerer is closed
+	ready     chan struct{}        // closed once the current turnID is set or the steerer is closed
+	readyDone bool                 // guards close(ready); reset for an automatic continuation turn
 	pending   map[int64]chan error // in-flight turn/steer request id -> response slot
 }
 
@@ -57,9 +57,32 @@ func (s *codexSteerer) setTurnID(id string) {
 	s.mu.Lock()
 	if s.turnID == "" && !s.closed {
 		s.turnID = id
+		if !s.readyDone {
+			close(s.ready)
+			s.readyDone = true
+		}
 	}
 	s.mu.Unlock()
-	s.readyOnce.Do(func() { close(s.ready) })
+}
+
+// finishTurn atomically retires the completed turn id and prepares the steer
+// handle for a possible automatic continuation. Existing waiters on the old
+// readiness channel are woken so they can observe the replacement channel;
+// in-flight steer RPCs remain tracked because their acknowledgements may be
+// delivered just after turn/completed and consumed by the next parse loop.
+func (s *codexSteerer) finishTurn() {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if !s.readyDone {
+		close(s.ready)
+	}
+	s.turnID = ""
+	s.ready = make(chan struct{})
+	s.readyDone = false
+	s.mu.Unlock()
 }
 
 // close marks the turn as over: subsequent steer calls fail with
@@ -70,13 +93,16 @@ func (s *codexSteerer) close() {
 	s.closed = true
 	pending := s.pending
 	s.pending = make(map[int64]chan error)
+	if !s.readyDone {
+		close(s.ready)
+		s.readyDone = true
+	}
 	s.mu.Unlock()
 	for _, ch := range pending {
 		// The turn is over, so map to ErrAgentNotBusy — the HTTP handler
 		// turns that into 409 not_busy instead of a 500.
 		ch <- fmt.Errorf("codex: turn ended before turn/steer was acknowledged: %w", ErrAgentNotBusy)
 	}
-	s.readyOnce.Do(func() { close(s.ready) })
 }
 
 // resolve delivers the RPC response for an outstanding turn/steer
@@ -108,42 +134,55 @@ func (s *codexSteerer) resolve(id int64, rpcErr *rpcError) bool {
 
 // steer implements SteerFunc for the codex backend.
 func (s *codexSteerer) steer(text string) error {
-	select {
-	case <-s.ready:
-	case <-time.After(codexSteerTurnWait):
-		return fmt.Errorf("codex: turn did not start within %s", codexSteerTurnWait)
-	}
+	deadline := time.NewTimer(codexSteerTurnWait)
+	defer deadline.Stop()
 
-	// Hold the lock across the closed-check and the write (mirroring
-	// claudeStdinWriter) so a steer can't slip a request onto stdin after
-	// close() has declared the turn over.
-	s.mu.Lock()
-	if s.closed || s.turnID == "" {
-		s.mu.Unlock()
-		return ErrAgentNotBusy
-	}
-	id, err := s.writeRPC("turn/steer", map[string]any{
-		"threadId":       s.threadID,
-		"expectedTurnId": s.turnID,
-		"input": []map[string]any{
-			{"type": "text", "text": text},
-		},
-	})
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("codex turn/steer write: %w", err)
-	}
-	respCh := make(chan error, 1)
-	s.pending[id] = respCh
-	s.mu.Unlock()
-
-	select {
-	case err := <-respCh:
-		return err
-	case <-time.After(codexSteerRespWait):
+	for {
+		// Read the current readiness channel under the lock. An automatic
+		// continuation replaces this channel between turns; looping after it
+		// closes avoids racing a steer onto the just-completed turn.
 		s.mu.Lock()
-		delete(s.pending, id)
+		if s.closed {
+			s.mu.Unlock()
+			return ErrAgentNotBusy
+		}
+		if s.turnID == "" {
+			ready := s.ready
+			s.mu.Unlock()
+			select {
+			case <-ready:
+				continue
+			case <-deadline.C:
+				return fmt.Errorf("codex: turn did not start within %s", codexSteerTurnWait)
+			}
+		}
+
+		// Hold the lock across the write (mirroring claudeStdinWriter) so
+		// finishTurn/close cannot change the expected turn id between the
+		// check and the JSON-RPC request.
+		id, err := s.writeRPC("turn/steer", map[string]any{
+			"threadId":       s.threadID,
+			"expectedTurnId": s.turnID,
+			"input": []map[string]any{
+				{"type": "text", "text": text},
+			},
+		})
+		if err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("codex turn/steer write: %w", err)
+		}
+		respCh := make(chan error, 1)
+		s.pending[id] = respCh
 		s.mu.Unlock()
-		return fmt.Errorf("codex: turn/steer was not acknowledged within %s", codexSteerRespWait)
+
+		select {
+		case err := <-respCh:
+			return err
+		case <-time.After(codexSteerRespWait):
+			s.mu.Lock()
+			delete(s.pending, id)
+			s.mu.Unlock()
+			return fmt.Errorf("codex: turn/steer was not acknowledged within %s", codexSteerRespWait)
+		}
 	}
 }

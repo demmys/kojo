@@ -7,7 +7,11 @@ import {
   sessionEffortLevelsForModel,
 } from "./toolModels";
 
-describe("toolModels — Opus 4.8 / effort defaults", () => {
+describe("toolModels — Opus 5 / effort defaults", () => {
+  it("lists claude-opus-5 as a claude model", () => {
+    expect(modelsForTool("claude")).toContain("claude-opus-5");
+  });
+
   it("lists claude-opus-4-8 as a claude model", () => {
     expect(modelsForTool("claude")).toContain("claude-opus-4-8");
   });
@@ -20,6 +24,12 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(effortLevelsForModel("claude-fable-5")).toContain("xhigh");
     expect(effortLevelsForModel("claude-fable-5")).toContain("max");
     expect(defaultEffortForModel("claude-fable-5")).toBe("high");
+  });
+
+  it("Opus 5 supports xhigh and max but defaults to high", () => {
+    expect(effortLevelsForModel("claude-opus-5")).toContain("xhigh");
+    expect(effortLevelsForModel("claude-opus-5")).toContain("max");
+    expect(defaultEffortForModel("claude-opus-5")).toBe("high");
   });
 
   it("Opus 4.8 supports xhigh but defaults to high", () => {
@@ -37,7 +47,7 @@ describe("toolModels — Opus 4.8 / effort defaults", () => {
     expect(defaultEffortForModel("claude-opus-4-6")).toBe("high");
   });
 
-  it("opus alias is treated as Opus 4.8: supports xhigh, defaults to high", () => {
+  it("opus alias is treated as Opus 5: supports xhigh, defaults to high", () => {
     expect(effortLevelsForModel("opus")).toContain("xhigh");
     expect(defaultEffortForModel("opus")).toBe("high");
   });

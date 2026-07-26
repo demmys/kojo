@@ -8,6 +8,7 @@
 //
 // Anthropic base input/output rates (USD / 1M tokens):
 //   claude-fable-5   : 10 / 50
+//   claude-opus-5    :  5 / 25
 //   claude-opus-4-8  :  5 / 25
 //   claude-opus-4-7  :  5 / 25
 //   claude-opus-4-6  :  5 / 25
@@ -68,6 +69,7 @@ function pricedXai(
 // Keyed by the canonical (full) model id.
 const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-fable-5": pricedAnthropic(10, 50),
+  "claude-opus-5": pricedAnthropic(5, 25),
   "claude-opus-4-8": pricedAnthropic(5, 25),
   "claude-opus-4-7": pricedAnthropic(5, 25),
   "claude-opus-4-6": pricedAnthropic(5, 25),
@@ -79,9 +81,9 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
 };
 
 // kojo agent.model aliases (see web/src/lib/toolModels.ts) mapped to a
-// canonical id. "opus" → Opus 4.8, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5.
+// canonical id. "opus" → Opus 5, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5.
 const ALIASES: Record<string, string> = {
-  opus: "claude-opus-4-8",
+  opus: "claude-opus-5",
   sonnet: "claude-sonnet-5",
   haiku: "claude-haiku-4-5",
 };

@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-5.6-sol",
@@ -52,7 +52,7 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 // codex CLI 0.144.1 models_cache.json: the gpt-5.6 family advertises
 // low/medium/high/xhigh/max (sol and terra also list "ultra", which kojo's
@@ -69,11 +69,11 @@ const grokEffortModels = new Set(toolModels.grok.models);
 
 /**
  * Models whose default effort is xhigh (rather than high).
- * Per https://code.claude.com/docs/en/model-config, Opus 4.8 supports xhigh but
- * defaults to high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated
- * as Opus 4.8, so it defaults to high. grok-4.5 advertises low/medium/high
- * (default high) and grok-composer-2.5-fast advertises an empty efforts list,
- * so neither offers xhigh and both default to high.
+ * Opus 5 / 4.8 support xhigh and max but default to high; only Opus 4.7
+ * defaults to xhigh. The "opus" alias is treated as Opus 5, so it defaults
+ * to high. grok-4.5 advertises low/medium/high (default high) and
+ * grok-composer-2.5-fast advertises an empty efforts list, so neither offers
+ * xhigh and both default to high.
  */
 const defaultXhighModels = new Set(["claude-opus-4-7"]);
 

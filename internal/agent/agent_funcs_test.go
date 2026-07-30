@@ -158,10 +158,14 @@ func TestValidEffort(t *testing.T) {
 
 func TestValidModelEffort(t *testing.T) {
 	// xhigh is valid for opus models, Fable 5, and Sonnet 5
-	for _, m := range []string{"opus", "claude-sonnet-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
+	for _, m := range []string{"opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
+	}
+	// Opus 5 supports max effort (full ladder: low … max)
+	if !ValidModelEffort("claude-opus-5", "max") {
+		t.Errorf("expected max to be valid for claude-opus-5")
 	}
 	// grok 0.2.91 advertises only low/medium/high (grok-4.5) or an empty
 	// efforts list (composer); xhigh/max are no longer valid here.

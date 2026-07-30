@@ -5,191 +5,41 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-
-	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
-// kojo-attach skill.
-//
-// Mechanism: the agent writes the file it wants to attach into a
-// dedicated subdirectory of its working dir
-//
-//	<agentDir>/.kojo/attach/
-//
-// During the turn the LLM may write any number of files there. The
-// streaming watcher ingests files as they appear, removes them from
-// the staging directory after ingest, and surfaces them immediately
-// in the UI. A final ScanAndIngestAttachments pass catches leftover
-// files before the assistant Message is persisted. On non-hub peers
-// the bytes are also forwarded to hub via the peer-signed ingest
-// endpoint so the UI (which always lives on hub) can preview /
-// download them through the standard /api/v1/blob/{scope}/{path}
-// route.
-//
-// We deliberately use a magic directory instead of a parse marker
-// inside the agent's chat text: it keeps the user-visible reply
-// clean, works identically for claude / codex / grok / llama.cpp
-// (none of them have to mutate the streamed text), and lets the
-// agent stage many files atomically by writing then renaming into
-// place.
-//
-// Lifecycle (mirrors device_switch_skill.go):
-//
-//   - Manager.prepareChat calls SyncAttachSkillForTool right after
-//     PrepareClaudeSettings / SyncDeviceSwitchSkill.
-//   - The skill is installed only when the blob store is wired and
-//     the operator has not opted out via PATCH /api/v1/agents/{id}
-//     {"attachmentsEnabled": false}. There is no peer-count gate:
-//     unlike device-switch, attachments work in single-node mode
-//     too (the bytes land in the local blob store).
-//   - Idempotent — safe to call on every prepareChat. A toggle-off
-//     removes the SKILL.md and the surrounding kojo-attach/ subdir
-//     in one RemoveAll so claude no longer sees the skill.
+// attachStagingSubpath is the path (relative to agentDir) where an agent
+// writes files it wants Kojo to attach to a WebUI response. The scanner and
+// the channel-aware system-prompt contract share this constant.
+const attachStagingSubpath = ".kojo/attach"
 
 const attachSkillDirName = "kojo-attach"
 
-// attachStagingSubpath is the path (relative to agentDir) where the
-// agent writes files it wants to attach. The scan code uses the
-// same constant so the SKILL.md and the daemon agree on a single
-// well-known directory.
-const attachStagingSubpath = ".kojo/attach"
-
-// attachSkillBody is the SKILL.md content for the kojo-attach skill.
-// Frontmatter follows the format documented at
-// https://code.claude.com/docs/en/skills.md.
-//
-// The skill is intentionally short and concrete: tell the agent
-// where to write files, what kojo does between tool calls, and a
-// few gotchas (subdirectories not preserved, only files written
-// under .kojo/attach are picked up).
-const attachSkillBody = `---
-name: kojo-attach
-description: Send a file (image, audio, video, PDF, archive, anything) to the user as a downloadable attachment on your next reply. Use whenever you need to surface bytes the user must see in the chat UI — generated images, rendered charts, fetched documents, build artifacts. The file is forwarded to the user automatically; you do NOT have to paste a link or describe a path in your reply.
----
-
-## How to attach a file
-
-1. Make sure the directory ` + "`.kojo/attach/`" + ` exists under your
-   current working directory:
-
-   ` + "```bash" + `
-   mkdir -p .kojo/attach
-   ` + "```" + `
-
-2. Write (or move) the file you want to send into
-   ` + "`.kojo/attach/<your-filename>`" + `. Use a plain filename
-   (no subdirectories — they are ignored). Examples:
-
-   ` + "```bash" + `
-   cp /tmp/chart.png .kojo/attach/chart.png
-   mv ./out/report.pdf .kojo/attach/report.pdf
-   ` + "```" + `
-
-3. The file appears in the user's chat UI immediately — kojo
-   watches the directory while your reply is in progress, streams
-   each file as soon as it lands, and removes the staged copy after
-   ingest. By your next tool call, files you already staged may be
-   gone. A final sweep catches any leftover files before the reply
-   is saved. On non-hub peers a copy is also forwarded to hub so
-   the UI can download it.
-
-## Rules
-
-- Only regular files directly inside ` + "`.kojo/attach/`" + ` are
-  picked up. Symlinks, sockets, FIFOs, hidden dotfiles, and any
-  nested subdirectories are ignored.
-- Per-file size is capped at 10 GiB (the same ceiling the user
-  upload path enforces). Anything larger is skipped with a
-  warning in the daemon log.
-- The directory is cleanup territory, not storage. Kojo removes
-  files after ingest, which can happen between tool calls. Do not
-  stash files there hoping to reference them later — copy them
-  somewhere else if you need them.
-- Attachment bodies are delivery artifacts, not long-term storage.
-  Kojo blob cleanup may remove them after ` + "`--clean-max-age-days`" + `
-  (default: 7 days), while the chat message metadata can remain.
-- You do not need to mention the attachment in your reply.
-  The UI renders previewable thumbnails (images / video) or a
-  download chip (everything else) on the assistant bubble. A
-  short caption (« here is the chart you asked for ») is still
-  fine if it helps the user, but writing the raw path or a curl
-  command in the reply is redundant.
-- Filenames are sanitised: the daemon keeps a basename only,
-  rejects ` + "`..`" + ` segments, and resolves clashes by appending
-  a numeric suffix. Pick a descriptive base name and let kojo
-  worry about uniqueness.
-`
-
-// attachSkillMu serializes SyncAttachSkill per-agent for the same
-// reason device_switch_skill.go does: concurrent prepareChat /
-// Manager.Update callers must not race a RemoveAll against a
-// mid-write. Map keyed by agent_id; entries are never deleted so
-// the mutex identity stays stable across the agent's lifetime.
+// attachSkillLocks serializes legacy cleanup against concurrent prepareChat
+// calls for the same agent. Entries intentionally live for the process
+// lifetime so the mutex identity remains stable.
 var attachSkillLocks keyedMutex
 
-func lockAttachSkill(agentID string) func() {
-	return attachSkillLocks.Lock(agentID)
-}
-
-// SyncAttachSkill writes or removes the kojo-attach SKILL.md based
-// on `enabled`. Idempotent: safe to call on every prepareChat.
-// Failures are logged at warn level; the agent can still run
-// without the skill so an I/O error here must not block the chat.
+// RemoveLegacyAttachSkills removes kojo-attach project skills installed by
+// older Kojo versions. Project skill files are visible to every session in an
+// agent directory, which makes them impossible to filter safely per delivery
+// transport: removing one for a Slack turn could race a concurrent WebUI turn.
 //
-// Skill placement mirrors SyncDeviceSwitchSkill: per-agent under
-// <agentDir>/.claude/skills/kojo-attach/SKILL.md. The claude CLI
-// walks up from its cwd looking for skills/, and we set cmd.Dir to
-// agentDir when spawning, so the skill is in scope.
-func SyncAttachSkill(agentID string, enabled bool, logger *slog.Logger) {
-	syncAttachSkillAt(agentID, ".claude", enabled, logger)
-}
-
-// SyncCodexAttachSkill installs the same kojo-attach instructions in
-// Codex's project skill tree. Codex app-server loads `.codex/skills`
-// from cwd, while Claude/Grok use `.claude/skills`.
-func SyncCodexAttachSkill(agentID string, enabled bool, logger *slog.Logger) {
-	syncAttachSkillAt(agentID, ".codex", enabled, logger)
-}
-
-func SyncAttachSkillForTool(agentID, tool string, enabled bool, logger *slog.Logger) {
-	switch tool {
-	case "claude", "custom", "grok":
-		SyncAttachSkill(agentID, enabled, logger)
-	case "codex":
-		SyncCodexAttachSkill(agentID, enabled, logger)
-	}
-}
-
-func syncAttachSkillAt(agentID, root string, enabled bool, logger *slog.Logger) {
+// The attachment contract now comes exclusively from the channel-aware system
+// prompt. Remove both backend layouts so switching tools cannot resurrect a
+// stale copy. Sibling skills and the surrounding project configuration remain
+// untouched.
+func RemoveLegacyAttachSkills(agentID string, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	unlock := lockAttachSkill(agentID)
+	unlock := attachSkillLocks.Lock(agentID)
 	defer unlock()
-	dir := agentDir(agentID)
-	skillDir := filepath.Join(dir, root, "skills", attachSkillDirName)
-	skillPath := filepath.Join(skillDir, "SKILL.md")
 
-	if !enabled {
-		// Remove any prior install so a toggle-off cleans up
-		// promptly. RemoveAll on the skill subdir leaves the
-		// surrounding .claude/ tree intact — settings.local.json
-		// and other skills are unaffected.
+	for _, root := range []string{".claude", ".codex"} {
+		skillDir := filepath.Join(agentDir(agentID), root, "skills", attachSkillDirName)
 		if err := os.RemoveAll(skillDir); err != nil && !errors.Is(err, os.ErrNotExist) {
-			logger.Warn("failed to remove attach skill", "agent", agentID, "err", err)
+			logger.Warn("failed to remove legacy attach skill",
+				"agent", agentID, "path", skillDir, "err", err)
 		}
-		return
 	}
-	if err := os.MkdirAll(skillDir, 0o755); err != nil {
-		logger.Warn("failed to create attach skill dir", "agent", agentID, "err", err)
-		return
-	}
-	// atomicfile.WriteBytes is tmp-rename so a concurrent claude
-	// read can never see a half-written body. Combined with the
-	// per-agent mutex above, sync is fully serialized.
-	if err := atomicfile.WriteBytes(skillPath, []byte(attachSkillBody), 0o644); err != nil {
-		logger.Warn("failed to write attach SKILL.md", "agent", agentID, "err", err)
-		return
-	}
-	logger.Debug("attach skill installed", "agent", agentID, "path", skillPath)
 }

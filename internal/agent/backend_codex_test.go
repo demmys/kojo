@@ -1,11 +1,15 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/chathistory"
 )
@@ -24,7 +28,8 @@ func rpcLine(method string, params any) string {
 
 // rpcResponseLine builds a JSON-RPC response line with an ID.
 func rpcResponseLine(id int64, result any, rpcErr *rpcError) string {
-	msg := rpcMessage{ID: &id}
+	rawID := json.RawMessage(strconv.FormatInt(id, 10))
+	msg := rpcMessage{ID: &rawID}
 	if result != nil {
 		raw, _ := json.Marshal(result)
 		rawMsg := json.RawMessage(raw)
@@ -34,6 +39,18 @@ func rpcResponseLine(id int64, result any, rpcErr *rpcError) string {
 		msg.Error = rpcErr
 	}
 	data, _ := json.Marshal(msg)
+	return string(data)
+}
+
+// rpcServerRequestLine builds a server-initiated JSON-RPC request. Codex may
+// use either a numeric or string request ID, so keep id polymorphic here.
+func rpcServerRequestLine(id any, method string, params any) string {
+	data, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	})
 	return string(data)
 }
 
@@ -49,7 +66,7 @@ func collectCodexEvents(t *testing.T, turnStartID int64, lines ...string) ([]Cha
 		return true
 	}
 
-	result := parseCodexStream(scanner, turnStartID, nil, testLogger(), send)
+	result := parseCodexStream(scanner, turnStartID, nil, nil, testLogger(), send)
 	return events, result
 }
 
@@ -241,6 +258,27 @@ func TestParseCodexStream_TextDelta(t *testing.T) {
 	}
 	if textEvents != 2 {
 		t.Errorf("expected 2 text events, got %d", textEvents)
+	}
+}
+
+func TestParseCodexStream_AgentMessageCompletedSnapshotFallback(t *testing.T) {
+	events, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "i1", "type": "agentMessage", "phase": "final_answer"},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "i1", "type": "agentMessage", "text": "snapshot answer"},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if got := result.fullText.String(); got != "snapshot answer" {
+		t.Fatalf("fullText = %q, want completed-item snapshot", got)
+	}
+	if len(events) != 1 || events[0].Type != "text" || events[0].Delta != "snapshot answer" {
+		t.Fatalf("events = %+v, want one snapshot text event", events)
 	}
 }
 
@@ -509,6 +547,232 @@ func TestParseCodexStream_TurnInterrupted(t *testing.T) {
 	}
 }
 
+func TestRunCodexTurns_RetriesEmptyCompletionAndPreservesWork(t *testing.T) {
+	input := strings.Join([]string{
+		rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "turn-1"}}, nil),
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "first thought;"}),
+		rpcLine("thread/tokenUsage/updated", map[string]any{
+			"tokenUsage": map[string]any{"last": map[string]int{"inputTokens": 10, "outputTokens": 2}},
+		}),
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "cmd-1", "type": "commandExecution", "command": "touch result.txt"},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "cmd-1", "type": "commandExecution", "aggregatedOutput": "done", "exitCode": 0},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"id": "turn-1", "status": "completed"},
+		}),
+		rpcResponseLine(2, map[string]any{"turn": map[string]any{"id": "turn-2"}}, nil),
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "second thought"}),
+		rpcLine("thread/tokenUsage/updated", map[string]any{
+			"tokenUsage": map[string]any{"last": map[string]int{"inputTokens": 20, "outputTokens": 3}},
+		}),
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "msg-2", "type": "agentMessage", "phase": "final_answer"},
+		}),
+		rpcLine("item/agentMessage/delta", map[string]any{
+			"itemId": "msg-2", "delta": "Recovered final answer",
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"id": "turn-2", "status": "completed"},
+		}),
+	}, "\n") + "\n"
+
+	var starts []string
+	startTurn := func(turnInput string) (int64, error) {
+		starts = append(starts, turnInput)
+		return int64(len(starts)), nil
+	}
+	var events []ChatEvent
+	result := runCodexTurns(
+		context.Background(),
+		newCodexLineScanner(strings.NewReader(input)),
+		"original request",
+		codexEmptyCompletionMaxRetries,
+		startTurn,
+		nil,
+		nil,
+		testLogger(),
+		func(event ChatEvent) bool {
+			events = append(events, event)
+			return true
+		},
+	)
+
+	if len(starts) != 2 {
+		t.Fatalf("turn starts = %d, want 2", len(starts))
+	}
+	if starts[0] != "original request" || starts[1] != codexEmptyCompletionRetryPrompt {
+		t.Fatalf("turn inputs = %#v, want original then recovery prompt", starts)
+	}
+	if !result.turnCompleted || result.processError != "" || result.cancelled {
+		t.Fatalf("result terminal state = %+v, want clean completion", result)
+	}
+	if got := result.fullText.String(); got != "Recovered final answer" {
+		t.Errorf("fullText = %q, want recovered answer", got)
+	}
+	if len(result.toolUses) != 1 || result.toolUses[0].Input != "touch result.txt" || result.toolUses[0].Output != "done" {
+		t.Errorf("preserved tool uses = %+v, want first-turn command", result.toolUses)
+	}
+	if got := result.thinking.String(); got != "first thought;second thought" {
+		t.Errorf("thinking = %q, want both attempts", got)
+	}
+	if result.usage == nil || result.usage.InputTokens != 30 || result.usage.OutputTokens != 5 {
+		t.Errorf("usage = %+v, want sum across attempts", result.usage)
+	}
+	var textEvents int
+	for _, event := range events {
+		if event.Type == "text" {
+			textEvents++
+		}
+	}
+	if textEvents != 1 {
+		t.Errorf("text events = %d, want only the recovered final answer", textEvents)
+	}
+}
+
+func TestRunCodexTurns_StopsAfterBoundedEmptyCompletionRetries(t *testing.T) {
+	var lines []string
+	for i := int64(1); i <= codexEmptyCompletionMaxRetries+1; i++ {
+		lines = append(lines,
+			rpcResponseLine(i, map[string]any{"turn": map[string]any{"id": "empty"}}, nil),
+			rpcLine("turn/completed", map[string]any{
+				"turn": map[string]any{"id": "empty", "status": "completed"},
+			}),
+		)
+	}
+
+	var starts int
+	result := runCodexTurns(
+		context.Background(),
+		newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n")+"\n")),
+		"original request",
+		codexEmptyCompletionMaxRetries,
+		func(string) (int64, error) {
+			starts++
+			return int64(starts), nil
+		},
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return true },
+	)
+
+	wantStarts := codexEmptyCompletionMaxRetries + 1
+	if starts != wantStarts {
+		t.Fatalf("turn starts = %d, want %d", starts, wantStarts)
+	}
+	if !result.turnCompleted || result.processError != codexEmptyCompletionError {
+		t.Fatalf("result = %+v, want completed with bounded-retry error", result)
+	}
+}
+
+func TestRunCodexTurns_DoesNotRetryFailedOrAnsweredTurn(t *testing.T) {
+	tests := []struct {
+		name     string
+		lines    []string
+		wantText string
+		wantErr  string
+	}{
+		{
+			name: "failed",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "failed"}}, nil),
+				rpcLine("turn/completed", map[string]any{
+					"turn": map[string]any{"id": "failed", "status": "failed", "error": map[string]any{"message": "service failed"}},
+				}),
+			},
+			wantErr: "service failed",
+		},
+		{
+			name: "answered",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "answered"}}, nil),
+				rpcLine("item/started", map[string]any{
+					"item": map[string]any{"id": "msg", "type": "agentMessage", "phase": "final_answer"},
+				}),
+				rpcLine("item/agentMessage/delta", map[string]any{"itemId": "msg", "delta": "done"}),
+				rpcLine("turn/completed", map[string]any{
+					"turn": map[string]any{"id": "answered", "status": "completed"},
+				}),
+			},
+			wantText: "done",
+		},
+		{
+			name: "missing status is not retryable",
+			lines: []string{
+				rpcResponseLine(1, map[string]any{"turn": map[string]any{"id": "unknown"}}, nil),
+				rpcLine("turn/completed", map[string]any{"turn": map[string]any{"id": "unknown"}}),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var starts int
+			result := runCodexTurns(
+				context.Background(),
+				newCodexLineScanner(strings.NewReader(strings.Join(tt.lines, "\n")+"\n")),
+				"original",
+				codexEmptyCompletionMaxRetries,
+				func(string) (int64, error) { starts++; return 1, nil },
+				nil,
+				nil,
+				testLogger(),
+				func(ChatEvent) bool { return true },
+			)
+			if starts != 1 {
+				t.Fatalf("turn starts = %d, want no retry", starts)
+			}
+			if got := result.fullText.String(); got != tt.wantText {
+				t.Errorf("fullText = %q, want %q", got, tt.wantText)
+			}
+			if result.processError != tt.wantErr {
+				t.Errorf("processError = %q, want %q", result.processError, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunCodexTurns_ContextCancelledBeforeRetryStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var starts int
+	result := runCodexTurns(
+		ctx,
+		newCodexLineScanner(strings.NewReader("")),
+		"original",
+		codexEmptyCompletionMaxRetries,
+		func(string) (int64, error) { starts++; return 1, nil },
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return true },
+	)
+	if starts != 0 || !result.cancelled || result.turnCompleted {
+		t.Fatalf("starts=%d result=%+v, want cancellation before turn/start", starts, result)
+	}
+}
+
+func TestParseCodexStream_ReasoningSendCancellationStops(t *testing.T) {
+	input := strings.Join([]string{
+		rpcLine("item/reasoning/textDelta", map[string]any{"delta": "reasoning"}),
+		rpcLine("turn/completed", map[string]any{"turn": map[string]any{"status": "completed"}}),
+	}, "\n") + "\n"
+	result := parseCodexStream(
+		newCodexLineScanner(strings.NewReader(input)),
+		1,
+		nil,
+		nil,
+		testLogger(),
+		func(ChatEvent) bool { return false },
+	)
+	if !result.cancelled || result.turnCompleted {
+		t.Fatalf("result = %+v, want immediate cancellation on rejected reasoning event", result)
+	}
+}
+
 func TestParseCodexStream_TurnStartError(t *testing.T) {
 	var turnID int64 = 5
 	events, result := collectCodexEvents(t, turnID,
@@ -578,6 +842,320 @@ func TestParseCodexStream_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestParseCodexStream_FailsPluginInstallAndContinues(t *testing.T) {
+	input := strings.Join([]string{
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{
+				"id": "plugin-tool-1", "type": "dynamicToolCall",
+				"tool": "request_plugin_install",
+			},
+		}),
+		rpcServerRequestLine("plugin-install-1", "item/tool/call", map[string]any{
+			"tool":      "request_plugin_install",
+			"arguments": map[string]string{"plugin_id": "google-drive@openai-curated-remote"},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id": "plugin-tool-1", "type": "dynamicToolCall",
+				"tool": "request_plugin_install", "success": false,
+			},
+		}),
+		rpcLine("item/agentMessage/delta", map[string]any{
+			"itemId": "i1", "delta": "fallback answer",
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	}, "\n") + "\n"
+
+	var wire strings.Builder
+	respond := newCodexServerRequestResponder(func(v any) error {
+		data, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		wire.Write(data)
+		wire.WriteByte('\n')
+		return nil
+	})
+	result := parseCodexStream(
+		newCodexLineScanner(strings.NewReader(input)),
+		1,
+		nil,
+		respond,
+		testLogger(),
+		func(ChatEvent) bool { return true },
+	)
+
+	var response struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  struct {
+			Success      bool `json:"success"`
+			ContentItems []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"contentItems"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(wire.String())), &response); err != nil {
+		t.Fatalf("decode tool failure response: %v; wire=%q", err, wire.String())
+	}
+	if got := string(response.ID); got != `"plugin-install-1"` {
+		t.Errorf("tool failure response ID = %s, want quoted string ID", got)
+	}
+	if response.JSONRPC != "2.0" || response.Result.Success {
+		t.Errorf("tool failure response = %+v, want unsuccessful JSON-RPC result", response)
+	}
+	if len(response.Result.ContentItems) != 1 || !strings.Contains(response.Result.ContentItems[0].Text, "normal chat") {
+		t.Errorf("tool failure contentItems = %+v, want fallback guidance", response.Result.ContentItems)
+	}
+	if !result.turnCompleted {
+		t.Fatal("turnCompleted = false; server request must not stop the stream")
+	}
+	if got := result.fullText.String(); got != "fallback answer" {
+		t.Errorf("fullText = %q, want fallback answer", got)
+	}
+	if len(result.toolUses) != 1 || result.toolUses[0].Output != "failed" {
+		t.Errorf("tool uses = %+v, want completed failed request_plugin_install call", result.toolUses)
+	}
+}
+
+func TestWaitCodexRPCResponse_RejectsServerRequestAndContinues(t *testing.T) {
+	input := strings.Join([]string{
+		rpcServerRequestLine(91, "mcpServer/elicitation/request", map[string]any{}),
+		rpcResponseLine(7, map[string]any{"ok": true}, nil),
+	}, "\n") + "\n"
+
+	var wire []byte
+	respond := newCodexServerRequestResponder(func(v any) error {
+		var err error
+		wire, err = json.Marshal(v)
+		return err
+	})
+	msg, ok, err := waitCodexRPCResponse(
+		newCodexLineScanner(strings.NewReader(input)),
+		7,
+		respond,
+		testLogger(),
+	)
+	if err != nil {
+		t.Fatalf("waitCodexRPCResponse error: %v", err)
+	}
+	if !ok || msg == nil {
+		t.Fatal("waitCodexRPCResponse did not return the target response")
+	}
+	var response struct {
+		ID     json.RawMessage   `json:"id"`
+		Result map[string]string `json:"result"`
+	}
+	if err := json.Unmarshal(wire, &response); err != nil {
+		t.Fatalf("decode elicitation response: %v", err)
+	}
+	if got := string(response.ID); got != "91" || response.Result["action"] != "decline" {
+		t.Errorf("elicitation response = %+v, want numeric ID 91 and decline", response)
+	}
+	if id, ok := msg.numericID(); !ok || id != 7 {
+		t.Errorf("response ID = (%d, %v), want (7, true)", id, ok)
+	}
+}
+
+func TestParseCodexStream_ServerRequestRejectionWriteFailureStops(t *testing.T) {
+	input := strings.Join([]string{
+		rpcServerRequestLine(91, "item/tool/call", map[string]any{"tool": "request_plugin_install"}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	}, "\n") + "\n"
+
+	var events []ChatEvent
+	result := parseCodexStream(
+		newCodexLineScanner(strings.NewReader(input)),
+		1,
+		nil,
+		newCodexServerRequestResponder(func(any) error { return errors.New("broken stdin") }),
+		testLogger(),
+		func(event ChatEvent) bool {
+			events = append(events, event)
+			return true
+		},
+	)
+
+	if !result.cancelled || result.turnCompleted {
+		t.Fatalf("result = %+v, want cancelled before turn completion", result)
+	}
+	if len(events) != 1 || events[0].Type != "error" || !strings.Contains(events[0].ErrorMessage, "broken stdin") {
+		t.Fatalf("events = %+v, want rejection write error", events)
+	}
+}
+
+func TestCodexServerRequestResponder_HandlesKnownInteractiveMethods(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		wantResult map[string]any
+	}{
+		{name: "command approval", method: "item/commandExecution/requestApproval", wantResult: map[string]any{"decision": "decline"}},
+		{name: "file approval", method: "item/fileChange/requestApproval", wantResult: map[string]any{"decision": "decline"}},
+		{name: "legacy command approval", method: "execCommandApproval", wantResult: map[string]any{"decision": "denied"}},
+		{name: "legacy patch approval", method: "applyPatchApproval", wantResult: map[string]any{"decision": "denied"}},
+		{name: "MCP elicitation", method: "mcpServer/elicitation/request", wantResult: map[string]any{"action": "decline"}},
+		{name: "user input", method: "item/tool/requestUserInput", wantResult: map[string]any{"answers": map[string]any{}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var wire []byte
+			respond := newCodexServerRequestResponder(func(v any) error {
+				var err error
+				wire, err = json.Marshal(v)
+				return err
+			})
+			id := json.RawMessage(`42`)
+			params := json.RawMessage(`{}`)
+			if _, err := respond(&rpcMessage{ID: &id, Method: tt.method, Params: &params}); err != nil {
+				t.Fatalf("respond: %v", err)
+			}
+
+			var response struct {
+				Result map[string]any `json:"result"`
+			}
+			if err := json.Unmarshal(wire, &response); err != nil {
+				t.Fatalf("decode result response: %v", err)
+			}
+			for key, want := range tt.wantResult {
+				if got := response.Result[key]; !reflect.DeepEqual(got, want) {
+					t.Errorf("result[%q] = %#v, want %#v", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexServerRequestResponder_DeclinesAdditionalPermissions(t *testing.T) {
+	var wire []byte
+	respond := newCodexServerRequestResponder(func(v any) error {
+		var err error
+		wire, err = json.Marshal(v)
+		return err
+	})
+	id := json.RawMessage(`43`)
+	params := json.RawMessage(`{}`)
+	if _, err := respond(&rpcMessage{ID: &id, Method: "item/permissions/requestApproval", Params: &params}); err != nil {
+		t.Fatalf("respond: %v", err)
+	}
+	var response struct {
+		Result struct {
+			Permissions struct {
+				FileSystem any `json:"fileSystem"`
+				Network    any `json:"network"`
+			} `json:"permissions"`
+			Scope string `json:"scope"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(wire, &response); err != nil {
+		t.Fatalf("decode permissions response: %v", err)
+	}
+	if response.Result.Scope != "turn" || response.Result.Permissions.FileSystem != nil || response.Result.Permissions.Network != nil {
+		t.Errorf("permissions response = %+v, want no additional permissions for turn", response.Result)
+	}
+}
+
+func TestCodexServerRequestResponder_ReturnsCurrentTime(t *testing.T) {
+	var wire []byte
+	respond := newCodexServerRequestResponder(func(v any) error {
+		var err error
+		wire, err = json.Marshal(v)
+		return err
+	})
+	id := json.RawMessage(`44`)
+	params := json.RawMessage(`{}`)
+	before := time.Now().Unix()
+	if _, err := respond(&rpcMessage{ID: &id, Method: "currentTime/read", Params: &params}); err != nil {
+		t.Fatalf("respond: %v", err)
+	}
+	after := time.Now().Unix()
+	var response struct {
+		Result struct {
+			CurrentTimeAt int64 `json:"currentTimeAt"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(wire, &response); err != nil {
+		t.Fatalf("decode current time response: %v", err)
+	}
+	if got := response.Result.CurrentTimeAt; got < before || got > after {
+		t.Errorf("currentTimeAt = %d, want between %d and %d", got, before, after)
+	}
+}
+
+func TestParseCodexStream_CriticalOrUnknownServerRequestStops(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		params any
+		want   string
+	}{
+		{name: "auth refresh", method: "account/chatgptAuthTokens/refresh", params: map[string]any{}, want: "infrastructure request"},
+		{name: "attestation", method: "attestation/generate", params: map[string]any{}, want: "infrastructure request"},
+		{name: "unknown method", method: "future/newRequest", params: map[string]any{}, want: "unknown Codex server request"},
+		{name: "unknown dynamic tool", method: "item/tool/call", params: map[string]any{"tool": "future_tool"}, want: `dynamic client tool "future_tool"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := strings.Join([]string{
+				rpcServerRequestLine("server-1", tt.method, tt.params),
+				rpcLine("turn/completed", map[string]any{"turn": map[string]any{"status": "completed"}}),
+			}, "\n") + "\n"
+			var wireCalls int
+			var events []ChatEvent
+			result := parseCodexStream(
+				newCodexLineScanner(strings.NewReader(input)),
+				1,
+				nil,
+				newCodexServerRequestResponder(func(any) error { wireCalls++; return nil }),
+				testLogger(),
+				func(event ChatEvent) bool { events = append(events, event); return true },
+			)
+			if !result.cancelled || result.turnCompleted {
+				t.Fatalf("result = %+v, want immediate stop", result)
+			}
+			if wireCalls != 0 {
+				t.Fatalf("wire calls = %d, want no generic response for critical request", wireCalls)
+			}
+			if len(events) != 1 || events[0].Type != "error" || !strings.Contains(events[0].ErrorMessage, tt.want) {
+				t.Fatalf("events = %+v, want explicit compatibility error containing %q", events, tt.want)
+			}
+		})
+	}
+}
+
+func TestCodexServerRequestResponder_PreservesRequestID(t *testing.T) {
+	for _, rawID := range []string{`91`, `"plugin-install-1"`} {
+		t.Run(rawID, func(t *testing.T) {
+			var wire []byte
+			respond := newCodexServerRequestResponder(func(v any) error {
+				var err error
+				wire, err = json.Marshal(v)
+				return err
+			})
+
+			id := json.RawMessage(rawID)
+			params := json.RawMessage(`{"tool":"request_plugin_install","arguments":{}}`)
+			if _, err := respond(&rpcMessage{ID: &id, Method: "item/tool/call", Params: &params}); err != nil {
+				t.Fatalf("respond: %v", err)
+			}
+			var response rpcResultResponse
+			if err := json.Unmarshal(wire, &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if got := string(response.ID); got != rawID {
+				t.Errorf("response ID = %s, want %s", got, rawID)
+			}
+		})
+	}
+}
+
 func TestParseCodexStream_Cancelled(t *testing.T) {
 	input := rpcLine("item/agentMessage/delta", map[string]any{
 		"itemId": "i1", "delta": "a",
@@ -593,7 +1171,7 @@ func TestParseCodexStream_Cancelled(t *testing.T) {
 		return callCount < 2
 	}
 
-	result := parseCodexStream(scanner, 1, nil, testLogger(), send)
+	result := parseCodexStream(scanner, 1, nil, nil, testLogger(), send)
 	if !result.cancelled {
 		t.Error("expected cancelled = true")
 	}

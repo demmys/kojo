@@ -1814,6 +1814,21 @@ type chatPrep struct {
 	mcpServers            map[string]mcpServerEntry
 }
 
+// prepareChatOptions describes response-surface capabilities that can differ
+// between delivery transports. Keep these separate from Agent settings: an
+// agent can serve WebUI and Slack conversations concurrently, so changing the
+// persisted DisabledInjections set for one Slack turn would affect unrelated
+// WebUI turns.
+type prepareChatOptions struct {
+	disableKojoAttachmentInstructions bool
+}
+
+func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
+	if opts.disableKojoAttachmentInstructions && !a.InjectionDisabled(InjectionAttachments) {
+		a.DisabledInjections = append(a.DisabledInjections, InjectionAttachments)
+	}
+}
+
 // prepareChat performs the common setup for Chat and ChatOneShot:
 // persona sync, agent snapshot, backend resolution, system prompt construction,
 // and memory context injection.
@@ -1821,7 +1836,7 @@ type chatPrep struct {
 // skipMemoryContext disables query-based memory hints. Use when the transcript
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
-func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool) (*chatPrep, error) {
+func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool, opts prepareChatOptions) (*chatPrep, error) {
 	// Cheap pre-check: refuse archived agents (and unknown ones) before any
 	// disk I/O like syncPersona, so dormant agents don't leak side effects
 	// into persona files / publicProfile regeneration.
@@ -1890,7 +1905,16 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, agentID)
 	}
 	agentCopy := *a
+	// prepareChatOptions may append a turn-local disabled injection below.
+	// Detach the slice while holding m.mu so the snapshot never writes through
+	// Agent's shared backing array or races a concurrent settings update.
+	agentCopy.DisabledInjections = append([]string(nil), a.DisabledInjections...)
 	m.mu.Unlock()
+
+	// External transports such as Slack deliver the assistant's text through
+	// their own API and do not consume Kojo's MessageAttachment events. Hide
+	// the staging contract for those turns without mutating the shared Agent.
+	applyPrepareChatOptions(&agentCopy, opts)
 
 	backend, err := m.resolveBackend(&agentCopy)
 	if err != nil {
@@ -1919,19 +1943,12 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// toggle, and removes any stale SKILL.md when the toggle is
 	// off or the last peer was dropped.
 	SyncDeviceSwitchSkillForTool(agentID, agentCopy.Tool, agentCopy.IsDeviceSwitchEnabled(), m.logger)
-	// kojo-attach skill: agent writes files into
-	// <agentDir>/.kojo/attach/ during the turn and kojo surfaces
-	// them as MessageAttachment chips on the assistant reply. The
-	// dispatcher writes to the backend's project skill tree
-	// (.claude/skills for Claude/Grok, .codex/skills for Codex).
-	// Gated on blob store presence because without a blob.Store
-	// there is no canonical place to store the bytes and the user UI
-	// cannot fetch them. The feature is always-on when both gates pass.
-	// Also gated on the per-agent attachments injection toggle so
-	// disabling the prompt section removes the SKILL.md copy of the
-	// same contract instead of leaving it reachable via the skill tree.
-	SyncAttachSkillForTool(agentID, agentCopy.Tool,
-		m.blobStore != nil && !agentCopy.InjectionDisabled(InjectionAttachments), m.logger)
+	// Older versions also installed kojo-attach as a project skill. A skill
+	// file is shared by every concurrent session in the agent directory, so it
+	// cannot be hidden for Slack without also racing WebUI turns. The system
+	// prompt is now the single source of the attachment contract and can be
+	// filtered per turn; remove any legacy skill copies during migration.
+	RemoveLegacyAttachSkills(agentID, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
@@ -2106,7 +2123,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// classifier runs concurrently with the (slow) prepare work.
 	effortCh := m.resolveTurnEffortAsync(ctx, agentID, userMessage, role == "system")
 
-	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false)
+	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false, prepareChatOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -2328,6 +2345,12 @@ type OneShotOpts struct {
 	// offset AFTER the cacheable shared prefix, so adding the block does
 	// not invalidate the prompt cache for other one-shot callers.
 	SystemPromptExtra string
+
+	// DisableKojoAttachmentInstructions hides Kojo's response-attachment staging
+	// instructions for delivery transports that only consume text. It is a
+	// per-call capability rather than an Agent setting so WebUI and external
+	// conversations can run concurrently without changing each other's prompt.
+	DisableKojoAttachmentInstructions bool
 }
 
 // ChatOneShot runs a one-shot chat that does not save to the agent's
@@ -2352,7 +2375,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// callers (Slack/Discord) are always human-driven → systemTurn=false.
 	effortCh := m.resolveTurnEffortAsync(ctx, agentID, userMessage, false)
 
-	prep, err := m.prepareChat(ctx, agentID, userMessage, false, false)
+	prep, err := m.prepareChat(ctx, agentID, userMessage, false, false, prepareChatOptions{
+		disableKojoAttachmentInstructions: opts.DisableKojoAttachmentInstructions,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -3738,7 +3763,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	// transcript so a setup failure leaves history intact. Memory context
 	// injection is skipped — the index still contains entries for messages
 	// about to be truncated, which would otherwise leak into the prompt.
-	prep, err := m.prepareChat(ctx, agentID, srcMsg.Content, true, true)
+	prep, err := m.prepareChat(ctx, agentID, srcMsg.Content, true, true, prepareChatOptions{})
 	if err != nil {
 		return err
 	}

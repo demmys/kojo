@@ -590,17 +590,10 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString("- The current date and time is supplied at the top of each user message in a `<context>` block. Read it from there when you need it — it intentionally is NOT in this system prompt so the prompt cache stays warm across turns.\n")
 
-	// kojo-attach contract. Backends that natively load `.claude/skills/`
-	// (claude / custom / grok — see backendLoadsClaudeSkills) ALSO see
-	// the dedicated kojo-attach SKILL.md installed by SyncAttachSkill;
-	// this short block in the system prompt is the SAME contract
-	// rendered inline so backends without a skill loader
-	// (codex / llama.cpp) can also surface attachments. Keeping the
-	// block unconditional means the SKILL.md and the system prompt
-	// agree on the staging dir for backends that read both — there
-	// is no risk of drift from a backend-gated branch. Costs a
-	// handful of tokens that stay cached as long as the agentDir
-	// path is stable.
+	// kojo response-attachment contract. This lives only in the system
+	// prompt (not a project skill) so transport-specific one-shot turns can
+	// omit it without mutating files shared by concurrent sessions. The block
+	// remains cache-stable for normal WebUI conversations.
 	attachStage := filepath.Join(dir, attachStagingSubpath)
 	guideDir := GuideDir()
 	if !a.InjectionDisabled(InjectionAttachments) {

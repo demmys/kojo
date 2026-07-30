@@ -34,7 +34,7 @@ version. Paths:
 - **Agent device-switch** — Move a running agent from one machine to
   another with a single UI action. Skills and credentials follow.
 - **Agent file attachments** — Agents can attach files back to the
-  operator (`kojo-attach` skill).
+  operator through Kojo's channel-aware response instructions.
 - **Grok Build CLI** — Added as an agent backend alongside Claude and
   Codex.
 - **Workspace files for agents** — Per-agent scratch directory with

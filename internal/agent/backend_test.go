@@ -2,12 +2,11 @@ package agent
 
 import "testing"
 
-// TestBackendLoadsClaudeSkills locks the gating contract for the
-// .claude/skills install sites. Adding a new backend that does
+// TestBackendLoadsClaudeSkills locks the loader contract for
+// .claude/skills. Adding a new backend that does
 // NOT read `.claude/skills/` MUST keep returning false; conversely
-// a new Claude-Code-compatible backend MUST be added here AND to
-// the relevant skill dispatcher (otherwise the skill
-// file never appears in its agentDir).
+// a new Claude-Code-compatible backend must be added here so the
+// device-switch skill-delivery invariant below remains accurate.
 func TestBackendLoadsClaudeSkills(t *testing.T) {
 	t.Parallel()
 

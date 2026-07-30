@@ -81,7 +81,7 @@ export interface GroupMessage {
   model?: string;
   /** Reasoning effort of an agent thread reply (absent otherwise). */
   effort?: string;
-  /** True when the turn ended early (stop/error/timeout) — content is the
+  /** True when the turn ended early (stop/error) — content is the
    * partial output, possibly even an empty string with only thinking or
    * toolUses. */
   interrupted?: boolean;

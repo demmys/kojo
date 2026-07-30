@@ -100,7 +100,7 @@ func cloneStringAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
-func waitCodexRPCResponse(scanner *jsonlLineScanner, id int64) (*rpcMessage, bool) {
+func waitCodexRPCResponse(scanner *jsonlLineScanner, id int64, respondServerRequest codexServerRequestResponder, logger *slog.Logger) (*rpcMessage, bool, error) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
@@ -110,11 +110,18 @@ func waitCodexRPCResponse(scanner *jsonlLineScanner, id int64) (*rpcMessage, boo
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			continue
 		}
-		if msg.ID != nil && *msg.ID == id {
-			return &msg, true
+		handled, err := handleCodexServerRequest(&msg, respondServerRequest, logger)
+		if err != nil {
+			return nil, false, err
+		}
+		if handled {
+			continue
+		}
+		if got, ok := msg.numericID(); ok && got == id {
+			return &msg, true, nil
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 func decodeCodexThreadResult(raw *json.RawMessage) (threadID, rolloutPath string) {

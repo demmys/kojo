@@ -322,6 +322,93 @@ describe("GroupDMChat thread room", () => {
     fireEvent.click(stopBtn);
     await waitFor(() => expect(mocks.stopThread).toHaveBeenCalledWith("g1"));
   });
+
+  it("keeps an in-flight turn pending past the former 60-minute limit", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "user",
+          agentName: "User",
+          content: "long-running task",
+          timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+        },
+      ],
+      hasMore: false,
+    });
+    mocks.threadLive.mockResolvedValue({ active: true, status: "working" });
+    renderGroup();
+
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeInTheDocument();
+    await waitFor(() => expect(mocks.threadLive).toHaveBeenCalledWith("g1"));
+  });
+
+  it("clears pending state when a live turn finishes without a reply message", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "user",
+          agentName: "User",
+          content: "question with an empty answer",
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      hasMore: false,
+    });
+    mocks.threadLive
+      .mockResolvedValueOnce({ active: true, status: "working" })
+      .mockResolvedValue({ active: false });
+    renderGroup();
+
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeInTheDocument();
+    await waitFor(() => expect(mocks.threadLive.mock.calls.length).toBeGreaterThanOrEqual(2), {
+      timeout: 2500,
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("waits for two inactive polls before treating a never-observed turn as settled", async () => {
+    mocks.groupGet.mockResolvedValue(threadGroup);
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        {
+          id: "m1",
+          agentId: "user",
+          agentName: "User",
+          content: "question",
+          timestamp: new Date().toISOString(),
+        },
+      ],
+      hasMore: false,
+    });
+    let resolveSecond: (value: { active: boolean }) => void = () => {
+      throw new Error("second live poll was not started");
+    };
+    mocks.threadLive
+      .mockResolvedValueOnce({ active: false })
+      .mockImplementationOnce(
+        () => new Promise((resolve) => {
+          resolveSecond = resolve;
+        }),
+      )
+      .mockResolvedValue({ active: false });
+    renderGroup();
+
+    const stopButton = await screen.findByRole("button", { name: "Stop" });
+    await waitFor(() => expect(mocks.threadLive.mock.calls.length).toBeGreaterThanOrEqual(2), {
+      timeout: 2500,
+    });
+    expect(stopButton).toBeInTheDocument();
+    resolveSecond({ active: false });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument(),
+    );
+  });
 });
 
 describe("GroupDMChat steering", () => {

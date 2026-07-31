@@ -188,6 +188,19 @@ func TestGenerateAvatarWithGeminiClassifiesProviderErrors(t *testing.T) {
 }
 
 func TestGenerateAvatarWithOpenAIReportsAPIAndDecodeErrors(t *testing.T) {
+	t.Run("authentication error", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"invalid API key","code":"invalid_api_key"}}`)
+		}))
+		defer stub.Close()
+		_, err := generateAvatarWithOpenAI(context.Background(), "key", "prompt", stub.Client(), stub.URL, nil)
+		var generationErr *AvatarGenerationError
+		if !errors.As(err, &generationErr) || generationErr.Code != "avatar_auth_failed" || generationErr.HTTPStatus != http.StatusUnauthorized {
+			t.Fatalf("classified error = %#v (%v)", generationErr, err)
+		}
+	})
+
 	t.Run("API error", func(t *testing.T) {
 		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusTooManyRequests)

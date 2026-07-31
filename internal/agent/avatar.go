@@ -740,6 +740,7 @@ func generateAvatarWithOpenAI(
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 			kind = "avatar_auth_failed"
+			status = resp.StatusCode
 		case resp.StatusCode == http.StatusTooManyRequests:
 			kind = "avatar_rate_limited"
 			status = http.StatusTooManyRequests

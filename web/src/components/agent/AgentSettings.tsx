@@ -1183,13 +1183,13 @@ export function AgentSettings() {
                   onChange={(e) => avatarProviders.setSelected(e.target.value as "gemini" | "openai")}
                 >
                   <option value="openai">OpenAI — GPT Image 2</option>
-                  <option value="gemini">Google — Gemini</option>
+                  <option value="gemini">Google — Nano Banana Pro</option>
                 </Select>
               </Field>
             ) : avatarProviders.loaded && avatarProviders.available.length === 1 ? (
               <div className="text-[12px] text-ink-faint">
                 {t("create.avatarProviderAuto", {
-                  provider: avatarProviders.available[0] === "openai" ? "OpenAI — GPT Image 2" : "Google — Gemini",
+                  provider: avatarProviders.available[0] === "openai" ? "OpenAI — GPT Image 2" : "Google — Nano Banana Pro",
                 })}
               </div>
             ) : avatarProviders.loaded ? (

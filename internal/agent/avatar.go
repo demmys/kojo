@@ -420,7 +420,7 @@ const (
 	AvatarProviderGemini AvatarProvider = "gemini"
 	AvatarProviderOpenAI AvatarProvider = "openai"
 
-	geminiImageModel        = "gemini-3.1-flash-image"
+	geminiImageModel        = "gemini-3-pro-image"
 	geminiImagesEndpoint    = "https://generativelanguage.googleapis.com/v1beta/interactions"
 	openAIImageModel        = "gpt-image-2"
 	openAIImagesEndpoint    = "https://api.openai.com/v1/images/generations"

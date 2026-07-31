@@ -11,6 +11,7 @@ import { ToolPicker } from "./fields/ToolPicker";
 import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { WorkDirInput } from "./fields/WorkDirInput";
+import { useAvatarImageProviders } from "./useAvatarImageProviders";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -68,6 +69,8 @@ export function AgentCreate() {
   const [silentEnd, setSilentEnd] = useState("");
   const [cronMessage, setCronMessage] = useState("");
   const [genPrompt, setGenPrompt] = useState("");
+  const [avatarPrompt, setAvatarPrompt] = useState("");
+  const [avatarWarning, setAvatarWarning] = useState("");
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -78,11 +81,14 @@ export function AgentCreate() {
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const blobUrlRef = useRef("");
+  const avatarTempPathRef = useRef("");
+  const mountedRef = useRef(true);
 
   // Generation state — single discriminated phase
   const [genPhase, setGenPhase] = useState<GenPhase>("idle");
 
   const isGenerating = genPhase !== "idle";
+  const avatarProviders = useAvatarImageProviders();
 
   useEffect(() => {
     api.info().then(setInfo).catch(console.error);
@@ -107,10 +113,21 @@ export function AgentCreate() {
       ? persona.trim()
       : effectivePersona.trim() || mission.trim();
 
-  // Revoke blob URL on unmount
+  const updateAvatarTempPath = (path: string) => {
+    avatarTempPathRef.current = path;
+    setAvatarTempPath(path);
+  };
+
+  // Release both local and server-side previews on unmount.
   useEffect(() => {
+    // React StrictMode performs a development-only setup/cleanup/setup cycle.
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+      if (avatarTempPathRef.current) {
+        void agentApi.discardAvatarPreview(avatarTempPathRef.current).catch(() => {});
+      }
     };
   }, []);
 
@@ -195,26 +212,27 @@ export function AgentCreate() {
     }
     setGenPhase("avatar");
     setError("");
-    const hadTempPath = !!avatarTempPath;
     try {
       const result = await agentApi.generateAvatar(
         genMaterial,
         n,
-        genPrompt.trim(),
+        avatarPrompt.trim(),
         avatarTempPath || undefined,
+        avatarProviders.providerForRequest,
+        !avatarPreviewUrl,
       );
+      if (!mountedRef.current) {
+        void agentApi.discardAvatarPreview(result.avatarPath).catch(() => {});
+        return;
+      }
       revokePreview();
-      setAvatarTempPath(result.avatarPath);
+      updateAvatarTempPath(result.avatarPath);
       setAvatarPreviewUrl(agentApi.previewAvatarUrl(result.avatarPath));
       setAvatarFile(null);
+      setAvatarWarning(result.warning ?? "");
     } catch (err) {
-      // Only clear avatar state if server deleted the old temp path
-      if (hadTempPath) {
-        revokePreview();
-        setAvatarTempPath("");
-        setAvatarPreviewUrl("");
-        setAvatarFile(null);
-      }
+      // The server keeps previousPath on regeneration failure, so retain the
+      // working preview instead of replacing it with an empty state.
       setError(errMsg(err));
     } finally {
       setGenPhase("idle");
@@ -246,25 +264,25 @@ export function AgentCreate() {
 
     // Avatar
     setGenPhase("all-avatar");
-    const hadTempPath = !!avatarTempPath;
     try {
       const result = await agentApi.generateAvatar(
         genMaterial,
         generatedName,
-        genPrompt.trim(),
+        avatarPrompt.trim(),
         avatarTempPath || undefined,
+        avatarProviders.providerForRequest,
+        !avatarPreviewUrl,
       );
+      if (!mountedRef.current) {
+        void agentApi.discardAvatarPreview(result.avatarPath).catch(() => {});
+        return;
+      }
       revokePreview();
-      setAvatarTempPath(result.avatarPath);
+      updateAvatarTempPath(result.avatarPath);
       setAvatarPreviewUrl(agentApi.previewAvatarUrl(result.avatarPath));
       setAvatarFile(null);
+      setAvatarWarning(result.warning ?? "");
     } catch (err) {
-      if (hadTempPath) {
-        revokePreview();
-        setAvatarTempPath("");
-        setAvatarPreviewUrl("");
-        setAvatarFile(null);
-      }
       setError(errMsg(err));
     }
     setGenPhase("idle");
@@ -278,12 +296,16 @@ export function AgentCreate() {
   const handleAvatarFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (avatarTempPathRef.current) {
+      void agentApi.discardAvatarPreview(avatarTempPathRef.current).catch(() => {});
+    }
     revokePreview();
     setAvatarFile(file);
     const url = URL.createObjectURL(file);
     blobUrlRef.current = url;
     setAvatarPreviewUrl(url);
-    setAvatarTempPath("");
+    updateAvatarTempPath("");
+    setAvatarWarning("");
     e.target.value = "";
   };
 
@@ -327,6 +349,7 @@ export function AgentCreate() {
       try {
         if (avatarTempPath) {
           await agentApi.uploadGeneratedAvatar(agent.id, avatarTempPath);
+          updateAvatarTempPath("");
         } else if (avatarFile) {
           await agentApi.uploadAvatar(agent.id, avatarFile);
         }
@@ -494,7 +517,7 @@ export function AgentCreate() {
                   <button
                     type="button"
                     onClick={() => handleGenerateAvatar()}
-                    disabled={isGenerating || !genMaterial}
+                    disabled={isGenerating || !genMaterial || !name.trim() || !avatarProviders.loaded}
                     className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border border-hairline bg-raised text-xs transition-colors hover:bg-hover disabled:opacity-40"
                     title={t("create.regenAvatarTitle")}
                   >
@@ -543,11 +566,44 @@ export function AgentCreate() {
               </div>
             </div>
 
+            <Field label={t("create.avatarPromptLabel")} help={t("create.avatarPromptHelp")}>
+              <Textarea
+                value={avatarPrompt}
+                onChange={(e) => setAvatarPrompt(e.target.value)}
+                placeholder={t("create.avatarPromptPlaceholder")}
+                rows={3}
+              />
+            </Field>
+
+            {avatarProviders.error ? (
+              <Banner tone="warn">{t("create.avatarProviderStatusError")}</Banner>
+            ) : avatarProviders.available.length > 1 ? (
+              <Field label={t("create.avatarProviderLabel")}>
+                <Select
+                  value={avatarProviders.selected}
+                  onChange={(e) => avatarProviders.setSelected(e.target.value as "gemini" | "openai")}
+                >
+                  <option value="openai">OpenAI — GPT Image 2</option>
+                  <option value="gemini">Google — Nano Banana Pro</option>
+                </Select>
+              </Field>
+            ) : avatarProviders.loaded && avatarProviders.available.length === 1 ? (
+              <div className="text-[12px] text-ink-faint">
+                {t("create.avatarProviderAuto", {
+                  provider: avatarProviders.available[0] === "openai" ? "OpenAI — GPT Image 2" : "Google — Nano Banana Pro",
+                })}
+              </div>
+            ) : avatarProviders.loaded ? (
+              <Banner tone="warn">{t("create.avatarProviderMissing")}</Banner>
+            ) : null}
+
+            {avatarWarning && <Banner tone="warn">{t("create.avatarFallback", { error: avatarWarning })}</Banner>}
+
             {/* Generate All / Avatar only */}
             <div className="flex gap-2">
               <Button
                 onClick={handleGenerateAll}
-                disabled={isGenerating || !genMaterial}
+                disabled={isGenerating || !genMaterial || !avatarProviders.loaded}
                 className="flex flex-1 items-center justify-center gap-2"
               >
                 {genPhase.startsWith("all-") ? (
@@ -561,7 +617,7 @@ export function AgentCreate() {
               </Button>
               <Button
                 onClick={() => handleGenerateAvatar()}
-                disabled={isGenerating || !genMaterial || !name.trim()}
+                disabled={isGenerating || !genMaterial || !name.trim() || !avatarProviders.loaded}
                 className="flex items-center justify-center gap-2"
                 title={!name.trim() ? t("create.setNameFirst") : t("create.genAvatarOnly")}
               >

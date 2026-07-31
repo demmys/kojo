@@ -29,6 +29,17 @@ var (
 	ErrAvatarUnsupportedImage = errors.New("unsupported image format")
 )
 
+// AvatarGenerationError classifies provider failures so the HTTP layer can
+// distinguish configuration, throttling, moderation, and timeout failures.
+type AvatarGenerationError struct {
+	Code       string
+	HTTPStatus int
+	Err        error
+}
+
+func (e *AvatarGenerationError) Error() string { return e.Err.Error() }
+func (e *AvatarGenerationError) Unwrap() error { return e.Err }
+
 // allowedImageExts is the set of image extensions accepted for avatars.
 var allowedImageExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".webp": true, ".svg": true,
@@ -40,13 +51,13 @@ var allowedImageExts = map[string]bool{
 // (legitimately disallowed by SaveAvatar but possible from a
 // hand-edited blob tree) presents the .png first to keep behaviour
 // stable across the cutover. The list is also used by SaveAvatar to
-// know what to delete before publishing the new extension.
+// know what to delete after publishing the new extension.
 var avatarExtProbe = []string{".png", ".jpg", ".jpeg", ".webp", ".svg"}
 
 // avatarMu serializes avatar operations per agent.
 //
 // Writers (SaveAvatar / DeleteAvatar) take Lock() so the
-// "delete other extensions, then Put" sequence is observed
+// "Put replacement, then delete other extensions" sequence is
 // atomically by concurrent callers — without this two parallel
 // uploads at different extensions could interleave their delete and
 // put calls and end up with multiple avatar rows surviving, with
@@ -293,25 +304,23 @@ func contentTypeForAvatarExt(ext string) string {
 // the leading-dot extension ("." + e.g. "png"); callers are
 // responsible for validating it via IsAllowedImageExt before calling.
 //
-// Removes any pre-existing avatar at a different extension so the
+// Publishes the replacement first, then removes any pre-existing avatar at a
+// different extension so a failed Put never destroys the current avatar. The
 // agent presents exactly one avatar at a time — without this a user
 // who first uploads avatar.png and then avatar.svg would have BOTH
 // surface, with resolveAvatarBlob's probe order picking .png and
-// silently discarding the new svg. Matches the v0 disk-write
-// semantics: SaveAvatar deletes every avatar.* before writing the
-// new one.
+// silently discarding the new svg. The final single-avatar state matches v0,
+// while the failure-safe operation order deliberately differs.
 //
 // Per-agent serialization (acquireAvatarLock) ensures the
-// "delete-then-put" sequence is observed atomically — without it,
+// "put-then-delete" sequence is serialized — without it,
 // two concurrent uploads at different extensions could interleave
 // their delete/put calls and leave multiple rows in place.
 //
-// Failure posture: if ANY of the per-extension cleanup Deletes
-// fails (other than ErrNotFound), SaveAvatar aborts before the
-// final Put. This is intentional — a partial cleanup that
-// proceeds to Put could leave two avatars surviving and the wrong
-// one wins resolveAvatarBlob's probe order. Aborting forces the
-// operator to see and resolve the underlying store error.
+// Failure posture: Put failures leave every previous extension untouched.
+// Cleanup failures keep the durable replacement: blob.Delete may report an
+// error after already removing the old file, so rolling the replacement back
+// could otherwise lose both versions. A later upload/reset retries cleanup.
 func SaveAvatar(bs *blob.Store, agentID string, src io.Reader, ext string) error {
 	if bs == nil {
 		return errors.New("avatar: blob store not configured")
@@ -323,21 +332,29 @@ func SaveAvatar(bs *blob.Store, agentID string, src io.Reader, ext string) error
 	unlock := acquireAvatarLock(agentID)
 	defer unlock()
 
-	// Delete every other extension first. Aborting on a non-
-	// ErrNotFound error preserves the "exactly one avatar" invariant
-	// — see the failure-posture note in the function's doc above.
+	if _, err := bs.Put(blob.ScopeGlobal, avatarBlobPath(agentID, ext), src, blob.PutOptions{}); err != nil {
+		return fmt.Errorf("avatar: put: %w", err)
+	}
+
+	// Delete every other extension only after the replacement is durable.
+	cleanupFailed := false
 	for _, e := range avatarExtProbe {
 		if e == ext {
 			continue
 		}
 		if err := bs.Delete(blob.ScopeGlobal, avatarBlobPath(agentID, e), blob.DeleteOptions{}); err != nil && !errors.Is(err, blob.ErrNotFound) {
-			return fmt.Errorf("avatar: cleanup old %s: %w", e, err)
+			cleanupFailed = true
+			slog.Default().Warn("avatar: replacement published but old extension cleanup failed",
+				"agent", agentID, "old_ext", e, "new_ext", ext, "err", err)
+		}
+	}
+	if cleanupFailed {
+		resolvedExt, _, ok := resolveAvatarBlob(bs, agentID)
+		if !ok || resolvedExt != ext {
+			return fmt.Errorf("avatar: replacement stored as %s but old extension still shadows it", ext)
 		}
 	}
 
-	if _, err := bs.Put(blob.ScopeGlobal, avatarBlobPath(agentID, ext), src, blob.PutOptions{}); err != nil {
-		return fmt.Errorf("avatar: put: %w", err)
-	}
 	return nil
 }
 
@@ -396,26 +413,20 @@ func ValidateTempAvatarPath(avatarPath string) (string, error) {
 	return absPath, nil
 }
 
-// geminiImageModel is the default image-output Gemini model.
-// Override via KOJO_GEMINI_IMAGE_MODEL.
-const geminiImageModel = "gemini-3.1-flash-image-preview"
+// AvatarProvider identifies an upstream image-generation service.
+type AvatarProvider string
 
-// resolveGeminiAPIKey returns an API key from env vars or legacy
-// nanobanana credentials file, or "" if none is configured.
-func resolveGeminiAPIKey() string {
-	for _, v := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
-		if key := strings.TrimSpace(os.Getenv(v)); key != "" {
-			return key
-		}
-	}
-	credPath := filepath.Join(os.Getenv("HOME"), ".config", "nanobanana", "credentials")
-	if b, err := os.ReadFile(credPath); err == nil {
-		if key := strings.TrimSpace(string(b)); key != "" {
-			return key
-		}
-	}
-	return ""
-}
+const (
+	AvatarProviderGemini AvatarProvider = "gemini"
+	AvatarProviderOpenAI AvatarProvider = "openai"
+
+	geminiImageModel        = "gemini-3-pro-image"
+	geminiImagesEndpoint    = "https://generativelanguage.googleapis.com/v1beta/interactions"
+	openAIImageModel        = "gpt-image-2"
+	openAIImagesEndpoint    = "https://api.openai.com/v1/images/generations"
+	avatarGenerationTimeout = 180 * time.Second
+	maxAvatarResponseBytes  = 32 << 20
+)
 
 func extFromMimeType(mime string) string {
 	switch strings.ToLower(strings.TrimSpace(strings.SplitN(mime, ";", 2)[0])) {
@@ -430,48 +441,119 @@ func extFromMimeType(mime string) string {
 	}
 }
 
-// GenerateAvatarWithAI generates an avatar by calling the Gemini image
-// generation API directly. Returns the path to an image file inside a
-// kojo-avatar-* temp dir.
-func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, name string, prompt string, logger *slog.Logger) (string, error) {
-	apiKey := resolveGeminiAPIKey()
-	if apiKey == "" {
-		return "", fmt.Errorf("no Gemini API key configured (set GEMINI_API_KEY)")
+// GenerateAvatarWithAI chooses an available provider and generates an avatar.
+// When both providers are configured, requestedProvider is required so a
+// caller cannot silently change the billing provider.
+func GenerateAvatarWithAI(
+	ctx context.Context,
+	creds *CredentialStore,
+	requestedProvider string,
+	persona string,
+	name string,
+	prompt string,
+	logger *slog.Logger,
+) (string, AvatarProvider, error) {
+	provider, apiKey, err := resolveAvatarProvider(creds, requestedProvider)
+	if err != nil {
+		return "", "", err
 	}
+	imagePrompt := buildAvatarPrompt(name, persona, prompt)
 
-	// Build image generation prompt
-	imagePrompt := fmt.Sprintf("Character portrait avatar of %s, ", name)
-	if persona != "" {
-		runes := []rune(persona)
-		if len(runes) > 100 {
-			runes = runes[:100]
+	switch provider {
+	case AvatarProviderOpenAI:
+		path, err := generateAvatarWithOpenAI(ctx, apiKey, imagePrompt, http.DefaultClient, openAIImagesEndpoint, logger)
+		return path, provider, err
+	case AvatarProviderGemini:
+		model := geminiImageModel
+		if m := strings.TrimSpace(os.Getenv("KOJO_GEMINI_IMAGE_MODEL")); m != "" {
+			model = m
 		}
-		imagePrompt += string(runes) + ", "
+		path, err := generateAvatarWithGemini(ctx, apiKey, model, imagePrompt, http.DefaultClient, geminiImagesEndpoint, logger)
+		return path, provider, err
+	default:
+		return "", "", fmt.Errorf("unsupported avatar provider %q", provider)
 	}
-	if prompt != "" {
-		imagePrompt += prompt + ", "
-	}
-	imagePrompt += "flat illustration style, clean background, centered face, square format"
+}
 
-	model := geminiImageModel
-	if m := strings.TrimSpace(os.Getenv("KOJO_GEMINI_IMAGE_MODEL")); m != "" {
-		model = m
-	}
+func resolveAvatarProvider(creds *CredentialStore, requested string) (AvatarProvider, string, error) {
+	geminiKey, geminiErr := LoadGeminiAPIKey(creds)
+	openAIKey, openAIErr := LoadOpenAIAPIKey(creds)
 
+	switch AvatarProvider(strings.ToLower(strings.TrimSpace(requested))) {
+	case AvatarProviderGemini:
+		if geminiErr != nil {
+			return "", "", geminiErr
+		}
+		return AvatarProviderGemini, geminiKey, nil
+	case AvatarProviderOpenAI:
+		if openAIErr != nil {
+			return "", "", openAIErr
+		}
+		return AvatarProviderOpenAI, openAIKey, nil
+	case "":
+		if geminiErr == nil && openAIErr == nil {
+			return "", "", fmt.Errorf("provider is required when both Gemini and OpenAI API keys are configured")
+		}
+		if geminiErr == nil {
+			return AvatarProviderGemini, geminiKey, nil
+		}
+		if openAIErr == nil {
+			return AvatarProviderOpenAI, openAIKey, nil
+		}
+		return "", "", fmt.Errorf("no image generation API key configured (configure Gemini or OpenAI in Global Settings)")
+	default:
+		return "", "", fmt.Errorf("unsupported avatar provider %q", requested)
+	}
+}
+
+func buildAvatarPrompt(name, persona, userPrompt string) string {
+	const maxPersonaRunes = 4000
+	const maxUserPromptRunes = 8000
+	persona = truncateRunes(strings.TrimSpace(persona), maxPersonaRunes)
+	userPrompt = truncateRunes(strings.TrimSpace(userPrompt), maxUserPromptRunes)
+
+	var b strings.Builder
+	b.WriteString("Create a square character portrait avatar.\n\nName:\n")
+	b.WriteString(strings.TrimSpace(name))
+	if persona != "" {
+		b.WriteString("\n\nCharacter description:\n")
+		b.WriteString(persona)
+	}
+	if userPrompt != "" {
+		b.WriteString("\n\nAdditional art direction from the user:\n")
+		b.WriteString(userPrompt)
+	}
+	b.WriteString("\n\nRequirements:\n- centered composition\n- readable at small icon sizes\n- clean opaque background\n- no text or logo\n- square format")
+	return b.String()
+}
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+func generateAvatarWithGemini(
+	ctx context.Context,
+	apiKey string,
+	model string,
+	imagePrompt string,
+	client *http.Client,
+	endpoint string,
+	logger *slog.Logger,
+) (string, error) {
 	reqBody := map[string]any{
-		"contents": []any{
-			map[string]any{
-				"parts": []any{
-					map[string]any{"text": imagePrompt},
-				},
-			},
+		"model": model,
+		"input": []any{
+			map[string]any{"type": "text", "text": imagePrompt},
 		},
-		"generationConfig": map[string]any{
-			"responseModalities": []string{"IMAGE"},
-			"imageConfig": map[string]any{
-				"aspectRatio": "1:1",
-				"imageSize":   "1K",
-			},
+		"response_format": map[string]any{
+			"type":         "image",
+			"mime_type":    "image/png",
+			"aspect_ratio": "1:1",
+			"image_size":   "1K",
 		},
 	}
 	payload, err := json.Marshal(reqBody)
@@ -479,8 +561,7 @@ func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, n
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}
 
-	endpoint := "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
-	reqCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, avatarGenerationTimeout)
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
@@ -490,14 +571,26 @@ func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, n
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-goog-api-key", apiKey)
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
+		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			return "", &AvatarGenerationError{
+				Code: "avatar_timeout", HTTPStatus: http.StatusGatewayTimeout,
+				Err: fmt.Errorf("Gemini image generation timed out: %w", reqCtx.Err()),
+			}
+		}
 		return "", fmt.Errorf("gemini request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readAvatarResponse(resp.Body)
 	if err != nil {
+		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			return "", &AvatarGenerationError{
+				Code: "avatar_timeout", HTTPStatus: http.StatusGatewayTimeout,
+				Err: fmt.Errorf("Gemini image generation timed out: %w", reqCtx.Err()),
+			}
+		}
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -514,41 +607,48 @@ func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, n
 				msg = msg[:300]
 			}
 		}
-		logger.Debug("gemini API error", "status", resp.StatusCode, "body", string(body))
-		return "", fmt.Errorf("gemini API HTTP %d: %s", resp.StatusCode, msg)
+		if logger != nil {
+			logger.Debug("gemini API error", "status", resp.StatusCode, "body", string(body))
+		}
+		kind := "avatar_provider_error"
+		status := http.StatusBadGateway
+		switch resp.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			kind = "avatar_auth_failed"
+			status = resp.StatusCode
+		case http.StatusTooManyRequests:
+			kind = "avatar_rate_limited"
+			status = http.StatusTooManyRequests
+		}
+		return "", &AvatarGenerationError{
+			Code: kind, HTTPStatus: status,
+			Err: fmt.Errorf("Gemini API HTTP %d: %s", resp.StatusCode, msg),
+		}
 	}
 
 	var parsed struct {
-		Candidates []struct {
-			Content struct {
-				Parts []struct {
-					InlineData *struct {
-						MimeType string `json:"mimeType"`
-						Data     string `json:"data"`
-					} `json:"inlineData"`
-				} `json:"parts"`
+		Steps []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type     string `json:"type"`
+				MimeType string `json:"mime_type"`
+				Data     string `json:"data"`
 			} `json:"content"`
-		} `json:"candidates"`
-		PromptFeedback struct {
-			BlockReason string `json:"blockReason"`
-		} `json:"promptFeedback"`
+		} `json:"steps"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", fmt.Errorf("parse response: %w", err)
 	}
-	if len(parsed.Candidates) == 0 {
-		if parsed.PromptFeedback.BlockReason != "" {
-			return "", fmt.Errorf("gemini blocked: %s", parsed.PromptFeedback.BlockReason)
-		}
-		return "", fmt.Errorf("no candidates in response")
-	}
-
 	var mimeType, b64 string
-	for _, p := range parsed.Candidates[0].Content.Parts {
-		if p.InlineData != nil && p.InlineData.Data != "" {
-			mimeType = p.InlineData.MimeType
-			b64 = p.InlineData.Data
-			break
+	for _, step := range parsed.Steps {
+		if step.Type != "model_output" {
+			continue
+		}
+		for _, content := range step.Content {
+			if content.Type == "image" && content.Data != "" {
+				mimeType = content.MimeType
+				b64 = content.Data
+			}
 		}
 	}
 	if b64 == "" {
@@ -563,7 +663,129 @@ func GenerateAvatarWithAI(ctx context.Context, agentID string, persona string, n
 	if err != nil {
 		return "", fmt.Errorf("decode image: %w", err)
 	}
+	return writeTempAvatar(raw, ext)
+}
 
+func generateAvatarWithOpenAI(
+	ctx context.Context,
+	apiKey string,
+	imagePrompt string,
+	client *http.Client,
+	endpoint string,
+	logger *slog.Logger,
+) (string, error) {
+	reqBody := map[string]any{
+		"model":         openAIImageModel,
+		"prompt":        imagePrompt,
+		"size":          "1024x1024",
+		"quality":       "low",
+		"output_format": "png",
+		"background":    "opaque",
+		"n":             1,
+	}
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal payload: %w", err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, avatarGenerationTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			return "", &AvatarGenerationError{
+				Code: "avatar_timeout", HTTPStatus: http.StatusGatewayTimeout,
+				Err: fmt.Errorf("OpenAI image generation timed out: %w", err),
+			}
+		}
+		return "", fmt.Errorf("OpenAI request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := readAvatarResponse(resp.Body)
+	if err != nil {
+		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			return "", &AvatarGenerationError{
+				Code: "avatar_timeout", HTTPStatus: http.StatusGatewayTimeout,
+				Err: fmt.Errorf("OpenAI image generation timed out: %w", reqCtx.Err()),
+			}
+		}
+		return "", fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var apiErr struct {
+			Error struct {
+				Message string `json:"message"`
+				Code    any    `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &apiErr)
+		msg := strings.TrimSpace(apiErr.Error.Message)
+		if msg == "" {
+			msg = truncateRunes(string(body), 300)
+		}
+		if logger != nil {
+			logger.Debug("OpenAI API error", "status", resp.StatusCode, "code", apiErr.Error.Code, "body", string(body))
+		}
+		codeText := strings.ToLower(fmt.Sprint(apiErr.Error.Code))
+		messageText := strings.ToLower(msg)
+		kind := "avatar_provider_error"
+		status := http.StatusBadGateway
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			kind = "avatar_auth_failed"
+			status = resp.StatusCode
+		case resp.StatusCode == http.StatusTooManyRequests:
+			kind = "avatar_rate_limited"
+			status = http.StatusTooManyRequests
+		case strings.Contains(codeText, "moderation"), strings.Contains(codeText, "safety"),
+			strings.Contains(codeText, "content_policy"), strings.Contains(messageText, "moderation"),
+			strings.Contains(messageText, "safety"), strings.Contains(messageText, "content policy"):
+			kind = "avatar_moderation_blocked"
+			status = http.StatusUnprocessableEntity
+		}
+		return "", &AvatarGenerationError{
+			Code: kind, HTTPStatus: status,
+			Err: fmt.Errorf("OpenAI API HTTP %d: %s", resp.StatusCode, msg),
+		}
+	}
+
+	var parsed struct {
+		Data []struct {
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+	if len(parsed.Data) == 0 || parsed.Data[0].B64JSON == "" {
+		return "", fmt.Errorf("no image data in OpenAI response")
+	}
+	raw, err := base64.StdEncoding.DecodeString(parsed.Data[0].B64JSON)
+	if err != nil {
+		return "", fmt.Errorf("decode image: %w", err)
+	}
+	return writeTempAvatar(raw, ".png")
+}
+
+func readAvatarResponse(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxAvatarResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxAvatarResponseBytes {
+		return nil, fmt.Errorf("image response exceeds %d bytes", maxAvatarResponseBytes)
+	}
+	return body, nil
+}
+
+func writeTempAvatar(raw []byte, ext string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "kojo-avatar-*")
 	if err != nil {
 		return "", err
@@ -586,6 +808,7 @@ func GenerateSVGAvatarFile(name string) (string, error) {
 	svg := generateSVGAvatar(name)
 	p := filepath.Join(tmpDir, "avatar.svg")
 	if err := os.WriteFile(p, []byte(svg), 0o644); err != nil {
+		_ = os.RemoveAll(tmpDir)
 		return "", err
 	}
 	return p, nil

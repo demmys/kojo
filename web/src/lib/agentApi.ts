@@ -38,6 +38,15 @@ export const MAX_SCHEDULE_MINUTES = 7 * 24 * 60;
 // "sched.resumeDefault" i18n label; the editor keeps 0 = server default.)
 export const DEFAULT_TIMEOUT_MINUTES = 10;
 
+export type AvatarProvider = "gemini" | "openai";
+
+export interface GeneratedAvatar {
+  avatarPath: string;
+  provider?: AvatarProvider;
+  fallback?: boolean;
+  warning?: string;
+}
+
 // TransferSkip is one session file the §3.7 device-switch transfer
 // left behind (see AgentInfo.lastTransferSkips).
 export interface TransferSkip {
@@ -827,16 +836,28 @@ export const agentApi = {
   generateName: (persona: string, prompt?: string) =>
     post<{ name: string }>("/api/v1/agents/generate-name", { persona, prompt }),
 
-  generateAvatar: (persona: string, name: string, prompt?: string, previousPath?: string) =>
-    post<{ avatarPath: string }>("/api/v1/agents/generate-avatar", {
+  generateAvatar: (
+    persona: string,
+    name: string,
+    prompt?: string,
+    previousPath?: string,
+    provider?: AvatarProvider,
+    allowFallback = true,
+  ) =>
+    post<GeneratedAvatar>("/api/v1/agents/generate-avatar", {
       persona,
       name,
       prompt,
       previousPath,
+      provider,
+      allowFallback,
     }),
 
   previewAvatarUrl: (path: string) =>
     appendTokenQuery(`/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`),
+
+  discardAvatarPreview: (path: string) =>
+    del<void>(`/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`),
 
   credentials: {
     list: (agentId: string) =>

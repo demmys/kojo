@@ -337,6 +337,14 @@ const messages = {
   "settings.changeAvatar": { ja: "アバターを変更", en: "Change Avatar" },
   "settings.generate": { ja: "生成", en: "Generate" },
   "settings.generating": { ja: "生成中...", en: "Generating..." },
+  "settings.avatarGenerationFailed": {
+    ja: "AIアバター生成に失敗したため、現在のアバターを維持した。",
+    en: "AI avatar generation failed; the current avatar was kept.",
+  },
+  "settings.avatarKeptWarning": {
+    ja: "AI画像生成に失敗したため現在のアバターを維持: {error}",
+    en: "The current avatar was kept because AI image generation failed: {error}",
+  },
   "settings.name": { ja: "名前", en: "Name" },
   "settings.personaPromptPlaceholder": { ja: "例: もっと毒舌にして", en: "e.g. make it snarkier" },
   "settings.templateNotSaved": { ja: "テンプレート — 未保存。", en: "Template — not yet saved." },
@@ -784,6 +792,32 @@ const messages = {
     ja: "生成ヒント (任意)",
     en: "Generation hint (optional)",
   },
+  "create.avatarPromptLabel": { ja: "アバター生成プロンプト", en: "Avatar generation prompt" },
+  "create.avatarPromptHelp": {
+    ja: "名前・人格・アイコン向け制約に加える画風や外見の指示。",
+    en: "Art direction and appearance instructions added to the name, persona, and icon constraints.",
+  },
+  "create.avatarPromptPlaceholder": {
+    ja: "例: 水彩画風、青い髪、人物の周囲に光る粒子。文字やロゴは入れない",
+    en: "e.g. watercolor style, blue hair, glowing particles around the character",
+  },
+  "create.avatarProviderLabel": { ja: "画像生成モデル", en: "Image generation model" },
+  "create.avatarProviderAuto": {
+    ja: "画像生成: {provider}（設定済みのAPIキーから自動選択）",
+    en: "Image generation: {provider} (automatically selected from configured API keys)",
+  },
+  "create.avatarProviderMissing": {
+    ja: "画像生成APIキーが未設定。Global SettingsでGeminiまたはOpenAIを設定して。",
+    en: "No image-generation API key is configured. Configure Gemini or OpenAI in Global Settings.",
+  },
+  "create.avatarProviderStatusError": {
+    ja: "画像生成APIキーの状態を取得できなかったため、生成を無効化した。画面を再読み込みして再試行して。",
+    en: "Could not load image-generation API key status, so generation is disabled. Reload the page to retry.",
+  },
+  "create.avatarFallback": {
+    ja: "AI画像生成に失敗したため代替アバターを使用: {error}",
+    en: "Using a fallback avatar because AI image generation failed: {error}",
+  },
   "create.nameAndAvatar": { ja: "名前とアバター", en: "Name & Avatar" },
   "create.setNameFirst": { ja: "先に名前を設定して", en: "Set a name first" },
   "create.genAvatarOnly": { ja: "アバターだけ生成", en: "Generate avatar only" },
@@ -913,9 +947,11 @@ const messages = {
   "gs.configured": { ja: "設定済み", en: "Configured" },
   "gs.usingFallback": { ja: "フォールバックを使用中", en: "Using fallback" },
   "gs.notConfigured": { ja: "未設定", en: "Not configured" },
+  "gs.keyStatusError": { ja: "状態を取得できません", en: "Status unavailable" },
   "gs.update": { ja: "更新", en: "Update" },
   "gs.configure": { ja: "設定する", en: "Configure" },
   "gs.removeGeminiKey": { ja: "Gemini API キーを削除", en: "Remove Gemini API key" },
+  "gs.removeOpenaiKey": { ja: "OpenAI API キーを削除", en: "Remove OpenAI API key" },
   "gs.removeXaiKey": { ja: "xAI API キーを削除", en: "Remove xAI API key" },
   "gs.save": { ja: "保存", en: "Save" },
   "gs.embeddingModel": { ja: "埋め込みモデル", en: "Embedding Model" },
@@ -927,6 +963,10 @@ const messages = {
     en: "Configure API key to see available models",
   },
   "gs.voiceInputStt": { ja: "音声入力 (音声認識)", en: "Voice input (speech-to-text)" },
+  "gs.openaiImageHelp": {
+    ja: "GPT Image 2によるエージェントのアバター生成",
+    en: "Agent avatar generation with GPT Image 2",
+  },
   "gs.archivedAgents": { ja: "アーカイブ済みエージェント", en: "Archived Agents" },
   "gs.archivedAgentsDesc": {
     ja: "アーカイブ済みエージェントはメインリストから隠れ、ランタイム活動もない。エージェント自身のデータ (1:1 チャット履歴・メモリ・人格・認証情報・通知トークン) は保持される。グループ DM のメンバーシップは保持されない — アーカイブ時に全グループから外れ (2人グループは解散してトランスクリプトも削除)、アーカイブ解除でも復帰しない。削除はすべてを完全に消す。",

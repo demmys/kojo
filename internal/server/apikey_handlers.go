@@ -23,22 +23,32 @@ var geminiListHTTPClient = &http.Client{Timeout: 30 * time.Second}
 // Does NOT return the actual key — only a configured/not-configured status.
 func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 	provider := r.PathValue("provider")
-	if !s.agents.HasCredentials() {
-		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store not available")
-		return
+	creds := s.agents.Credentials()
+	configured := false
+	if creds != nil {
+		storedKey, err := creds.GetToken(provider, "", "", "api_key")
+		configured = err == nil && strings.TrimSpace(storedKey) != ""
 	}
 
-	creds := s.agents.Credentials()
-	_, err := creds.GetToken(provider, "", "", "api_key")
-	configured := err == nil
-
-	// Check nanobanana fallback for gemini
+	// Check environment / legacy-file fallbacks without ever returning the
+	// key itself. Keep this aligned with agent.Load*APIKey.
 	hasFallback := false
 	if provider == "gemini" {
-		if home, err := os.UserHomeDir(); err == nil {
-			data, err := os.ReadFile(filepath.Join(home, ".config", "nanobanana", "credentials"))
-			hasFallback = err == nil && strings.TrimSpace(string(data)) != ""
+		for _, envName := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
+			if strings.TrimSpace(os.Getenv(envName)) != "" {
+				hasFallback = true
+				break
+			}
 		}
+		if !hasFallback {
+			if home, err := os.UserHomeDir(); err == nil {
+				data, err := os.ReadFile(filepath.Join(home, ".config", "nanobanana", "credentials"))
+				hasFallback = err == nil && strings.TrimSpace(string(data)) != ""
+			}
+		}
+	}
+	if provider == "openai" {
+		hasFallback = strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
 	}
 	// xAI falls back to the XAI_API_KEY env var or the grok-research
 	// credentials file, mirroring agent.LoadXAIAPIKey's priority.
@@ -59,7 +69,10 @@ func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 
 	// Include embedding model setting for gemini
 	if provider == "gemini" {
-		embModel := creds.GetSetting("embedding_model")
+		embModel := ""
+		if creds != nil {
+			embModel = creds.GetSetting("embedding_model")
+		}
 		if embModel == "" {
 			embModel = agent.DefaultEmbeddingModel
 		}
@@ -80,10 +93,10 @@ func (s *Server) handleSetAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		APIKey string `json:"apiKey"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+	if !readCappedJSON(w, r, 16<<10, "request body too large", "invalid JSON", &req) {
 		return
 	}
+	req.APIKey = strings.TrimSpace(req.APIKey)
 	if req.APIKey == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "apiKey is required")
 		return
@@ -165,14 +178,9 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 
 // handleListEmbeddingModels fetches available embedding models from the Gemini API.
 func (s *Server) handleListEmbeddingModels(w http.ResponseWriter, r *http.Request) {
-	if !s.agents.HasCredentials() {
-		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store not available")
-		return
-	}
-
 	creds := s.agents.Credentials()
-	apiKey, err := creds.GetToken("gemini", "", "", "api_key")
-	if err != nil || apiKey == "" {
+	apiKey, err := agent.LoadGeminiAPIKey(creds)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "no_api_key", "Gemini API key not configured")
 		return
 	}
@@ -193,11 +201,12 @@ const maxListModelsErrorBody = 16 * 1024
 // fetchGeminiEmbeddingModels calls the Gemini ListModels API and returns
 // model names that support embedContent.
 func fetchGeminiEmbeddingModels(ctx context.Context, apiKey string) ([]string, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s&pageSize=100", apiKey)
+	url := "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
+	req.Header.Set("x-goog-api-key", apiKey)
 	resp, err := geminiListHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)

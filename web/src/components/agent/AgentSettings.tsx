@@ -22,6 +22,7 @@ import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
+import { useAvatarImageProviders } from "./useAvatarImageProviders";
 import { buildAgentSavePayload, needsCustomURLFor } from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
@@ -202,6 +203,9 @@ export function AgentSettings() {
   const [checkinNotice, setCheckinNotice] = useState("");
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
+  const [avatarPrompt, setAvatarPrompt] = useState("");
+  const [avatarWarning, setAvatarWarning] = useState("");
+  const avatarProviders = useAvatarImageProviders();
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
@@ -929,6 +933,7 @@ export function AgentSettings() {
       await agentApi.uploadAvatar(id, file);
       setAvatarToken(Date.now());
       setAgent((a) => (a ? { ...a, hasAvatar: true } : a));
+      setAvatarWarning("");
     } catch (err) {
       setError(errMsg(err));
     }
@@ -953,14 +958,36 @@ export function AgentSettings() {
     if (!id || !persona.trim()) return;
     setGeneratingAvatar(true);
     setError("");
+    let generatedPath = "";
     try {
-      const result = await agentApi.generateAvatar(persona.trim(), name.trim());
+      const result = await agentApi.generateAvatar(
+        persona.trim(),
+        name.trim(),
+        avatarPrompt.trim(),
+        undefined,
+        avatarProviders.providerForRequest,
+        false,
+      );
+      generatedPath = result.avatarPath;
+      // Older servers ignore allowFallback; never replace a published avatar
+      // with the initials SVG if such a server returns one.
+      if (result.fallback) {
+        setAvatarWarning(result.warning ?? t("settings.avatarGenerationFailed"));
+        return;
+      }
       await agentApi.uploadGeneratedAvatar(id, result.avatarPath);
+      // The publish handler owns and removes the temp directory after it has
+      // validated the path, regardless of SaveAvatar success.
+      generatedPath = "";
       setAvatarToken(Date.now());
       setAgent((a) => (a ? { ...a, hasAvatar: true } : a));
+      setAvatarWarning("");
     } catch (err) {
       setError(errMsg(err));
     } finally {
+      if (generatedPath) {
+        await agentApi.discardAvatarPreview(generatedPath).catch(() => {});
+      }
       setGeneratingAvatar(false);
     }
   };
@@ -1108,10 +1135,18 @@ export function AgentSettings() {
           <div className="mb-4 flex items-center gap-4">
             <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
             <div className="flex flex-wrap gap-2">
-              <Button onClick={() => fileRef.current?.click()}>{t("settings.changeAvatar")}</Button>
+              <Button onClick={() => fileRef.current?.click()} disabled={generatingAvatar}>
+                {t("settings.changeAvatar")}
+              </Button>
               <Button
                 onClick={handleGenerateAvatar}
-                disabled={generatingAvatar || !persona.trim()}
+                disabled={
+                  generatingAvatar ||
+                  !persona.trim() ||
+                  !name.trim() ||
+                  !avatarProviders.loaded ||
+                  avatarProviders.available.length === 0
+                }
                 className="flex items-center gap-1.5"
               >
                 {generatingAvatar ? (
@@ -1128,6 +1163,39 @@ export function AgentSettings() {
                 className="hidden"
               />
             </div>
+          </div>
+
+          <div className="mb-4 space-y-3">
+            <Field label={t("create.avatarPromptLabel")} help={t("create.avatarPromptHelp")}>
+              <Textarea
+                value={avatarPrompt}
+                onChange={(e) => setAvatarPrompt(e.target.value)}
+                placeholder={t("create.avatarPromptPlaceholder")}
+                rows={3}
+              />
+            </Field>
+            {avatarProviders.error ? (
+              <Banner tone="warn">{t("create.avatarProviderStatusError")}</Banner>
+            ) : avatarProviders.available.length > 1 ? (
+              <Field label={t("create.avatarProviderLabel")}>
+                <Select
+                  value={avatarProviders.selected}
+                  onChange={(e) => avatarProviders.setSelected(e.target.value as "gemini" | "openai")}
+                >
+                  <option value="openai">OpenAI — GPT Image 2</option>
+                  <option value="gemini">Google — Gemini</option>
+                </Select>
+              </Field>
+            ) : avatarProviders.loaded && avatarProviders.available.length === 1 ? (
+              <div className="text-[12px] text-ink-faint">
+                {t("create.avatarProviderAuto", {
+                  provider: avatarProviders.available[0] === "openai" ? "OpenAI — GPT Image 2" : "Google — Gemini",
+                })}
+              </div>
+            ) : avatarProviders.loaded ? (
+              <Banner tone="warn">{t("create.avatarProviderMissing")}</Banner>
+            ) : null}
+            {avatarWarning && <Banner tone="warn">{t("settings.avatarKeptWarning", { error: avatarWarning })}</Banner>}
           </div>
 
           <div className="space-y-4">

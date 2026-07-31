@@ -8,6 +8,7 @@ import { PersonaTemplatesSection } from "./globalsettings/PersonaTemplatesSectio
 import { SystemSection } from "./globalsettings/SystemSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
+import { useOpenAIApiKey } from "./globalsettings/useOpenAIApiKey";
 import { useXAIApiKey } from "./globalsettings/useXAIApiKey";
 import { useEnterSends } from "../lib/preferences";
 import { useLocale, setLocale, useT, type Locale } from "../lib/i18n";
@@ -38,12 +39,13 @@ export function GlobalSettings() {
   // initial load *and* after a subsequent save.
   const gemini = useGeminiApiKey(setError, flashSuccess);
   const embedding = useEmbeddingModel(
-    gemini.configured,
+    gemini.configured || gemini.hasFallback,
     gemini.saveToken,
     gemini.initialEmbeddingModel,
     setError,
     flashSuccess,
   );
+  const openai = useOpenAIApiKey(setError, flashSuccess);
   const xai = useXAIApiKey(setError, flashSuccess);
 
   return (
@@ -62,7 +64,7 @@ export function GlobalSettings() {
             </Select>
           </Field>
         </SectionCard>
-        <ApiKeysSection gemini={gemini} embedding={embedding} xai={xai} />
+        <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />

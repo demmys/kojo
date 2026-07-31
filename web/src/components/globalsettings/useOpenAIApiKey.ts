@@ -2,39 +2,24 @@ import { useCallback, useEffect, useState } from "react";
 import { agentApi } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
 
-/**
- * useGeminiApiKey encapsulates the Gemini API key configured/fallback status
- * and the save/remove flows. Errors and success pulses are surfaced through
- * the caller-supplied callbacks so the owning page can render a single
- * shared banner.
- *
- * `saveToken` increments on every successful Save so downstream hooks
- * (e.g. useEmbeddingModel) can re-run side effects without having to
- * observe imperative events.
- */
-export interface GeminiApiKeyHook {
+export interface OpenAIApiKeyHook {
   configured: boolean;
   hasFallback: boolean;
   editing: boolean;
   input: string;
   saving: boolean;
-  /** Resolves once the initial GET has completed. */
   loaded: boolean;
   loadError: boolean;
-  /** Embedding model name reported by the initial GET (null until loaded). */
-  initialEmbeddingModel: string | null;
-  /** Monotonically-increasing counter; bumps on each successful save. */
-  saveToken: number;
-  setInput: (v: string) => void;
+  setInput: (value: string) => void;
   toggleEditing: () => void;
   save: () => Promise<void>;
   remove: () => Promise<void>;
 }
 
-export function useGeminiApiKey(
-  onError: (msg: string) => void,
+export function useOpenAIApiKey(
+  onError: (message: string) => void,
   onSuccess: () => void,
-): GeminiApiKeyHook {
+): OpenAIApiKeyHook {
   const [configured, setConfigured] = useState(false);
   const [hasFallback, setHasFallback] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -42,18 +27,15 @@ export function useGeminiApiKey(
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState(false);
-  const [initialEmbeddingModel, setInitialEmbeddingModel] = useState<string | null>(null);
-  const [saveToken, setSaveToken] = useState(0);
 
   useEffect(() => {
     let active = true;
     agentApi.apiKeys
-      .get("gemini")
-      .then((r: { configured: boolean; hasFallback?: boolean; embeddingModel?: string }) => {
+      .get("openai")
+      .then((result) => {
         if (!active) return;
-        setConfigured(r.configured);
-        setHasFallback(r.hasFallback ?? false);
-        setInitialEmbeddingModel(r.embeddingModel ?? null);
+        setConfigured(result.configured);
+        setHasFallback(result.hasFallback ?? false);
         setLoadError(false);
       })
       .catch(() => {
@@ -68,7 +50,7 @@ export function useGeminiApiKey(
   }, []);
 
   const toggleEditing = useCallback(() => {
-    setEditing((e) => !e);
+    setEditing((current) => !current);
     setInput("");
     onError("");
   }, [onError]);
@@ -78,28 +60,27 @@ export function useGeminiApiKey(
     setSaving(true);
     onError("");
     try {
-      await agentApi.apiKeys.set("gemini", input.trim());
+      await agentApi.apiKeys.set("openai", input.trim());
       setLoadError(false);
       setConfigured(true);
       setEditing(false);
       setInput("");
-      setSaveToken((t) => t + 1);
       onSuccess();
-    } catch (err) {
-      onError(errMsg(err));
+    } catch (error) {
+      onError(errMsg(error));
     } finally {
       setSaving(false);
     }
   }, [input, onError, onSuccess]);
 
   const remove = useCallback(async () => {
-    if (!confirm("Remove Gemini API key?")) return;
+    if (!confirm("Remove OpenAI API key?")) return;
     try {
-      await agentApi.apiKeys.delete("gemini");
+      await agentApi.apiKeys.delete("openai");
       setLoadError(false);
       setConfigured(false);
-    } catch (err) {
-      onError(errMsg(err));
+    } catch (error) {
+      onError(errMsg(error));
     }
   }, [onError]);
 
@@ -111,8 +92,6 @@ export function useGeminiApiKey(
     saving,
     loaded,
     loadError,
-    initialEmbeddingModel,
-    saveToken,
     setInput,
     toggleEditing,
     save,

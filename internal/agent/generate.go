@@ -390,22 +390,33 @@ func GeneratePublicProfile(persona string) (string, error) {
 // LoadGeminiAPIKey is the exported wrapper around loadGeminiAPIKey for
 // callers outside the agent package (e.g. internal/server's TTS handler).
 // It applies the same priority order: encrypted credential store first,
-// then the legacy nanobanana credentials file as a fallback.
+// environment variables second, then the legacy nanobanana credentials file.
 func LoadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	return loadGeminiAPIKey(creds)
 }
 
 // loadGeminiAPIKey loads the Gemini API key.
-// Priority: 1) encrypted credential store, 2) nanobanana credentials file (fallback).
+// Priority: 1) encrypted credential store, 2) environment variables,
+// 3) nanobanana credentials file (fallback).
 func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 	// 1. Try credential store (encrypted, set via Settings UI)
 	if creds != nil {
-		if key, err := creds.GetToken("gemini", "", "", "api_key"); err == nil && key != "" {
+		if key, err := creds.GetToken("gemini", "", "", "api_key"); err == nil {
+			if key = strings.TrimSpace(key); key != "" {
+				return key, nil
+			}
+		}
+	}
+
+	// 2. Environment variables. Keep all historical names because existing
+	// deployments use different Google SDK conventions.
+	for _, envName := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
+		if key := strings.TrimSpace(os.Getenv(envName)); key != "" {
 			return key, nil
 		}
 	}
 
-	// 2. Fallback: nanobanana credentials file
+	// 3. Fallback: nanobanana credentials file
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot get home dir: %w", err)
@@ -422,6 +433,23 @@ func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 		return "", fmt.Errorf("gemini API key not configured (check Settings)")
 	}
 	return key, nil
+}
+
+// LoadOpenAIAPIKey loads the OpenAI API key used by GPT Image models.
+// Priority: 1) encrypted credential store (provider "openai"),
+// 2) OPENAI_API_KEY environment variable.
+func LoadOpenAIAPIKey(creds *CredentialStore) (string, error) {
+	if creds != nil {
+		if key, err := creds.GetToken("openai", "", "", "api_key"); err == nil {
+			if key = strings.TrimSpace(key); key != "" {
+				return key, nil
+			}
+		}
+	}
+	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
+		return key, nil
+	}
+	return "", fmt.Errorf("OpenAI API key not configured (check Settings or OPENAI_API_KEY)")
 }
 
 // LoadXAIAPIKey loads the xAI (Grok) API key for callers outside the

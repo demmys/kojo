@@ -92,6 +92,7 @@ type Server struct {
 	agents          *agent.Manager
 	groupdms        *agent.GroupDMManager
 	slackHub        *slackbot.Hub
+	externalChat    *externalChatRouter
 	files           *filebrowser.Browser
 	git             *gitpkg.Manager
 	notify          *notify.Manager
@@ -514,12 +515,14 @@ func New(cfg Config) *Server {
 	// peer would race the Hub's hub for the same Slack tokens.
 	if s.agents != nil && !cfg.PeerOnly {
 		creds := s.agents.Credentials()
+		s.externalChat = newExternalChatRouter(s)
 		s.slackHub = slackbot.NewHub(
-			s.agents, creds,
+			s.externalChat, creds,
 			func(id string) string { return agent.AgentDir(id) },
 			logger,
 		)
-		for _, a := range s.agents.List() {
+		allAgents := append(s.agents.List(), s.agents.ListRemote()...)
+		for _, a := range allAgents {
 			if a.Archived {
 				continue
 			}
@@ -769,6 +772,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// DELETE) are Hub-only — peer pairing is an operator workflow
 	// that runs on the Hub.
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		// The canonical Hub owns external chat connections. A holder peer
+		// exposes only the fenced agent-turn endpoint used by the Hub.
+		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
 		if !cfg.PeerOnly {

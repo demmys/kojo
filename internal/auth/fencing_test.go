@@ -118,6 +118,28 @@ func TestAgentFencing_PassesHandoffSwitch(t *testing.T) {
 	}
 }
 
+func TestAgentFencing_PassesHubOwnedSlackRoutes(t *testing.T) {
+	st := &fakeLockStore{holderByID: map[string]string{"ag_x": "peer-tgt"}}
+	h := newFencingHandler(t, st, "peer-self",
+		Principal{Role: RoleAgent, AgentID: "ag_x"})
+
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPut, "/api/v1/agents/ag_x/slackbot"},
+		{http.MethodDelete, "/api/v1/agents/ag_x/slackbot"},
+		{http.MethodPost, "/api/v1/agents/ag_x/slackbot/test"},
+	} {
+		r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s %s: status = %d, want 200", tc.method, tc.path, w.Code)
+		}
+	}
+}
+
 func TestAgentFencing_PassesWhenNoLockExists(t *testing.T) {
 	// v1: ErrNotFound means AgentLockGuard hasn't Acquired yet.
 	// Pass through rather than block a fresh agent.

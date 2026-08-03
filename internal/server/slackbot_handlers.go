@@ -33,8 +33,11 @@ type slackBotResponse struct {
 }
 
 func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSlackHub(w) {
+		return
+	}
 	agentID := r.PathValue("id")
-	a, ok := s.agents.Get(agentID)
+	a, ok := s.agents.GetAny(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
@@ -69,8 +72,11 @@ func (s *Server) handleGetSlackBot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSlackHub(w) {
+		return
+	}
 	agentID := r.PathValue("id")
-	_, ok := s.agents.Get(agentID)
+	_, ok := s.agents.GetAny(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
@@ -120,7 +126,7 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	// re-check (and with If-Match omitted, where agentIfMatchPrecheck
 	// is a no-op), we'd write Slack tokens to a credential store row
 	// for a freshly-deleted agent — orphaned secrets.
-	if _, ok := s.agents.Get(agentID); !ok {
+	if _, ok := s.agents.GetAny(agentID); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
 	}
@@ -202,7 +208,7 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 	// active. Reconfigure on an archived agent would start the bot we
 	// intentionally stopped at archive time.
 	if s.slackHub != nil {
-		if a, ok := s.agents.Get(agentID); ok && !a.Archived {
+		if a, ok := s.agents.GetAny(agentID); ok && !a.Archived {
 			s.slackHub.Reconfigure(agentID, cfg)
 		}
 	}
@@ -218,6 +224,9 @@ func (s *Server) handleSetSlackBot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSlackHub(w) {
+		return
+	}
 	// Wrap the whole delete flow (token Delete + UpdateSlackBot
 	// + hub StopBot) in one mutation guard so a handoff that
 	// lands mid-delete can't leave source with credentials but
@@ -231,7 +240,7 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 		defer releaseMut()
 	}
 	agentID := r.PathValue("id")
-	_, ok := s.agents.Get(agentID)
+	_, ok := s.agents.GetAny(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
@@ -254,7 +263,7 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	// Re-check existence under the lock — see handleSetSlackBot.
-	if _, ok := s.agents.Get(agentID); !ok {
+	if _, ok := s.agents.GetAny(agentID); !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
 	}
@@ -308,8 +317,11 @@ func (s *Server) handleDeleteSlackBot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTestSlackBot(w http.ResponseWriter, r *http.Request) {
+	if !s.requireSlackHub(w) {
+		return
+	}
 	agentID := r.PathValue("id")
-	_, ok := s.agents.Get(agentID)
+	_, ok := s.agents.GetAny(agentID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "agent not found")
 		return
@@ -355,4 +367,15 @@ func (s *Server) handleTestSlackBot(w http.ResponseWriter, r *http.Request) {
 		"team":    team,
 		"botUser": botUser,
 	})
+}
+
+// requireSlackHub keeps Slack configuration and credentials on the canonical
+// Hub. Peer-only runtimes expose the agent-turn relay, but never the Slack
+// management surface, even to another paired peer.
+func (s *Server) requireSlackHub(w http.ResponseWriter) bool {
+	if s != nil && s.slackHub != nil {
+		return true
+	}
+	writeError(w, http.StatusNotFound, "not_found", "Slack integration is managed by the Hub")
+	return false
 }

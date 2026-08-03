@@ -1202,12 +1202,9 @@ func main() {
 		// Source-side hook: after the orchestrator's complete
 		// + finalize succeed, drop the agent from THIS peer's
 		// AgentLockGuard.desired so target's lease expiry
-		// doesn't trigger a stale re-Acquire from here. Also
-		// stops the source-side SlackBot (if any) so the
-		// migrated agent doesn't keep responding from this
-		// peer — v1 doesn't auto-start it on target (the
-		// operator re-enables via UI on the target host), but
-		// stopping here avoids the duplicate-bot bug.
+		// doesn't trigger a stale re-Acquire from here. Slack is
+		// deliberately not stopped: the canonical Hub owns the
+		// Socket connection and routes turns to the new holder.
 		srv.SetOnAgentReleasedAsSource(func(hookCtx context.Context, agentID string) {
 			// ReleaseAgentLocally FIRST so the durable
 			// handoff/released/<id> marker lands before any
@@ -1227,9 +1224,6 @@ func main() {
 			}
 			if capturedGuard != nil {
 				capturedGuard.RemoveAgent(hookCtx, agentID)
-			}
-			if hub := srv.SlackHub(); hub != nil {
-				hub.StopBot(agentID)
 			}
 		})
 		// Operator-driven force-reclaim path. After
@@ -1253,9 +1247,6 @@ func main() {
 			}
 			if agentMgr != nil {
 				agentMgr.TeardownAgentRuntime(agentID)
-			}
-			if hub := srv.SlackHub(); hub != nil {
-				hub.StopBot(agentID)
 			}
 		})
 		srv.SetOnAgentForceReclaimed(func(hookCtx context.Context, agentID string) {

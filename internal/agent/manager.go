@@ -1003,6 +1003,17 @@ func (m *Manager) GetRemote(id string) *Agent {
 	return a
 }
 
+// GetAny returns an agent whether its runtime is local or held by a peer.
+// Hub-owned integrations use the persisted remote mirror for configuration;
+// execution paths must continue to use Get so they cannot run a remote agent.
+func (m *Manager) GetAny(id string) (*Agent, bool) {
+	if a, ok := m.Get(id); ok {
+		return a, true
+	}
+	a := m.GetRemote(id)
+	return a, a != nil
+}
+
 // List returns deep copies of all agents.
 func (m *Manager) List() []*Agent {
 	// Collect IDs (skipping archived for syncPersona) outside the main lock
@@ -1753,10 +1764,22 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 // variant skips the inner guard so the whole handler is one
 // transactional unit under the outer mutation.
 //
+// For a remote runtime this updates only the Hub-owned slackBot field in the
+// persisted mirror, leaving all holder-owned settings untouched.
+//
 // MUST NOT be called from any path that does NOT already hold
-// AcquireMutation for this agent.
+// AcquireMutation and LockPatch for this agent.
 func (m *Manager) UpdateSlackBotAlreadyGuarded(id string, cfg *SlackBotConfig) error {
-	return m.updateSlackBotUnguarded(id, cfg)
+	m.mu.Lock()
+	_, local := m.agents[id]
+	m.mu.Unlock()
+	if local {
+		return m.updateSlackBotUnguarded(id, cfg)
+	}
+	if m.store == nil {
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	return m.store.UpdateAgentSetting(id, "slackBot", cfg, cfg == nil)
 }
 
 func (m *Manager) updateSlackBotUnguarded(id string, cfg *SlackBotConfig) error {
@@ -2351,6 +2374,13 @@ type OneShotOpts struct {
 	// per-call capability rather than an Agent setting so WebUI and external
 	// conversations can run concurrently without changing each other's prompt.
 	DisableKojoAttachmentInstructions bool
+
+	// ResumeMessage is an alternate user payload for an existing
+	// SessionKey-backed session. External transports can provide both the
+	// full-history first-turn payload and a smaller resumed-session payload
+	// without probing holder-local session files over the network. The
+	// Manager selects this value only when the session is actually usable.
+	ResumeMessage string
 }
 
 // ChatOneShot runs a one-shot chat that does not save to the agent's
@@ -2370,6 +2400,14 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	defer m.releasePreparing(agentID)
+
+	// Session state lives on the execution holder. Select the resumed payload
+	// here, inside the device-switch preparation gate, so a Hub-owned external
+	// transport does not need a separate CanResumeSession RPC (and cannot race
+	// a handoff between probing and starting the turn).
+	if opts.ResumeMessage != "" && opts.SessionKey != "" && m.CanResumeSession(agentID, opts.SessionKey) {
+		userMessage = opts.ResumeMessage
+	}
 
 	// Concurrent dynamic-effort resolution, same as Chat. One-shot
 	// callers (Slack/Discord) are always human-driven → systemTurn=false.

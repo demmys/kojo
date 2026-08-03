@@ -21,28 +21,7 @@ import (
 // ChatManager is the interface the bot uses to interact with agents.
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
-	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error)
-	// CanResumeSession reports whether the next ChatOneShot for this
-	// (agentID, sessionKey) pair is likely to resume an existing
-	// backend session. True when the backend honors SessionKey AND
-	// the on-disk session artifact exists AND is non-empty. The
-	// Slack bot uses this to choose between two injection modes:
-	//   - false (backend runs OneShot, or the session file was removed
-	//     or empty) → inject the full thread via FormatForInjection so
-	//     the model has every prior message.
-	//   - true AND we have already replied in this conversation →
-	//     inject only a head+tail safety net via
-	//     FormatForInjectionHeadTail. The backend's resumed transcript
-	//     already carries the bulk of the conversation; the safety net
-	//     covers the mid-thread session-reset edge case documented at
-	//     Manager.CanResumeSession (sessionResetThresholdTokens) and
-	//     the user-message delta gap between the last bot reply and
-	//     this turn.
-	//   - true but no prior bot reply (first turn of a resumable
-	//     session) → still use full FormatForInjection so the seeded
-	//     session gets the complete Slack context.
-	CanResumeSession(agentID, sessionKey string) bool
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
@@ -559,13 +538,10 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// snippets, not new events.
 	//
 	// "Already replied" is detected via the same bot-reply heuristic as
-	// before: a chat_history entry whose UserID matches our bot user or
-	// whose MessageID has the local ".bot" suffix. CanResumeSession
-	// additionally verifies the session artifact still exists on disk —
-	// claude /clear, upgrade or manual cleanup can remove it independently
-	// of Slack-side history, so the chat_history signal alone is not safe.
+	// before. We build both payloads here; Manager.ChatOneShot chooses the
+	// head+tail form only when the holder-local SessionKey artifact is usable.
 	useHeadTail := false
-	if len(history) > 0 && b.mgr.CanResumeSession(b.agentID, sessionKey) {
+	if len(history) > 0 {
 		// Match our own bot replies only. Two reliable signals are OR'd:
 		//
 		//   (1) UserID == b.botUserID — set by every AppendMessages write
@@ -590,23 +566,31 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		}
 	}
 
-	// Build enriched message with conversation history (when needed).
-	var sb strings.Builder
-	if len(history) > 0 {
-		if useHeadTail {
-			sb.WriteString(chathistory.FormatForInjectionHeadTail(history, b.botUserID, chathistory.DefaultHeadCount, chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
-		} else {
-			sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
+	buildMessage := func(historyPrefix string) string {
+		var sb strings.Builder
+		if historyPrefix != "" {
+			sb.WriteString(historyPrefix)
+			sb.WriteString("\n---\n\n")
 		}
-		sb.WriteString("\n---\n\n")
+		safeDisplay := sanitizeDisplayName(displayName)
+		if threadTS != "" {
+			sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text))
+		} else {
+			sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text))
+		}
+		return sb.String()
 	}
-	safeDisplay := sanitizeDisplayName(displayName)
-	if threadTS != "" {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text))
-	} else {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text))
+
+	fullHistory := ""
+	if len(history) > 0 {
+		fullHistory = chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars)
 	}
-	message := sb.String()
+	message := buildMessage(fullHistory)
+	resumeMessage := ""
+	if useHeadTail {
+		resumeMessage = buildMessage(chathistory.FormatForInjectionHeadTail(
+			history, b.botUserID, chathistory.DefaultHeadCount, chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
+	}
 
 	// Volatile per-conversation context goes in SystemPromptExtra (appended
 	// to the system prompt by Manager). Per-channel/thread context is
@@ -622,6 +606,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		SessionKey:                        sessionKey,
 		SystemPromptExtra:                 systemPromptExtra,
 		DisableKojoAttachmentInstructions: true,
+		ResumeMessage:                     resumeMessage,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)

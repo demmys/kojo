@@ -224,6 +224,18 @@ type Manager struct {
 	// by server.go to push an "agent_awaiting_input" web-push notification.
 	OnQuestionRaised func(agentID string)
 
+	// attention tracks agent-raised, non-blocking "look at me" pages,
+	// keyed by agentID. Set by RaiseAttention (POST /attention), cleared
+	// by ClearAttention (the operator opening the agent's chat, or an
+	// explicit DELETE). Folded into Agent.Attention* by List/Get.
+	// Guarded by busyMu, same as pendingQuestions.
+	attention map[string]attentionEntry
+
+	// OnAttentionRaised is called once per RaiseAttention call — NOT on
+	// every List() poll — mirroring OnQuestionRaised. Wired by server.go
+	// to push an "agent_attention" web-push notification.
+	OnAttentionRaised func(agentID, reason string)
+
 	// chatWatchers tracks per-agent channels notified when a new chat starts.
 	chatWatchers   map[string]map[*chatWatcher]struct{}
 	chatWatchersMu sync.Mutex
@@ -1045,6 +1057,7 @@ func (m *Manager) List() []*Agent {
 		// safe to consult IsBusy while holding m.mu here.
 		c.Busy = m.IsBusyForStatus(a.ID)
 		c.AwaitingAnswer = m.HasPendingQuestion(a.ID)
+		m.applyAttention(c)
 		list = append(list, c)
 	}
 	return list

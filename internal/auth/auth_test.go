@@ -217,6 +217,13 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodPatch, "/api/v1/agents/ag_y", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/reset", ag, true},
 		{http.MethodPost, "/api/v1/agents/ag_y/reset", ag, false},
+		// paging the operator: self-scoped, POST raises / DELETE retracts.
+		{http.MethodPost, "/api/v1/agents/ag_x/attention", ag, true},
+		{http.MethodDelete, "/api/v1/agents/ag_x/attention", ag, true},
+		{http.MethodPost, "/api/v1/agents/ag_y/attention", ag, false},
+		{http.MethodDelete, "/api/v1/agents/ag_y/attention", ag, false},
+		{http.MethodGet, "/api/v1/agents/ag_x/attention", ag, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/attention", guest, false},
 		// privileged: cross-agent delete/reset
 		{http.MethodDelete, "/api/v1/agents/ag_y", priv, true},
 		{http.MethodPost, "/api/v1/agents/ag_y/reset", priv, true},

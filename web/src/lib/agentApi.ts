@@ -157,6 +157,18 @@ export interface AgentInfo {
   // a turn blocked on human input is obvious at a glance. Server-derived;
   // never sent on update.
   awaitingAnswer?: boolean;
+  // attention is a runtime-only flag the agent raises for itself via
+  // POST /agents/{id}/attention — the non-blocking counterpart to
+  // awaitingAnswer. The turn keeps running; the dashboard just highlights
+  // the row until the operator opens the chat (which clears it).
+  attention?: boolean;
+  // attentionReason is the optional one-line note supplied with the
+  // raise, rendered next to the highlight. Empty when the agent paged
+  // without saying why.
+  attentionReason?: string;
+  // attentionAt is the raise time in unix millis, for the relative
+  // timestamp next to the pill.
+  attentionAt?: number;
 }
 
 // TURN_ERROR_PREFIX is the marker the server stamps onto the system
@@ -190,6 +202,7 @@ export const CONTEXT_INJECTION_KEYS = [
   "memory_search",
   "recent_conversation",
   "persona_anchor",
+  "call_user",
 ] as const;
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
@@ -745,6 +758,23 @@ export const agentApi = {
       deny,
       denyMessage,
     }),
+
+  // raiseAttention flags the agent as wanting the operator's eyes. The
+  // agent normally calls this itself over HTTP; the UI ships it for
+  // completeness/tests. Non-blocking — nothing waits on the operator.
+  raiseAttention: (agentId: string, reason = "") =>
+    post<{ attention: boolean; reason?: string; at?: number }>(
+      `/api/v1/agents/${agentId}/attention`,
+      { reason },
+    ),
+
+  // clearAttention retracts the page. Idempotent — the chat view calls
+  // it on every open, so "nothing was set" is the normal outcome and is
+  // reported as cleared=false rather than an error.
+  clearAttention: (agentId: string) =>
+    del<{ attention: boolean; cleared?: boolean }>(
+      `/api/v1/agents/${agentId}/attention`,
+    ),
 
   getQueuedMessages: (agentId: string) =>
     get<{ messages: QueuedAgentMessage[] }>(

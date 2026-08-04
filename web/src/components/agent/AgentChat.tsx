@@ -196,6 +196,29 @@ export function AgentChat() {
     }).catch(console.error);
   }, [id]);
 
+  // Looking at an agent's chat IS the acknowledgement of a page it
+  // raised, so retract it — on open, and again on a slow tick while the
+  // tab stays visible so a page raised WHILE the operator is already
+  // reading doesn't leave a stale highlight waiting on the dashboard.
+  // The DELETE is idempotent and cheap, so it fires unconditionally
+  // rather than costing a GET to find out whether anything was set. The
+  // dashboard clears too when it is mounted; on narrow screens the
+  // detail route unmounts the list, which is why this exists at all.
+  useEffect(() => {
+    if (!id) return;
+    const retract = () => {
+      if (document.visibilityState !== "visible") return;
+      agentApi.clearAttention(id).catch(() => {});
+    };
+    retract();
+    const interval = setInterval(retract, 15000);
+    document.addEventListener("visibilitychange", retract);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", retract);
+    };
+  }, [id]);
+
   // §3.7 device-switch: when the agent's runtime lives on a remote
   // peer that is currently offline, the WS proxy + GET /messages
   // proxy both 502, the transcript shown is whatever stale snapshot

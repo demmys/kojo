@@ -294,6 +294,27 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     return () => clearInterval(interval);
   }, []);
 
+  // An agent-raised page clears as soon as the operator is looking at that
+  // agent — including a page raised WHILE the chat is already open (the
+  // next poll surfaces it here and it's retracted immediately). The local
+  // state is cleared optimistically so the row never flashes highlighted
+  // between the DELETE and the following poll. Errors are swallowed: a
+  // failed clear just leaves the highlight up until the next attempt.
+  // AgentChat clears on open too — on narrow screens the detail route
+  // unmounts this list entirely, so it cannot be the only clearer.
+  useEffect(() => {
+    if (!activeAgentId) return;
+    if (!agents.some((a) => a.id === activeAgentId && a.attention)) return;
+    setAgents((prev) =>
+      prev.map((a) =>
+        a.id === activeAgentId
+          ? { ...a, attention: false, attentionReason: undefined, attentionAt: undefined }
+          : a,
+      ),
+    );
+    agentApi.clearAttention(activeAgentId).catch(() => {});
+  }, [agents, activeAgentId]);
+
   useEffect(() => {
     // Unread counts piggyback on the existing 5s room-list poll (no extra
     // timer). Per-room GET /unread?after=<localStorage lastRead>; failures
@@ -459,11 +480,15 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   // already running, so the stale error would just be noise.
   const agentErrored = (a: AgentInfo) =>
     !a.busy && !a.awaitingAnswer && !a.holderPeer && isTurnErrorPreview(a.lastMessage);
+  // attention ranks just under awaitingAnswer: both are "the agent wants
+  // you", but a blocked turn is strictly more urgent than a page that
+  // lets the turn keep running.
   const agentRank = (a: AgentInfo) => {
     if (a.awaitingAnswer) return 0;
-    if (a.busy) return 1;
-    if (agentErrored(a)) return 2;
-    return 3;
+    if (a.attention) return 1;
+    if (a.busy) return 2;
+    if (agentErrored(a)) return 3;
+    return 4;
   };
   // Order by most-recent activity: newest last message first. lastMessageAt
   // is epoch-millis (server-derived from the message row's created_at), so
@@ -656,7 +681,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                   <div
                     key={agent.id}
                     className={`flex items-stretch transition-colors hover:bg-hover${rowEdge(agent.id === activeAgentId)}${
-                      agent.awaitingAnswer ? " bg-lamp-warn/10" : errored ? " bg-lamp-err/10" : ""
+                      agent.awaitingAnswer
+                        ? " bg-lamp-warn/10"
+                        : agent.attention
+                          ? " bg-copper/10"
+                          : errored
+                            ? " bg-lamp-err/10"
+                            : ""
                     }`}
                   >
                     <button
@@ -682,6 +713,15 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                               {t("dash.awaitingAnswer")}
                             </span>
                           )}
+                          {agent.attention && !agent.awaitingAnswer && (
+                            <span
+                              className="flex shrink-0 items-center gap-1 rounded-full bg-copper/15 px-1.5 py-0.5 text-[10px] font-semibold text-copper"
+                              title={agent.attentionReason || t("dash.attention")}
+                            >
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-copper" />
+                              {t("dash.attention")}
+                            </span>
+                          )}
                           {errored && (
                             <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-err/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-err">
                               <span className="h-1.5 w-1.5 rounded-full bg-lamp-err" />
@@ -699,6 +739,11 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                         </div>
                         {open && (
                           <>
+                            {agent.attention && agent.attentionReason && (
+                              <div className="mt-0.5 truncate text-[13px] text-copper" title={agent.attentionReason}>
+                                {agent.attentionReason}
+                              </div>
+                            )}
                             <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
                             <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
                               <Chip className="shrink-0">{agent.tool}</Chip>

@@ -400,6 +400,11 @@ func isSelfScopedRoute(method, sub string) bool {
 		return false
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
+	case "/attention":
+		// Non-blocking "look at me" page: POST raises it, DELETE
+		// retracts it. Self only — an agent must not be able to
+		// light up another agent's dashboard row.
+		return method == http.MethodPost || method == http.MethodDelete
 	case "/credentials":
 		return method == http.MethodGet || method == http.MethodPost
 	case "/slackbot":

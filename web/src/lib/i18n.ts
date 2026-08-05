@@ -142,6 +142,7 @@ const messages = {
   "dash.expand": { ja: "展開", en: "Expand" },
   "dash.processing": { ja: "処理中", en: "Processing" },
   "dash.awaitingAnswer": { ja: "回答待ち", en: "Awaiting answer" },
+  "dash.attention": { ja: "呼び出し", en: "Wants you" },
   "dash.turnError": { ja: "エラー", en: "Error" },
   "dash.transferring": { ja: "転移中 @ {peer}", en: "Transferring @ {peer}" },
   "dash.transferringPreview": {
@@ -304,6 +305,11 @@ const messages = {
   "settings.inj.persona_anchor.desc": {
     ja: "毎ターンの文脈末尾に注入される人格アンカー (anchor.md)",
     en: "Persona anchor appended to the per-turn context tail (anchor.md)",
+  },
+  "settings.inj.call_user.label": { ja: "ユーザー呼び出し", en: "Call the User" },
+  "settings.inj.call_user.desc": {
+    ja: "待機せずに操作者を呼ぶ API の手順 (一覧を強調表示)",
+    en: "How to page the operator without waiting (highlights the row)",
   },
 
   // ── AgentSettings: card titles / descriptions ──

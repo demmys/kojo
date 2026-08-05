@@ -130,6 +130,12 @@ var reservedAgentKeys = map[string]bool{
 	"holderPeerStatus": true,
 	"busy":             true,
 	"awaitingAnswer":   true,
+	// attention* is the agent-raised "look at me" flag. Runtime-only
+	// like busy/awaitingAnswer: a persisted copy would resurrect a
+	// stale page on the next Load, long after the operator cleared it.
+	"attention":       true,
+	"attentionReason": true,
+	"attentionAt":     true,
 	// mission is a create-time transient (materialised into MEMORY.md
 	// by ensureAgentDir, then cleared). Strip defensively so no future
 	// Save path can leak a still-set value into settings_json.
@@ -246,6 +252,9 @@ var loadStripKeys = map[string]bool{
 	"holderPeerStatus": true,
 	"busy":             true,
 	"awaitingAnswer":   true,
+	"attention":        true,
+	"attentionReason":  true,
+	"attentionAt":      true,
 	// mission mirrors the Save-side strip above: a row written by a
 	// binary predating that guard must not rehydrate a transient
 	// Mission and re-trigger materialisation on an existing agent.

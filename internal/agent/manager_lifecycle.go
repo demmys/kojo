@@ -341,6 +341,10 @@ func (m *Manager) Archive(id string) error {
 		m.groupdms.RemoveAgent(id)
 	}
 	m.closeIndex(id)
+	// An archived agent is off the dashboard, so a page it raised before
+	// being archived has nowhere to show — and would reappear on
+	// Unarchive if left in the map.
+	m.ClearAttention(id)
 
 	m.save()
 	m.logger.Info("agent archived", "id", id)
@@ -572,6 +576,9 @@ func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	delete(m.agents, id)
 	m.mu.Unlock()
+	// Drop any outstanding page. Nothing else expires it, so a deleted
+	// agent would otherwise leak its entry for the life of the process.
+	m.ClearAttention(id)
 
 	m.logger.Info("agent deleted", "id", id)
 	return nil
@@ -1916,6 +1923,12 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, markReleased bool) {
 	if m.switching != nil {
 		delete(m.switching, agentID)
 	}
+	// An outstanding page belongs to the runtime we just tore down.
+	// Unlike pendingQuestions (bounded by the turn that raised it) a
+	// page has no natural expiry, so without this the entry would
+	// outlive the agent and light the row back up if the same ID is
+	// re-installed here later (device-switch back, reload from store).
+	delete(m.attention, agentID)
 	m.busyMu.Unlock()
 	// (Marker write moved to the top of this function; see the
 	// comment above the cron.Remove call for the durability

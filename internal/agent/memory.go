@@ -601,6 +601,16 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 		sb.WriteString(fmt.Sprintf("To attach a file (any type) to your NEXT reply, stage it as `%s/<basename>` (`mkdir -p` first). kojo ingests staged files while your reply is in progress and may remove them between tool calls — the directory is cleanup territory, not storage. Details: read %s.\n", attachStage, filepath.Join(guideDir, "attachments.md")))
 	}
 
+	// Non-blocking operator page. Deliberately NOT a skill and not an
+	// AskUserQuestion: the turn keeps running, the dashboard row just
+	// lights up until the operator opens this chat. Only injected when
+	// the API is reachable from the agent's shell (apiBase != "").
+	if apiBase != "" && !a.InjectionDisabled(InjectionCallUser) {
+		sb.WriteString("\n## Calling the user\n\n")
+		sb.WriteString(fmt.Sprintf("When you want the operator's eyes on this agent but do NOT need to wait for them, page them:\n\n```bash\ncurl %s -X POST %s/api/v1/agents/%s/attention -H 'Content-Type: application/json' -d '{\"reason\":\"<one line, why>\"}'\n```\n\n", curlFlagsForAPI(apiBase), apiBase, a.ID))
+		sb.WriteString("This highlights your row in the dashboard and sends a push notification; it does not block or pause you — keep working after the call. The flag clears by itself once the operator opens your chat, so never poll for a reply. Use AskUserQuestion instead when you genuinely cannot proceed without an answer. `DELETE` the same URL to retract a page you no longer need.\n")
+	}
+
 	// Memory paths.
 	// Use absolute paths everywhere so the agent doesn't rely on cwd being
 	// correct when it Edits or Greps the diary. Relative paths silently

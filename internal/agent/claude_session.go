@@ -259,13 +259,11 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 		}
 	}
 
-	// Recent-context bootstrap applies only when this turn actually starts
-	// a fresh session process (--session-id). A reused live session already
-	// carries the conversation in memory — injecting the recap would
-	// duplicate context the model just saw.
-	if spawned && inv.bootstrapRecentContext && opts.RecentMessagesContext != "" {
-		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
-	}
+	// The backend is the authority on whether this turn actually resumed.
+	// A live reused process carries context even when its JSONL has not been
+	// flushed yet; only a newly spawned --session-id process is fresh.
+	fresh := spawned && inv.bootstrapRecentContext
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, !fresh)
 
 	// A question can be surfaced whenever the caller wired an answer channel.
 	// Automated turns surface it too (held with a timeout by handleControlRequest)

@@ -647,7 +647,7 @@ func TestStageGrokSession_TotalSizeCap(t *testing.T) {
 // TestReadGrokSessionFiles_TotalSizeCap covers the source-side
 // cap that mirrors the stage-side one. Without it source could
 // allocate up to grokSessionTransferMaxFiles ×
-// grokSessionFileMaxBytes (32 GiB) before the wire cap rejected
+// grokSessionFileMaxBytes × file-count before the wire cap rejected
 // the request. Use the same var-shrink trick to keep CI alloc
 // small.
 func TestReadGrokSessionFiles_TotalSizeCap(t *testing.T) {
@@ -718,6 +718,9 @@ func TestReadGrokSessionFiles_CoreFileOversizedFails(t *testing.T) {
 	const agentID = "ag_grok_core_big"
 	const sessionID = "019e0000-0000-7000-8000-000000000001"
 	plantGrokSession(t, agentID, sessionID)
+	prevFileCap := grokSessionFileMaxBytes
+	grokSessionFileMaxBytes = 1024
+	t.Cleanup(func() { grokSessionFileMaxBytes = prevFileCap })
 
 	// Overwrite events.jsonl with a file > grokSessionFileMaxBytes.
 	bigPath := filepath.Join(grokSessionDir(agentDir(agentID)), sessionID, "events.jsonl")
@@ -780,6 +783,9 @@ func TestStageGrokSession_RejectsOversizedFile(t *testing.T) {
 
 	const agentID = "ag_grok_stage_big_file"
 	const sessionID = "019e0000-0000-7000-8000-000000000001"
+	prevFileCap := grokSessionFileMaxBytes
+	grokSessionFileMaxBytes = 1024
+	t.Cleanup(func() { grokSessionFileMaxBytes = prevFileCap })
 
 	transfer := &GrokSessionTransfer{
 		SessionID: sessionID,

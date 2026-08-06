@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"strings"
+	"time"
 )
 
 // pathSafeAgentIDPattern restricts the agentID character set to one
@@ -78,6 +81,8 @@ type ClaudeSessionFile struct {
 	Content   []byte
 }
 
+const claudeSessionTransferMaxFiles = 1024
+
 // ReadClaudeSessionFiles pulls every session JSONL claude has
 // recorded for the given agent's source AgentDir. Returns an
 // empty slice (no error) if the project dir doesn't exist —
@@ -106,8 +111,23 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []SkippedSessi
 		}
 		return nil, nil, fmt.Errorf("agent.ReadClaudeSessionFiles: readdir: %w", err)
 	}
+	// Newest activity first. JSONL mtime advances on every resumed turn, so
+	// this order lets the switch orchestrator fill its bounded session budget
+	// with the conversations most likely to be used after the handoff.
+	slices.SortFunc(entries, func(a, b os.DirEntry) int {
+		ai, aerr := a.Info()
+		bi, berr := b.Info()
+		if aerr == nil && berr == nil && !ai.ModTime().Equal(bi.ModTime()) {
+			if ai.ModTime().After(bi.ModTime()) {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.Name(), b.Name())
+	})
 	out := make([]ClaudeSessionFile, 0, len(entries))
 	skipped := make([]SkippedSessionFile, 0)
+	var totalBytes int64
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
 			continue
@@ -129,12 +149,25 @@ func ReadClaudeSessionFiles(agentID string) ([]ClaudeSessionFile, []SkippedSessi
 			})
 			continue
 		}
+		if totalBytes+st.Size() > claudeSessionTransferMaxTotalBytes {
+			skipped = append(skipped, SkippedSessionFile{
+				Path: e.Name(), Reason: "capacity", SizeBytes: st.Size(),
+			})
+			continue
+		}
+		if len(out) >= claudeSessionTransferMaxFiles {
+			skipped = append(skipped, SkippedSessionFile{
+				Path: e.Name(), Reason: "capacity", SizeBytes: st.Size(),
+			})
+			continue
+		}
 		body, readErr := os.ReadFile(full)
 		if readErr != nil {
 			return nil, nil, fmt.Errorf("agent.ReadClaudeSessionFiles: read %s: %w", e.Name(), readErr)
 		}
 		sessionID := e.Name()[:len(e.Name())-len(".jsonl")]
 		out = append(out, ClaudeSessionFile{SessionID: sessionID, Content: body})
+		totalBytes += int64(len(body))
 	}
 	return out, skipped, nil
 }
@@ -184,11 +217,28 @@ func mkdirAllReplacingDanglingSymlink(path string) error {
 // commit / rollback are nil-safe and idempotent (calling either
 // twice is a no-op). Both are nil when files is empty.
 func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit func(), rollback func(), err error) {
+	return stageClaudeSessionFiles(agentID, files, false)
+}
+
+// StageClaudeSessionSnapshot stages an authoritative, possibly partial,
+// snapshot selected by the device-switch capacity budget. Existing target
+// JSONLs not present in files are tombstoned in the same two-phase operation,
+// otherwise a capacity-omitted thread could resume stale target-local state
+// instead of taking the canonical-history fallback.
+func StageClaudeSessionSnapshot(agentID string, files []ClaudeSessionFile) (commit func(), rollback func(), err error) {
+	return stageClaudeSessionFiles(agentID, files, true)
+}
+
+func stageClaudeSessionFiles(agentID string, files []ClaudeSessionFile, replaceExisting bool) (commit func(), rollback func(), err error) {
 	if agentID == "" {
 		return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: agent_id required")
 	}
-	if len(files) == 0 {
+	if len(files) == 0 && !replaceExisting {
 		return nil, nil, nil
+	}
+	if len(files) > claudeSessionTransferMaxFiles {
+		return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: too many sessions (%d > %d)",
+			len(files), claudeSessionTransferMaxFiles)
 	}
 	targetAgentDir, aerr := filepath.Abs(AgentDir(agentID))
 	if aerr != nil {
@@ -219,6 +269,9 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 		tmp   string
 	}
 	stagedFiles := make([]staged, 0, len(files))
+	selected := make(map[string]struct{}, len(files))
+	activityOrder := make([]string, 0, len(files))
+	var totalBytes int64
 	cleanupTmps := func() {
 		for _, s := range stagedFiles {
 			_ = os.Remove(s.tmp)
@@ -236,7 +289,23 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 			cleanupTmps()
 			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: refusing session_id with path separators: %q", f.SessionID)
 		}
+		if int64(len(f.Content)) > claudeSessionMaxBytes {
+			cleanupTmps()
+			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: session %q exceeds per-file cap", f.SessionID)
+		}
+		totalBytes += int64(len(f.Content))
+		if totalBytes > claudeSessionTransferMaxTotalBytes {
+			cleanupTmps()
+			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: total payload exceeds %d bytes",
+				claudeSessionTransferMaxTotalBytes)
+		}
+		if _, dup := selected[f.SessionID]; dup {
+			cleanupTmps()
+			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: duplicate session_id %q", f.SessionID)
+		}
+		selected[f.SessionID] = struct{}{}
 		final := filepath.Join(projectDir, f.SessionID+".jsonl")
+		activityOrder = append(activityOrder, final)
 		tmp, terr := os.CreateTemp(projectDir, ".session-*.jsonl.tmp")
 		if terr != nil {
 			cleanupTmps()
@@ -282,6 +351,38 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 			}
 		}
 	}
+	if replaceExisting {
+		entries, readErr := os.ReadDir(projectDir)
+		if readErr != nil {
+			cleanupTmps()
+			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: list existing sessions: %w", readErr)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+				continue
+			}
+			sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
+			if _, keep := selected[sessionID]; keep {
+				continue
+			}
+			final := filepath.Join(projectDir, entry.Name())
+			bf, bErr := os.CreateTemp(projectDir, ".sync-backup-*.jsonl")
+			if bErr != nil {
+				rollbackBackups()
+				cleanupTmps()
+				return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: tombstone backup temp: %w", bErr)
+			}
+			backupPath := bf.Name()
+			_ = bf.Close()
+			if rerr := renameOverwrite(final, backupPath); rerr != nil {
+				_ = os.Remove(backupPath)
+				rollbackBackups()
+				cleanupTmps()
+				return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: tombstone %s: %w", final, rerr)
+			}
+			backups = append(backups, backedUp{final: final, backup: backupPath})
+		}
+	}
 	for _, s := range stagedFiles {
 		// Snapshot the existing final (if any) under a
 		// timestamped backup name BEFORE renaming the tmp in.
@@ -317,6 +418,16 @@ func StageClaudeSessionFiles(agentID string, files []ClaudeSessionFile) (commit 
 			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: rename %s: %w", s.final, rerr)
 		}
 		backups = append(backups, backedUp{final: s.final, backup: backupPath})
+	}
+	// Input is newest-first. Preserve that relative activity order on target
+	// rather than letting temp-file creation order invert it on the next move.
+	now := time.Now()
+	for i, path := range activityOrder {
+		mtime := now.Add(-time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			rollbackBackups()
+			return nil, nil, fmt.Errorf("agent.StageClaudeSessionFiles: preserve activity order: %w", err)
+		}
 	}
 	// Renames committed; backups still on disk. commit/rollback
 	// decide their fate.
@@ -403,7 +514,13 @@ func EnsureAgentWorkspaceDirIfDefault(workDir, agentID string) error {
 }
 
 // claudeSessionMaxBytes caps an individual JSONL file the
-// transfer accepts. claude session files routinely reach a few
-// MB; 32 MiB is comfortable headroom without inviting a hostile
-// source to balloon the agent-sync payload.
-const claudeSessionMaxBytes = 32 << 20
+// transfer reader accepts. The switch orchestrator applies the stricter
+// aggregate 128 MiB JSON-envelope budget after base64 overhead and all
+// non-droppable history rows are known. Keeping the defensive per-file cap
+// at that same upper bound allows a useful 32+ MiB active rollout to compete
+// for the aggregate budget instead of being discarded prematurely.
+var claudeSessionMaxBytes int64 = 128 << 20
+
+// Bounds source-side allocation before the orchestrator applies the exact
+// raw-JSON budget (normally 128 MiB including base64 and history rows).
+var claudeSessionTransferMaxTotalBytes int64 = 256 << 20

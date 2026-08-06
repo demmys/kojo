@@ -90,6 +90,10 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior answer", nil)
+	if err := appendGroupMessage(g.ID, prior, 0, false); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "ping", nil, true); err != nil {
 		t.Fatal(err)
 	}
@@ -102,12 +106,36 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	if got := stub.lastOpts().SessionKey; got != "groupdm:"+g.ID {
 		t.Errorf("SessionKey = %q, want %q", got, "groupdm:"+g.ID)
 	}
+	if got := stub.lastOpts().History; len(got) != 1 || got[0].Text != "prior answer" || !got[0].IsBot {
+		t.Errorf("History = %+v, want prior agent answer only", got)
+	}
 	// notify path must not have fired for the thread room.
 	gdm.notifyMu.Lock()
 	_, exists := gdm.notify[g.ID+":ag_alice"]
 	gdm.notifyMu.Unlock()
 	if exists {
 		t.Errorf("thread post should not create notify state")
+	}
+}
+
+func TestThreadConversationHistory_StopsBeforeTriggeringMessage(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior", nil)
+	current := newGroupMessage(UserSenderID, "User", "current", nil)
+	future := newGroupMessage(UserSenderID, "User", "future", nil)
+	for _, msg := range []*GroupMessage{prior, current, future} {
+		if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	history := gdm.threadConversationHistory(g.ID, current.ID, "ag_alice")
+	if len(history) != 1 || history[0].MessageID != prior.ID || history[0].Text != "prior" {
+		t.Fatalf("history = %+v, want only the message before the trigger", history)
 	}
 }
 

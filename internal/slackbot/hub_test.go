@@ -43,12 +43,6 @@ func (m *mockMgr) ChatOneShot(_ context.Context, _, _ string, _ agent.OneShotOpt
 	return ch, nil
 }
 
-// CanResumeSession satisfies the ChatManager interface. The mock has no
-// on-disk session artifact so it always reports "no resumable session";
-// the bot then injects history every turn, matching the safe fallback
-// path for backends that don't honor SessionKey.
-func (m *mockMgr) CanResumeSession(_, _ string) bool { return false }
-
 var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // mockSlackServer returns an httptest.Server that handles common Slack API calls.

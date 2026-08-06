@@ -14,6 +14,7 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -1819,12 +1820,12 @@ func (m *Manager) HasCredentials() bool {
 // keys on the system prompt prefix, and any per-turn change there
 // invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy             Agent
-	backend               ChatBackend
-	sysPrompt             string
-	volatileContext       string
-	recentMessagesContext string
-	mcpServers            map[string]mcpServerEntry
+	agentCopy           Agent
+	backend             ChatBackend
+	sysPrompt           string
+	volatileContext     string
+	freshSessionContext string
+	mcpServers          map[string]mcpServerEntry
 }
 
 // prepareChatOptions describes response-surface capabilities that can differ
@@ -2009,19 +2010,19 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
-	recentMessagesContext := ""
-	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
+	freshSessionContext := ""
+	if indexNewMessages &&
 		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
-		recentMessagesContext = m.BuildRecentMessagesContext(ctx, agentID)
+		freshSessionContext = m.BuildSessionHistoryContext(ctx, agentID)
 	}
 
 	return &chatPrep{
-		agentCopy:             agentCopy,
-		backend:               backend,
-		sysPrompt:             sysPrompt,
-		volatileContext:       volatileContext,
-		recentMessagesContext: recentMessagesContext,
-		mcpServers:            mcpServers,
+		agentCopy:           agentCopy,
+		backend:             backend,
+		sysPrompt:           sysPrompt,
+		volatileContext:     volatileContext,
+		freshSessionContext: freshSessionContext,
+		mcpServers:          mcpServers,
 	}, nil
 }
 
@@ -2228,9 +2229,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
-		MCPServers:            prep.mcpServers,
-		AutomatedTrigger:      role == "system",
-		RecentMessagesContext: prep.recentMessagesContext,
+		MCPServers:          prep.mcpServers,
+		AutomatedTrigger:    role == "system",
+		FreshSessionContext: prep.freshSessionContext,
 		OnSteerReady: func(fn SteerFunc) {
 			m.busyMu.Lock()
 			if entry, ok := m.busy[agentID]; ok {
@@ -2346,11 +2347,20 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude/codex). For
+	// Honored only by backends in backendSupportsSessionKey (claude/custom/codex). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
 	SessionKey string
+
+	// History is the response surface's canonical transcript, excluding the
+	// current user message. Manager formats it both as the common fresh-session
+	// fallback and as a bounded resume safety recap. This keeps
+	// continuity policy out of Slack and GroupDM call sites.
+	History []chathistory.HistoryMessage
+
+	// HistorySelfUserID identifies this agent's messages inside History.
+	HistorySelfUserID string
 
 	// SystemPromptExtra is appended to the system prompt for this call
 	// only. Slack uses it to inject per-channel/thread context
@@ -2474,6 +2484,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		MCPServers: prep.mcpServers,
 		SessionKey: sessionKey,
 	}
+	chatOpts.FreshSessionContext = formatSessionHistoryContext(opts.History, opts.HistorySelfUserID)
+	chatOpts.ResumeSessionContext = formatResumeSessionContext(opts.History, opts.HistorySelfUserID)
 	if sessionKey != "" {
 		// Register a nil placeholder immediately so SteerOneShot can
 		// distinguish "no turn running" (ErrAgentNotBusy, key absent) from
@@ -3041,77 +3053,6 @@ func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
 	}
 	return backend, nil
-}
-
-// CanResumeSession reports whether the next ChatOneShot for this
-// (agentID, sessionKey) pair will actually resume an existing backend
-// session. Three conditions must hold: the configured backend honors
-// ChatOptions.SessionKey for resumption, the on-disk session artifact
-// exists, AND the artifact is non-empty (a zero-byte JSONL is treated
-// as "no session" because sessionFileUsable would delete it and start
-// fresh on the next invocation anyway).
-//
-// Used by the Slack bot to gate the "head+tail safety net" injection
-// mode: on the first message in a thread we replay the full history,
-// on subsequent messages we send only a small head+tail recap because
-// the resumed session already carries the bulk of the conversation
-// (see slackbot.Bot.sendToAgent and chathistory.FormatForInjectionHeadTail).
-//
-// Claude caveat: this does NOT check sessionResetThresholdTokens. If a
-// long-running thread's JSONL eventually exceeds the reset threshold,
-// sessionFileUsable will summarise + delete it on the next chat and
-// Claude starts a new session with --session-id. CanResumeSession would
-// keep returning true (the file existed at probe time) so the resumed
-// session loses prior Slack context. The head+tail safety net is the
-// primary mitigation: even when this caveat fires, the next turn still
-// re-injects the opening and most-recent slices of the thread, which
-// re-seeds the new session with enough framing to continue. Replicating
-// sessionFileUsable's token check here would either duplicate its
-// destructive side effects (preReset summary, file removal) or require
-// splitting it into a read-only probe; we accept that instead.
-func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
-	if sessionKey == "" {
-		return false
-	}
-	m.mu.Lock()
-	a, ok := m.agents[agentID]
-	if !ok {
-		m.mu.Unlock()
-		return false
-	}
-	tool := a.Tool
-	m.mu.Unlock()
-
-	backend, ok := m.backends[tool]
-	if !ok {
-		return false
-	}
-	if !backendSupportsSessionKey(backend) {
-		return false
-	}
-
-	if backend.Name() == "codex" {
-		return codexCanResumeSession(agentID, sessionKey)
-	}
-
-	// Probe the deterministic Claude session file. expectedClaudeSessionID is
-	// called with oneShot=false because CanResumeSession asks whether a
-	// resumable session EXISTS; the ChatOneShot call site decides the
-	// actual oneShot/sessionKey combination.
-	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
-	if sessionID == "" {
-		return false
-	}
-	dir := agentDir(agentID)
-	absDir, err := filepath.Abs(dir)
-	if err != nil {
-		return false
-	}
-	info, err := os.Stat(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
-	if err != nil {
-		return false
-	}
-	return info.Size() > 0
 }
 
 // updatePostChatIndex updates the memory index after a chat completes.
@@ -3799,6 +3740,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		return err
 	}
 	m.refreshLastMessage(agentID)
+	// prepareChat ran before truncation so setup failures could not mutate the
+	// transcript. Rebuild the fresh-session fallback now from the committed
+	// prefix; otherwise regenerate could inject the answer it just removed.
+	if !prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		prep.freshSessionContext = m.buildSessionHistoryContext(context.Background(), agentID, rt.SourceID)
+	}
 
 	chatCtx, cancel := context.WithCancel(context.Background())
 	outCh := make(chan ChatEvent, 64)
@@ -3820,6 +3767,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer cancel()
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			FreshSessionContext: prep.freshSessionContext,
 			// Register the steer handle so a steer sent during a
 			// regenerate turn injects into it instead of stalling in
 			// awaitSteerHandle until the deadline.

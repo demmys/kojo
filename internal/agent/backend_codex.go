@@ -257,6 +257,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 		var rolloutPath string
 		var existingRef *codexThreadRef
+		resumed := false
 		if !opts.OneShot {
 			if ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey); rerr == nil && ref != nil && ref.ThreadID != "" {
 				existingRef = ref
@@ -285,6 +286,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					deleteCodexThreadRef(agent.ID, opts.SessionKey, b.logger)
 				} else {
 					threadID, rolloutPath = decodeCodexThreadResult(msg.Result)
+					resumed = threadID != ""
 					if rolloutPath == "" {
 						rolloutPath = ref.RolloutPath
 					}
@@ -334,6 +336,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				RolloutPath: rolloutPath,
 			}, b.logger)
 		}
+
+		// Context fallback selection is centralized here because only the
+		// backend knows whether thread/resume actually succeeded or
+		// thread/start was used.
+		userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumed)
 
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through

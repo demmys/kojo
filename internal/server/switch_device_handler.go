@@ -553,11 +553,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 
 	// Step 0: build the agent-sync payload BEFORE begin. When
 	// targetState is non-nil + Known, the builder filters
-	// messages / memory_entries by seq so only the delta target
-	// is missing rides the wire. Other surfaces (agent / persona
-	// / memory / tasks / claude_sessions / token) ship as
-	// before — they're small enough that incremental gates
-	// aren't worth the complexity.
+	// messages / memory_entries by seq so only the canonical-history
+	// delta missing on the target rides the wire. Native backend sessions
+	// are ordered newest-first and fitted to the transfer envelope below;
+	// the remaining agent state is sent as a complete snapshot.
 	//
 	// Failure here is a precondition error (source missing data
 	// we'd need to migrate); we bail BEFORE marking
@@ -576,7 +575,6 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	syncReq.DegradedFlushes = degradedFlushes
 	resp.DegradedFlushes = degradedFlushes
 	resp.Degraded = len(degradedFlushes) > 0
-	resp.TransferSkips = syncReq.TransferSkips
 	// Raw token unavailable on source (hash-only after a restart):
 	// target auto-repairs at finalize if it also lacks the raw.
 	// Surface the fact so the operator knows no raw rode the wire.
@@ -624,6 +622,19 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// a prior attempt can't collide with a fresh retry's
 	// pending-sync entry on target.
 	syncReq.OpID = uuid.NewString()
+	keptSessions, capacitySkips, budgetErr := fitAgentSyncSessions(syncReq, int64(peerAgentSyncMaxBody))
+	if budgetErr != nil {
+		s.noteSwitchFailure(agentID, "fit session transfer budget: "+budgetErr.Error())
+		writeError(w, http.StatusInternalServerError, "internal",
+			"fit session transfer budget: "+budgetErr.Error())
+		return
+	}
+	if capacitySkips > 0 {
+		s.logger.Info("switch-device: session artifacts trimmed to transfer capacity",
+			"agent", agentID, "kept", keptSessions, "skipped", capacitySkips,
+			"single_shot_cap", peerAgentSyncMaxBody)
+	}
+	resp.TransferSkips = syncReq.TransferSkips
 	// Surface op_id in the response immediately so even early
 	// failures (begin / sync / pull / complete) carry the
 	// identifier the operator needs to correlate target-side
@@ -1587,27 +1598,31 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		req.Credentials = &creds
 	}
 
-	// claude session JSONLs — claude's cwd is AgentDir(agentID),
-	// NOT Settings.workDir (workDir is the user's project files
-	// surface, unrelated to claude's --resume session
-	// placement). Read from source's AgentDir, target writes
-	// into its own AgentDir.
-	files, skipped, ferr := agent.ReadClaudeSessionFiles(agentID)
-	if ferr != nil {
-		return nil, fmt.Errorf("read claude sessions: %w", ferr)
-	}
-	if len(skipped) > 0 {
-		s.logger.Warn("agent-sync: skipped oversized claude session files",
-			"agent", agentID, "files", skipped)
-		req.TransferSkips = append(req.TransferSkips, skipped...)
-	}
-	if len(files) > 0 {
-		req.ClaudeSessions = make([]claudeSessionWire, 0, len(files))
-		for _, f := range files {
-			req.ClaudeSessions = append(req.ClaudeSessions, claudeSessionWire{
-				SessionID:  f.SessionID,
-				ContentB64: base64.StdEncoding.EncodeToString(f.Content),
-			})
+	tool := agentRecordTool(rec)
+	// Transfer only the configured backend's active native sessions. Stale
+	// artifacts left by a previous backend are not part of the running
+	// agent state and previously accounted for tens of MiB of duplicate
+	// history on codex agents.
+	if tool == "claude" || tool == "custom" {
+		// Claude's cwd is AgentDir(agentID), NOT Settings.workDir. Read from
+		// source's AgentDir; target writes into its own AgentDir.
+		files, skipped, ferr := agent.ReadClaudeSessionFiles(agentID)
+		if ferr != nil {
+			return nil, fmt.Errorf("read claude sessions: %w", ferr)
+		}
+		if len(skipped) > 0 {
+			s.logger.Warn("agent-sync: skipped oversized claude session files",
+				"agent", agentID, "files", skipped)
+			req.TransferSkips = append(req.TransferSkips, skipped...)
+		}
+		if len(files) > 0 {
+			req.ClaudeSessions = make([]claudeSessionWire, 0, len(files))
+			for _, f := range files {
+				req.ClaudeSessions = append(req.ClaudeSessions, claudeSessionWire{
+					SessionID:  f.SessionID,
+					ContentB64: base64.StdEncoding.EncodeToString(f.Content),
+				})
+			}
 		}
 	}
 
@@ -1616,8 +1631,8 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// stale `.grok/session_id` (e.g. from a previous era when the
 	// operator briefly switched to grok and back) does NOT
 	// accidentally ship grok state target would then resume from.
-	// The wire's tombstone branch on the receiver does the same
-	// gate, so source + target stay in lockstep.
+	// The receiver treats an absent Grok snapshot as authoritative
+	// cleanup, so stale target state cannot survive a tool change.
 	//
 	// CAVEAT (torn-turn read): when the agent triggered the switch
 	// via the kojo-switch-device skill, this read happens WHILE
@@ -1631,19 +1646,27 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// never a partial. If a required core file is somehow absent
 	// (a half-deleted session left behind by a crashed `grok
 	// sessions delete --partial`, etc.), ReadGrokSessionFiles
-	// returns an error and buildAgentSyncRequest fails — the
-	// orchestrator reports this as a switch failure with the
-	// error attached, and the operator can retry. The in-flight
+	// returns an error and this optional native artifact is skipped;
+	// target starts fresh from canonical Kojo history. The in-flight
 	// message itself is captured separately via
 	// SnapshotAccumulatedMessageRecord (the same path claude
 	// uses), so target's UI transcript stays complete even when
 	// the file-level session lags a turn. The transcript is the
 	// authoritative carried-over state; ResetSession remains available
 	// for operators who want to discard a stale backend-local session.
-	if agentRecordTool(rec) == "grok" {
+	if tool == "grok" {
 		grokTransfer, grokSkipped, gerr := agent.ReadGrokSessionFiles(agentID)
 		if gerr != nil {
-			return nil, fmt.Errorf("read grok session: %w", gerr)
+			// Native session artifacts are an optimisation: canonical Kojo
+			// history remains authoritative and fresh-session bootstrap can
+			// recover continuity. A corrupt/oversized Grok directory must not
+			// block that non-droppable state from moving.
+			s.logger.Warn("agent-sync: grok session unavailable; using history fallback",
+				"agent", agentID, "err", gerr)
+			req.TransferSkips = append(req.TransferSkips, agent.SkippedSessionFile{
+				Path: "grok-session", Reason: "unreadable",
+			})
+			grokTransfer = nil
 		}
 		if len(grokSkipped) > 0 {
 			s.logger.Warn("agent-sync: skipped oversized grok session files",
@@ -1665,7 +1688,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
-	if agentRecordTool(rec) == "codex" {
+	if tool == "codex" {
 		codexTransfer, codexSkipped, cerr := agent.ReadCodexSessionFiles(agentID)
 		if cerr != nil {
 			return nil, fmt.Errorf("read codex session: %w", cerr)

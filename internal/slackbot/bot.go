@@ -75,15 +75,14 @@ type Bot struct {
 	// sem limits the number of concurrent sendToAgent goroutines.
 	sem chan struct{}
 
-	// rateLimitSleep, when non-nil, replaces time.After in postMessage /
-	// appendStream's rate-limit backoff wait. Tests use this to count
+	// rateLimitSleep, when non-nil, replaces time.After in Slack API
+	// rate-limit backoff waits. Tests use this to count
 	// sleeps and run the retry loop without real wall-clock delays. nil
 	// in production.
 	rateLimitSleep func(time.Duration) <-chan time.Time
 
 	// runAsync, when non-nil, replaces the bare `go fn()` used by
-	// sendToAgent for fire-and-forget background work (currently:
-	// dead-stream cleanup after the thread mutex is released). Tests
+	// sendToAgent for fire-and-forget dead-stream cleanup. Tests
 	// use this to run the work synchronously so they can observe the
 	// resulting Slack API calls. nil in production, where the default
 	// `go fn()` semantics are used.
@@ -109,6 +108,14 @@ const (
 
 	// typingStatus is the assistant status text shown while processing a message.
 	typingStatus = "Thinking…"
+
+	// noReplyToken is an assistant control response consumed by the Slack
+	// transport. It must be the entire final response (surrounding whitespace is
+	// ignored); otherwise it is delivered as ordinary text. A visible non-empty
+	// token is intentional: backends such as Codex treat an empty successful
+	// completion as a recoverable failure and automatically ask the model to
+	// produce a real answer.
+	noReplyToken = "[[NO_REPLY]]"
 
 	// finalizeShortTimeout caps the single-call finalize ops
 	// (StopStream, chat.update, clearAssistantStatus) that share finCtx.
@@ -176,6 +183,117 @@ func trimStreamDeathsOutsideWindow(deaths []time.Time, now time.Time) []time.Tim
 		}
 	}
 	return recent
+}
+
+// isNoReplyResponse reports whether text is the exact Slack no-reply control
+// response. Exact matching prevents ordinary discussion of the token from
+// suppressing a reply.
+func isNoReplyResponse(text string) bool {
+	return strings.TrimSpace(text) == noReplyToken
+}
+
+// couldBeNoReplyResponse is used while text is still streaming. Holding a
+// possible token prefix avoids briefly creating a Slack message containing the
+// control token. As soon as the text diverges, the buffered prefix is flushed
+// normally. An exact token remains a candidate because a later delta may still
+// turn it into ordinary prose.
+func couldBeNoReplyResponse(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(noReplyToken, trimmed)
+}
+
+// discardSuppressedStreams removes every Slack message artifact created before
+// the assistant chose no-reply. Each external call gets a fresh timeout: a slow
+// StopStream must not consume the DeleteMessage budget, and one stale dead
+// stream must not prevent later artifacts from being removed. The work is
+// intentionally synchronous so sendToAgent cannot release the per-thread lock
+// while a supposedly suppressed message is still visible.
+func (b *Bot) discardSuppressedStreams(channel, liveStream string, deadStreams []string) {
+	if liveStream != "" {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+		if _, _, err := b.api.StopStreamContext(stopCtx, channel, liveStream); err != nil {
+			b.logger.Debug("failed to stop suppressed slack stream",
+				"channel", channel, "streamTS", liveStream, "err", err)
+		}
+		stopCancel()
+	}
+
+	streams := make([]string, 0, len(deadStreams)+1)
+	streams = append(streams, deadStreams...)
+	if liveStream != "" {
+		streams = append(streams, liveStream)
+	}
+	seen := make(map[string]struct{}, len(streams))
+	for _, ts := range streams {
+		if ts == "" {
+			continue
+		}
+		if _, duplicate := seen[ts]; duplicate {
+			continue
+		}
+		seen[ts] = struct{}{}
+
+		if err := b.deleteMessageWithRateLimit(channel, ts); err != nil {
+			b.logger.Warn("failed to delete suppressed slack stream",
+				"channel", channel, "streamTS", ts, "err", err)
+		}
+	}
+}
+
+// deleteMessageWithRateLimit deletes one Slack message with the same bounded
+// Retry-After-aware backoff used by the delivery paths. It owns a fresh timeout
+// because suppression cleanup runs after the request context may have expired.
+func (b *Bot) deleteMessageWithRateLimit(channel, ts string) error {
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), chunkPostTimeoutBase)
+	defer deleteCancel()
+
+	outcome, err := b.withRateLimitRetry(deleteCtx, func() error {
+		_, _, deleteErr := b.api.DeleteMessageContext(deleteCtx, channel, ts)
+		return deleteErr
+	}, func(delay time.Duration) {
+		b.logger.Debug("slack rate limited suppressed stream deletion; retrying",
+			"channel", channel, "streamTS", ts, "delay", delay)
+	})
+	if outcome == rlSuccess {
+		return nil
+	}
+	return err
+}
+
+// ensureUserTurnInHistory persists the triggering Slack message when a
+// no-reply turn returns before the normal bot-response history append. The
+// Slack history fetch may fail transiently or may not yet include the event
+// that triggered this turn; without this guard, shouldAutoReply can still see
+// the preceding bot message as last and accidentally continue the thread.
+func (b *Bot) ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID string) {
+	if b.agentDataDir == "" || threadTS == "" || messageTS == "" {
+		return
+	}
+	path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
+	history, err := chathistory.LoadHistory(path)
+	if err != nil {
+		b.logger.Warn("failed to load slack history before no-reply", "path", path, "err", err)
+		return
+	}
+	for _, msg := range history {
+		if msg.MessageID == messageTS {
+			return
+		}
+	}
+	userMsg := chathistory.HistoryMessage{
+		Platform:  platformSlack,
+		ChannelID: channel,
+		ThreadID:  threadTS,
+		MessageID: messageTS,
+		UserID:    userID,
+		UserName:  displayName,
+		Text:      text,
+		Timestamp: time.Now().Format(time.RFC3339),
+		IsBot:     false,
+	}
+	if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
+		b.logger.Warn("failed to save slack user message before no-reply", "path", path, "err", err)
+	}
 }
 
 // NewBot creates a new Bot instance. Call Run() to start it.
@@ -635,8 +753,18 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
 	var deadStreams []string           // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
 	var recentStreamDeaths []time.Time // deaths inside streamRestartWindow; drives the rapid-failure circuit breaker
+	// Streams evicted from deadStreams are deleted asynchronously to keep the
+	// retained artifact set bounded. If that eager deletion fails, keep the TS
+	// until the turn ends so a later no-reply decision can synchronously retry
+	// it rather than leaving a visible progress artifact behind.
+	var supersededCleanupWG sync.WaitGroup
+	var failedSupersededMu sync.Mutex
+	var failedSupersededStreams []string
 	var lastAppend time.Time
 	hasError := false
+	completedCleanly := false
+	terminalContent := ""
+	noReplyCandidate := true
 	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
 	streamNow := time.Now
 	if b.streamNow != nil {
@@ -671,10 +799,13 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if len(deadStreams) > maxRetainedDeadStreams {
 			oldest := deadStreams[0]
 			deadStreams = deadStreams[1:]
+			supersededCleanupWG.Add(1)
 			runAsync(func() {
-				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
-				defer deleteCancel()
-				if _, _, err := b.api.DeleteMessageContext(deleteCtx, channel, oldest); err != nil {
+				defer supersededCleanupWG.Done()
+				if err := b.deleteMessageWithRateLimit(channel, oldest); err != nil {
+					failedSupersededMu.Lock()
+					failedSupersededStreams = append(failedSupersededStreams, oldest)
+					failedSupersededMu.Unlock()
 					b.logger.Debug("failed to delete superseded slack stream",
 						"channel", channel, "streamTS", oldest, "err", err)
 				}
@@ -765,6 +896,16 @@ streamLoop:
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
 
+			// Do not expose the no-reply control token while it is still a
+			// possible prefix. If later text turns it into a normal response,
+			// pendingDelta still contains the entire prefix and is flushed below.
+			if noReplyCandidate {
+				noReplyCandidate = couldBeNoReplyResponse(response.String())
+				if noReplyCandidate {
+					continue
+				}
+			}
+
 			// Start the stream on the first text event so the user sees
 			// the reply build live.
 			if !startStream() {
@@ -802,6 +943,15 @@ streamLoop:
 
 			// Inline stream indicator (Slack mrkdwn).
 			indicator := toolStatusIndicator(evt.ToolName, evt.ToolInput)
+
+			// A model may emit the no-reply token in more than one delta before
+			// its terminal event. Do not let a subsequent tool event expose that
+			// buffered control response. Tool activity that happened before the
+			// token may already have opened a stream; the final suppression path
+			// removes it.
+			if response.Len() > 0 && noReplyCandidate {
+				continue
+			}
 
 			// Append a tool-use indicator to the stream so the user sees
 			// progress during long tool executions. The final chat.update
@@ -856,6 +1006,15 @@ streamLoop:
 		case "error":
 			hasError = true
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
+		case "done":
+			completedCleanly = evt.ErrorMessage == ""
+			if evt.ErrorMessage != "" {
+				hasError = true
+				b.logger.Warn("agent completed slack chat with an error", "err", evt.ErrorMessage)
+			}
+			if evt.Message != nil {
+				terminalContent = evt.Message.Content
+			}
 		}
 	}
 
@@ -867,6 +1026,62 @@ streamLoop:
 	// chunkPostTimeout) so rate-limit backoff doesn't truncate the reply.
 	finCtx, finCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	defer finCancel()
+
+	// The terminal Message is the backend's authoritative full response. Live
+	// text events are deliberately forwarded non-blockingly by ChatOneShot and
+	// may therefore be incomplete under backpressure. Reconcile both builders
+	// before interpreting the control token or finalizing normal delivery. An
+	// empty terminal body is not authoritative because some test/custom
+	// backends emit a bare done event after otherwise valid text deltas.
+	if terminalContent != "" && terminalContent != response.String() {
+		response.Reset()
+		response.WriteString(terminalContent)
+		// Do not append the authoritative full body onto a stream that may
+		// already contain most of it. chat.update below replaces the stream
+		// with response; the batch fallback also reads response directly.
+		pendingDelta.Reset()
+	}
+
+	// If the event stream fails or closes before a clean terminal event while
+	// the buffered text is still a possible control-token prefix, never publish
+	// that implementation detail. Treat it as an ordinary backend failure.
+	if response.Len() > 0 && couldBeNoReplyResponse(response.String()) && (!completedCleanly || hasError) {
+		response.Reset()
+		pendingDelta.Reset()
+		hasError = true
+	}
+
+	// A clean terminal no-reply response is a transport control signal, not
+	// message content. Usually no stream exists because possible token prefixes
+	// are buffered above. If tools or earlier text opened streams before the
+	// model chose silence, remove every artifact and post nothing. Explicit
+	// backend failures still take the ordinary error path even if partial output
+	// happened to equal the token.
+	controlReply := isNoReplyResponse(response.String())
+	suppressReply := completedCleanly && !hasError && controlReply
+	if suppressReply {
+		// Eager deletion of old dead streams may still be in flight. Wait for
+		// those bounded calls and include every failed TS in the synchronous
+		// suppression cleanup so no visible progress artifact is forgotten.
+		supersededCleanupWG.Wait()
+		failedSupersededMu.Lock()
+		failedSuperseded := append([]string(nil), failedSupersededStreams...)
+		failedSupersededMu.Unlock()
+		b.discardSuppressedStreams(channel, streamTS, append(deadStreams, failedSuperseded...))
+		b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+		b.clearAssistantStatus(clearCtx, channel, threadTS)
+		clearCancel()
+		return
+	}
+	if controlReply {
+		// Never leak the transport token as user-visible content. A token that
+		// did not end in a clean done event is not a valid request for silence;
+		// route it through the existing generic failure path instead.
+		response.Reset()
+		pendingDelta.Reset()
+		hasError = true
+	}
 
 	// Flush any remaining text delta before finalizing. If the final
 	// flush also hits a dead stream, park it so the code below falls
@@ -1126,7 +1341,7 @@ func slackSessionKey(agentID, channel, threadTS string) string {
 func buildSlackSystemPromptExtra(channel, threadTS, displayName, userID string) string {
 	var sb strings.Builder
 	sb.WriteString("## Slack Conversation Context\n\n")
-	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
+	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
 	if threadTS != "" {
 		sb.WriteString(fmt.Sprintf("You are participating in Slack channel %s, thread %s.\n", channel, threadTS))
 	} else {

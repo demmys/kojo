@@ -463,6 +463,10 @@ type streamScript struct {
 	killAt     []int    // 0-based indexes of appendStream calls that should fail with message_not_in_streaming_state
 	failUpdate bool     // chat.update returns an error (simulate finalize replacement failure)
 	failPost   bool     // chat.postMessage returns an error (simulate batch/fallback delivery failure)
+	// 0-based chat.delete call indexes that return HTTP 429. Tests use this
+	// to verify Retry-After recovery and failed eager-cleanup handoff.
+	rateLimitDeleteAt []int
+	repliesJSON       string // optional conversations.replies response body
 
 	startCalls   int
 	appendCalls  int
@@ -476,6 +480,7 @@ type streamScript struct {
 	appendOnTS   []string // ts the bot tried to append to (in order)
 	lastUpdateTS string
 	lastUpdateMD string
+	lastPostMD   string
 }
 
 // newStreamServer returns a mock Slack server that delegates streaming
@@ -522,16 +527,29 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
 		case "/chat.postMessage":
 			script.postCalls++
+			script.lastPostMD = r.FormValue("markdown_text")
 			if script.failPost {
 				fmt.Fprintf(w, `{"ok":false,"error":"channel_not_found"}`)
 				return
 			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":"post.999"}`)
 		case "/chat.delete":
+			idx := script.deleteCalls
 			script.deleteCalls++
 			script.deletedTS = append(script.deletedTS, r.FormValue("ts"))
+			if slices.Contains(script.rateLimitDeleteAt, idx) {
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, r.FormValue("ts"))
-		case "/conversations.history", "/conversations.replies":
+		case "/conversations.replies":
+			if script.repliesJSON != "" {
+				fmt.Fprint(w, script.repliesJSON)
+				return
+			}
+			fmt.Fprintf(w, `{"ok":true,"messages":[]}`)
+		case "/conversations.history":
 			fmt.Fprintf(w, `{"ok":true,"messages":[]}`)
 		case "/assistant.threads.setStatus":
 			fmt.Fprintf(w, `{"ok":true}`)
@@ -569,6 +587,326 @@ func newBotWithStream(t *testing.T, mgr ChatManager, srv *httptest.Server) *Bot 
 		// Run the dead-stream cleanup goroutine synchronously so the
 		// test can observe its API calls after sendToAgent returns.
 		runAsync: func(fn func()) { fn() },
+	}
+}
+
+func TestSendToAgentSuppressesNoReplyToken(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.unused"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "[[NO_"},
+		{Type: "text", Delta: "REPLY]]"},
+		{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if !strings.Contains(mgr.lastOneShotOpts.SystemPromptExtra, noReplyToken) {
+		t.Fatalf("Slack system prompt does not advertise no-reply token: %q", mgr.lastOneShotOpts.SystemPromptExtra)
+	}
+	if script.startCalls != 0 || script.appendCalls != 0 || script.stopCalls != 0 ||
+		script.updateCalls != 0 || script.postCalls != 0 || script.deleteCalls != 0 {
+		t.Fatalf("no-reply emitted Slack message calls: start=%d append=%d stop=%d update=%d post=%d delete=%d",
+			script.startCalls, script.appendCalls, script.stopCalls, script.updateCalls, script.postCalls, script.deleteCalls)
+	}
+}
+
+func TestSendToAgentNoReplyTerminalMessageWithoutTextEvent(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.unused"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "done", Message: &agent.Message{Content: " \n" + noReplyToken + "\t"}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.startCalls != 0 || script.updateCalls != 0 || script.postCalls != 0 {
+		t.Fatalf("terminal-only no-reply emitted Slack message calls: start=%d update=%d post=%d",
+			script.startCalls, script.updateCalls, script.postCalls)
+	}
+}
+
+func TestSendToAgentUsesTerminalContentForNoReplyDecision(t *testing.T) {
+	t.Run("terminal token overrides incomplete ordinary delta", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "partial ordinary text"},
+			{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if script.postCalls != 0 || script.updateCalls != 0 {
+			t.Fatalf("authoritative terminal token delivered content: post=%d update=%d", script.postCalls, script.updateCalls)
+		}
+		if !containsString(script.deletedTS, "stream.1") {
+			t.Fatalf("stream containing incomplete delta was not deleted: %v", script.deletedTS)
+		}
+	})
+
+	t.Run("terminal ordinary text overrides streamed token", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.unused"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: noReplyToken},
+			{Type: "done", Message: &agent.Message{Content: "ordinary final response"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if script.postCalls != 1 || script.lastPostMD != "ordinary final response" {
+			t.Fatalf("authoritative ordinary response not delivered: posts=%d body=%q", script.postCalls, script.lastPostMD)
+		}
+	})
+}
+
+func TestSendToAgentNeverLeaksNoReplyTokenOnError(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.unused"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: noReplyToken},
+		{Type: "done", Message: &agent.Message{Content: noReplyToken}, ErrorMessage: "backend failed"},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.postCalls != 1 {
+		t.Fatalf("error after no-reply token should post one generic failure, got %d", script.postCalls)
+	}
+	if strings.Contains(script.lastPostMD, noReplyToken) {
+		t.Fatalf("no-reply token leaked in failure message: %q", script.lastPostMD)
+	}
+}
+
+func TestSendToAgentNeverLeaksIncompleteNoReplyPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []agent.ChatEvent
+	}{
+		{
+			name: "event stream closes without done",
+			events: []agent.ChatEvent{
+				{Type: "text", Delta: "[[NO_"},
+			},
+		},
+		{
+			name: "done reports backend error",
+			events: []agent.ChatEvent{
+				{Type: "text", Delta: "[[NO_"},
+				{Type: "done", Message: &agent.Message{Content: "[[NO_"}, ErrorMessage: "backend failed"},
+			},
+		},
+		{
+			name: "authoritative terminal prefix replaces ordinary delta",
+			events: []agent.ChatEvent{
+				{Type: "text", Delta: "ordinary streamed text"},
+				{Type: "done", Message: &agent.Message{Content: "[[NO_"}, ErrorMessage: "backend failed"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			script := &streamScript{streamTSs: []string{"stream.unused"}}
+			srv := newStreamServer(t, script)
+			bot := newBotWithStream(t, &scriptedMgr{events: tc.events}, srv)
+
+			bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+			if script.postCalls != 1 {
+				t.Fatalf("incomplete control prefix should post one generic failure, got %d", script.postCalls)
+			}
+			if strings.Contains(script.lastPostMD, "[[NO_") {
+				t.Fatalf("incomplete no-reply prefix leaked in failure message: %q", script.lastPostMD)
+			}
+		})
+	}
+}
+
+func TestSendToAgentNoReplyDeletesEarlierToolStream(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.1"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "tool_use", ToolName: "Bash"},
+		{Type: "text", Delta: noReplyToken},
+		{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.startCalls != 1 {
+		t.Fatalf("chat.startStream calls = %d, want 1 for the earlier tool indicator", script.startCalls)
+	}
+	if !containsString(script.stoppedTS, "stream.1") || !containsString(script.deletedTS, "stream.1") {
+		t.Fatalf("suppressed tool stream was not stopped and deleted; stopped=%v deleted=%v", script.stoppedTS, script.deletedTS)
+	}
+	if script.updateCalls != 0 || script.postCalls != 0 {
+		t.Fatalf("suppressed tool stream delivered content: update=%d post=%d", script.updateCalls, script.postCalls)
+	}
+}
+
+func TestSendToAgentNoReplyDeleteRecoversFromRateLimit(t *testing.T) {
+	script := &streamScript{
+		streamTSs:         []string{"stream.1"},
+		rateLimitDeleteAt: []int{0},
+	}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "tool_use", ToolName: "Bash"},
+		{Type: "text", Delta: noReplyToken},
+		{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+	var sleeps atomic.Int32
+	bot.rateLimitSleep = func(time.Duration) <-chan time.Time {
+		sleeps.Add(1)
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.deleteCalls != 2 {
+		t.Fatalf("chat.delete calls = %d, want one rate-limited attempt plus one retry", script.deleteCalls)
+	}
+	if sleeps.Load() != 1 {
+		t.Fatalf("rate-limit sleeps = %d, want 1", sleeps.Load())
+	}
+	if countString(script.deletedTS, "stream.1") != 2 {
+		t.Fatalf("stream.1 delete attempts = %d, want 2; deletedTS=%v", countString(script.deletedTS, "stream.1"), script.deletedTS)
+	}
+}
+
+func TestSendToAgentNoReplyRetriesFailedSupersededStreamDeletion(t *testing.T) {
+	rotations := maxRetainedDeadStreams + 1
+	streams := make([]string, rotations)
+	killRotations := make([]int, rotations)
+	events := make([]agent.ChatEvent, rotations)
+	for i := range rotations {
+		streams[i] = fmt.Sprintf("stream.%d", i+1)
+		killRotations[i] = i
+		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
+	}
+	events = append(events,
+		agent.ChatEvent{Type: "text", Delta: noReplyToken},
+		agent.ChatEvent{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+	)
+	// Exhaust every rate-limit attempt made by the eager cleanup of the
+	// first superseded stream. Suppression must retain that TS and make a
+	// fifth, successful delete attempt before returning.
+	rateLimitedDeletes := make([]int, maxRateLimitRetry+1)
+	for i := range rateLimitedDeletes {
+		rateLimitedDeletes[i] = i
+	}
+	script := &streamScript{
+		streamTSs:         streams,
+		killAt:            killRotations,
+		rateLimitDeleteAt: rateLimitedDeletes,
+	}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: events}
+	bot := newBotWithStream(t, mgr, srv)
+	bot.rateLimitSleep = func(time.Duration) <-chan time.Time {
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	var clock atomic.Int64
+	bot.streamNow = func() time.Time {
+		ns := clock.Add(int64(streamRestartWindow + time.Second))
+		return time.Unix(0, ns)
+	}
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if got := countString(script.deletedTS, "stream.1"); got != maxRateLimitRetry+2 {
+		t.Fatalf("stream.1 delete attempts = %d, want %d (exhausted eager cleanup + suppression retry); deletedTS=%v",
+			got, maxRateLimitRetry+2, script.deletedTS)
+	}
+	for _, ts := range streams {
+		if !containsString(script.deletedTS, ts) {
+			t.Errorf("suppressed stream %q was never deleted; deletedTS=%v", ts, script.deletedTS)
+		}
+	}
+	if script.updateCalls != 0 || script.postCalls != 0 {
+		t.Fatalf("no-reply delivered content after cleanup retry: update=%d post=%d", script.updateCalls, script.postCalls)
+	}
+}
+
+func TestSendToAgentNoReplyLeavesUserAsLastThreadHistoryEntry(t *testing.T) {
+	const (
+		channel   = "C1"
+		threadTS  = "1700000000.000100"
+		messageTS = "1700000001.000200"
+	)
+	script := &streamScript{
+		streamTSs: []string{"stream.unused"},
+		// Simulate conversations.replies succeeding before Slack has made the
+		// triggering event visible: the response contains only the root.
+		repliesJSON: `{"ok":true,"messages":[` +
+			`{"type":"message","user":"UROOT","text":"root","ts":"` + threadTS + `","thread_ts":"` + threadTS + `"}` +
+			`]}`,
+	}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: noReplyToken},
+		{Type: "done", Message: &agent.Message{Content: noReplyToken}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+	bot.agentDataDir = t.TempDir()
+
+	path := chathistory.HistoryFilePath(bot.agentDataDir, platformSlack, channel, threadTS)
+	if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{
+		{Platform: platformSlack, ChannelID: channel, ThreadID: threadTS, MessageID: threadTS, UserID: "UROOT", Text: "root"},
+		{Platform: platformSlack, ChannelID: channel, ThreadID: threadTS, MessageID: "1700000000.bot", UserID: bot.botUserID, Text: "prior answer", IsBot: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bot.sendToAgent(context.Background(), channel, threadTS, threadTS, messageTS, "ping", "alice", "U123")
+
+	history, err := chathistory.LoadHistory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) == 0 || history[len(history)-1].MessageID != messageTS || history[len(history)-1].IsBot {
+		t.Fatalf("last history entry after no-reply is not the triggering user message: %+v", history)
+	}
+	for _, msg := range history {
+		if strings.Contains(msg.Text, noReplyToken) {
+			t.Fatalf("no-reply token was persisted to Slack history: %+v", msg)
+		}
+	}
+	if bot.shouldAutoReply(channel, threadTS, "another unmentioned message") {
+		t.Fatal("no-reply should leave the triggering user as last history entry and stop auto-reply chaining")
+	}
+}
+
+func TestSendToAgentFlushesNoReplyPrefixWhenResponseDiverges(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.1"}}
+	srv := newStreamServer(t, script)
+	text := noReplyToken + " is the control token"
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "[[NO_"},
+		{Type: "text", Delta: "REPLY]] is the control token"},
+		{Type: "done", Message: &agent.Message{Content: text}},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+	if script.startCalls != 1 || script.updateCalls != 1 {
+		t.Fatalf("ordinary response after token prefix was not delivered: start=%d update=%d", script.startCalls, script.updateCalls)
+	}
+	if script.lastUpdateMD != text {
+		t.Fatalf("final response = %q, want %q", script.lastUpdateMD, text)
 	}
 }
 
@@ -888,6 +1226,16 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func countString(haystack []string, needle string) int {
+	count := 0
+	for _, s := range haystack {
+		if s == needle {
+			count++
+		}
+	}
+	return count
 }
 
 // TestIsStreamClosedErr verifies the typed-error detection used by

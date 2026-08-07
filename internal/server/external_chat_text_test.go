@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,11 +103,71 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 		if req.Message != "full history" || req.SessionKey != "slack-thread" {
 			t.Fatalf("request = %#v", req)
 		}
-		if len(req.History) != 1 || req.History[0].Text != "earlier" || req.HistorySelfUserID != "B1" {
-			t.Fatalf("request history = %#v", req)
+		if req.FreshSessionContext == "" || req.ResumeSessionContext == "" ||
+			!strings.Contains(req.FreshSessionContext, "earlier") ||
+			!strings.Contains(req.ResumeSessionContext, "earlier") {
+			t.Fatalf("request history contexts = %#v", req)
 		}
 		if !req.DisableAttachments || req.SystemPromptExtra != "slack context" {
 			t.Fatalf("request options = %#v", req)
+		}
+	default:
+		t.Fatal("holder did not receive request")
+	}
+}
+
+func TestExternalChatRouterBoundsHistoryBeforeRemoteRelay(t *testing.T) {
+	requestSeen := make(chan externalChatTextRequest, 1)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+			return
+		}
+		if r.ContentLength >= externalChatTextBodyLimit {
+			t.Errorf("relayed body = %d bytes, limit = %d", r.ContentLength, externalChatTextBodyLimit)
+		}
+		var req externalChatTextRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		requestSeen <- req
+		writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "done"})
+	}))
+	t.Cleanup(holder.Close)
+
+	history := make([]chathistory.HistoryMessage, 6000)
+	for i := range history {
+		history[i] = chathistory.HistoryMessage{
+			MessageID: fmt.Sprintf("m-%04d", i),
+			UserID:    "U1",
+			UserName:  "User",
+			Text:      fmt.Sprintf("message-%04d-%s", i, strings.Repeat("x", 1000)),
+		}
+	}
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	events, err := router.ChatOneShot(context.Background(), agentID, "current", agent.OneShotOpts{
+		History: history, HistorySelfUserID: "B1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+
+	select {
+	case req := <-requestSeen:
+		if len(req.FreshSessionContext) > chathistory.DefaultMaxChars+len("\n---\n\n") {
+			t.Fatalf("fresh context length = %d", len(req.FreshSessionContext))
+		}
+		if !strings.Contains(req.FreshSessionContext, "message-5999") ||
+			strings.Contains(req.FreshSessionContext, "message-0000") {
+			t.Fatal("fresh context did not preserve the bounded recent window")
+		}
+		if !strings.Contains(req.ResumeSessionContext, "message-0000") ||
+			!strings.Contains(req.ResumeSessionContext, "message-5999") ||
+			strings.Contains(req.ResumeSessionContext, "message-3000") {
+			t.Fatal("resume context did not preserve bounded head and tail windows")
 		}
 	default:
 		t.Fatal("holder did not receive request")

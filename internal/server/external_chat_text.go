@@ -14,7 +14,6 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
-	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -45,12 +44,12 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
-	Message            string                       `json:"message"`
-	SessionKey         string                       `json:"sessionKey,omitempty"`
-	History            []chathistory.HistoryMessage `json:"history,omitempty"`
-	HistorySelfUserID  string                       `json:"historySelfUserId,omitempty"`
-	SystemPromptExtra  string                       `json:"systemPromptExtra,omitempty"`
-	DisableAttachments bool                         `json:"disableAttachments,omitempty"`
+	Message              string `json:"message"`
+	SessionKey           string `json:"sessionKey,omitempty"`
+	FreshSessionContext  string `json:"freshSessionContext,omitempty"`
+	ResumeSessionContext string `json:"resumeSessionContext,omitempty"`
+	SystemPromptExtra    string `json:"systemPromptExtra,omitempty"`
+	DisableAttachments   bool   `json:"disableAttachments,omitempty"`
 }
 
 type externalChatTextEnvelope struct {
@@ -121,13 +120,17 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	if r == nil || r.server == nil || r.server.agents == nil {
 		return nil, errors.New("external chat router is unavailable")
 	}
+	freshContext, resumeContext := opts.FreshSessionContext, opts.ResumeSessionContext
+	if freshContext == "" && resumeContext == "" {
+		freshContext, resumeContext = agent.FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
+	}
 	req := externalChatTextRequest{
-		Message:            message,
-		SessionKey:         opts.SessionKey,
-		History:            opts.History,
-		HistorySelfUserID:  opts.HistorySelfUserID,
-		SystemPromptExtra:  opts.SystemPromptExtra,
-		DisableAttachments: opts.DisableKojoAttachmentInstructions,
+		Message:              message,
+		SessionKey:           opts.SessionKey,
+		FreshSessionContext:  freshContext,
+		ResumeSessionContext: resumeContext,
+		SystemPromptExtra:    opts.SystemPromptExtra,
+		DisableAttachments:   opts.DisableKojoAttachmentInstructions,
 	}
 
 	holder, local, err := r.initialRoute(ctx, agentID)
@@ -257,8 +260,8 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 		events, err := s.agents.ChatOneShot(turnCtx, agentID, req.Message, agent.OneShotOpts{
 			SessionKey:                        req.SessionKey,
-			History:                           req.History,
-			HistorySelfUserID:                 req.HistorySelfUserID,
+			FreshSessionContext:               req.FreshSessionContext,
+			ResumeSessionContext:              req.ResumeSessionContext,
 			SystemPromptExtra:                 req.SystemPromptExtra,
 			DisableKojoAttachmentInstructions: req.DisableAttachments,
 		})
@@ -518,8 +521,8 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	}
 	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
 		SessionKey:                        req.SessionKey,
-		History:                           req.History,
-		HistorySelfUserID:                 req.HistorySelfUserID,
+		FreshSessionContext:               req.FreshSessionContext,
+		ResumeSessionContext:              req.ResumeSessionContext,
 		SystemPromptExtra:                 req.SystemPromptExtra,
 		DisableKojoAttachmentInstructions: req.DisableAttachments,
 	})

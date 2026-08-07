@@ -2385,6 +2385,13 @@ type OneShotOpts struct {
 	// HistorySelfUserID identifies this agent's messages inside History.
 	HistorySelfUserID string
 
+	// FreshSessionContext and ResumeSessionContext are preformatted, bounded
+	// equivalents of History. Trusted internal transports use these instead of
+	// relaying an unbounded canonical transcript. Ordinary callers should pass
+	// History and let Manager derive both contexts locally.
+	FreshSessionContext  string
+	ResumeSessionContext string
+
 	// SystemPromptExtra is appended to the system prompt for this call
 	// only. Slack uses it to inject per-channel/thread context
 	// ("You are participating in channel #foo, thread …") at a stable
@@ -2507,8 +2514,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		MCPServers: prep.mcpServers,
 		SessionKey: sessionKey,
 	}
-	chatOpts.FreshSessionContext = formatSessionHistoryContext(opts.History, opts.HistorySelfUserID)
-	chatOpts.ResumeSessionContext = formatResumeSessionContext(opts.History, opts.HistorySelfUserID)
+	chatOpts.FreshSessionContext = opts.FreshSessionContext
+	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
+	if chatOpts.FreshSessionContext == "" && chatOpts.ResumeSessionContext == "" {
+		chatOpts.FreshSessionContext, chatOpts.ResumeSessionContext =
+			FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
+	}
 	if sessionKey != "" {
 		// Register a nil placeholder immediately so SteerOneShot can
 		// distinguish "no turn running" (ErrAgentNotBusy, key absent) from

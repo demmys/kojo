@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
@@ -246,7 +247,18 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 
 				// Validate attachments: paths must be inside uploadDir and exist on disk.
-				validatedAtts := validateAttachments(msg.Attachments)
+				selfPeerID := ""
+				if s.peerID != nil {
+					selfPeerID = s.peerID.DeviceID
+				}
+				validatedAtts := validateAttachmentsForPeer(msg.Attachments, selfPeerID)
+				if len(validatedAtts) != len(msg.Attachments) {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": "an attachment belongs to a different holder or is no longer available; upload it again",
+					})
+					continue
+				}
 
 				// Reject empty messages after validation
 				if msg.Content == "" && len(validatedAtts) == 0 {
@@ -286,14 +298,37 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				// Use background context for chat so it survives WebSocket disconnects.
 				// The response is saved to transcript even if the client navigates away.
-				events, err := s.agents.Chat(context.Background(), agentID, msg.Content, "user", validatedAtts)
+				turnCtx, turnDone := agent.WithChatCompletion(context.Background())
+				releaseRelay := func() {}
+				hubPeerID, hubAddr, hubErr := s.externalChatHubAddress(turnCtx, r, "")
+				if hubErr == nil {
+					turnCtx = agent.WithSlackMCPBaseURL(turnCtx, hubAddr)
+					if s.externalChatRelays != nil {
+						releaseRelay = s.externalChatRelays.acquire(agentID, hubPeerID)
+					}
+				} else if auth.FromContext(r.Context()).IsPeer() {
+					_ = writeJSON(ctx, conn, map[string]string{
+						"type":         "error",
+						"errorMessage": "the remote holder could not authenticate its Hub: " + hubErr.Error(),
+					})
+					continue
+				}
+				events, err := s.agents.Chat(turnCtx, agentID, msg.Content, "user", validatedAtts)
 				if err != nil {
+					releaseRelay()
 					_ = writeJSON(ctx, conn, map[string]string{
 						"type":         "error",
 						"errorMessage": err.Error(),
 					})
 					continue
 				}
+				// Chat intentionally survives a WebSocket disconnect. Keep the
+				// holder-file callback authorized until the actual backend turn,
+				// not merely this browser subscription, reaches a terminal event.
+				go func() {
+					<-turnDone
+					releaseRelay()
+				}()
 
 				// Stream events to client, while also listening for abort
 				s.streamAgentEvents(ctx, conn, events, agentID, clientMsgs, heartbeat)
@@ -460,6 +495,10 @@ func (s *Server) synthesizeTerminal(agentID string) agent.ChatEvent {
 // directory and exists on disk, then rebuilds metadata from the file system.
 // Any attachment that fails validation is silently dropped.
 func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachment {
+	return validateAttachmentsForPeer(atts, "")
+}
+
+func validateAttachmentsForPeer(atts []agent.MessageAttachment, selfPeerID string) []agent.MessageAttachment {
 	if len(atts) == 0 {
 		return nil
 	}
@@ -472,6 +511,9 @@ func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachme
 
 	result := make([]agent.MessageAttachment, 0, len(atts))
 	for _, a := range atts {
+		if a.PeerID != "" && selfPeerID != "" && a.PeerID != selfPeerID {
+			continue
+		}
 		// Resolve to absolute, canonical path
 		resolved, err := filepath.Abs(a.Path)
 		if err != nil {
@@ -502,10 +544,11 @@ func validateAttachments(atts []agent.MessageAttachment) []agent.MessageAttachme
 		}
 
 		result = append(result, agent.MessageAttachment{
-			Path: resolved,
-			Name: name,
-			Size: info.Size(),
-			Mime: mimeType,
+			Path:   resolved,
+			Name:   name,
+			Size:   info.Size(),
+			Mime:   mimeType,
+			PeerID: a.PeerID,
 		})
 	}
 	return result

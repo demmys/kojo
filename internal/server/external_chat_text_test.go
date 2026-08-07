@@ -1,17 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -113,6 +118,161 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 		}
 	default:
 		t.Fatal("holder did not receive request")
+	}
+}
+
+func TestExternalChatRouterUploadsAttachmentsToRemoteHolder(t *testing.T) {
+	originalUploadDir := uploadDir
+	uploadDir = t.TempDir()
+	t.Cleanup(func() { uploadDir = originalUploadDir })
+	sourcePath := filepath.Join(uploadDir, "source.txt")
+	if err := os.WriteFile(sourcePath, []byte("peer attachment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	requestSeen := make(chan externalChatTextRequest, 1)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+		case r.URL.Path == "/api/v1/upload":
+			if err := r.ParseMultipartForm(1 << 20); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			f, h, err := r.FormFile("file")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer f.Close()
+			raw, _ := io.ReadAll(f)
+			if !bytes.Equal(raw, []byte("peer attachment")) || h.Filename != "source.txt" {
+				t.Errorf("uploaded file = %q filename=%q", raw, h.Filename)
+			}
+			_ = json.NewEncoder(w).Encode(agent.MessageAttachment{
+				Path: "/holder/upload/source.txt", Name: h.Filename, Mime: h.Header.Get("Content-Type"), Size: int64(len(raw)),
+			})
+		case r.Method == http.MethodPost:
+			var req externalChatTextRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode external chat: %v", err)
+				return
+			}
+			requestSeen <- req
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "done"})
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	events, err := router.ChatOneShot(context.Background(), agentID, "read this", agent.OneShotOpts{
+		Attachments: []agent.MessageAttachment{{Path: sourcePath, Name: "source.txt", Mime: "text/plain", Size: 15}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+	select {
+	case req := <-requestSeen:
+		if len(req.Attachments) != 1 || req.Attachments[0].Path != "/holder/upload/source.txt" {
+			t.Fatalf("relayed attachments = %#v", req.Attachments)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("holder did not receive external chat request")
+	}
+}
+
+func TestExternalChatFileRequiresActiveMatchingRelay(t *testing.T) {
+	originalUploadDir := uploadDir
+	uploadDir = t.TempDir()
+	t.Cleanup(func() { uploadDir = originalUploadDir })
+	path := filepath.Join(uploadDir, "result.txt")
+	if err := os.WriteFile(path, []byte("result"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{externalChatRelays: newExternalChatRelayRegistry()}
+	release := s.externalChatRelays.acquire("ag_test", "hub")
+	defer release()
+
+	call := func(peerID string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]string{"path": path})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/ag_test/external-chat/file", bytes.NewReader(body))
+		req.SetPathValue("id", "ag_test")
+		req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Role: auth.RolePeer, PeerID: peerID}))
+		rr := httptest.NewRecorder()
+		s.handleExternalChatFile(rr, req)
+		return rr
+	}
+	if rr := call("other"); rr.Code != http.StatusForbidden {
+		t.Fatalf("other peer status = %d", rr.Code)
+	}
+	if rr := call("hub"); rr.Code != http.StatusOK || rr.Body.String() != "result" {
+		t.Fatalf("hub response status=%d body=%q", rr.Code, rr.Body.String())
+	}
+}
+
+func TestExternalChatHubAddressRequiresAllowedProxyPeer(t *testing.T) {
+	s := newChunkedSyncTestServer(t)
+	a, err := s.agents.Create(agent.AgentConfig{Name: "remote MCP trust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, id := range []string{"hub", "other"} {
+		if _, err := s.agents.Store().UpsertPeer(ctx, &store.PeerRecord{
+			DeviceID: id, Name: id, URL: "https://" + id + ".example:443", Status: store.PeerStatusOnline,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.agents.Store().AcquireAgentLock(ctx, a.ID, "holder", store.NowMillis(), int64(time.Minute/time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.agents.Store().UpdateAgentLockAllowedProxy(ctx, a.ID, "holder", "hub"); err != nil {
+		t.Fatal(err)
+	}
+
+	resolve := func(peerID string) (string, error) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+a.ID+"/external-chat/text", nil)
+		req.SetPathValue("id", a.ID)
+		req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Role: auth.RolePeer, PeerID: peerID}))
+		_, addr, err := s.externalChatHubAddress(ctx, req, "")
+		return addr, err
+	}
+	if _, err := resolve("other"); err == nil {
+		t.Fatal("unrelated paired peer was accepted as the Hub")
+	}
+	addr, err := resolve("hub")
+	if err != nil || addr != "https://hub.example:443" {
+		t.Fatalf("allowed Hub addr=%q err=%v", addr, err)
+	}
+}
+
+func TestAgentWebSocketRoutingRejectsUnrelatedPeer(t *testing.T) {
+	s := newChunkedSyncTestServer(t)
+	s.peerID = &peer.Identity{DeviceID: "holder", Name: "Holder"}
+	a, err := s.agents.Create(agent.AgentConfig{Name: "remote WebUI trust"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := s.agents.Store().AcquireAgentLock(ctx, a.ID, "holder", store.NowMillis(), int64(time.Minute/time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.agents.Store().UpdateAgentLockAllowedProxy(ctx, a.ID, "holder", "hub"); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/"+a.ID+"/ws", nil)
+	req.SetPathValue("id", a.ID)
+	req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Role: auth.RolePeer, PeerID: "other"}))
+	rr := httptest.NewRecorder()
+	s.handleAgentWebSocketRouting(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -58,7 +58,7 @@ func isPeerProxyPath(p string) bool {
 	}
 	switch p {
 	case "/api/v1/info", "/api/v1/dirs", "/api/v1/upload",
-		"/api/v1/files", "/api/v1/files/view", "/api/v1/files/raw",
+		"/api/v1/files", "/api/v1/files/view", "/api/v1/files/raw", "/api/v1/files/thumb",
 		"/api/v1/git/status", "/api/v1/git/log", "/api/v1/git/diff", "/api/v1/git/exec":
 		return true
 	}

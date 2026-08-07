@@ -235,7 +235,8 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// Hub UI hits when it has selected a remote peer in the
 		// session screen's File/Attachments tabs.
 		if method == http.MethodGet && (path == "/api/v1/files" ||
-			path == "/api/v1/files/view" || path == "/api/v1/files/raw") {
+			path == "/api/v1/files/view" || path == "/api/v1/files/raw" ||
+			path == "/api/v1/files/thumb") {
 			return true
 		}
 		if method == http.MethodPost && path == "/api/v1/upload" {

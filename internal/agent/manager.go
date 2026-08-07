@@ -2165,6 +2165,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
+	applySlackMCPRelay(prep, agentID, slackMCPBaseURLFromContext(ctx))
 
 	// Check if agent is busy, editing, being reset, or switching
 	m.busyMu.Lock()
@@ -2311,6 +2312,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	_, callerCh, _ := bc.Subscribe()
 
 	go func() {
+		defer signalChatCompletion(ctx)
 		defer close(outCh)
 		defer m.clearBusy(agentID)
 		defer cancel()
@@ -2404,6 +2406,16 @@ type OneShotOpts struct {
 	// per-call capability rather than an Agent setting so WebUI and external
 	// conversations can run concurrently without changing each other's prompt.
 	DisableKojoAttachmentInstructions bool
+
+	// Attachments are files already materialized on the machine running the
+	// backend. External transports use this field so ChatOneShot formats the
+	// same attachment block as the interactive WebUI chat path.
+	Attachments []MessageAttachment
+
+	// SlackMCPBaseURL overrides the local Slack MCP endpoint for this turn.
+	// Runtime peers use the canonical Hub URL so Slack credentials stay on the
+	// Hub while the agent backend itself runs on the holder.
+	SlackMCPBaseURL string
 }
 
 // ChatOneShot runs a one-shot chat that does not save to the agent's
@@ -2435,6 +2447,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
+	applySlackMCPRelay(prep, agentID, opts.SlackMCPBaseURL)
 
 	chatCtx, cancel := context.WithCancel(ctx)
 
@@ -2482,8 +2495,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// chat path: keep dynamic data out of the system prompt to preserve
 	// the prompt cache.
 	effectiveMessage := userMessage
+	if len(opts.Attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(effectiveMessage, opts.Attachments)
+	}
 	if prep.volatileContext != "" {
-		effectiveMessage = prep.volatileContext + userMessage
+		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
 
 	// Gate SessionKey to backends that actually honor it. Other backends

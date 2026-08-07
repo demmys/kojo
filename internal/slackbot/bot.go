@@ -411,10 +411,13 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 
 	// Extract files from the message (populated by UnmarshalJSON into ev.Message).
 	text := ev.Text
+	var attachments []agent.MessageAttachment
 	if ev.Message != nil && len(ev.Message.Files) > 0 {
 		b.logger.Debug("slack files attached", "count", len(ev.Message.Files))
 		downloaded, errs := b.downloadSlackFiles(ctx, ev.Message.Files)
-		text = appendFileInfo(text, downloaded, errs)
+		attachments = downloadedAttachments(downloaded)
+		text = appendDownloadedFileNames(text, downloaded)
+		text = appendFileErrors(text, errs)
 	}
 
 	// Direct messages
@@ -422,7 +425,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 		if !b.config.ReactDM() {
 			return
 		}
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+		b.processIncomingWithAttachments(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User, attachments)
 		return
 	}
 
@@ -430,7 +433,7 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 	// we've previously participated in (history exists), the last message
 	// in history was from us, and the new message doesn't mention someone else.
 	if b.config.ReactThread() && ev.ThreadTimeStamp != "" && b.shouldAutoReply(ev.Channel, ev.ThreadTimeStamp, ev.Text) {
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+		b.processIncomingWithAttachments(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User, attachments)
 	}
 }
 
@@ -477,19 +480,26 @@ func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMent
 	}
 	// Strip the bot mention from the message
 	text := StripBotMention(ev.Text, b.botUserID)
+	var attachments []agent.MessageAttachment
 
 	// Download attached files (same as DM handling in handleMessageEvent)
 	if len(ev.Files) > 0 {
 		b.logger.Debug("slack files attached to mention", "count", len(ev.Files))
 		downloaded, errs := b.downloadSlackFiles(ctx, ev.Files)
-		text = appendFileInfo(text, downloaded, errs)
+		attachments = downloadedAttachments(downloaded)
+		text = appendDownloadedFileNames(text, downloaded)
+		text = appendFileErrors(text, errs)
 	}
 
-	b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+	b.processIncomingWithAttachments(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User, attachments)
 }
 
 func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS, text, userID string) {
-	if strings.TrimSpace(text) == "" {
+	b.processIncomingWithAttachments(ctx, channel, threadTS, messageTS, text, userID, nil)
+}
+
+func (b *Bot) processIncomingWithAttachments(ctx context.Context, channel, threadTS, messageTS, text, userID string, attachments []agent.MessageAttachment) {
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
 		return
 	}
 
@@ -509,7 +519,7 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 	case b.sem <- struct{}{}:
 		go func() {
 			defer func() { <-b.sem }()
-			b.sendToAgent(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID)
+			b.sendToAgentWithAttachments(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID, attachments)
 		}()
 	default:
 		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
@@ -543,6 +553,10 @@ const streamHeartbeatTick = 3 * time.Second
 const streamHeartbeatPayload = "\u200B"
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string) {
+	b.sendToAgentWithAttachments(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, nil)
+}
+
+func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment) {
 	// Serialize processing within the same thread to maintain history
 	// consistency. The lock must cover both history fetching and prompt
 	// construction so that concurrent messages to the same thread observe
@@ -642,6 +656,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		HistorySelfUserID:                 b.botUserID,
 		SystemPromptExtra:                 systemPromptExtra,
 		DisableKojoAttachmentInstructions: true,
+		Attachments:                       attachments,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)

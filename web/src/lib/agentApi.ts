@@ -264,6 +264,7 @@ export interface AgentMessageAttachment {
   name: string;
   size: number;
   mime: string;
+  peerId?: string;
 }
 
 export interface AgentMessage {

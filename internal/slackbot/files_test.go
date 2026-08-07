@@ -82,6 +82,15 @@ func TestAppendFileInfo(t *testing.T) {
 	})
 }
 
+func TestDownloadedAttachmentsPreservesMetadata(t *testing.T) {
+	got := downloadedAttachments([]downloadedFile{{
+		Path: "/tmp/kojo/upload/a.png", Name: "a.png", Mime: "image/png", Size: 42,
+	}})
+	if len(got) != 1 || got[0].Path != "/tmp/kojo/upload/a.png" || got[0].Name != "a.png" || got[0].Mime != "image/png" || got[0].Size != 42 {
+		t.Fatalf("attachments = %#v", got)
+	}
+}
+
 func TestPreflightSlackFile(t *testing.T) {
 	t.Run("oversize rejected", func(t *testing.T) {
 		err := preflightSlackFile(slack.File{Size: int(maxFileSize) + 1, URLPrivateDownload: "https://x"})

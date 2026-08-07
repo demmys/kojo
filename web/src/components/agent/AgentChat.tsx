@@ -92,7 +92,7 @@ export function AgentChat() {
     fileInputRef,
     handleFileSelect,
     removePendingFile,
-  } = useFileUpload();
+  } = useFileUpload(agent?.holderPeer);
   const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea(input);
   // Canonical auto-scroll + pagination shared with GroupDMChat. The suppress /
   // restore refs are owned by useChatScroll; the holder-peer refetch effect

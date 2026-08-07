@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -116,68 +117,119 @@ var uploadDir = uploadpath.Dir()
 // the usual public-endpoint DoS concerns don't apply.
 const maxUploadSize = 10 << 30 // 10 GiB
 
-// maxUploadInMemory is the in-memory threshold passed to
-// ParseMultipartForm; anything above this spills to a temp file. Keep
-// this small so we don't accidentally hold a multi-GB body in RAM
-// when the cap above grows.
-const maxUploadInMemory = 32 << 20 // 32 MiB
+// Multipart framing is not file content. Leave a small bounded allowance so
+// a file at the advertised ceiling is not rejected solely because of its
+// Content-Disposition and boundary bytes.
+const maxUploadRequestSize = maxUploadSize + (1 << 20)
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	if err := r.ParseMultipartForm(maxUploadInMemory); err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10GiB)")
-		return
-	}
-	// ParseMultipartForm spills bodies above maxUploadInMemory to
-	// os.TempDir. Without RemoveAll those temp files survive until
-	// the OS cleans the temp dir, which on a 10 GiB cap is a real
-	// disk-leak vector. Defer the cleanup so it runs whether the
-	// handler succeeds or aborts mid-flight.
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
-
-	file, header, err := r.FormFile("file")
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadRequestSize)
+	mr, err := r.MultipartReader()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "missing file field")
 		return
 	}
-	defer file.Close()
+	var fileName, contentType string
+	var part io.ReadCloser
+	for {
+		p, nextErr := mr.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(nextErr, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10GiB)")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "bad_request", "invalid multipart upload")
+			return
+		}
+		if p.FormName() == "file" && p.FileName() != "" {
+			part = p
+			fileName = p.FileName()
+			contentType = p.Header.Get("Content-Type")
+			break
+		}
+		_ = p.Close()
+	}
+	if part == nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "missing file field")
+		return
+	}
+	defer part.Close()
 
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to create upload directory")
 		return
 	}
 
-	safeName := uploadpath.SanitizeName(header.Filename)
+	safeName := uploadpath.SanitizeName(fileName)
 	filename := fmt.Sprintf("%d_%s", time.Now().UnixNano(), safeName)
 	destPath := filepath.Join(uploadDir, filename)
 
-	dst, err := os.Create(destPath)
+	// Stream into a restrictive temporary file and only publish the final
+	// path after both the copy and Close succeed. This avoids the former
+	// ParseMultipartForm double-spool for large peer transfers and prevents
+	// partially-written files from being accepted by a concurrent chat.
+	dst, err := os.CreateTemp(uploadDir, ".upload-*")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to create file")
 		return
 	}
-	defer dst.Close()
-
-	written, err := dst.ReadFrom(file)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write file")
+	tmpPath := dst.Name()
+	keep := false
+	defer func() {
+		_ = dst.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := dst.Chmod(0o600); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to secure file")
 		return
 	}
 
-	mime := header.Header.Get("Content-Type")
+	written, copyErr := io.Copy(dst, io.LimitReader(part, maxUploadSize+1))
+	if copyErr != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(copyErr, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10GiB)")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to write file")
+		return
+	}
+	if written > maxUploadSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "file too large (max 10GiB)")
+		return
+	}
+	if err := dst.Close(); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to finalize file")
+		return
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to publish file")
+		return
+	}
+	keep = true
+
+	mime := contentType
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
 
 	writeJSONResponse(w, http.StatusOK, map[string]any{
 		"path": destPath,
-		"name": header.Filename,
+		"name": fileName,
 		"size": written,
 		"mime": mime,
+		"peerId": func() string {
+			if s.peerID != nil {
+				return s.peerID.DeviceID
+			}
+			return ""
+		}(),
 	})
 }
 

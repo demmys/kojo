@@ -1,9 +1,39 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
+
+type slackMCPBaseURLContextKey struct{}
+
+// WithSlackMCPBaseURL directs one interactive chat turn at the stable Hub's
+// Slack MCP endpoint. It is used by a migrated agent's holder; the server only
+// sets it after authenticating the Hub against agent_locks.allowed_proxy_peer.
+func WithSlackMCPBaseURL(ctx context.Context, baseURL string) context.Context {
+	return context.WithValue(ctx, slackMCPBaseURLContextKey{}, baseURL)
+}
+
+func slackMCPBaseURLFromContext(ctx context.Context) string {
+	url, _ := ctx.Value(slackMCPBaseURLContextKey{}).(string)
+	return url
+}
+
+func applySlackMCPRelay(prep *chatPrep, agentID, baseURL string) {
+	if baseURL == "" {
+		return
+	}
+	prep.mcpServers = BuildMCPServers(agentID, baseURL, true)
+	if entry, ok := prep.mcpServers["slack"]; ok {
+		entry.URL += "?external_chat_relay=1"
+		if entry.Headers == nil {
+			entry.Headers = make(map[string]string)
+		}
+		entry.Headers["X-Kojo-External-Chat-Relay"] = "1"
+		prep.mcpServers["slack"] = entry
+	}
+}
 
 // mcpServerEntry represents one MCP server configuration.
 // For HTTP transport, only URL (and optionally Type) are set.

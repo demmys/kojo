@@ -84,6 +84,15 @@ func formatResumeSessionContext(history []chathistory.HistoryMessage, selfUserID
 		chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
 }
 
+// FormatOneShotHistoryContexts converts a response surface's canonical
+// transcript into the two bounded contexts consumed by ChatOneShot backends.
+// It is exported for trusted internal transports that must relay continuity
+// without sending an unbounded raw transcript across the network.
+func FormatOneShotHistoryContexts(history []chathistory.HistoryMessage, selfUserID string) (fresh, resume string) {
+	return formatSessionHistoryContext(history, selfUserID),
+		formatResumeSessionContext(history, selfUserID)
+}
+
 // injectSessionHistoryContext enforces the shared continuity rule for every
 // response surface and backend: a fresh session gets the canonical transcript,
 // while a resumed external session gets a small, explicitly historical recap.

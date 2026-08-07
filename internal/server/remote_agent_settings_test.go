@@ -49,6 +49,38 @@ func patchRemoteAgent(srv *Server, agentID, body string, p auth.Principal) *http
 	return w
 }
 
+func TestRemoteAgentSlackSettingsStayOnHub(t *testing.T) {
+	srv := newRemoteAgentPatchServer(t, "ag_slack_hub", store.PeerStatusOnline)
+	called := false
+	h := srv.remoteAgentProxyMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		called = false
+		r := httptest.NewRequest(method, "/api/v1/agents/ag_slack_hub/slackbot", nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if !called || w.Code != http.StatusNoContent {
+			t.Fatalf("%s /slackbot was proxied: called=%v status=%d body=%s",
+				method, called, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestPeerOnlySlackSettingsHandlerIsUnavailable(t *testing.T) {
+	srv := newQueueTestServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/agents/ag_any/slackbot",
+		strings.NewReader(`{"enabled":true,"appToken":"xapp-test","botToken":"xoxb-test"}`))
+	req.SetPathValue("id", "ag_any")
+	rr := httptest.NewRecorder()
+	srv.handleSetSlackBot(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("peer-only Slack handler status = %d, want %d; body=%s",
+			rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
 // Hub-local-safe PATCH must succeed against the hub row while the
 // holder peer is offline.
 func TestRemoteAgentPatchHubLocalWhenHolderOffline(t *testing.T) {

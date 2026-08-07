@@ -1016,6 +1016,17 @@ func (m *Manager) GetRemote(id string) *Agent {
 	return a
 }
 
+// GetAny returns an agent whether its runtime is local or held by a peer.
+// Hub-owned integrations use the persisted remote mirror for configuration;
+// execution paths must continue to use Get so they cannot run a remote agent.
+func (m *Manager) GetAny(id string) (*Agent, bool) {
+	if a, ok := m.Get(id); ok {
+		return a, true
+	}
+	a := m.GetRemote(id)
+	return a, a != nil
+}
+
 // List returns deep copies of all agents.
 func (m *Manager) List() []*Agent {
 	// Collect IDs (skipping archived for syncPersona) outside the main lock
@@ -1767,10 +1778,22 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 // variant skips the inner guard so the whole handler is one
 // transactional unit under the outer mutation.
 //
+// For a remote runtime this updates only the Hub-owned slackBot field in the
+// persisted mirror, leaving all holder-owned settings untouched.
+//
 // MUST NOT be called from any path that does NOT already hold
-// AcquireMutation for this agent.
+// AcquireMutation and LockPatch for this agent.
 func (m *Manager) UpdateSlackBotAlreadyGuarded(id string, cfg *SlackBotConfig) error {
-	return m.updateSlackBotUnguarded(id, cfg)
+	m.mu.Lock()
+	_, local := m.agents[id]
+	m.mu.Unlock()
+	if local {
+		return m.updateSlackBotUnguarded(id, cfg)
+	}
+	if m.store == nil {
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	return m.store.UpdateAgentSetting(id, "slackBot", cfg, cfg == nil)
 }
 
 func (m *Manager) updateSlackBotUnguarded(id string, cfg *SlackBotConfig) error {
@@ -2362,6 +2385,13 @@ type OneShotOpts struct {
 	// HistorySelfUserID identifies this agent's messages inside History.
 	HistorySelfUserID string
 
+	// FreshSessionContext and ResumeSessionContext are preformatted, bounded
+	// equivalents of History. Trusted internal transports use these instead of
+	// relaying an unbounded canonical transcript. Ordinary callers should pass
+	// History and let Manager derive both contexts locally.
+	FreshSessionContext  string
+	ResumeSessionContext string
+
 	// SystemPromptExtra is appended to the system prompt for this call
 	// only. Slack uses it to inject per-channel/thread context
 	// ("You are participating in channel #foo, thread …") at a stable
@@ -2484,8 +2514,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		MCPServers: prep.mcpServers,
 		SessionKey: sessionKey,
 	}
-	chatOpts.FreshSessionContext = formatSessionHistoryContext(opts.History, opts.HistorySelfUserID)
-	chatOpts.ResumeSessionContext = formatResumeSessionContext(opts.History, opts.HistorySelfUserID)
+	chatOpts.FreshSessionContext = opts.FreshSessionContext
+	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
+	if chatOpts.FreshSessionContext == "" && chatOpts.ResumeSessionContext == "" {
+		chatOpts.FreshSessionContext, chatOpts.ResumeSessionContext =
+			FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
+	}
 	if sessionKey != "" {
 		// Register a nil placeholder immediately so SteerOneShot can
 		// distinguish "no turn running" (ErrAgentNotBusy, key absent) from

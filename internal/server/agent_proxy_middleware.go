@@ -95,6 +95,13 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Slack Socket configuration and credentials belong to the
+		// canonical Hub even while the agent runtime is remote.
+		if sub == "/slackbot" || sub == "/slackbot/test" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Hub-only management ops: the target peer's handler would
 		// 403 anyway (CanForkOrCreate / CanSetPrivileged don't
 		// admit RolePeer). Short-circuit here to avoid a wasted

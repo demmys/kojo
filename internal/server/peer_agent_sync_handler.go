@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -706,17 +707,28 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// Hold memorySyncMu across BOTH the DB write and the disk
-	// materialize. Without one lock spanning both, a concurrent
-	// prepareChat on this peer could slip between commit and
-	// materialize, scan the STALE disk, and UPSERT the old bodies
-	// back into the DB — silently rolling back what we just synced.
-	// The lock is per-agent, so concurrent syncs for OTHER agents
-	// are unaffected.
-	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
-
 	incrementalMessages := req.SinceMessageSeq > 0
 	incrementalMemoryEntries := req.SinceMemoryEntryUpdatedAt > 0
+
+	// Slack integration state belongs only to the canonical Hub. Serialize a
+	// Hub ingest against PUT/DELETE /slackbot, then merge the Hub value into
+	// the incoming runtime snapshot. A peer-only target strips the field.
+	releaseSlackPatch := func() {}
+	if s.slackHub != nil {
+		releaseSlackPatch = s.agents.LockPatch(req.Agent.ID)
+	}
+	// Preserve the repository-wide LockPatch -> memorySync order used by
+	// memory/persona writes. Hold memorySyncMu across BOTH the DB write and
+	// disk materialize so prepareChat cannot scan stale disk between them and
+	// overwrite the freshly synced rows.
+	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
+	if err := s.applySlackOwnershipToSyncRecord(r.Context(), req.Agent); err != nil {
+		releaseSlackPatch()
+		releaseMemSync()
+		writeError(w, http.StatusInternalServerError, "internal",
+			"merge Hub Slack settings: "+err.Error())
+		return
+	}
 
 	if err := s.agents.Store().SyncAgentFromPeer(r.Context(), store.AgentSyncPayload{
 		Agent:         req.Agent,
@@ -731,6 +743,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		IncrementalMessages:      incrementalMessages,
 		IncrementalMemoryEntries: incrementalMemoryEntries,
 	}); err != nil {
+		releaseSlackPatch()
 		releaseMemSync()
 		if sessionRollback != nil {
 			sessionRollback()
@@ -747,6 +760,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			"sync apply: "+err.Error())
 		return
 	}
+	releaseSlackPatch()
 	if sessionCommit != nil {
 		sessionCommit()
 	}
@@ -902,4 +916,115 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	}
 
 	writeJSONResponse(w, http.StatusOK, peerAgentSyncResponse{AgentID: req.Agent.ID})
+}
+
+// applySlackOwnershipToSyncRecord makes the wire's AgentRecord consistent
+// with where Slack is actually owned. Holder peers never retain a stale copy
+// of slackBot. The Hub preserves its local value when a runtime returns. Any
+// changed record gets fresh metadata so its ETag still hashes the bytes that
+// SyncAgentFromPeer will persist.
+func (s *Server) applySlackOwnershipToSyncRecord(ctx context.Context, rec *store.AgentRecord) error {
+	if rec == nil {
+		return errors.New("nil agent record")
+	}
+	originalSettings := make(map[string]any, len(rec.Settings))
+	for key, value := range rec.Settings {
+		originalSettings[key] = value
+	}
+	sourceValue, sourceHas := takeSettingFold(rec.Settings, "slackBot")
+	desiredValue, desiredHas := any(nil), false
+	maxVersion := rec.Version
+	var current *store.AgentRecord
+	current, err := s.agents.Store().GetAgent(ctx, rec.ID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if current != nil && current.Version > maxVersion {
+		maxVersion = current.Version
+	}
+	if s.slackHub != nil {
+		if current != nil {
+			desiredValue, desiredHas = findSettingFold(current.Settings, "slackBot")
+		}
+	}
+	if desiredHas {
+		if rec.Settings == nil {
+			rec.Settings = make(map[string]any)
+		}
+		rec.Settings["slackBot"] = desiredValue
+	}
+	settingsChanged := !reflect.DeepEqual(originalSettings, rec.Settings)
+	if !settingsChanged && sourceHas == desiredHas && reflect.DeepEqual(sourceValue, desiredValue) {
+		return nil
+	}
+	// Agent-sync is retried as a whole after failures in later phases. If a
+	// previous attempt already persisted these merged bytes, retain its
+	// metadata instead of bumping version/ETag on every retry.
+	currentMetadataCoversSource := current != nil &&
+		(current.Version > rec.Version ||
+			current.Version == rec.Version && current.UpdatedAt >= rec.UpdatedAt)
+	if currentMetadataCoversSource && sameSyncedAgentContent(rec, current) {
+		rec.Seq = current.Seq
+		rec.Version = current.Version
+		rec.UpdatedAt = current.UpdatedAt
+		rec.CreatedAt = current.CreatedAt
+		rec.ETag = current.ETag
+		return nil
+	}
+	rec.Version = maxVersion + 1
+	mergedUpdatedAt := store.NowMillis()
+	if rec.UpdatedAt > mergedUpdatedAt {
+		mergedUpdatedAt = rec.UpdatedAt
+	}
+	if current != nil && current.UpdatedAt > mergedUpdatedAt {
+		mergedUpdatedAt = current.UpdatedAt
+	}
+	rec.UpdatedAt = mergedUpdatedAt
+	rec.ETag = "" // SyncAgentFromPeer recomputes it from the merged record.
+	return nil
+}
+
+func findSettingFold(settings map[string]any, wanted string) (any, bool) {
+	for key, value := range settings {
+		if strings.EqualFold(key, wanted) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func sameSyncedAgentContent(a, b *store.AgentRecord) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	// SyncAgentFromPeer persists empty persona/workspace references as the
+	// agent ID. Compare that canonical form so a retry of the same sync does
+	// not manufacture another version merely because the wire used the
+	// shorthand empty value.
+	canonicalRef := func(value, agentID string) string {
+		if value == "" {
+			return agentID
+		}
+		return value
+	}
+	return a.ID == b.ID && a.Name == b.Name &&
+		canonicalRef(a.PersonaRef, a.ID) == canonicalRef(b.PersonaRef, b.ID) &&
+		canonicalRef(a.WorkspaceID, a.ID) == canonicalRef(b.WorkspaceID, b.ID) &&
+		a.PeerID == b.PeerID && a.Seq == b.Seq &&
+		reflect.DeepEqual(a.Settings, b.Settings) && reflect.DeepEqual(a.DeletedAt, b.DeletedAt)
+}
+
+func takeSettingFold(settings map[string]any, wanted string) (any, bool) {
+	var value any
+	found := false
+	for key, candidate := range settings {
+		if strings.EqualFold(key, wanted) {
+			if !found {
+				value = candidate
+				found = true
+			}
+			delete(settings, key)
+		}
+	}
+	return value, found
 }

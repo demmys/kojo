@@ -387,6 +387,44 @@ func (st *agentStore) SaveAgentRowOnly(a *Agent) error {
 	return st.upsertAgentSkipPersona(ctx, a)
 }
 
+// UpdateAgentSetting updates one settings_json field against the current DB
+// row. Hub-owned integrations use this while the agent runtime is remote: a
+// load-modify-save of the Hub's whole mirror could overwrite unrelated fields
+// with a stale snapshot from before the handoff.
+func (st *agentStore) UpdateAgentSetting(id, key string, value any, remove bool) error {
+	if st == nil || st.db == nil {
+		return errors.New("agentStore: not initialized")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := st.db.UpdateAgent(ctx, id, "", func(rec *store.AgentRecord) error {
+		if rec.Settings == nil {
+			rec.Settings = make(map[string]any)
+		}
+		for existing := range rec.Settings {
+			if strings.EqualFold(existing, key) {
+				delete(rec.Settings, existing)
+			}
+		}
+		if remove {
+			return nil
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		var normalized any
+		if err := json.Unmarshal(raw, &normalized); err != nil {
+			return err
+		}
+		rec.Settings[key] = normalized
+		return nil
+	})
+	return err
+}
+
 // Upsert writes a single agent through upsertAgent under the store
 // mutex and returns the underlying error rather than logging-and-
 // continuing as Save() does. Used by paths that must observe the

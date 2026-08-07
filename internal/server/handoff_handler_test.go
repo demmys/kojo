@@ -38,8 +38,14 @@ func TestRunHandoffOp_OnlyAvatarBlobMoves(t *testing.T) {
 	prefix := "kojo://global/agents/ag_x/"
 	avatarURI := prefix + "avatar.png"
 	attachURI := prefix + "attach/m_1/chart.png"
+	if _, err := st.InsertAgent(ctx, &store.AgentRecord{ID: "ag_x", Name: "x"}, store.AgentInsertOptions{}); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
 	seedServerHandoffBlob(t, st, avatarURI, "peer-src", "aaa")
 	seedServerHandoffBlob(t, st, attachURI, "peer-src", "bbb")
+	if _, err := st.AcquireAgentLock(ctx, "ag_x", "peer-src", store.NowMillis(), 60_000); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
 
 	begin, err := srv.runHandoffOp(ctx, "ag_x", "begin", "peer-tgt")
 	if err != nil {

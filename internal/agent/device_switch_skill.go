@@ -165,12 +165,11 @@ Outcome catalog:
   with the full migrated state; that is where the conversation
   continues. Treat the curl response as the end of your turn:
   no acknowledgement, no farewell, no plan, no summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -279,12 +278,11 @@ Outcome catalog:
   with the full migrated state; that is where the conversation
   continues. Treat the curl response as the end of your turn:
   no acknowledgement, no farewell, no plan, no summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -403,12 +401,11 @@ Outcome catalog:
   where the conversation continues. Treat the curl response as the
   end of your turn: no acknowledgement, no farewell, no plan, no
   summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -507,12 +504,11 @@ Outcome catalog:
   where the conversation continues. Treat the curl response as the
   end of your turn: no acknowledgement, no farewell, no plan, no
   summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the

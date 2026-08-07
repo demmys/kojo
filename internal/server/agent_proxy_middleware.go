@@ -97,7 +97,7 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 
 		// Slack Socket configuration and credentials belong to the
 		// canonical Hub even while the agent runtime is remote.
-		if sub == "/slackbot" || sub == "/slackbot/test" {
+		if sub == "/slackbot" || sub == "/slackbot/test" || sub == "/mcp" {
 			next.ServeHTTP(w, r)
 			return
 		}

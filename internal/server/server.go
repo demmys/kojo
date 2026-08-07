@@ -244,6 +244,9 @@ type Server struct {
 	// becomes RolePeer (on a peer daemon) or RoleOwner (on the Hub
 	// when the listener is the public one). Wired from --unsafe.
 	unsafePeer bool
+	// externalChatRelays authorizes short-lived Hub callbacks for files
+	// produced by an agent during a remotely dispatched Slack turn.
+	externalChatRelays *externalChatRelayRegistry
 	// identityMu guards nodeKeyResolver + selfNodeKey, both of
 	// which can be (re)wired after server construction.
 	identityMu sync.RWMutex
@@ -483,6 +486,7 @@ func New(cfg Config) *Server {
 		repoDir:              cfg.RepoDir,
 		updateChecker:        cfg.UpdateChecker,
 		unsafePeer:           cfg.Unsafe,
+		externalChatRelays:   newExternalChatRelayRegistry(),
 		thumbPurgeDone:       make(chan struct{}),
 		ttsSweepDone:         make(chan struct{}),
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
@@ -796,6 +800,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// exposes only the fenced agent-turn endpoint used by the Hub.
 		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/file", s.handleExternalChatFile)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
 		if !cfg.PeerOnly {

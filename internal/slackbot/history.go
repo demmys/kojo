@@ -234,6 +234,7 @@ func slackMsgToHistory(sm slack.Message, channelID, threadID string, resolve Use
 
 	// Convert Slack mrkdwn to plain text
 	text := SlackToPlain(sm.Text, resolve)
+	text = appendSlackHistoryFileNames(text, sm.Files)
 
 	return chathistory.HistoryMessage{
 		Platform:  platformSlack,

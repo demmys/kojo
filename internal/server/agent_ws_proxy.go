@@ -68,6 +68,12 @@ func (s *Server) handleAgentWebSocketRouting(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	if lock.HolderPeer == "" || lock.HolderPeer == s.peerID.DeviceID {
+		if p := auth.FromContext(r.Context()); p.IsPeer() &&
+			(lock.AllowedProxyPeer == "" || lock.AllowedProxyPeer != p.PeerID) {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"peer is not the agent's allowed proxy")
+			return
+		}
 		s.handleAgentWebSocket(w, r)
 		return
 	}

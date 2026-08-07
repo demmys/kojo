@@ -44,12 +44,14 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
-	Message              string `json:"message"`
-	SessionKey           string `json:"sessionKey,omitempty"`
-	FreshSessionContext  string `json:"freshSessionContext,omitempty"`
-	ResumeSessionContext string `json:"resumeSessionContext,omitempty"`
-	SystemPromptExtra    string `json:"systemPromptExtra,omitempty"`
-	DisableAttachments   bool   `json:"disableAttachments,omitempty"`
+	Message              string                    `json:"message"`
+	SessionKey           string                    `json:"sessionKey,omitempty"`
+	FreshSessionContext  string                    `json:"freshSessionContext,omitempty"`
+	ResumeSessionContext string                    `json:"resumeSessionContext,omitempty"`
+	SystemPromptExtra    string                    `json:"systemPromptExtra,omitempty"`
+	DisableAttachments   bool                      `json:"disableAttachments,omitempty"`
+	Attachments          []agent.MessageAttachment `json:"attachments,omitempty"`
+	HubMCPBaseURL        string                    `json:"hubMcpBaseUrl,omitempty"`
 }
 
 type externalChatTextEnvelope struct {
@@ -131,6 +133,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		ResumeSessionContext: resumeContext,
 		SystemPromptExtra:    opts.SystemPromptExtra,
 		DisableAttachments:   opts.DisableKojoAttachmentInstructions,
+		Attachments:          append([]agent.MessageAttachment(nil), opts.Attachments...),
 	}
 
 	holder, local, err := r.initialRoute(ctx, agentID)
@@ -264,6 +267,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			ResumeSessionContext:              req.ResumeSessionContext,
 			SystemPromptExtra:                 req.SystemPromptExtra,
 			DisableKojoAttachmentInstructions: req.DisableAttachments,
+			Attachments:                       req.Attachments,
 		})
 		if err != nil {
 			if errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID) {
@@ -348,7 +352,21 @@ func (r *externalChatRouter) postRemote(ctx context.Context, agentID, holder str
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve holder address: %w", err)
 	}
-	body, err := json.Marshal(payload)
+	remotePayload := payload
+	remotePayload.Attachments = make([]agent.MessageAttachment, 0, len(payload.Attachments))
+	for _, attachment := range payload.Attachments {
+		materialized, err := uploadAttachmentToPeer(ctx, addr, attachment)
+		if err != nil {
+			return nil, false, err
+		}
+		remotePayload.Attachments = append(remotePayload.Attachments, materialized)
+	}
+	if r.server.peerID != nil {
+		if hub, getErr := r.server.agents.Store().GetPeer(ctx, r.server.peerID.DeviceID); getErr == nil {
+			remotePayload.HubMCPBaseURL, _ = peer.NormalizeAddress(hub.URL)
+		}
+	}
+	body, err := json.Marshal(remotePayload)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode Slack turn: %w", err)
 	}
@@ -519,12 +537,41 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", "message is required")
 		return
 	}
+	for i := range req.Attachments {
+		if req.Attachments[i].PeerID != "" && s.peerID != nil && req.Attachments[i].PeerID != s.peerID.DeviceID {
+			writeError(w, http.StatusConflict, "wrong_holder", "attachment belongs to a different holder")
+			return
+		}
+		f, size, kind := openUploadPath(req.Attachments[i].Path)
+		if kind != "" {
+			writeError(w, http.StatusBadRequest, "invalid_attachment", uploadPathUserMessage(kind))
+			return
+		}
+		_ = f.Close()
+		req.Attachments[i].Size = size
+	}
+	hubPeerID, hubAddr, hubErr := s.externalChatHubAddress(r.Context(), r, req.HubMCPBaseURL)
+	if hubErr != nil {
+		if errors.Is(hubErr, errExternalChatHubForbidden) {
+			writeError(w, http.StatusForbidden, "forbidden", hubErr.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "hub_unavailable", hubErr.Error())
+		}
+		return
+	}
+	releaseRelay := func() {}
+	if s.externalChatRelays != nil {
+		releaseRelay = s.externalChatRelays.acquire(agentID, hubPeerID)
+	}
+	defer releaseRelay()
 	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
 		SessionKey:                        req.SessionKey,
 		FreshSessionContext:               req.FreshSessionContext,
 		ResumeSessionContext:              req.ResumeSessionContext,
 		SystemPromptExtra:                 req.SystemPromptExtra,
 		DisableKojoAttachmentInstructions: req.DisableAttachments,
+		Attachments:                       req.Attachments,
+		SlackMCPBaseURL:                   hubAddr,
 	})
 	if err != nil {
 		switch {

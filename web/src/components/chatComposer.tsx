@@ -73,8 +73,8 @@ export function PendingAttachments({
               <img
                 src={
                   isThumbSupported(file.path)
-                    ? api.files.thumbUrl(file.path, 64)
-                    : api.files.rawUrl(file.path)
+                    ? api.files.thumbUrl(file.path, 64, undefined, file.peerId)
+                    : api.files.rawUrl(file.path, false, file.peerId)
                 }
                 alt={file.name}
                 className="h-6 w-6 rounded object-cover"
@@ -83,7 +83,7 @@ export function PendingAttachments({
               />
             ) : (
               <img
-                src={api.files.rawUrl(file.path)}
+                src={api.files.rawUrl(file.path, false, file.peerId)}
                 alt={file.name}
                 className="h-6 w-6 rounded object-cover"
               />

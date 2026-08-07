@@ -312,6 +312,11 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
 		{http.MethodGet, "/api/v1/peers/binary", ag, false},
 		{http.MethodGet, "/api/v1/peers/binary", guest, false},
+		// Remote attachment previews are fetched through the holder peer.
+		{http.MethodGet, "/api/v1/files/thumb",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/files/thumb",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
 		// §3.7 agent-sync surfaces. Same trust model: RolePeer
 		// only (handler enforces signer-equals-source + holder
 		// check). Agent / Guest principals MUST be denied —

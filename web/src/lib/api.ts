@@ -53,6 +53,7 @@ export interface Attachment {
   name: string;
   size: number;
   mime: string;
+  peerId?: string;
   modTime: string;
   createdAt: string;
 }
@@ -261,7 +262,7 @@ export const api = {
   upload: (file: File, peerId?: string) => {
     const form = new FormData();
     form.append("file", file);
-    return upload<{ path: string; name: string; size: number; mime: string }>(
+    return upload<{ path: string; name: string; size: number; mime: string; peerId?: string }>(
       withPeer("/api/v1/upload", peerId),
       form,
     );

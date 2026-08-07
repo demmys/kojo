@@ -4,14 +4,130 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/store"
 	"github.com/slack-go/slack"
 )
+
+func TestOpenMCPUploadSourceRelaysFromCurrentHolder(t *testing.T) {
+	var agentID string
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/agents/"+agentID+"/external-chat/file" {
+			w.Header().Set("Content-Length", "11")
+			_, _ = io.WriteString(w, "holder file")
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(holder.Close)
+
+	s := newChunkedSyncTestServer(t)
+	ctx := context.Background()
+	a, err := s.agents.Create(agent.AgentConfig{Name: "remote MCP"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentID = a.ID
+	if _, err := s.agents.Store().UpsertPeer(ctx, &store.PeerRecord{
+		DeviceID: "holder", Name: "Holder", URL: holder.URL, Status: store.PeerStatusOnline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.agents.Store().AcquireAgentLock(ctx, agentID, "holder", store.NowMillis(), int64((time.Minute)/time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	r, size, kind := openMCPUploadSource(ctx, s.agents, agentID, "holder", true, "/peer/upload/result.txt")
+	if kind != "" {
+		t.Fatalf("relay error kind = %q", kind)
+	}
+	defer r.Close()
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 11 || string(raw) != "holder file" {
+		t.Fatalf("relayed size=%d body=%q", size, raw)
+	}
+
+	if _, _, kind := openMCPUploadSource(ctx, s.agents, agentID, "different-peer", true, "/peer/upload/result.txt"); kind == "" {
+		t.Fatal("non-holder MCP caller was accepted")
+	}
+}
+
+type failingUploadReader struct{}
+
+func (failingUploadReader) Read([]byte) (int, error) {
+	return 0, errors.New("peer stream interrupted")
+}
+
+func TestPostSlackMultipartFileReturnsWhenSourceFails(t *testing.T) {
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upload.Close)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- postSlackMultipartFile(
+			context.Background(), upload.Client(), upload.URL, "test-token", "result.txt", failingUploadReader{},
+		)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "peer stream interrupted") {
+			t.Fatalf("error = %v, want interrupted source error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("multipart upload hung after the source stream failed")
+	}
+}
+
+func TestPostSlackMultipartFileStreamsFile(t *testing.T) {
+	upload := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("ParseMultipartForm: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Errorf("FormFile: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+		raw, err := io.ReadAll(file)
+		if err != nil {
+			t.Errorf("ReadAll: %v", err)
+		}
+		if header.Filename != "result.txt" || string(raw) != "holder file" {
+			t.Errorf("filename=%q body=%q", header.Filename, raw)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upload.Close)
+
+	if err := postSlackMultipartFile(
+		context.Background(), upload.Client(), upload.URL, "test-token", "result.txt", strings.NewReader("holder file"),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestParseListChannelsArgs(t *testing.T) {
 	cases := []struct {

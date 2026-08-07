@@ -9,25 +9,26 @@ export type MediaPreviewType = "image" | "video";
 // pushes) route to /api/v1/blob/<scope>/<path>; everything else is
 // treated as a legacy filesystem path and served via the file
 // browser raw endpoint.
-export function attachmentURL(path: string): string {
-  return api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path);
+export function attachmentURL(path: string, peerId?: string): string {
+  return api.blob.urlFromKojoURI(path) ?? api.files.rawUrl(path, false, peerId);
 }
 
 // attachmentThumbURL is the inline-grid variant of attachmentURL.
 // Both kojo:// blob URIs and filesystem paths route through their
 // respective thumb endpoints so the browser fetches a cached
 // low-res JPEG instead of the full body.
-export function attachmentThumbURL(path: string, size = 400): string {
+export function attachmentThumbURL(path: string, size = 400, peerId?: string): string {
   // Blob path: use ?thumb=<size> on the blob endpoint.
   const blobThumb = api.blob.thumbFromKojoURI(path, size);
   if (blobThumb) return blobThumb;
   // Filesystem path: use the dedicated thumb endpoint.
-  return isThumbSupported(path) ? api.files.thumbUrl(path, size) : api.files.rawUrl(path);
+  return isThumbSupported(path) ? api.files.thumbUrl(path, size, undefined, peerId) : api.files.rawUrl(path, false, peerId);
 }
 
 /** Full-screen overlay for image/video preview */
 export function MediaOverlay({
   path,
+  peerId,
   type,
   currentIndex,
   total,
@@ -35,6 +36,7 @@ export function MediaOverlay({
   onNavigate,
 }: {
   path: string;
+  peerId?: string;
   type: MediaPreviewType;
   currentIndex?: number;
   total?: number;
@@ -44,7 +46,7 @@ export function MediaOverlay({
   const t = useT();
   // attachmentURL routes kojo:// → /api/v1/blob/... and falls back
   // to the file browser raw endpoint for legacy filesystem paths.
-  const rawUrl = attachmentURL(path);
+  const rawUrl = attachmentURL(path, peerId);
   const [videoError, setVideoError] = useState(false);
   const [mediaWidth, setMediaWidth] = useState<number | null>(null);
   const mediaFrameRef = useRef<HTMLDivElement>(null);

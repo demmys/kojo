@@ -7,10 +7,11 @@ import (
 
 // MessageAttachment represents a file attached to a chat message.
 type MessageAttachment struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
-	Size int64  `json:"size"`
-	Mime string `json:"mime"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	Mime   string `json:"mime"`
+	PeerID string `json:"peerId,omitempty"` // host that owns Path; prevents handoff races
 }
 
 // Message represents a single chat message in the transcript.

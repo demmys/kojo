@@ -14,6 +14,7 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -44,11 +45,12 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
-	Message            string `json:"message"`
-	ResumeMessage      string `json:"resumeMessage,omitempty"`
-	SessionKey         string `json:"sessionKey,omitempty"`
-	SystemPromptExtra  string `json:"systemPromptExtra,omitempty"`
-	DisableAttachments bool   `json:"disableAttachments,omitempty"`
+	Message            string                       `json:"message"`
+	SessionKey         string                       `json:"sessionKey,omitempty"`
+	History            []chathistory.HistoryMessage `json:"history,omitempty"`
+	HistorySelfUserID  string                       `json:"historySelfUserId,omitempty"`
+	SystemPromptExtra  string                       `json:"systemPromptExtra,omitempty"`
+	DisableAttachments bool                         `json:"disableAttachments,omitempty"`
 }
 
 type externalChatTextEnvelope struct {
@@ -121,8 +123,9 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	}
 	req := externalChatTextRequest{
 		Message:            message,
-		ResumeMessage:      opts.ResumeMessage,
 		SessionKey:         opts.SessionKey,
+		History:            opts.History,
+		HistorySelfUserID:  opts.HistorySelfUserID,
 		SystemPromptExtra:  opts.SystemPromptExtra,
 		DisableAttachments: opts.DisableKojoAttachmentInstructions,
 	}
@@ -254,9 +257,10 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 		events, err := s.agents.ChatOneShot(turnCtx, agentID, req.Message, agent.OneShotOpts{
 			SessionKey:                        req.SessionKey,
+			History:                           req.History,
+			HistorySelfUserID:                 req.HistorySelfUserID,
 			SystemPromptExtra:                 req.SystemPromptExtra,
 			DisableKojoAttachmentInstructions: req.DisableAttachments,
-			ResumeMessage:                     req.ResumeMessage,
 		})
 		if err != nil {
 			if errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID) {
@@ -514,9 +518,10 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	}
 	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
 		SessionKey:                        req.SessionKey,
+		History:                           req.History,
+		HistorySelfUserID:                 req.HistorySelfUserID,
 		SystemPromptExtra:                 req.SystemPromptExtra,
 		DisableKojoAttachmentInstructions: req.DisableAttachments,
-		ResumeMessage:                     req.ResumeMessage,
 	})
 	if err != nil {
 		switch {

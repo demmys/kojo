@@ -571,6 +571,26 @@ func New(cfg Config) *Server {
 		}
 	}
 
+	// send push notification when an agent pages the operator via
+	// POST /agents/{id}/attention. Unlike agent_awaiting_input the turn
+	// is NOT blocked — this is "come look when you can". Same PeerOnly
+	// guard as the hooks above.
+	if s.notify != nil && s.agents != nil && !cfg.PeerOnly {
+		s.agents.OnAttentionRaised = func(agentID, reason string) {
+			name := agentID
+			if ag, ok := s.agents.Get(agentID); ok {
+				name = ag.Name
+			}
+			payload, _ := json.Marshal(map[string]any{
+				"type":    "agent_attention",
+				"agentId": agentID,
+				"name":    truncateUTF8(name, 80),
+				"reason":  truncateUTF8(reason, 200),
+			})
+			s.notify.Send(payload)
+		}
+	}
+
 	mux := http.NewServeMux()
 	s.registerRoutes(mux, cfg)
 	s.mux = mux
@@ -951,6 +971,11 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/queued-messages/{qid}", s.handleCancelQueuedAgentMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/steer", s.handleSteerAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/answer", s.handleAnswerAgentQuestion)
+	// Agent-raised, non-blocking "look at me" page. POST raises (with an
+	// optional one-line reason), DELETE clears — the web UI clears
+	// whenever the operator has the agent's chat open.
+	mux.HandleFunc("POST /api/v1/agents/{id}/attention", s.handleRaiseAgentAttention)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/attention", s.handleClearAgentAttention)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/messages/{msgId}", s.handleUpdateMessage)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/messages/{msgId}", s.handleDeleteMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/messages/{msgId}/regenerate", s.handleRegenerateMessage)

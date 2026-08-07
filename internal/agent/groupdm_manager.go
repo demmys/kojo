@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -1461,11 +1462,14 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	defer m.endThreadLive(groupID)
 
 	payload := m.renderThreadPayload(groupName, msg)
+	history := m.threadConversationHistory(groupID, msg.ID, agentID)
 	replyMessageID := generateGroupMessageID()
 	attachmentStageDir := threadAttachmentStageDir(agentID, groupID)
 	attachmentWatcher := m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
 	events, err := oneShot(ctx, agentID, payload, OneShotOpts{
 		SessionKey:                        "groupdm:" + groupID,
+		History:                           history,
+		HistorySelfUserID:                 agentID,
 		SystemPromptExtra:                 threadSystemPrompt(attachmentStageDir),
 		DisableKojoAttachmentInstructions: true,
 	})
@@ -1692,6 +1696,34 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 			sanitizeHeaderField(a.Mime))
 	}
 	return b.String()
+}
+
+// threadConversationHistory returns the bounded canonical transcript for the
+// common Manager resume/fallback path. It is bounded strictly before the
+// triggering message so a queued turn cannot observe messages posted later.
+func (m *GroupDMManager) threadConversationHistory(groupID, currentMessageID, agentID string) []chathistory.HistoryMessage {
+	msgs, _, _, err := loadGroupMessages(groupID, chathistory.DefaultMaxMessages, currentMessageID)
+	if err != nil {
+		m.logger.Debug("thread history context skipped", "group", groupID, "agent", agentID, "err", err)
+		return nil
+	}
+	out := make([]chathistory.HistoryMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		if msg == nil || msg.ID == currentMessageID || strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		uid := msg.AgentID
+		if uid == "" {
+			uid = "system"
+		}
+		out = append(out, chathistory.HistoryMessage{
+			Platform: "kojo-thread", ChannelID: groupID, ThreadID: groupID,
+			MessageID: msg.ID, UserID: uid, UserName: msg.AgentName,
+			Text: msg.Content, Timestamp: msg.Timestamp,
+			IsBot: uid != UserSenderID,
+		})
+	}
+	return out
 }
 
 // postThreadReply appends an agent-authored message to a thread room on the

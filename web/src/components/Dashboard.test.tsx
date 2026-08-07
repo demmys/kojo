@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   openDM: vi.fn(),
   createThread: vi.fn(),
   agentList: vi.fn(),
+  clearAttention: vi.fn(),
 }));
 
 vi.mock("../lib/groupdmApi", () => ({
@@ -35,6 +36,7 @@ vi.mock("../lib/agentApi", async (importOriginal) => ({
     cronPaused: vi.fn().mockResolvedValue(false),
     setCronPaused: vi.fn(),
     forceReclaim: vi.fn(),
+    clearAttention: mocks.clearAttention,
   },
 }));
 
@@ -65,13 +67,14 @@ const room = (over: Record<string, unknown>) => ({
   ...over,
 });
 
-function renderDashboard() {
+function renderDashboard(initialPath = "/") {
   const router = createMemoryRouter(
     [
       { path: "/", element: <Dashboard /> },
+      { path: "/agents/:id", element: <Dashboard /> },
       { path: "/groupdms/:id", element: <div>room page</div> },
     ],
-    { initialEntries: ["/"] },
+    { initialEntries: [initialPath] },
   );
   render(<RouterProvider router={router} />);
   return router;
@@ -104,6 +107,7 @@ beforeEach(() => {
     ),
   );
   mocks.openDM.mockResolvedValue(room({ id: "d1", name: "Alice", kind: "dm" }));
+  mocks.clearAttention.mockResolvedValue({ attention: false, cleared: true });
   mocks.createThread.mockResolvedValue(
     room({
       id: "t1",
@@ -208,5 +212,77 @@ describe("Dashboard agent error badge", () => {
       // AgentAvatar mock also renders the name; keep first occurrence order.
       .filter((v, i, arr) => arr.indexOf(v) === i);
     expect(names).toEqual(["Broken", "Healthy"]);
+  });
+});
+
+describe("Dashboard agent attention", () => {
+  const agent = (over: Record<string, unknown> = {}) => ({
+    id: "ag_a",
+    name: "Alice",
+    tool: "claude",
+    createdAt: "2026-06-15T00:00:00Z",
+    updatedAt: "2026-06-15T00:00:00Z",
+    ...over,
+  });
+
+  it("badges a paged agent and shows the reason inline", async () => {
+    mocks.agentList.mockResolvedValue([
+      agent({ attention: true, attentionReason: "デプロイの承認が要る", attentionAt: 1760000000000 }),
+    ]);
+    renderDashboard();
+    expect(await screen.findByText("Wants you")).toBeInTheDocument();
+    expect(screen.getByText("デプロイの承認が要る")).toBeInTheDocument();
+  });
+
+  it("shows no badge when the agent has not paged", async () => {
+    mocks.agentList.mockResolvedValue([agent()]);
+    renderDashboard();
+    await screen.findAllByText("Alice");
+    expect(screen.queryByText("Wants you")).not.toBeInTheDocument();
+  });
+
+  it("lets the blocking awaiting-answer state win over a page", async () => {
+    mocks.agentList.mockResolvedValue([
+      agent({ awaitingAnswer: true, attention: true, attentionReason: "見て" }),
+    ]);
+    renderDashboard();
+    expect(await screen.findByText("Awaiting answer")).toBeInTheDocument();
+    expect(screen.queryByText("Wants you")).not.toBeInTheDocument();
+  });
+
+  it("ranks a paged agent above busy and idle, below awaiting answer", async () => {
+    mocks.agentList.mockResolvedValue([
+      agent({ id: "ag_idle", name: "Idle", lastMessageAt: 1770000000000 }),
+      agent({ id: "ag_busy", name: "Busy", busy: true, lastMessageAt: 1770000000000 }),
+      agent({ id: "ag_page", name: "Paged", attention: true, lastMessageAt: 1000 }),
+      agent({ id: "ag_ask", name: "Asking", awaitingAnswer: true, lastMessageAt: 1000 }),
+    ]);
+    renderDashboard();
+    await screen.findByText("Wants you");
+    const names = screen
+      .getAllByText(/^(Idle|Busy|Paged|Asking)$/)
+      .map((el) => el.textContent)
+      .filter((v, i, arr) => arr.indexOf(v) === i);
+    expect(names).toEqual(["Asking", "Paged", "Busy", "Idle"]);
+  });
+
+  it("clears the page when the operator is looking at that agent's chat", async () => {
+    mocks.agentList.mockResolvedValue([
+      agent({ id: "ag_page", name: "Paged", attention: true, attentionReason: "見て" }),
+    ]);
+    renderDashboard("/agents/ag_page");
+    await waitFor(() => expect(mocks.clearAttention).toHaveBeenCalledWith("ag_page"));
+    // Optimistic local clear: the badge disappears without waiting for a poll.
+    await waitFor(() => expect(screen.queryByText("Wants you")).not.toBeInTheDocument());
+  });
+
+  it("does not clear a page for an agent the operator is not viewing", async () => {
+    mocks.agentList.mockResolvedValue([
+      agent({ id: "ag_page", name: "Paged", attention: true }),
+      agent({ id: "ag_open", name: "Open" }),
+    ]);
+    renderDashboard("/agents/ag_open");
+    await screen.findByText("Wants you");
+    expect(mocks.clearAttention).not.toHaveBeenCalled();
   });
 });

@@ -61,12 +61,19 @@ type ChatOptions struct {
 	// the call site rather than silently leaking context across keys.
 	SessionKey string
 
-	// RecentMessagesContext is a short, bounded transcript excerpt the
-	// backend may prepend when it has to start a fresh persistent session
-	// instead of resuming an existing one. Claude uses this as a continuity
-	// fallback for missing/empty/reset JSONL sessions; when --resume works,
-	// it is intentionally ignored to avoid duplicating history.
-	RecentMessagesContext string
+	// FreshSessionContext is a bounded transcript supplied by the response
+	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends
+	// it only when no native session can be resumed and a fresh session is
+	// started. Keeping that choice in the backend is important: only the
+	// backend knows whether thread/start, --session-id, or an equivalent
+	// fresh path was actually selected.
+	FreshSessionContext string
+
+	// ResumeSessionContext is a small bounded safety recap supplied by an
+	// external response surface. It is prepended after native resume to cover
+	// transport/session cursor gaps. WebUI main leaves it empty because its
+	// native session and canonical transcript advance together.
+	ResumeSessionContext string
 
 	// SystemPromptExtra is appended verbatim to the systemPrompt argument
 	// AFTER the backend's normal prompt assembly. Use it to inject

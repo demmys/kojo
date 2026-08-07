@@ -26,6 +26,14 @@ self.addEventListener("push", (event) => {
     // notification is still sitting unread would otherwise be silently
     // folded into the same tag with no re-alert.
     renotify = true;
+  } else if (data.type === "agent_attention") {
+    title = `呼び出し: ${data.name || "Agent"}`;
+    body = data.reason || "エージェントがあなたを呼んでいます";
+    tag = `kojo-agent-${data.agentId}`;
+    // Every raise is a deliberate, distinct page — folding a second one
+    // into the first notification silently would defeat the point.
+    navData = { agentId: data.agentId };
+    renotify = true;
   }
 
   event.waitUntil(

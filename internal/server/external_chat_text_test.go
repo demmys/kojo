@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -68,7 +69,7 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 			writeExternalChatTestStream(t, w,
 				agent.ChatEvent{Type: "text", Delta: "hel"},
 				agent.ChatEvent{Type: "text", Delta: "lo"},
-				agent.ChatEvent{Type: "done"})
+				agent.ChatEvent{Type: "done", Message: &agent.Message{Role: "assistant", Content: "hello"}})
 		default:
 			http.Error(w, "method", http.StatusMethodNotAllowed)
 		}
@@ -77,7 +78,11 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 
 	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
 	events, err := router.ChatOneShot(context.Background(), agentID, "full history", agent.OneShotOpts{
-		SessionKey: "slack-thread", ResumeMessage: "head tail", SystemPromptExtra: "slack context",
+		SessionKey: "slack-thread", SystemPromptExtra: "slack context",
+		History: []chathistory.HistoryMessage{
+			{MessageID: "m1", UserID: "U1", Text: "earlier"},
+		},
+		HistorySelfUserID:                 "B1",
 		DisableKojoAttachmentInstructions: true,
 	})
 	if err != nil {
@@ -87,13 +92,17 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 	for evt := range events {
 		got = append(got, evt)
 	}
-	if len(got) != 3 || got[0].Delta != "hel" || got[1].Delta != "lo" || got[2].Type != "done" {
+	if len(got) != 3 || got[0].Delta != "hel" || got[1].Delta != "lo" || got[2].Type != "done" ||
+		got[2].Message == nil || got[2].Message.Content != "hello" {
 		t.Fatalf("events = %#v", got)
 	}
 	select {
 	case req := <-requestSeen:
-		if req.Message != "full history" || req.ResumeMessage != "head tail" || req.SessionKey != "slack-thread" {
+		if req.Message != "full history" || req.SessionKey != "slack-thread" {
 			t.Fatalf("request = %#v", req)
+		}
+		if len(req.History) != 1 || req.History[0].Text != "earlier" || req.HistorySelfUserID != "B1" {
+			t.Fatalf("request history = %#v", req)
 		}
 		if !req.DisableAttachments || req.SystemPromptExtra != "slack context" {
 			t.Fatalf("request options = %#v", req)

@@ -530,9 +530,8 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// already placed at offset 0.
 	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 	args := inv.args
-	if inv.bootstrapRecentContext && opts.RecentMessagesContext != "" {
-		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
-	}
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext,
+		!opts.OneShot && !inv.bootstrapRecentContext)
 
 	// Expected session ID for THIS branch, used as the recovery fallback if
 	// Claude exits before result.streamSessionID is set. Without this anchor,

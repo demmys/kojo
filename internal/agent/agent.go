@@ -486,6 +486,26 @@ type Agent struct {
 	// holder* fields. The dashboard highlights the agent row so a
 	// blocked-on-human turn is obvious at a glance.
 	AwaitingAnswer bool `json:"awaitingAnswer,omitempty"`
+
+	// Attention is a runtime-only flag raised by the agent itself via
+	// POST /agents/{id}/attention when it wants the operator to look at
+	// this agent — the non-blocking counterpart to AwaitingAnswer: the
+	// turn does NOT wait for a human, it just highlights the row in the
+	// dashboard. Cleared when the operator opens the agent's chat (or
+	// explicitly via DELETE). Never persisted — stripped from
+	// settings_json on Save and Load like Busy / AwaitingAnswer.
+	Attention bool `json:"attention,omitempty"`
+
+	// AttentionReason is the optional one-line note supplied with the
+	// raise, shown next to the highlight so the operator knows what the
+	// agent wants before opening the chat. Runtime-only, same lifecycle
+	// as Attention.
+	AttentionReason string `json:"attentionReason,omitempty"`
+
+	// AttentionAt is the unix-millis timestamp of the raise, so the UI
+	// can render "3分前" next to the pill. Runtime-only, same lifecycle
+	// as Attention.
+	AttentionAt int64 `json:"attentionAt,omitempty"`
 }
 
 // ShouldNotifyDuringSilent returns whether the agent should receive DM
@@ -663,6 +683,7 @@ const (
 	InjectionMemorySearch       = "memory_search"       // Relevant Memory block in volatile context
 	InjectionRecentConversation = "recent_conversation" // session-resume transcript fallback
 	InjectionPersonaAnchor      = "persona_anchor"      // persona anchor block appended after volatile context
+	InjectionCallUser           = "call_user"           // non-blocking "page the operator" contract
 )
 
 var validInjectionKeys = map[string]bool{
@@ -677,6 +698,7 @@ var validInjectionKeys = map[string]bool{
 	InjectionMemorySearch:       true,
 	InjectionRecentConversation: true,
 	InjectionPersonaAnchor:      true,
+	InjectionCallUser:           true,
 }
 
 // ValidInjectionKey reports whether key is a known injection section.

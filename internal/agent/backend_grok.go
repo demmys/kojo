@@ -173,6 +173,16 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
+	// Resume strategy:
+	//   non-OneShot + stored session ID present → --resume <id>
+	//   non-OneShot + no stored ID             → fresh session; capture ID on completion
+	//   OneShot                                 → always fresh; never read/write stored ID
+	var resumeID string
+	if !opts.OneShot {
+		resumeID = readGrokSessionID(dir)
+	}
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumeID != "")
+
 	// Materialise the user message via --prompt-file. Passing the
 	// prompt through argv works for short inputs but risks ARG_MAX
 	// truncation and removes ambiguity around messages that start
@@ -190,15 +200,6 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 	if err := promptFile.Close(); err != nil {
 		os.Remove(promptPath)
 		return nil, fmt.Errorf("close prompt file: %w", err)
-	}
-
-	// Resume strategy:
-	//   non-OneShot + stored session ID present → --resume <id>
-	//   non-OneShot + no stored ID             → fresh session; capture ID on completion
-	//   OneShot                                 → always fresh; never read/write stored ID
-	var resumeID string
-	if !opts.OneShot {
-		resumeID = readGrokSessionID(dir)
 	}
 
 	args := buildGrokArgs(promptPath, dir, resumeID, agent, systemPrompt)

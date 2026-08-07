@@ -178,6 +178,17 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			return true
 		}
 		if method == http.MethodPost &&
+			strings.HasPrefix(path, "/api/v1/peers/agent-sync/chunked/") {
+			// Large, non-droppable history payloads use the same
+			// RolePeer-authenticated agent-sync protocol in four phases.
+			// Keep the suffix list explicit so a future route under the
+			// prefix is not admitted accidentally.
+			switch strings.TrimPrefix(path, "/api/v1/peers/agent-sync/chunked/") {
+			case "begin", "chunk", "commit", "abort":
+				return true
+			}
+		}
+		if method == http.MethodPost &&
 			(path == "/api/v1/peers/agent-sync/finalize" ||
 				path == "/api/v1/peers/agent-sync/drop") {
 			// Two-phase agent-sync companions. finalize
@@ -400,6 +411,11 @@ func isSelfScopedRoute(method, sub string) bool {
 		return false
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
+	case "/attention":
+		// Non-blocking "look at me" page: POST raises it, DELETE
+		// retracts it. Self only — an agent must not be able to
+		// light up another agent's dashboard row.
+		return method == http.MethodPost || method == http.MethodDelete
 	case "/credentials":
 		return method == http.MethodGet || method == http.MethodPost
 	case "/slackbot":

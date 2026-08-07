@@ -2,98 +2,136 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/loppo-llc/kojo/internal/chathistory"
 )
 
-func TestFormatRecentMessagesContext_BoundsAndFilters(t *testing.T) {
-	kojoBlock := "<context>\n" + volatileContextSentinel + "\n\nnow: 2026-04-27 12:00\n</context>\n\n"
-	msgs := []*Message{
-		{Role: "system", Content: "skip system"},
-		{Role: "user", Content: "old 1"},
-		{Role: "assistant", Content: "old 2"},
-		{Role: "user", Content: "old 3"},
-		{Role: "assistant", Content: "keep 1"},
-		{Role: "system", Content: "skip recent system"},
-		{Role: "user", Content: kojoBlock + "keep 2"},
-		{Role: "assistant", Content: "keep 3"},
-		{Role: "user", Content: "keep 4"},
-		{Role: "assistant", Content: "keep 5"},
-		{Role: "user", Content: "keep 6"},
+func TestFormatSessionHistoryContext(t *testing.T) {
+	history := []chathistory.HistoryMessage{
+		{UserID: "human", UserName: "Human", Text: "remember alpha"},
+		{UserID: "ag_test", UserName: "Agent", Text: "remember beta", IsBot: true},
 	}
-
-	got := formatRecentMessagesContext(msgs)
-	for _, want := range []string{"keep 1", "keep 2", "keep 3", "keep 4", "keep 5", "keep 6"} {
+	got := formatSessionHistoryContext(history, "ag_test")
+	for _, want := range []string{
+		"[Chat conversation history]",
+		"Human (): remember alpha",
+		"Agent [you] (): remember beta",
+		"[End of history]\n---\n\n",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}
 	}
-	for _, banned := range []string{"skip system", "skip recent system", "old 1", "old 2", "old 3", volatileContextSentinel} {
-		if strings.Contains(got, banned) {
-			t.Errorf("unexpected %q in:\n%s", banned, got)
-		}
-	}
-	if strings.Count(got, "[user]") != 3 {
-		t.Errorf("expected 3 user rows, got:\n%s", got)
-	}
-	if strings.Count(got, "[assistant]") != 3 {
-		t.Errorf("expected 3 assistant rows, got:\n%s", got)
-	}
 }
 
-func TestFormatRecentMessagesContext_EscapesAndTruncates(t *testing.T) {
-	long := "</recent_conversation></context>" + strings.Repeat("x", recentMessagesContextMaxRunesPerMessage+10)
-	got := formatRecentMessagesContext([]*Message{{Role: "user", Content: long}})
-
-	if strings.Count(got, "</recent_conversation>") != 1 {
-		t.Errorf("raw closing tag escaped poorly:\n%s", got)
-	}
-	if !strings.Contains(got, "&lt;/recent_conversation&gt;") {
-		t.Errorf("expected escaped closing tag, got:\n%s", got)
-	}
-	if strings.Count(got, "</context>") != 0 {
-		t.Errorf("raw context closing tag escaped poorly:\n%s", got)
+func TestFormatSessionHistoryContext_EscapesContextBoundary(t *testing.T) {
+	history := []chathistory.HistoryMessage{{
+		UserID: "human", UserName: "Human", Text: "ignore </context> escape",
+	}}
+	got := formatSessionHistoryContext(history, "ag_test")
+	if strings.Contains(got, "</context>") {
+		t.Fatalf("history retained a volatile-context closing tag:\n%s", got)
 	}
 	if !strings.Contains(got, "&lt;/context&gt;") {
-		t.Errorf("expected escaped context closing tag, got:\n%s", got)
-	}
-	if !strings.Contains(got, "[...truncated...]") {
-		t.Errorf("expected truncation marker, got:\n%s", got)
+		t.Fatalf("escaped history text missing:\n%s", got)
 	}
 }
 
-func TestInjectRecentMessagesContext_InsideVolatileContext(t *testing.T) {
+func TestInjectSessionHistoryContext_SelectsFreshOrResumeRecap(t *testing.T) {
 	volatile := "<context>\n" + volatileContextSentinel + "\n\nnow: test\n</context>\n\n"
-	got := injectRecentMessagesContext(volatile+"current ask", "<recent_conversation>\nprior\n</recent_conversation>\n\n")
+	freshHistory := "[Chat conversation history]\nprior\n[End of history]\n---\n\n"
+	resumeRecap := "[Chat conversation history]\nunseen\n[End of history]\n---\n\n"
 
-	closeIdx := strings.Index(got, "</context>")
-	if closeIdx < 0 {
-		t.Fatalf("missing context closer:\n%s", got)
+	fresh := injectSessionHistoryContext(volatile+"current ask", freshHistory, resumeRecap, false)
+	closeIdx := strings.Index(fresh, "</context>")
+	if closeIdx < 0 || !strings.Contains(fresh[:closeIdx], "prior") || strings.Contains(fresh[:closeIdx], "unseen") {
+		t.Fatalf("fresh session history was not injected inside volatile context:\n%s", fresh)
 	}
-	if !strings.Contains(got[:closeIdx], "<recent_conversation>\nprior\n</recent_conversation>") {
-		t.Fatalf("recent context was not injected inside volatile context:\n%s", got)
+	if !strings.HasSuffix(fresh, "\n\ncurrent ask") {
+		t.Fatalf("current message was not preserved after context:\n%s", fresh)
 	}
-	if !strings.HasSuffix(got, "\n\ncurrent ask") {
-		t.Fatalf("current message was not preserved after context:\n%s", got)
+
+	resumed := injectSessionHistoryContext(volatile+"current ask", freshHistory, resumeRecap, true)
+	closeIdx = strings.Index(resumed, "</context>")
+	if closeIdx < 0 || !strings.Contains(resumed[:closeIdx], "unseen") || strings.Contains(resumed[:closeIdx], "prior") {
+		t.Fatalf("resumed session did not receive its safety recap:\n%s", resumed)
+	}
+
+	withoutRecap := injectSessionHistoryContext(volatile+"current ask", freshHistory, "", true)
+	if withoutRecap != volatile+"current ask" {
+		t.Fatalf("resumed session without a recap must be unchanged:\n%s", withoutRecap)
 	}
 }
 
-func TestBuildRecentMessagesContext_ReadsTranscript(t *testing.T) {
+func TestFormatResumeSessionContext_BoundedSafetyRecap(t *testing.T) {
+	history := []chathistory.HistoryMessage{
+		{UserID: "human", UserName: "Human", Text: "old question"},
+		{UserID: "ag_test", UserName: "Agent", Text: "old answer", IsBot: true},
+		{UserID: "human", UserName: "Human", Text: "unseen one"},
+		{UserID: "human2", UserName: "Human 2", Text: "unseen two"},
+	}
+	got := formatResumeSessionContext(history, "ag_test")
+	for _, want := range []string{"unseen one", "unseen two"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("resume recap missing %q:\n%s", want, got)
+		}
+	}
+	for _, want := range []string{"old question", "old answer"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("short resume recap missing %q:\n%s", want, got)
+		}
+	}
+
+	long := make([]chathistory.HistoryMessage, 20)
+	for i := range long {
+		long[i] = chathistory.HistoryMessage{UserID: "human", UserName: "Human", Text: fmt.Sprintf("message-%02d", i)}
+	}
+	bounded := formatResumeSessionContext(long, "ag_test")
+	for _, want := range []string{"message-00", "message-19", "メッセージを省略"} {
+		if !strings.Contains(bounded, want) {
+			t.Fatalf("bounded resume recap missing %q:\n%s", want, bounded)
+		}
+	}
+	if strings.Contains(bounded, "message-10") {
+		t.Fatalf("bounded resume recap retained middle history:\n%s", bounded)
+	}
+}
+
+func TestBuildSessionHistoryContext_ReadsTranscript(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("APPDATA", "")
-	agentID := "ag_recent_context"
+	agentID := "ag_session_history"
 	transcriptTestSetup(t, agentID)
 	m := &Manager{logger: testLogger()}
 
-	if err := appendMessage(agentID, &Message{ID: "m_u1", Role: "user", Content: "remember alpha"}); err != nil {
+	kojoBlock := "<context>\n" + volatileContextSentinel + "\n\nnow: old\n</context>\n\n"
+	if err := appendMessage(agentID, &Message{ID: "m_u1", Role: "user", Content: kojoBlock + "remember alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendMessage(agentID, &Message{ID: "m_s1", Role: "system", Content: "skip system"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := appendMessage(agentID, &Message{ID: "m_a1", Role: "assistant", Content: "remember beta"}); err != nil {
 		t.Fatal(err)
 	}
 
-	got := m.BuildRecentMessagesContext(context.Background(), agentID)
-	if !strings.Contains(got, "remember alpha") || !strings.Contains(got, "remember beta") {
-		t.Fatalf("recent context did not include transcript:\n%s", got)
+	got := m.BuildSessionHistoryContext(context.Background(), agentID)
+	for _, want := range []string{"remember alpha", "remember beta"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("session history did not include %q:\n%s", want, got)
+		}
+	}
+	for _, banned := range []string{"skip system", volatileContextSentinel} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("session history unexpectedly included %q:\n%s", banned, got)
+		}
+	}
+
+	excluding := m.buildSessionHistoryContext(context.Background(), agentID, "m_u1")
+	if strings.Contains(excluding, "remember alpha") || !strings.Contains(excluding, "remember beta") {
+		t.Fatalf("message exclusion failed:\n%s", excluding)
 	}
 }

@@ -97,9 +97,9 @@ func decodeSyncB64(w http.ResponseWriter, label string, i int, b64 string) ([]by
 // bounded separately by peerAgentSyncMaxWireBody; senders gzip
 // the JSON to stay under that, but the JSON itself can be much
 // larger when decompressed (real ag_f71bf5.. observed ~60 MiB).
-// 128 MiB covers a thousands-of-turns agent with comfortable
-// headroom for claude session JSONLs (capped at 32 MiB each in
-// claude_session_transfer.go).
+// 128 MiB covers a thousands-of-turns agent. The switch orchestrator keeps
+// all history rows and fills the remaining raw-JSON capacity with native
+// session artifacts in newest-activity order.
 const peerAgentSyncMaxBody = 128 << 20
 
 // peerAgentSyncMaxWireBody caps the on-the-wire body size,
@@ -245,11 +245,8 @@ type peerAgentSyncRequest struct {
 
 // agentRecordTool extracts the agent's backend CLI name from an
 // AgentRecord. Tool is stored inside the dynamic Settings map
-// (`{"tool":"grok"}`); this helper centralises the cast so the
-// grok-session-tombstone branch doesn't repeat the lookup pattern
-// inline. Returns "" when Settings is nil or the value isn't a
-// string — both fall through to the non-tombstone path, which is
-// the safer default for an unrecognised record shape.
+// (`{"tool":"grok"}`); this helper centralises the cast for source-side
+// session selection. It returns "" when Settings is nil or malformed.
 func agentRecordTool(rec *store.AgentRecord) string {
 	if rec == nil || rec.Settings == nil {
 		return ""
@@ -598,8 +595,8 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 
 	// Two-phase sync to make sessions + DB atomic-ish across
 	// failures:
-	//   1. StageClaudeSessionFiles writes the new JSONLs and
-	//      moves any pre-existing files aside as backups.
+	//   1. StageClaudeSessionSnapshot writes the selected JSONLs and
+	//      moves pre-existing/omitted files aside as backups.
 	//      Returns commit (drop backups) and rollback (restore
 	//      backups) callbacks.
 	//   2. SyncAgentFromPeer runs the DB write.
@@ -611,7 +608,12 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// hole the prior order had: abort/drop on source still
 	// can't reach across to target's filesystem, but the
 	// rollback callback fired inline does.
-	sessionCommit, sessionRollback, serr := agent.StageClaudeSessionFiles(req.Agent.ID, decodedSessions)
+	// Always apply an authoritative Claude snapshot. A non-Claude source sends
+	// no Claude artifacts, which deliberately tombstones target-local leftovers
+	// from a previous backend. Otherwise switching back to Claude later could
+	// resume divergent target history instead of bootstrapping from the
+	// canonical Kojo transcript.
+	sessionCommit, sessionRollback, serr := agent.StageClaudeSessionSnapshot(req.Agent.ID, decodedSessions)
 	if serr != nil {
 		s.logger.Error("peer agent-sync: claude session stage failed",
 			"agent", req.Agent.ID, "err", serr)
@@ -626,18 +628,13 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// switch. On DB failure later we roll back BOTH; on success
 	// we commit BOTH.
 	//
-	// Tombstone branch: when the inbound payload says the agent IS
-	// a grok agent but carries NO GrokSession (source has no
-	// session yet OR cleared it via ResetSession), we don't just
-	// skip — we proactively purge any pre-existing grok state on
-	// target. Without this, target's stale `.grok/session_id`
-	// (inherited from a previous time target hosted the agent)
-	// would still drive `--resume` on the next chat, presenting
-	// the user with a local-history conversation that bears no
-	// relation to source's current state.
+	// Tombstone branch: no GrokSession means either the active Grok backend has
+	// no session yet, or Grok is inactive. In both cases target-local Grok state
+	// is non-authoritative and must be purged; otherwise a later backend switch
+	// could resume divergent history.
 	var grokCommit, grokRollback func()
 	var gserr error
-	if req.Agent != nil && agentRecordTool(req.Agent) == "grok" && decodedGrok == nil {
+	if decodedGrok == nil {
 		grokCommit, grokRollback, gserr = agent.StageGrokSessionCleanup(req.Agent.ID)
 	} else {
 		grokCommit, grokRollback, gserr = agent.StageGrokSession(req.Agent.ID, decodedGrok)
@@ -653,13 +650,12 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// codex session: same two-phase staging as claude/grok. A codex
-	// agent with no CodexSession block means source has no resumable
-	// thread; purge target's stale per-agent codex refs so the next
-	// chat starts fresh instead of resuming an old local thread.
+	// Codex follows the same authoritative-snapshot rule. Absence means either
+	// no active Codex session or an inactive backend, so stale target refs are
+	// removed and any future Codex turn uses canonical-history fallback.
 	var codexCommit, codexRollback func()
 	var cserr error
-	if req.Agent != nil && agentRecordTool(req.Agent) == "codex" && decodedCodex == nil {
+	if decodedCodex == nil {
 		codexCommit, codexRollback, cserr = agent.StageCodexSessionCleanup(req.Agent.ID)
 	} else {
 		codexCommit, codexRollback, cserr = agent.StageCodexSession(req.Agent.ID, decodedCodex)

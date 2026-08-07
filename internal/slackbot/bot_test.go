@@ -449,8 +449,6 @@ func (m *scriptedMgr) ChatOneShot(_ context.Context, _, _ string, opts agent.One
 	return ch, nil
 }
 
-func (m *scriptedMgr) CanResumeSession(_, _ string) bool { return false }
-
 // streamScript drives a mockSlackServer for sendToAgent-level tests of
 // the stream-restart behavior. It hands out fresh stream timestamps from
 // streamTSs in order, fails the appendStream call at the indexes in
@@ -871,6 +869,12 @@ func TestSendToAgentNoReplyLeavesUserAsLastThreadHistoryEntry(t *testing.T) {
 	}
 
 	bot.sendToAgent(context.Background(), channel, threadTS, threadTS, messageTS, "ping", "alice", "U123")
+	if got := mgr.lastOneShotOpts.History; len(got) != 2 || got[0].Text != "root" || got[1].Text != "prior answer" {
+		t.Fatalf("ChatOneShot history = %+v, want canonical prior Slack transcript", got)
+	}
+	if mgr.lastOneShotOpts.HistorySelfUserID != bot.botUserID {
+		t.Fatalf("HistorySelfUserID = %q, want %q", mgr.lastOneShotOpts.HistorySelfUserID, bot.botUserID)
+	}
 
 	history, err := chathistory.LoadHistory(path)
 	if err != nil {

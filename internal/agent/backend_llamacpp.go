@@ -34,6 +34,7 @@ func (b *LlamaCppBackend) Name() string { return "llama.cpp" }
 func (b *LlamaCppBackend) Available() bool { return true }
 
 func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, false)
 	if agent.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for llama.cpp backend")
 	}

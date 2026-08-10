@@ -199,7 +199,15 @@ type GroupDMManager struct {
 	// "dm" with a single agent member). Two rapid user posts to the same
 	// thread wait on this so they never --resume the same Claude session
 	// UUID concurrently; the second post's turn just waits.
-	threadMus keyedMutex
+	threadTurns keyedFIFO
+	// threadQueued contains triggering message IDs with pending FIFO tickets.
+	// Steer messages are deliberately absent: although also authored by "user",
+	// they belong to the active turn and must survive in an arrival snapshot.
+	threadQueueMu sync.Mutex
+	threadQueued  map[string]map[string]struct{}
+	// threadSteerMus serializes persist→inject→rollback with arrival snapshot
+	// admission for one thread without blocking unrelated rooms.
+	threadSteerMus keyedMutex
 
 	// threadCancels holds the cancel func of the in-flight thread turn per
 	// room so Delete (archive) can abort a running turn. Guarded by
@@ -219,7 +227,12 @@ type GroupDMManager struct {
 
 	// oneShot runs a one-shot agent turn for thread rooms. Defaults to
 	// agentMgr.ChatOneShot; overridable in tests to stub the agent turn.
-	oneShot func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)
+	oneShot                 func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)
+	holderAttachmentCapture bool
+	// steerOneShot injects into the holder-local one-shot behind a thread
+	// room. The Hub replaces this with its external-chat router so WebUI
+	// steers follow a thread turn that is executing on a remote holder.
+	steerOneShot func(ctx context.Context, agentID, sessionKey, text string) error
 
 	// threadLiveMu guards threadLive. A dedicated mutex (not m.mu) so the
 	// per-event UI-snapshot update on the hot streaming path never
@@ -243,6 +256,10 @@ type threadLiveState struct {
 	Model     string
 	Effort    string
 	UpdatedAt time.Time
+	// SteerSealed closes the source turn's steer admission once a handoff
+	// arrival has captured its final canonical snapshot. The arrival creates
+	// a new live state after the source FIFO ticket is released.
+	SteerSealed bool
 }
 
 // ThreadLiveSnapshot is a defensive copy of a thread room's live turn state,
@@ -272,11 +289,90 @@ func (m *GroupDMManager) Steer(ctx context.Context, groupID, content string) (*G
 	if !active {
 		return nil, ErrAgentNotBusy
 	}
-	sessionKey := "groupdm:" + groupID
-	if err := m.agentMgr.SteerOneShot(sessionKey, content); err != nil {
+	release := m.threadSteerMus.Lock(groupID)
+	defer release()
+	// The turn may have ended while this steer waited behind arrival admission.
+	active, _ = m.ThreadLive(groupID)
+	if !active {
+		return nil, ErrAgentNotBusy
+	}
+	if m.threadSteerSealed(groupID) {
+		return nil, ErrAgentNotBusy
+	}
+	// Persist first so an agent that immediately initiates handoff after reading
+	// the injected text cannot produce an arrival snapshot that omits the steer.
+	msg, err := m.PostSteerMessage(ctx, groupID, content, nil)
+	if err != nil {
 		return nil, err
 	}
-	return m.PostSteerMessage(ctx, groupID, content, nil)
+	sessionKey := "groupdm:" + groupID
+	steerOneShot := m.steerOneShot
+	if steerOneShot == nil {
+		steerOneShot = func(_ context.Context, _, sessionKey, text string) error {
+			return m.agentMgr.SteerOneShot(sessionKey, text)
+		}
+	}
+	if err := steerOneShot(ctx, m.threadAgentID(groupID), sessionKey, content); err != nil {
+		if errors.Is(err, ErrSteerDeliveryUncertain) {
+			// The holder may already have injected the text. Retaining the
+			// canonical row is the only choice that cannot make a future fresh
+			// session silently forget input the source model observed.
+			return nil, err
+		}
+		if rollbackErr := m.rollbackSteerMessage(groupID, msg.ID); rollbackErr != nil {
+			return nil, fmt.Errorf("steer injection failed: %w (rollback failed: %v)", err, rollbackErr)
+		}
+		return nil, err
+	}
+	return msg, nil
+}
+
+func (m *GroupDMManager) rollbackSteerMessage(groupID, messageID string) error {
+	db := getGlobalStore()
+	if db == nil {
+		return errStoreNotReady
+	}
+	// Cleanup must outlive the request that attempted the steer. A browser
+	// disconnect can cancel ctx after the row was persisted but before the
+	// holder accepts the injection; inheriting that cancellation would leave a
+	// user message in canonical history that the model never received.
+	rollbackCtx, cancel := transcriptCtx()
+	defer cancel()
+	m.mu.Lock()
+	head, err := db.RollbackGroupDMMessage(rollbackCtx, groupID, messageID)
+	if err == nil {
+		m.latestMsgID[groupID] = head
+	}
+	m.mu.Unlock()
+	return err
+}
+
+func (m *GroupDMManager) threadAgentID(groupID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, err := m.liveGroupLocked(groupID)
+	if err != nil || len(g.Members) != 1 {
+		return ""
+	}
+	return g.Members[0].AgentID
+}
+
+func (m *GroupDMManager) threadSteerSealed(groupID string) bool {
+	m.threadLiveMu.Lock()
+	defer m.threadLiveMu.Unlock()
+	st := m.threadLive[groupID]
+	return st != nil && st.SteerSealed
+}
+
+func (m *GroupDMManager) sealThreadSteer(groupID string) error {
+	m.threadLiveMu.Lock()
+	defer m.threadLiveMu.Unlock()
+	st := m.threadLive[groupID]
+	if st == nil {
+		return ErrAgentNotBusy
+	}
+	st.SteerSealed = true
+	return nil
 }
 
 func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot ThreadLiveSnapshot) {
@@ -315,6 +411,22 @@ func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot Threa
 // used in production code paths.
 func (m *GroupDMManager) SetOneShotForTesting(fn func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)) {
 	m.oneShot = fn
+	m.holderAttachmentCapture = false
+}
+
+// SetOneShotRouter installs the production response-surface router used by
+// thread rooms. The Hub wires this to externalChatRouter so ordinary thread
+// turns and handoff arrivals execute on the agent's current holder.
+func (m *GroupDMManager) SetOneShotRouter(fn func(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error)) {
+	m.oneShot = fn
+	m.holderAttachmentCapture = true
+}
+
+// SetOneShotSteerRouter installs the holder-aware steer companion to
+// SetOneShotRouter. It is used only by the Hub; peer-only daemons inject
+// directly through their local Manager endpoint.
+func (m *GroupDMManager) SetOneShotSteerRouter(fn func(ctx context.Context, agentID, sessionKey, text string) error) {
+	m.steerOneShot = fn
 }
 
 // startThreadLive creates (or replaces) the live-state entry for groupID at
@@ -1315,11 +1427,9 @@ func (m *GroupDMManager) PostUserMessage(ctx context.Context, groupID, content s
 	return m.postUserMessage(ctx, groupID, content, attachments, notify, false)
 }
 
-// PostSteerMessage posts an operator message into a thread room the same
-// way PostUserMessage does (so it renders in order for every viewer) but
-// never triggers runThreadTurn. Callers are expected to have already
-// injected the text into the in-flight turn via Manager.SteerOneShot — this
-// only handles the transcript/broadcast side.
+// PostSteerMessage persists an operator message in a thread room without
+// starting another turn. Steer calls it before backend injection so a handoff
+// triggered immediately by that input cannot omit it from arrival history.
 func (m *GroupDMManager) PostSteerMessage(ctx context.Context, groupID, content string, attachments []MessageAttachment) (*GroupMessage, error) {
 	return m.postUserMessage(ctx, groupID, content, attachments, true, true)
 }
@@ -1360,6 +1470,13 @@ func (m *GroupDMManager) postUserMessage(ctx context.Context, groupID, content s
 	m.latestMsgID[groupID] = msg.ID
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
 	updatedAt := g.UpdatedAt
+	var threadTurn, threadArrival *fifoReservation
+	if isThread && !isSteer {
+		// Reserve while the transcript mutex still defines user-message order.
+		// Reserving after touchStore would let a later post overtake this one.
+		threadTurn, threadArrival = m.threadTurns.ReservePair(groupID)
+		m.registerThreadQueued(groupID, msg.ID)
+	}
 	m.mu.Unlock()
 	// See PostMessage: touchStore persists the updated_at bump that save's
 	// settings-only upsert would drop as a no-op.
@@ -1374,7 +1491,7 @@ func (m *GroupDMManager) postUserMessage(ctx context.Context, groupID, content s
 		// runThreadTurn for it would race a second --resume of the same
 		// session and duplicate the reply.
 		if !isSteer {
-			go m.runThreadTurn(threadAgentID, groupID, groupName, msg)
+			go m.runThreadTurnReserved(threadAgentID, groupID, groupName, msg, threadTurn, threadArrival)
 		}
 	} else if notify {
 		for _, r := range recipients {
@@ -1399,7 +1516,11 @@ func threadAttachmentStageDir(agentID, groupID string) string {
 }
 
 func threadSystemPrompt(stageDir string) string {
-	return threadSystemPromptExtra + fmt.Sprintf("\n\nFor file attachments in this thread, stage each file as `%s/<basename>` (`mkdir -p` first). Use this exact thread-specific directory, not `.kojo/attach`; Kojo ingests files from it while the reply is in progress and attaches them to this thread reply.", stageDir)
+	return threadSystemPromptExtra + "\n\n" + threadAttachmentPrompt(stageDir)
+}
+
+func threadAttachmentPrompt(stageDir string) string {
+	return fmt.Sprintf("For file attachments in this thread, stage each file as `%s/<basename>` (`mkdir -p` first). Use this exact thread-specific directory, not `.kojo/attach`; Kojo ingests files from it while the reply is in progress and attaches them to this thread reply.", stageDir)
 }
 
 // runThreadTurn executes one temporary side-thread turn for a thread room
@@ -1409,10 +1530,140 @@ func threadSystemPrompt(stageDir string) string {
 // concurrently; the reply is posted daemon-authored on the agent's behalf,
 // bypassing CAS and suppressing notify.
 func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *GroupMessage) {
-	// Serialize per thread — the second concurrent post waits here so both
-	// turns don't --resume the same session UUID at once.
-	release := m.threadMus.Lock(groupID)
-	defer release()
+	turn, arrival := m.threadTurns.ReservePair(groupID)
+	m.registerThreadQueued(groupID, msg.ID)
+	m.runThreadTurnReserved(agentID, groupID, groupName, msg, turn, arrival)
+}
+
+func (m *GroupDMManager) registerThreadQueued(groupID, messageID string) {
+	if groupID == "" || messageID == "" {
+		return
+	}
+	m.threadQueueMu.Lock()
+	if m.threadQueued == nil {
+		m.threadQueued = make(map[string]map[string]struct{})
+	}
+	if m.threadQueued[groupID] == nil {
+		m.threadQueued[groupID] = make(map[string]struct{})
+	}
+	m.threadQueued[groupID][messageID] = struct{}{}
+	m.threadQueueMu.Unlock()
+}
+
+func (m *GroupDMManager) unregisterThreadQueued(groupID, messageID string) {
+	m.threadQueueMu.Lock()
+	if queued := m.threadQueued[groupID]; queued != nil {
+		delete(queued, messageID)
+		if len(queued) == 0 {
+			delete(m.threadQueued, groupID)
+		}
+	}
+	m.threadQueueMu.Unlock()
+}
+
+func (m *GroupDMManager) threadQueuedSnapshot(groupID string) map[string]struct{} {
+	m.threadQueueMu.Lock()
+	defer m.threadQueueMu.Unlock()
+	queued := m.threadQueued[groupID]
+	out := make(map[string]struct{}, len(queued))
+	for id := range queued {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
+func (m *GroupDMManager) runThreadTurnReserved(agentID, groupID, groupName string, msg *GroupMessage, reservation, arrival *fifoReservation) {
+	m.runThreadTurnPayload(agentID, groupID, groupName,
+		m.renderThreadPayload(groupName, msg), msg.ID, msg.Content, false, reservation, arrival)
+}
+
+func (m *GroupDMManager) runThreadTurnPayload(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, forceFresh bool, reservation, arrival *fifoReservation) {
+	m.runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage, forceFresh, "", reservation, arrival, nil)
+}
+
+type groupDMHandoffReservation struct {
+	mu               sync.Mutex
+	manager          *GroupDMManager
+	agentID          string
+	groupID          string
+	groupName        string
+	triggerMessageID string
+	reservation      *fifoReservation
+	activated        bool
+	released         bool
+}
+
+func (r *groupDMHandoffReservation) Activate(ctx context.Context, prompt, expectedHolder string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return errors.New("WebUI thread arrival reservation was released")
+	}
+	if r.activated {
+		return nil
+	}
+	r.manager.mu.Lock()
+	g, err := r.manager.liveGroupLocked(r.groupID)
+	if err == nil && (!isThreadRoom(g) || len(g.Members) != 1 || g.Members[0].AgentID != r.agentID) {
+		err = errors.New("conversation is not a thread for this agent")
+	}
+	r.manager.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	releaseSteer := r.manager.threadSteerMus.Lock(r.groupID)
+	defer releaseSteer()
+	// Snapshot at activation, not at source-turn start. This incorporates steer
+	// messages accepted while the source turn was running, while the queued-ID
+	// filter still excludes later turns that own their own FIFO tickets.
+	history, err := r.manager.threadConversationSnapshot(ctx, r.groupID, r.triggerMessageID, r.agentID)
+	if err != nil {
+		return fmt.Errorf("capture WebUI thread arrival history: %w", err)
+	}
+	// Seal before releasing threadSteerMus. Otherwise a steer can persist and
+	// inject into the doomed source turn after this snapshot was finalized,
+	// making the resumed arrival omit text the source model observed.
+	if err := r.manager.sealThreadSteer(r.groupID); err != nil {
+		return fmt.Errorf("seal WebUI thread source turn: %w", err)
+	}
+	r.activated = true
+	go r.manager.runThreadTurnPayloadLocked(r.agentID, r.groupID, r.groupName,
+		"[system message]\n"+prompt, "", "", true, expectedHolder, r.reservation, nil,
+		append([]chathistory.HistoryMessage{}, history...))
+	return nil
+}
+
+func (r *groupDMHandoffReservation) Release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released || r.activated {
+		return
+	}
+	r.released = true
+	r.reservation.Release()
+}
+
+func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, forceFresh bool, expectedHolder string, reservation, arrival *fifoReservation, presetHistory []chathistory.HistoryMessage) {
+	reservation.Wait()
+	var arrivalReservation *groupDMHandoffReservation
+	if arrival != nil {
+		arrivalReservation = &groupDMHandoffReservation{
+			manager: m, agentID: agentID, groupID: groupID, groupName: groupName,
+			triggerMessageID: historyBeforeID, reservation: arrival,
+		}
+	}
+	defer func() {
+		// Preserve FIFO history semantics: the current ticket and its queued
+		// marker must disappear before the unused arrival slot admits the next
+		// human turn. Releasing these with independent defers reverses the order.
+		reservation.Release()
+		if historyBeforeID != "" {
+			m.unregisterThreadQueued(groupID, historyBeforeID)
+		}
+		if arrivalReservation != nil {
+			arrivalReservation.Release()
+		}
+	}()
 
 	// Recheck the room is still live: a turn queued behind the mutex may
 	// have waited across an archive (Delete). Running it anyway would
@@ -1430,6 +1681,31 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// It remains cancellable via StopThreadTurn or room archival.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Capture the source turn's canonical snapshot when this ticket reaches the
+	// FIFO head. Later queued user posts are filtered out, while a reply from the
+	// preceding turn that completed after this trigger was posted remains
+	// visible. A handoff arrival takes a second filtered snapshot at activation
+	// so steer messages accepted during this turn are included too.
+	history := append([]chathistory.HistoryMessage(nil), presetHistory...)
+	if presetHistory == nil {
+		releaseSteer := m.threadSteerMus.Lock(groupID)
+		history, err = m.threadConversationSnapshot(ctx, groupID, historyBeforeID, agentID)
+		releaseSteer()
+		if err != nil {
+			m.handleThreadTurnError(groupID, agentID, payload, fmt.Errorf("capture thread history: %w", err))
+			return
+		}
+	}
+	if historyBeforeID != "" {
+		filtered := history[:0]
+		for _, msg := range history {
+			if msg.MessageID != historyBeforeID {
+				filtered = append(filtered, msg)
+			}
+		}
+		history = filtered
+	}
 
 	// Register the cancel so archive (Delete) and the operator stop
 	// control (StopThreadTurn) can abort a running turn.
@@ -1461,20 +1737,33 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	m.startThreadLive(groupID, agentModel, agentEffort)
 	defer m.endThreadLive(groupID)
 
-	payload := m.renderThreadPayload(groupName, msg)
-	history := m.threadConversationHistory(groupID, msg.ID, agentID)
 	replyMessageID := generateGroupMessageID()
 	attachmentStageDir := threadAttachmentStageDir(agentID, groupID)
-	attachmentWatcher := m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
-	events, err := oneShot(ctx, agentID, payload, OneShotOpts{
+	captureOnHolder := m.oneShot == nil || m.holderAttachmentCapture
+	var attachmentWatcher *attachWatcher
+	if !captureOnHolder {
+		attachmentWatcher = m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
+	}
+	oneShotOpts := OneShotOpts{
 		SessionKey:                        "groupdm:" + groupID,
 		History:                           history,
 		HistorySelfUserID:                 agentID,
 		SystemPromptExtra:                 threadSystemPrompt(attachmentStageDir),
 		DisableKojoAttachmentInstructions: true,
-	})
+		ForceFreshSession:                 forceFresh,
+		ExpectedHolderPeer:                expectedHolder,
+		HandoffArrivalReservation:         arrivalReservation,
+	}
+	if captureOnHolder {
+		oneShotOpts.SystemPromptExtra = threadSystemPromptExtra
+		oneShotOpts.ResponseAttachmentGroupID = groupID
+		oneShotOpts.ResponseAttachmentMessageID = replyMessageID
+	}
+	events, err := oneShot(ctx, agentID, payload, oneShotOpts)
 	if err != nil {
-		m.agentMgr.deleteIngestedAttachments(attachmentWatcher.StopAndDrain())
+		if attachmentWatcher != nil {
+			m.agentMgr.deleteIngestedAttachments(attachmentWatcher.StopAndDrain())
+		}
 		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
 			_ = os.RemoveAll(stageDir)
 		}
@@ -1505,6 +1794,19 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	var usage *Usage
 	var thinking string
 	var toolUses []ToolUse
+	var replyAttachments []MessageAttachment
+	var attachmentClaims []ChatEvent
+	attachmentClaimsFinished := false
+	finishAttachmentClaims := func(accepted bool) {
+		if attachmentClaimsFinished {
+			return
+		}
+		attachmentClaimsFinished = true
+		for i := range attachmentClaims {
+			attachmentClaims[i].FinishAttachmentOwnership(accepted)
+		}
+	}
+	defer func() { finishAttachmentClaims(false) }()
 	for ev := range events {
 		// Subagent (Task tool) events route into the matching top-level
 		// ToolUse's Children in the live snapshot instead of the main
@@ -1534,6 +1836,12 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		case "text":
 			reply.WriteString(ev.Delta)
 			m.appendThreadLiveText(groupID, ev.Delta)
+		case "attachment":
+			if !ev.BeginAttachmentOwnership() {
+				continue
+			}
+			replyAttachments = append(replyAttachments, ev.Attachments...)
+			attachmentClaims = append(attachmentClaims, ev)
 		case "done":
 			// The done event's assembled message is the authoritative
 			// reply text: it merges assistant-event text that never
@@ -1559,6 +1867,9 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 				streamErr = ev.ErrorMessage
 			}
 		}
+	}
+	if attachmentWatcher != nil {
+		replyAttachments = append(replyAttachments, attachmentWatcher.StopAndDrain()...)
 	}
 	// Assemble the reply text; the partial live snapshot fills in
 	// thinking/toolUses when the turn never reached its "done" event
@@ -1588,8 +1899,6 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// Stop live capture only after unregistering the completed turn. A large
 	// attachment may take time to finish forwarding; a stop request during
 	// that drain must not relabel an already-finished response as interrupted.
-	replyAttachments := attachmentWatcher.StopAndDrain()
-
 	// An operator stop cancels the context; treat it separately from
 	// archive-cancel (room going away — discard) and real errors.
 	if errors.Is(ctx.Err(), context.Canceled) {
@@ -1611,7 +1920,6 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// completed response as interrupted. Delete still gets a dedicated cancel
 	// handle so archiving the room aborts a slow final forward.
 	archiveCtx, archiveCancel := context.WithCancel(context.Background())
-	scanCtx, scanCancel := context.WithTimeout(archiveCtx, attachScanCeiling)
 	m.mu.Lock()
 	_, liveErr := m.liveGroupLocked(groupID)
 	if liveErr == nil {
@@ -1621,7 +1929,6 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	}
 	m.mu.Unlock()
 	if liveErr != nil {
-		scanCancel()
 		archiveCancel()
 		m.agentMgr.deleteIngestedAttachments(replyAttachments)
 		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
@@ -1629,9 +1936,12 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		}
 		return
 	}
-	replyAttachments = append(replyAttachments,
-		m.agentMgr.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, replyMessageID, attachmentStageDir, replyAttachments)...)
-	scanCancel()
+	if attachmentWatcher != nil {
+		scanCtx, scanCancel := context.WithTimeout(archiveCtx, attachScanCeiling)
+		replyAttachments = append(replyAttachments,
+			m.agentMgr.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, replyMessageID, attachmentStageDir, replyAttachments)...)
+		scanCancel()
+	}
 	// The generic scan keeps an already-empty directory for the next normal
 	// chat turn. Thread directories are per-room and must not accumulate after
 	// successful turns, including replies that attached no files.
@@ -1654,7 +1964,7 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 		// Preserve whatever the turn produced before failing, then post
 		// the visible failure notice / dead-letter as before.
 		if text != "" || thinking != "" || len(toolUses) > 0 || len(replyAttachments) > 0 {
-			if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true, replyMessageID, replyAttachments); err != nil {
+			if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 				m.logger.Warn("failed to post partial thread reply", "group", groupID, "agent", agentID, "err", err)
 			}
 		}
@@ -1671,8 +1981,10 @@ func (m *GroupDMManager) runThreadTurn(agentID, groupID, groupName string, msg *
 	// head, and a client that refreshes the room info on head change would
 	// otherwise race the rename and pin the stale default title. No-op after
 	// the first rename; empty replies (above) still skip titling entirely.
-	m.maybeAutoTitleThread(groupID, agentID, msg.Content)
-	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments); err != nil {
+	if firstUserMessage != "" {
+		m.maybeAutoTitleThread(groupID, agentID, firstUserMessage)
+	}
+	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
 }
@@ -1698,19 +2010,36 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 	return b.String()
 }
 
-// threadConversationHistory returns the bounded canonical transcript for the
-// common Manager resume/fallback path. It is bounded strictly before the
-// triggering message so a queued turn cannot observe messages posted later.
-func (m *GroupDMManager) threadConversationHistory(groupID, currentMessageID, agentID string) []chathistory.HistoryMessage {
-	msgs, _, _, err := loadGroupMessages(groupID, chathistory.DefaultMaxMessages, currentMessageID)
+// threadConversationSnapshot returns the bounded canonical transcript visible
+// when a triggering turn reaches the FIFO head. It includes the trigger and
+// any preceding-turn agent reply committed after it, but excludes later user
+// posts that each own a subsequent FIFO ticket.
+func (m *GroupDMManager) threadConversationSnapshot(ctx context.Context, groupID, triggerMessageID, agentID string) ([]chathistory.HistoryMessage, error) {
+	// PostUserMessage persists and registers a FIFO trigger while holding m.mu.
+	// Capture both the durable head and queued IDs under that same boundary;
+	// the potentially slow DB read happens after unlock and is bounded by ctx.
+	m.mu.Lock()
+	headID := m.latestMsgID[groupID]
+	queued := m.threadQueuedSnapshot(groupID)
+	m.mu.Unlock()
+	if headID == "" {
+		return []chathistory.HistoryMessage{}, nil
+	}
+	// Fetch one extra row per queued turn. Filtering those rows still leaves a
+	// full canonical window even if the operator posted a large burst.
+	msgs, err := loadGroupMessagesThroughContext(ctx, groupID, chathistory.DefaultMaxMessages+len(queued), headID)
 	if err != nil {
-		m.logger.Debug("thread history context skipped", "group", groupID, "agent", agentID, "err", err)
-		return nil
+		return nil, err
 	}
 	out := make([]chathistory.HistoryMessage, 0, len(msgs))
 	for _, msg := range msgs {
-		if msg == nil || msg.ID == currentMessageID || strings.TrimSpace(msg.Content) == "" {
+		if msg == nil || strings.TrimSpace(msg.Content) == "" {
 			continue
+		}
+		if msg.ID != triggerMessageID {
+			if _, isLaterQueuedTurn := queued[msg.ID]; isLaterQueuedTurn {
+				continue
+			}
 		}
 		uid := msg.AgentID
 		if uid == "" {
@@ -1723,20 +2052,23 @@ func (m *GroupDMManager) threadConversationHistory(groupID, currentMessageID, ag
 			IsBot: uid != UserSenderID,
 		})
 	}
-	return out
+	if len(out) > chathistory.DefaultMaxMessages {
+		out = out[len(out)-chathistory.DefaultMaxMessages:]
+	}
+	return out, nil
 }
 
 // postThreadReply appends an agent-authored message to a thread room on the
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
 func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool) (*GroupMessage, error) {
-	return m.postThreadReplyWithAttachments(groupID, agentID, content, model, effort, usage, thinking, toolUses, interrupted, "", nil)
+	return m.postThreadReplyWithAttachments(groupID, agentID, content, model, effort, usage, thinking, toolUses, interrupted, "", nil, nil)
 }
 
 // postThreadReplyWithAttachments is the attachment-aware thread reply path.
 // messageID is allocated before the one-shot stream starts so attachment blob
 // ownership and the persisted group message use the same stable ID.
-func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment) (*GroupMessage, error) {
+func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment, onPersisted func()) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -1772,6 +2104,9 @@ func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, conten
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
 	updatedAt := g.UpdatedAt
 	m.mu.Unlock()
+	if onPersisted != nil {
+		onPersisted()
+	}
 	m.touchStore(groupID, updatedAt)
 	return msg, nil
 }

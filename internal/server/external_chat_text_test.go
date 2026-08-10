@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -60,6 +62,29 @@ func writeExternalChatTestStream(t *testing.T, w http.ResponseWriter, events ...
 	}
 }
 
+func TestTrackHandoffCapabilityStreamDropsUnusedCapability(t *testing.T) {
+	srv := &Server{}
+	capability := srv.mintHandoffArrivalCapability("ag_1", "slack:C:T",
+		&fakeArrivalReservation{started: make(chan struct{}, 1)})
+	router := &externalChatRouter{server: srv}
+	source := make(chan agent.ChatEvent, 1)
+	source <- agent.ChatEvent{Type: "text", Delta: "done"}
+	close(source)
+
+	var got []agent.ChatEvent
+	for event := range router.trackHandoffCapabilityStream(context.Background(), capability, source) {
+		got = append(got, event)
+	}
+	if len(got) != 1 || got[0].Delta != "done" {
+		t.Fatalf("events = %#v", got)
+	}
+	srv.handoffArrivalMu.Lock()
+	defer srv.handoffArrivalMu.Unlock()
+	if _, ok := srv.handoffArrivalCaps[capability]; ok {
+		t.Fatal("capability survived closed source stream")
+	}
+}
+
 func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 	requestSeen := make(chan externalChatTextRequest, 1)
 	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +116,7 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 		},
 		HistorySelfUserID:                 "B1",
 		DisableKojoAttachmentInstructions: true,
+		ForceFreshSession:                 true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,11 +139,149 @@ func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 			!strings.Contains(req.ResumeSessionContext, "earlier") {
 			t.Fatalf("request history contexts = %#v", req)
 		}
-		if !req.DisableAttachments || req.SystemPromptExtra != "slack context" {
+		if !req.DisableAttachments || req.SystemPromptExtra != "slack context" || !req.ForceFreshSession {
 			t.Fatalf("request options = %#v", req)
 		}
 	default:
 		t.Fatal("holder did not receive request")
+	}
+}
+
+func TestExternalChatRouterSteersRemoteThreadHolder(t *testing.T) {
+	requestSeen := make(chan externalChatSteerRequest, 1)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/external-chat/ready"):
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/external-chat/steer"):
+			var req externalChatSteerRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			requestSeen <- req
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		default:
+			http.Error(w, "unexpected route", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	if err := router.SteerOneShot(context.Background(), agentID, "groupdm:g_test", "additional detail"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case req := <-requestSeen:
+		if req.SessionKey != "groupdm:g_test" || req.Content != "additional detail" {
+			t.Fatalf("request = %#v", req)
+		}
+	default:
+		t.Fatal("holder did not receive steer")
+	}
+}
+
+func TestExternalChatRouterReroutesSteerFromStaleHolderHint(t *testing.T) {
+	var oldPosts atomic.Int32
+	oldHolder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			oldPosts.Add(1)
+			t.Error("steer must not be posted to stale holder")
+		}
+		_ = json.NewEncoder(w).Encode(externalChatReadyResponse{
+			Ready: false, HolderPeer: "new-holder", Unavailable: "agent is held by another peer",
+		})
+	}))
+	t.Cleanup(oldHolder.Close)
+
+	requestSeen := make(chan externalChatSteerRequest, 1)
+	newHolder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "new-holder"})
+		case http.MethodPost:
+			var req externalChatSteerRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			requestSeen <- req
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		}
+	}))
+	t.Cleanup(newHolder.Close)
+
+	srv, router, agentID := prepareRemoteExternalChat(t, oldHolder.URL)
+	if _, err := srv.agents.Store().UpsertPeer(context.Background(), &store.PeerRecord{
+		DeviceID: "new-holder", Name: "New Holder", URL: newHolder.URL, Status: store.PeerStatusOnline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router.rememberRoute(agentID, "holder")
+	if err := router.SteerOneShot(context.Background(), agentID, "groupdm:g_test", "follow handoff"); err != nil {
+		t.Fatal(err)
+	}
+	if got := oldPosts.Load(); got != 0 {
+		t.Fatalf("old holder received %d steer POSTs", got)
+	}
+	select {
+	case req := <-requestSeen:
+		if req.SessionKey != "groupdm:g_test" || req.Content != "follow handoff" {
+			t.Fatalf("request = %#v", req)
+		}
+	default:
+		t.Fatal("new holder did not receive steer")
+	}
+}
+
+func TestExternalChatRouterMapsRemoteSteerNotBusy(t *testing.T) {
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+			return
+		}
+		writeError(w, http.StatusConflict, "not_busy", "turn ended")
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	err := router.SteerOneShot(context.Background(), agentID, "groupdm:g_test", "late")
+	if !errors.Is(err, agent.ErrAgentNotBusy) {
+		t.Fatalf("err = %v, want ErrAgentNotBusy", err)
+	}
+}
+
+func TestExternalChatRouterMarksLostSteerResponseUncertain(t *testing.T) {
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	err := router.SteerOneShot(context.Background(), agentID, "groupdm:g_test", "maybe delivered")
+	if !errors.Is(err, agent.ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+}
+
+func TestExternalChatRouterDoesNotMarkDialFailureUncertain(t *testing.T) {
+	holder := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	holder.Close()
+	resp, attempted, err := router.postRemoteSteer(context.Background(), agentID, "holder", externalChatSteerRequest{
+		SessionKey: "groupdm:g_test", Content: "not delivered",
+	})
+	if resp != nil || err == nil || attempted {
+		t.Fatalf("resp = %v, attempted = %v, err = %v; want definite pre-write failure", resp, attempted, err)
 	}
 }
 
@@ -584,5 +748,174 @@ func TestExternalChatHandlerRejectsNonPeer(t *testing.T) {
 	srv.handleExternalChatReady(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusForbidden)
+	}
+}
+
+func TestExternalChatReadyAdvertisesOriginAwareArrival(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents/ag_x/external-chat/ready", nil)
+	req.SetPathValue("id", "ag_x")
+	req = authedRequest(req, auth.Principal{Role: auth.RolePeer, PeerID: "peer-a"})
+	rr := httptest.NewRecorder()
+	srv.handleExternalChatReady(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var got externalChatReadyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OriginAwareArrivalV1 {
+		t.Fatal("origin-aware arrival capability was not advertised")
+	}
+}
+
+func TestDispatchFinalizeSignalsDowngradeWhenOldTargetRejectsContinuation(t *testing.T) {
+	var calls int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if _, has := body["continuation"]; has {
+			http.Error(w, `json: unknown field "continuation"`, http.StatusBadRequest)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, peerAgentSyncFinalizeResponse{AgentID: "ag_x"})
+	}))
+	defer target.Close()
+	srv := &Server{peerID: &peer.Identity{DeviceID: "source"}, logger: slog.Default()}
+	err := srv.dispatchPeerAgentSyncFinalize(context.Background(), target.URL, "target", "ag_x", "op_x", nil,
+		&handoffContinuation{SessionKey: "groupdm:g", OriginPeerID: "hub", Capability: "cap"})
+	if !errors.Is(err, errFinalizeContinuationDowngrade) {
+		t.Fatalf("err = %v, want continuation downgrade", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want only capability finalize before caller applies barrier", calls)
+	}
+}
+
+func TestExternalChatRouterAcknowledgesAttachmentAfterConsumerAccepts(t *testing.T) {
+	ackSeen := make(chan struct{}, 1)
+	ackCalled := make(chan struct{}, 1)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+		case strings.HasSuffix(r.URL.Path, "/external-chat/attachment-ack"):
+			var in externalChatAttachmentAckRequest
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Token != "ack-token" {
+				t.Errorf("attachment ack = %#v err=%v", in, err)
+				http.Error(w, "bad ack", http.StatusBadRequest)
+				return
+			}
+			ackSeen <- struct{}{}
+			ackCalled <- struct{}{}
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		case strings.HasSuffix(r.URL.Path, "/external-chat"):
+			w.Header().Set("Content-Type", externalChatTextContentType)
+			w.WriteHeader(http.StatusOK)
+			enc := json.NewEncoder(w)
+			evt := agent.ChatEvent{Type: "attachment", Attachments: []agent.MessageAttachment{{Path: "blob:result"}}}
+			if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &evt, AttachmentAckToken: "ack-token"}); err != nil {
+				t.Error(err)
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			done := agent.ChatEvent{Type: "done"}
+			if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &done}); err != nil {
+				t.Error(err)
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-ackSeen:
+			case <-time.After(time.Second):
+				t.Error("Hub did not acknowledge accepted attachment")
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	events, err := router.ChatOneShot(context.Background(), agentID, "create file", agent.OneShotOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenDone := false
+	var attachmentClaims []agent.ChatEvent
+	for evt := range events {
+		switch evt.Type {
+		case "attachment":
+			if !evt.BeginAttachmentOwnership() {
+				t.Fatal("could not claim remote attachment")
+			}
+			attachmentClaims = append(attachmentClaims, evt)
+		case "done":
+			seenDone = true
+		}
+	}
+	if !seenDone {
+		t.Fatal("stream did not reach terminal event before persistence")
+	}
+	// The response adapter acknowledges only after its durable append succeeds.
+	for i := range attachmentClaims {
+		attachmentClaims[i].FinishAttachmentOwnership(true)
+	}
+	select {
+	case <-ackCalled:
+	case <-time.After(time.Second):
+		t.Fatal("holder did not receive post-persistence acknowledgement")
+	}
+}
+
+func TestExternalChatAttachmentAckIsBoundToAgentAndPeer(t *testing.T) {
+	s := &Server{}
+	token, entry, err := s.externalChatAttachmentAcks.register("ag_test", "hub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := entry.done
+	call := func(agentID, peerID string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(externalChatAttachmentAckRequest{Token: token})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/external-chat/attachment-ack", bytes.NewReader(body))
+		req.SetPathValue("id", agentID)
+		req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Role: auth.RolePeer, PeerID: peerID}))
+		rr := httptest.NewRecorder()
+		s.handleExternalChatAttachmentAck(rr, req)
+		return rr
+	}
+	if rr := call("ag_other", "hub"); rr.Code != http.StatusConflict {
+		t.Fatalf("wrong agent status = %d", rr.Code)
+	}
+	if rr := call("ag_test", "other"); rr.Code != http.StatusConflict {
+		t.Fatalf("wrong peer status = %d", rr.Code)
+	}
+	select {
+	case <-done:
+		t.Fatal("invalid caller acknowledged attachment")
+	default:
+	}
+	if rr := call("ag_test", "hub"); rr.Code != http.StatusOK {
+		t.Fatalf("matching ack status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !s.externalChatAttachmentAcks.finish(token, entry) {
+		t.Fatal("acknowledged entry was not accepted")
+	}
+	if rr := call("ag_test", "hub"); rr.Code != http.StatusOK {
+		t.Fatalf("idempotent retry status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("matching acknowledgement did not release holder")
 	}
 }

@@ -61,6 +61,13 @@ type ChatOptions struct {
 	// the call site rather than silently leaking context across keys.
 	SessionKey string
 
+	// ConversationKey is the response-surface key for the current turn even
+	// when this backend does not support native SessionKey resumption. It is
+	// exported to the child process as KOJO_SESSION_KEY so a self-initiated
+	// device switch can bind the HTTP request to the exact Slack/WebUI thread.
+	// Backends must not use it for resume decisions.
+	ConversationKey string
+
 	// FreshSessionContext is a bounded transcript supplied by the response
 	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends
 	// it only when no native session can be resumed and a fresh session is
@@ -339,6 +346,13 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 		filtered = append(filtered, "KOJO_API_BASE="+kojoAPIBase)
 	}
 	return filtered
+}
+
+func appendKojoTurnEnv(env []string, opts ChatOptions) []string {
+	if opts.ConversationKey != "" {
+		env = append(env, "KOJO_SESSION_KEY="+opts.ConversationKey)
+	}
+	return env
 }
 
 // emitCancelDone sends a partial "done" event when the backend process is

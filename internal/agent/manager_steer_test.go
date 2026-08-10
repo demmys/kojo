@@ -274,3 +274,37 @@ func TestManager_Steer_SteerFuncError(t *testing.T) {
 		t.Error("expected error from steer func to propagate")
 	}
 }
+
+func TestManager_Steer_UncertainDeliveryRetainsAndPublishes(t *testing.T) {
+	m := newTestManager(t)
+	m.agents["ag_test"] = &Agent{ID: "ag_test", Name: "Test", Tool: "claude"}
+	if err := m.store.Upsert(m.agents["ag_test"]); err != nil {
+		t.Fatal(err)
+	}
+	outCh := make(chan ChatEvent, 1)
+	m.busyMu.Lock()
+	m.busy["ag_test"] = busyEntry{
+		startedAt: time.Now(), cancel: func() {}, outCh: outCh,
+		steer: func(string) error { return ErrSteerDeliveryUncertain },
+	}
+	m.busyMu.Unlock()
+
+	if _, err := m.Steer(context.Background(), "ag_test", "maybe delivered"); !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+	msgs, err := m.Messages("ag_test", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "maybe delivered" {
+		t.Fatalf("uncertain steer was not retained: %+v", msgs)
+	}
+	select {
+	case evt := <-outCh:
+		if evt.Type != "message" || evt.Message == nil || evt.Message.ID != msgs[0].ID {
+			t.Fatalf("event = %+v", evt)
+		}
+	default:
+		t.Fatal("uncertain canonical steer was not published")
+	}
+}

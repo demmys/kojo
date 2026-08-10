@@ -243,6 +243,10 @@ const messages = {
   "chat.messagePlaceholder": { ja: "メッセージ… ({key} で送信)", en: "Message… ({key} to send)" },
   "chat.listening": { ja: "聞き取り中…", en: "Listening…" },
   "chat.steerTitle": { ja: "実行中のターンに割り込む", en: "Steer the running turn" },
+  "chat.steerDeliveryUncertain": {
+    ja: "割り込みは届いた可能性があります。重複を避けるため再送しません。",
+    en: "The steer may have arrived. It was not retried to avoid a duplicate.",
+  },
   "chat.sendQueuedTitle": {
     ja: "ホストピアがオフライン — メッセージはキューに登録され @ {peer} の復帰時に配送する",
     en: "Holder peer is offline — message will be queued and delivered when @ {peer} reconnects",
@@ -1324,6 +1328,10 @@ const messages = {
     en: "Message the group… ({key} to send)",
   },
   "gdm.steerFailed": { ja: "割り込みに失敗", en: "Failed to steer" },
+  "gdm.steerDeliveryUncertain": {
+    ja: "割り込みは届いた可能性があります。重複を避けるため再送しません。",
+    en: "The steer may have arrived. It was not retried to avoid a duplicate.",
+  },
   "gdm.sendFailed": { ja: "送信に失敗", en: "Failed to send" },
   "gdm.clearConfirmTitle": { ja: "履歴を消去する?", en: "Clear history?" },
   "gdm.clearConfirmBody": {

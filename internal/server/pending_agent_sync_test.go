@@ -105,6 +105,31 @@ func TestPendingAgentSync_SurvivesDaemonRestart(t *testing.T) {
 	}
 }
 
+func TestPendingAgentSync_ArrivalDecisionSurvivesDaemonRestart(t *testing.T) {
+	ctx := context.Background()
+	srv, _ := newPendingSyncTestServer(t)
+	const agentID, opID = "ag_arrival", "op_arrival"
+	entry := pendingSyncEntry{RawToken: "token"}
+	if err := srv.recordPendingAgentSync(ctx, agentID, opID, entry); err != nil {
+		t.Fatal(err)
+	}
+	entry.ArrivalUncertain = true
+	if err := srv.updatePendingAgentSyncAfterSideEffect(ctx, agentID, opID, entry); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.pendingTokensMu.Lock()
+	srv.pendingAgentSyncs = nil
+	srv.pendingTokensMu.Unlock()
+	got, ok, err := srv.consumePendingAgentSync(ctx, agentID, opID)
+	if err != nil || !ok {
+		t.Fatalf("consume after restart: ok=%v err=%v", ok, err)
+	}
+	if !got.ArrivalUncertain || got.ArrivalHandled {
+		t.Fatalf("arrival decision = %#v", got)
+	}
+}
+
 // TestPendingAgentSync_AADBindsKey ensures a row written under (a1,
 // o1) cannot be decrypted under (a2, o2) — defends against a row
 // swapped onto the wrong key (manual db edit, future bug in key

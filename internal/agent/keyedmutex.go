@@ -2,6 +2,66 @@ package agent
 
 import "sync"
 
+type fifoReservation struct {
+	ready   <-chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	cleanup func()
+}
+
+func (r *fifoReservation) Wait() { <-r.ready }
+func (r *fifoReservation) Release() {
+	r.once.Do(func() {
+		close(r.done)
+		if r.cleanup != nil {
+			r.cleanup()
+		}
+	})
+}
+
+// keyedFIFO reserves strict per-key execution order without blocking the
+// caller. Reserve appends a ticket synchronously; workers wait on their ticket
+// later, so an arrival callback can acknowledge queue admission without
+// holding a global event loop or relying on sync.Mutex waiter ordering.
+type keyedFIFO struct {
+	mu    sync.Mutex
+	tails map[string]chan struct{}
+}
+
+func (q *keyedFIFO) Reserve(id string) *fifoReservation {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reserveLocked(id)
+}
+
+// ReservePair appends a turn and its optional handoff-arrival slot in one
+// critical section. A later human turn therefore cannot land between them.
+func (q *keyedFIFO) ReservePair(id string) (*fifoReservation, *fifoReservation) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reserveLocked(id), q.reserveLocked(id)
+}
+
+func (q *keyedFIFO) reserveLocked(id string) *fifoReservation {
+	if q.tails == nil {
+		q.tails = make(map[string]chan struct{})
+	}
+	ready := q.tails[id]
+	if ready == nil {
+		ready = make(chan struct{})
+		close(ready)
+	}
+	done := make(chan struct{})
+	q.tails[id] = done
+	return &fifoReservation{ready: ready, done: done, cleanup: func() {
+		q.mu.Lock()
+		if q.tails[id] == done {
+			delete(q.tails, id)
+		}
+		q.mu.Unlock()
+	}}
+}
+
 // keyedMutex is a set of mutexes keyed by string id, created lazily on
 // first use. The zero value is ready to use and safe for concurrent
 // callers. It replaces the hand-rolled "guard mutex + map[string]*sync.Mutex"

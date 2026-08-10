@@ -806,6 +806,19 @@ func buildArrivalPrompt(ctx context.Context, m *Manager, agentID, sourcePeerName
 	return b.String()
 }
 
+// BuildExternalDeviceSwitchArrivalPrompt is the conversation-scoped variant.
+// Slack and WebUI threads carry their own canonical history and are not part of
+// agent_messages, so quoting the main transcript here would surface an
+// unrelated instruction. The fresh one-shot session receives the actual
+// conversation history separately.
+func (m *Manager) BuildExternalDeviceSwitchArrivalPrompt(sourcePeerName string, notes ArrivalNotes) string {
+	source := strings.TrimSpace(sourcePeerName)
+	if source == "" {
+		source = "the previous device"
+	}
+	return fmt.Sprintf("デバイス移動が完了しました。%s からこのデバイスへ移動しています。このシステムメッセージは移動を開始した会話に配送されています。直前の会話履歴を確認し、未完了の依頼があればここで再開してください。すでに完了している場合は簡潔に到着を知らせてください。", source) + arrivalNotesSection(notes)
+}
+
 // arrivalNotesSection renders the per-switch caveat block appended to
 // every arrival prompt. Returns "" for a clean transfer so the prompt
 // stays byte-identical to the pre-notes shape (prompt-cache friendly).

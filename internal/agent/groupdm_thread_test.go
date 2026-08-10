@@ -132,10 +132,52 @@ func TestThreadConversationHistory_StopsBeforeTriggeringMessage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	gdm.latestMsgID[g.ID] = future.ID
+	gdm.registerThreadQueued(g.ID, current.ID)
+	gdm.registerThreadQueued(g.ID, future.ID)
 
-	history := gdm.threadConversationHistory(g.ID, current.ID, "ag_alice")
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, current.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered := history[:0]
+	for _, msg := range history {
+		if msg.MessageID != current.ID {
+			filtered = append(filtered, msg)
+		}
+	}
+	history = filtered
 	if len(history) != 1 || history[0].MessageID != prior.ID || history[0].Text != "prior" {
 		t.Fatalf("history = %+v, want only the message before the trigger", history)
+	}
+}
+
+func TestThreadConversationHistory_StopsThroughArrivalTrigger(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior", nil)
+	current := newGroupMessage(UserSenderID, "User", "current", nil)
+	future := newGroupMessage(UserSenderID, "User", "future", nil)
+	steer := newGroupMessage(UserSenderID, "User", "steer current turn", nil)
+	latePriorReply := newGroupMessage("ag_alice", "Alice", "reply to prior", nil)
+	for _, msg := range []*GroupMessage{prior, current, future, steer, latePriorReply} {
+		if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gdm.latestMsgID[g.ID] = latePriorReply.ID
+	gdm.registerThreadQueued(g.ID, current.ID)
+	gdm.registerThreadQueued(g.ID, future.ID)
+
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, current.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 4 || history[0].MessageID != prior.ID || history[1].MessageID != current.ID || history[2].MessageID != steer.ID || history[3].MessageID != latePriorReply.ID {
+		t.Fatalf("history = %+v, want prior, trigger, steer, and preceding-turn reply but not future queued post", history)
 	}
 }
 

@@ -517,9 +517,11 @@ func (b *Bot) processIncomingWithAttachments(ctx context.Context, channel, threa
 
 	select {
 	case b.sem <- struct{}{}:
+		turn, arrival := b.reserveThreadPair(channel, replyTS)
 		go func() {
 			defer func() { <-b.sem }()
-			b.sendToAgentWithAttachments(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID, attachments)
+			b.sendToAgentTurnReserved(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID,
+				"", attachments, false, messageTS, nil, turn, arrival)
 		}()
 	default:
 		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
@@ -557,44 +559,69 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 }
 
 func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment) {
+	b.sendToAgentTurn(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, attachments, false)
+}
+
+func (b *Bot) sendToAgentTurn(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment, syntheticSystem bool) {
 	// Serialize processing within the same thread to maintain history
 	// consistency. The lock must cover both history fetching and prompt
 	// construction so that concurrent messages to the same thread observe
 	// each other's updates rather than building prompts from stale history.
-	tl := b.acquireThreadLock(channel, replyTS)
-	tl.mu.Lock()
+	reservation, arrival := b.reserveThreadPair(channel, replyTS)
+	b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, "", attachments, syntheticSystem, messageTS, nil, reservation, arrival)
+}
+
+func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, expectedHolder string, attachments []agent.MessageAttachment, syntheticSystem bool, historyThroughTS string, presetHistory []chathistory.HistoryMessage, reservation, arrival *threadReservation) {
+	reservation.Wait()
+	var arrivalReservation *slackHandoffReservation
 	defer func() {
-		tl.mu.Unlock()
-		b.releaseThreadLock(channel, replyTS, tl)
+		b.releaseThreadReservation(channel, replyTS, reservation)
+		if arrivalReservation != nil {
+			arrivalReservation.Release()
+		}
 	}()
+	currentUserMsg := chathistory.HistoryMessage{
+		Platform: platformSlack, ChannelID: channel, ThreadID: replyTS, MessageID: messageTS,
+		UserID: userID, UserName: displayName, Text: text, Timestamp: time.Now().Format(time.RFC3339),
+	}
 
 	// When creating a new thread (origThreadTS was empty), save the user's
 	// message to the thread history file so it appears as the first entry.
-	if origThreadTS == "" && replyTS != "" && b.agentDataDir != "" {
-		userMsg := chathistory.HistoryMessage{
-			Platform:  platformSlack,
-			ChannelID: channel,
-			ThreadID:  replyTS,
-			MessageID: messageTS,
-			UserID:    userID,
-			UserName:  displayName,
-			Text:      text,
-			Timestamp: time.Now().Format(time.RFC3339),
-			IsBot:     false,
-		}
+	if !syntheticSystem && origThreadTS == "" && replyTS != "" && b.agentDataDir != "" {
 		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, replyTS)
-		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
+		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{currentUserMsg}); err != nil {
 			b.logger.Warn("failed to save initial user message to thread history", "err", err)
 		}
 	}
 
-	// Fetch conversation history from Slack for context injection.
-	var history []chathistory.HistoryMessage
-	if origThreadTS != "" {
-		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
-	} else {
-		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+	// Capture the history exactly once when the ticket reaches the FIFO head.
+	// Arrival reuses that snapshot so a later Slack post cannot leak into the
+	// fresh target session while the handoff is in flight.
+	history := append([]chathistory.HistoryMessage(nil), presetHistory...)
+	if presetHistory == nil {
+		if origThreadTS != "" {
+			history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
+		} else {
+			history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+		}
+		history = slackHistoryAtTurnStart(history, historyThroughTS, b.botUserID)
 	}
+	// Slack search/history is eventually consistent and its error fallback may
+	// be a stale local file. The live event is authoritative: make sure the
+	// snapshot reserved for post-handoff continuation contains its trigger.
+	if !syntheticSystem && messageTS != "" {
+		found := false
+		for _, msg := range history {
+			if msg.MessageID == messageTS {
+				found = true
+				break
+			}
+		}
+		if !found {
+			history = append(history, currentUserMsg)
+		}
+	}
+	arrivalHistory := append([]chathistory.HistoryMessage{}, history...)
 
 	// From here on, the thread handle used for posting/streaming.
 	threadTS := replyTS
@@ -609,7 +636,7 @@ func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThrea
 	// Letting it appear in both the transcript header AND the suffix
 	// makes a fresh backend session see the current turn twice — once
 	// labeled as history, once as the authoritative live request.
-	if messageTS != "" {
+	if !syntheticSystem && messageTS != "" {
 		filtered := make([]chathistory.HistoryMessage, 0, len(history))
 		for _, m := range history {
 			if m.MessageID == messageTS {
@@ -631,14 +658,19 @@ func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThrea
 	// Pass the canonical Slack transcript separately. Manager formats the
 	// fresh-session fallback; each backend injects it only when it selects its
 	// native fresh-session path.
-	var sb strings.Builder
-	safeDisplay := sanitizeDisplayName(displayName)
-	if threadTS != "" {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text))
+	var message string
+	if syntheticSystem {
+		message = "[system message]\n" + text
 	} else {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text))
+		var sb strings.Builder
+		safeDisplay := sanitizeDisplayName(displayName)
+		if threadTS != "" {
+			sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text))
+		} else {
+			sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text))
+		}
+		message = sb.String()
 	}
-	message := sb.String()
 
 	// Volatile per-conversation context goes in SystemPromptExtra (appended
 	// to the system prompt by Manager). Per-channel/thread context is
@@ -646,6 +678,12 @@ func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThrea
 	// system prompt — not the user message — keeps it out of the cacheable
 	// prefix's transcript while still teaching the agent where it is.
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
+	if arrival != nil {
+		arrivalReservation = &slackHandoffReservation{
+			bot: b, channel: channel, threadTS: threadTS,
+			reservation: arrival, history: arrivalHistory,
+		}
+	}
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
 	b.setStatus(ctx, channel, threadTS, typingStatus)
@@ -657,6 +695,9 @@ func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThrea
 		SystemPromptExtra:                 systemPromptExtra,
 		DisableKojoAttachmentInstructions: true,
 		Attachments:                       attachments,
+		ForceFreshSession:                 syntheticSystem,
+		ExpectedHolderPeer:                expectedHolder,
+		HandoffArrivalReservation:         arrivalReservation,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
@@ -1786,32 +1827,136 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 // race where a new mutex is created while another goroutine is still waiting on
 // the previous one.
 type threadLock struct {
-	mu      sync.Mutex
+	tail    chan struct{}
 	waiters int
+}
+
+// slackHistoryAtTurnStart excludes later human posts while retaining replies
+// from the preceding FIFO turn that may have completed after cutoff was posted.
+// The result is captured and reused by the paired handoff arrival.
+func slackHistoryAtTurnStart(history []chathistory.HistoryMessage, cutoff, selfUserID string) []chathistory.HistoryMessage {
+	if cutoff == "" {
+		return history
+	}
+	bounded := make([]chathistory.HistoryMessage, 0, len(history))
+	for _, msg := range history {
+		if (msg.IsBot && msg.UserID == selfUserID) || msg.MessageID == "" || msg.MessageID == incompleteMessageID || msg.MessageID <= cutoff {
+			bounded = append(bounded, msg)
+		}
+	}
+	return bounded
+}
+
+type threadReservation struct {
+	ready <-chan struct{}
+	done  chan struct{}
+	tl    *threadLock
+	once  sync.Once
+}
+
+func (r *threadReservation) Wait() { <-r.ready }
+
+type slackHandoffReservation struct {
+	mu          sync.Mutex
+	bot         *Bot
+	channel     string
+	threadTS    string
+	reservation *threadReservation
+	history     []chathistory.HistoryMessage
+	activated   bool
+	released    bool
+}
+
+func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expectedHolder string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return errors.New("Slack arrival reservation was released")
+	}
+	if r.activated {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.bot.ctx.Done():
+		return errors.New("slack bot is stopped")
+	default:
+	}
+	r.activated = true
+	go func() {
+		// Admission is already guaranteed by the FIFO reservation. Wait for
+		// the initiating turn to release it, then take a global execution slot
+		// instead of rejecting a valid arrival while the semaphore is full.
+		r.reservation.Wait()
+		select {
+		case <-r.bot.ctx.Done():
+			r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+			return
+		case r.bot.sem <- struct{}{}:
+		}
+		defer func() { <-r.bot.sem }()
+		r.bot.sendToAgentTurnReserved(r.bot.ctx, r.channel, r.threadTS, r.threadTS,
+			"", prompt, "", "", expectedHolder, nil, true, "", append([]chathistory.HistoryMessage{}, r.history...), r.reservation, nil)
+	}()
+	return nil
+}
+
+func (r *slackHandoffReservation) Release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released || r.activated {
+		return
+	}
+	r.released = true
+	r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 }
 
 // acquireThreadLock returns the threadLock for the given channel+thread,
 // creating one if needed, and increments its reference count.
 // Must be paired with releaseThreadLock after tl.mu.Unlock().
-func (b *Bot) acquireThreadLock(channel, threadTS string) *threadLock {
+func (b *Bot) reserveThread(channel, threadTS string) *threadReservation {
+	turn, _ := b.reserveThreadN(channel, threadTS, 1)
+	return turn
+}
+
+func (b *Bot) reserveThreadPair(channel, threadTS string) (*threadReservation, *threadReservation) {
+	return b.reserveThreadN(channel, threadTS, 2)
+}
+
+func (b *Bot) reserveThreadN(channel, threadTS string, count int) (*threadReservation, *threadReservation) {
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
 	tl, ok := b.threadLocks[key]
 	if !ok {
-		tl = &threadLock{}
+		ready := make(chan struct{})
+		close(ready)
+		tl = &threadLock{tail: ready}
 		b.threadLocks[key] = tl
 	}
-	tl.waiters++
-	return tl
+	reserve := func() *threadReservation {
+		ready := tl.tail
+		done := make(chan struct{})
+		tl.tail = done
+		tl.waiters++
+		return &threadReservation{ready: ready, done: done, tl: tl}
+	}
+	first := reserve()
+	if count == 1 {
+		return first, nil
+	}
+	return first, reserve()
 }
 
 // releaseThreadLock decrements the reference count and removes the map entry
 // when no goroutines are waiting or holding the lock.
-func (b *Bot) releaseThreadLock(channel, threadTS string, tl *threadLock) {
+func (b *Bot) releaseThreadReservation(channel, threadTS string, reservation *threadReservation) {
+	reservation.once.Do(func() { close(reservation.done) })
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
+	tl := reservation.tl
 	tl.waiters--
 	if tl.waiters == 0 {
 		delete(b.threadLocks, key)

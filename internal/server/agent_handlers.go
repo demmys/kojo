@@ -1776,6 +1776,8 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
 		case errors.Is(err, agent.ErrSteerUnsupported):
 			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", "the steer may have reached the backend; the message was retained")
 		case errors.Is(err, agent.ErrAgentBusy):
 			writeError(w, http.StatusConflict, "busy", "agent is busy")
 		default:

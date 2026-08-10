@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,17 +92,18 @@ type Usage struct {
 
 // ChatEvent is streamed from backend to WebSocket during a chat.
 type ChatEvent struct {
-	Type         string              `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error", "message", "attachment"
-	Status       string              `json:"status,omitempty"`
-	Delta        string              `json:"delta,omitempty"`
-	ToolUseID    string              `json:"toolUseId,omitempty"`
-	ToolName     string              `json:"toolName,omitempty"`
-	ToolInput    string              `json:"toolInput,omitempty"`
-	ToolOutput   string              `json:"toolOutput,omitempty"`
-	Message      *Message            `json:"message,omitempty"`
-	Attachments  []MessageAttachment `json:"attachments,omitempty"` // streamed kojo-attach files
-	Usage        *Usage              `json:"usage,omitempty"`
-	ErrorMessage string              `json:"errorMessage,omitempty"`
+	Type            string              `json:"type"` // "status", "text", "thinking", "tool_use", "tool_result", "done", "error", "message", "attachment"
+	Status          string              `json:"status,omitempty"`
+	Delta           string              `json:"delta,omitempty"`
+	ToolUseID       string              `json:"toolUseId,omitempty"`
+	ToolName        string              `json:"toolName,omitempty"`
+	ToolInput       string              `json:"toolInput,omitempty"`
+	ToolOutput      string              `json:"toolOutput,omitempty"`
+	Message         *Message            `json:"message,omitempty"`
+	Attachments     []MessageAttachment `json:"attachments,omitempty"` // streamed kojo-attach files
+	attachmentClaim *attachmentOwnership
+	Usage           *Usage `json:"usage,omitempty"`
+	ErrorMessage    string `json:"errorMessage,omitempty"`
 	// ParentToolUseID is set when this event originates from a subagent
 	// spawned by a Task tool call rather than the main assistant turn.
 	// Its value is the tool_use ID of the parent Task invocation (or, for
@@ -125,6 +128,74 @@ type ChatEvent struct {
 	// backend stream. Populated only on "rate_limit" events, which arrive
 	// mid-turn whenever the Claude CLI reports a usage threshold crossing.
 	RateLimit *RateLimitInfo `json:"rateLimit,omitempty"`
+}
+
+type attachmentOwnership struct {
+	state atomic.Int32 // 0=pending, 2=consumer committing, 1=accepted, -1=rejected
+	done  chan struct{}
+}
+
+func newAttachmentOwnership() *attachmentOwnership {
+	return &attachmentOwnership{done: make(chan struct{})}
+}
+
+// PrepareAttachmentOwnership installs an ownership handshake on an attachment
+// event received across a transport boundary. The producer-side event already
+// has one; decoded copies need a fresh local claim so the transport can wait
+// until the response adapter has durably accepted the attachment metadata.
+func (e *ChatEvent) PrepareAttachmentOwnership() {
+	if e != nil && e.attachmentClaim == nil {
+		e.attachmentClaim = newAttachmentOwnership()
+	}
+}
+
+// WaitAttachmentOwnership waits for the response adapter to accept or reject
+// an attachment event prepared with PrepareAttachmentOwnership.
+func (e *ChatEvent) WaitAttachmentOwnership(ctx context.Context) bool {
+	return e.waitAttachmentOwnership(ctx)
+}
+
+// BeginAttachmentOwnership reserves the ownership decision before a consumer
+// performs an irreversible append/encode. Cancellation can reject only while
+// the claim is still pending.
+func (e *ChatEvent) BeginAttachmentOwnership() bool {
+	if e == nil || e.attachmentClaim == nil {
+		return true
+	}
+	return e.attachmentClaim.state.CompareAndSwap(0, 2)
+}
+
+// FinishAttachmentOwnership commits or rejects a claim acquired by Begin.
+func (e *ChatEvent) FinishAttachmentOwnership(accepted bool) {
+	if e == nil || e.attachmentClaim == nil {
+		return
+	}
+	value := int32(-1)
+	if accepted {
+		value = 1
+	}
+	if e.attachmentClaim.state.CompareAndSwap(2, value) {
+		close(e.attachmentClaim.done)
+	}
+}
+
+func (e *ChatEvent) rejectAttachmentOwnership() {
+	if e != nil && e.attachmentClaim != nil && e.attachmentClaim.state.CompareAndSwap(0, -1) {
+		close(e.attachmentClaim.done)
+	}
+}
+
+func (e *ChatEvent) waitAttachmentOwnership(ctx context.Context) bool {
+	if e == nil || e.attachmentClaim == nil {
+		return false
+	}
+	select {
+	case <-e.attachmentClaim.done:
+	case <-ctx.Done():
+		e.rejectAttachmentOwnership()
+		<-e.attachmentClaim.done
+	}
+	return e.attachmentClaim.state.Load() == 1
 }
 
 func generateMessageID() string {

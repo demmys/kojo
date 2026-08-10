@@ -436,8 +436,18 @@ export function GroupDMChat() {
           });
           return;
         } catch (e) {
-          if (!/^409:/.test(e instanceof Error ? e.message : String(e))) {
-            setSendError(e instanceof Error ? e.message : t("gdm.steerFailed"));
+          const message = e instanceof Error ? e.message : String(e);
+          if (/^502:.*delivery_uncertain/.test(message)) {
+            // The server retained this canonical message because the remote
+            // holder may already have injected it. Clear the draft so an
+            // operator retry cannot duplicate the steer; polling will render
+            // the retained row.
+            clearDraft();
+            setSendError(t("gdm.steerDeliveryUncertain"));
+            return;
+          }
+          if (!/^409:/.test(message)) {
+            setSendError(e instanceof Error ? message : t("gdm.steerFailed"));
             return;
           }
           // 409: the turn already finished — fall through to a normal post.

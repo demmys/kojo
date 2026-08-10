@@ -138,8 +138,8 @@ func TestCodexSteerer_CloseFailsPendingWaiter(t *testing.T) {
 	s.close()
 
 	err := <-done
-	if !errors.Is(err, ErrAgentNotBusy) {
-		t.Fatalf("expected ErrAgentNotBusy-wrapped error, got %v", err)
+	if !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("expected ErrSteerDeliveryUncertain-wrapped error, got %v", err)
 	}
 }
 

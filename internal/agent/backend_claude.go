@@ -56,13 +56,21 @@ func (s *claudeStdinWriter) writeUserLine(text string) error {
 		// the frontend falls back to a normal send.
 		return ErrAgentNotBusy
 	}
-	if _, err = s.w.Write(append(line, '\n')); err != nil {
+	payload := append(line, '\n')
+	n, writeErr := s.w.Write(payload)
+	if writeErr != nil {
+		if n > 0 {
+			return fmt.Errorf("%w: Claude steer stdin accepted %d/%d bytes before error: %v", ErrSteerDeliveryUncertain, n, len(payload), writeErr)
+		}
 		// A broken/closed pipe means the process died mid-turn — same
 		// caller-facing meaning as the closed flag above.
-		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
+		if errors.Is(writeErr, syscall.EPIPE) || errors.Is(writeErr, os.ErrClosed) {
 			return ErrAgentNotBusy
 		}
-		return err
+		return writeErr
+	}
+	if n != len(payload) {
+		return fmt.Errorf("%w: Claude steer stdin accepted %d/%d bytes", ErrSteerDeliveryUncertain, n, len(payload))
 	}
 	return nil
 }
@@ -151,7 +159,9 @@ func (t *claudeTurnSteer) writeUserLine(text string) error {
 	// the reaper deadline bounds any residual overshoot anyway.
 	t.writes.Add(1)
 	if err := t.stdinW.writeUserLine(text); err != nil {
-		t.writes.Add(-1)
+		if !errors.Is(err, ErrSteerDeliveryUncertain) {
+			t.writes.Add(-1)
+		}
 		return err
 	}
 	return nil
@@ -542,6 +552,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	// Token conservation: agents persist state in files (MEMORY.md, memory/),
 	// not in Claude's conversation history. 1M context only inflates
 	// cache_read/cache_creation across runs without adding real value, and its
@@ -1926,24 +1937,45 @@ func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
 // state so a fresh --session-id spawn succeeds immediately; the lost in-flight
 // context is recovered on the next turn via recent-messages bootstrap.
 func resetClaudeSessionFiles(agentID, sessionKey string, logger *slog.Logger) {
+	if err := resetClaudeSessionFilesStrict(agentID, sessionKey); err != nil && logger != nil {
+		logger.Warn("reset claude session files failed", "agent", agentID, "err", err)
+		return
+	}
+	if logger != nil {
+		logger.Warn("reset claude session file to clear stale in-use state",
+			"agent", agentID, "sessionID", expectedClaudeSessionID(agentID, sessionKey, false))
+	}
+}
+
+// resetClaudeSessionFilesStrict removes every native artifact that can make a
+// deterministic Claude session resume or appear in-use. Handoff arrival uses
+// the strict form and fails closed: continuing with a partially removed torn
+// session is more dangerous than surfacing a retryable turn error.
+func resetClaudeSessionFilesStrict(agentID, sessionKey string) error {
 	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
 	if sessionID == "" {
-		return
+		return nil
 	}
 	// claude encodes its project dir from the process's RESOLVED cwd, so the
 	// path must be symlink-resolved (on macOS the agent dir under /tmp resolves
 	// to /private/tmp; filepath.Abs alone would target a nonexistent
 	// "-tmp-..." project dir and the delete would silently no-op).
-	dir := agentDir(agentID)
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = resolved
-	}
-	absDir, err := filepath.Abs(dir)
+	dir, err := filepath.Abs(agentDir(agentID))
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.Remove(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
-	_ = os.RemoveAll(filepath.Join(claudeConfigDir(), "session-env", sessionID))
+	dirs := []string{dir}
+	if resolved, rerr := filepath.EvalSymlinks(dir); rerr == nil && resolved != dir {
+		dirs = append(dirs, resolved)
+	}
+	for _, projectRoot := range dirs {
+		if err := os.Remove(filepath.Join(claudeProjectDir(projectRoot), sessionID+".jsonl")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(claudeConfigDir(), "session-env", sessionID)); err != nil {
+		return err
+	}
 	// Also drop any lingering per-pid session lease that names this session.
 	leaseDir := filepath.Join(claudeConfigDir(), "sessions")
 	if entries, derr := os.ReadDir(leaseDir); derr == nil {
@@ -1952,15 +1984,23 @@ func resetClaudeSessionFiles(agentID, sessionKey string, logger *slog.Logger) {
 				continue
 			}
 			p := filepath.Join(leaseDir, e.Name())
-			if data, rerr := os.ReadFile(p); rerr == nil && strings.Contains(string(data), sessionID) {
-				_ = os.Remove(p)
+			data, rerr := os.ReadFile(p)
+			if rerr != nil {
+				if os.IsNotExist(rerr) {
+					continue
+				}
+				return rerr
+			}
+			if strings.Contains(string(data), sessionID) {
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					return err
+				}
 			}
 		}
+	} else if !os.IsNotExist(derr) {
+		return derr
 	}
-	if logger != nil {
-		logger.Warn("reset claude session file to clear stale in-use state",
-			"agent", agentID, "sessionID", sessionID)
-	}
+	return nil
 }
 
 // removeClaudeSession best-effort deletes the Claude session JSONL for the

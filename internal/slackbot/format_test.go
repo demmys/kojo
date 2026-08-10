@@ -119,6 +119,14 @@ func TestStripBotMention(t *testing.T) {
 	}
 }
 
+func TestPlainToSlackPreservesCodeWhileConvertingMarkdown(t *testing.T) {
+	in := "## Heading\n**bold** ~~gone~~ [link](https://example.com) `**code**`\n```go\n**block**\n```"
+	want := "*Heading*\n*bold* ~gone~ <https://example.com|link> `**code**`\n```go\n**block**\n```"
+	if got := PlainToSlack(in); got != want {
+		t.Fatalf("PlainToSlack() = %q, want %q", got, want)
+	}
+}
+
 func TestSplitMessage(t *testing.T) {
 	tests := []struct {
 		name   string

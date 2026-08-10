@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 )
 
@@ -258,6 +260,882 @@ func TestBotShouldAutoReplyEmptyDataDir(t *testing.T) {
 	}
 }
 
+func TestIsStopCommandExactMatchOnly(t *testing.T) {
+	tests := []struct {
+		text string
+		want bool
+	}{
+		{"!stop", true},
+		{" !STOP \n", true},
+		{"!cancel", true},
+		{"!stop please", false},
+		{"please !stop", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := isStopCommand(tt.text); got != tt.want {
+			t.Errorf("isStopCommand(%q) = %v, want %v", tt.text, got, tt.want)
+		}
+	}
+}
+
+func TestActiveTurnCancelIsThreadScoped(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel1()
+	defer cancel2()
+	turn1 := bot.registerActiveTurn("C1", "thread.1", cancel1)
+	turn2 := bot.registerActiveTurn("C1", "thread.2", cancel2)
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn1)
+	defer bot.unregisterActiveTurn("C1", "thread.2", turn2)
+
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("cancelActiveTurn returned false for a registered turn")
+	}
+	select {
+	case <-ctx1.Done():
+	case <-time.After(time.Second):
+		t.Fatal("thread.1 context was not cancelled")
+	}
+	if !turn1.stopRequested() {
+		t.Fatal("thread.1 should be marked as user-stopped")
+	}
+	select {
+	case <-ctx2.Done():
+		t.Fatal("thread.2 must not be cancelled when stopping thread.1")
+	default:
+	}
+	if turn2.stopRequested() {
+		t.Fatal("thread.2 must not be marked stopped")
+	}
+}
+
+func TestActiveTurnCancelTargetsFIFOHead(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel1()
+	defer cancel2()
+	turn1 := bot.registerActiveTurn("C1", "thread.1", cancel1)
+	turn2 := bot.registerActiveTurn("C1", "thread.1", cancel2)
+
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("first cancel returned false")
+	}
+	select {
+	case <-ctx1.Done():
+	case <-time.After(time.Second):
+		t.Fatal("FIFO head was not cancelled")
+	}
+	select {
+	case <-ctx2.Done():
+		t.Fatal("queued turn was cancelled before the FIFO head unregistered")
+	default:
+	}
+
+	bot.unregisterActiveTurn("C1", "thread.1", turn1)
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("second cancel returned false")
+	}
+	select {
+	case <-ctx2.Done():
+	case <-time.After(time.Second):
+		t.Fatal("next FIFO turn was not cancelled")
+	}
+	bot.unregisterActiveTurn("C1", "thread.1", turn2)
+}
+
+type steerCall struct {
+	agentID, sessionKey, content string
+}
+
+type steerTestMgr struct {
+	calls       chan steerCall
+	turns       chan string
+	release     <-chan struct{}
+	err         error
+	waitContext bool
+	oneShots    atomic.Int32
+}
+
+func (m *steerTestMgr) ChatOneShot(_ context.Context, _, message string, _ agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	m.oneShots.Add(1)
+	if m.turns != nil {
+		m.turns <- message
+	}
+	ch := make(chan agent.ChatEvent, 1)
+	ch <- agent.ChatEvent{Type: "done"}
+	close(ch)
+	return ch, nil
+}
+
+func (m *steerTestMgr) SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error {
+	select {
+	case m.calls <- steerCall{agentID: agentID, sessionKey: sessionKey, content: content}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if m.release != nil {
+		select {
+		case <-m.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if m.waitContext {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return m.err
+}
+
+func waitSteerQueue(t *testing.T, turn *activeTurn) {
+	t.Helper()
+	barrier := turn.reserveSteer(false)
+	done := make(chan struct{})
+	go func() {
+		barrier.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		barrier.Release()
+	case <-time.After(time.Second):
+		t.Fatal("steer queue did not drain")
+	}
+}
+
+func TestProcessIncomingSteersActiveSlackThread(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1)}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "change direction", "U123")
+	select {
+	case call := <-mgr.calls:
+		if call.agentID != "test-agent" || call.sessionKey != slackSessionKey("test-agent", "C1", "thread.1") {
+			t.Fatalf("steer route = %+v", call)
+		}
+		if call.content != "[Slack @Alice | channel:C1 thread:thread.1] change direction" {
+			t.Fatalf("steer content = %q", call.content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active Slack message was not steered")
+	}
+	waitSteerQueue(t, turn)
+	if got := mgr.oneShots.Load(); got != 0 {
+		t.Fatalf("successful steer started %d follow-up turns", got)
+	}
+	if len(turn.steerHistory) != 1 || turn.steerHistory[0].MessageID != "100.000002" {
+		t.Fatalf("steer history = %+v", turn.steerHistory)
+	}
+}
+
+func TestHandleThreadMessageSteersBeforeBotReplyReachesHistory(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1)}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+
+	// The local history is deliberately empty, so shouldAutoReply alone would
+	// reject this message until the first bot response had finished persisting.
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.1", TimeStamp: "100.000002", Text: "interrupt now",
+	})
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("live thread reply was ignored before bot history persistence")
+	}
+	waitSteerQueue(t, turn)
+}
+
+func TestSlackSteersAreSerializedInMessageOrder(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	release := make(chan struct{})
+	mgr := &steerTestMgr{calls: make(chan steerCall, 2), release: release}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "first", "U123")
+	first := <-mgr.calls
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000003", "second", "U123")
+	select {
+	case call := <-mgr.calls:
+		t.Fatalf("second steer overtook blocked first steer: %+v", call)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case second := <-mgr.calls:
+		if !strings.HasSuffix(first.content, "] first") || !strings.HasSuffix(second.content, "] second") {
+			t.Fatalf("steer order = %q, %q", first.content, second.content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second steer did not run after first completed")
+	}
+	waitSteerQueue(t, turn)
+}
+
+func TestUnsupportedSlackSteerFallsBackToFIFO(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1), err: agent.ErrSteerUnsupported}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	hold := bot.reserveThread("C1", "thread.1")
+	hold.Wait()
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "follow up", "U123")
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("steer was not attempted")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		bot.activeTurnsMu.Lock()
+		registered := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+		bot.activeTurnsMu.Unlock()
+		if registered == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unsupported steer did not reserve a FIFO follow-up")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	bot.finishActiveTurn("C1", "thread.1", turn)
+	cancel()
+	bot.releaseThreadReservation("C1", "thread.1", hold)
+
+	deadline = time.Now().Add(time.Second)
+	for mgr.oneShots.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("FIFO fallback did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSlackFallbackReservesFIFOBeforeLaterAttachment(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	release := make(chan struct{})
+	mgr := &steerTestMgr{
+		calls: make(chan steerCall, 1), turns: make(chan string, 2),
+		release: release, err: agent.ErrSteerUnsupported,
+	}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	hold := bot.reserveThread("C1", "thread.1")
+	hold.Wait()
+	_, cancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", cancel)
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "first", "U123")
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("first steer was not attempted")
+	}
+	bot.processIncomingWithAttachments(context.Background(), "C1", "thread.1", "100.000003", "with file", "U123",
+		[]agent.MessageAttachment{{Name: "note.txt"}})
+
+	// The attachment shares the active-turn admission queue; it must not
+	// reserve a normal FIFO slot while the earlier steer outcome is pending.
+	bot.activeTurnsMu.Lock()
+	beforeRelease := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+	bot.activeTurnsMu.Unlock()
+	if beforeRelease != 1 {
+		t.Fatalf("later attachment overtook pending steer: %d active turns", beforeRelease)
+	}
+	close(release)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		bot.activeTurnsMu.Lock()
+		registered := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+		bot.activeTurnsMu.Unlock()
+		if registered == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ordered fallback turns were not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	bot.finishActiveTurn("C1", "thread.1", source)
+	cancel()
+	bot.releaseThreadReservation("C1", "thread.1", hold)
+
+	var got []string
+	for range 2 {
+		select {
+		case message := <-mgr.turns:
+			got = append(got, message)
+		case <-time.After(time.Second):
+			t.Fatal("ordered fallback turn did not start")
+		}
+	}
+	if !strings.HasSuffix(got[0], "] first") || !strings.HasSuffix(got[1], "] with file") {
+		t.Fatalf("FIFO fallback order = %q", got)
+	}
+}
+
+func TestActiveThreadAttachmentIsReservedBeforeSlowDownload(t *testing.T) {
+	withTempUploadDir(t)
+	downloadStarted := make(chan struct{})
+	releaseDownload := make(chan struct{})
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(downloadStarted)
+		<-releaseDownload
+		_, _ = w.Write([]byte("attachment"))
+	}))
+	t.Cleanup(fileServer.Close)
+
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	bot.botToken = "xoxb-test"
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1)}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	hold := bot.reserveThread("C1", "thread.1")
+	hold.Wait()
+	_, cancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", cancel)
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel", SubType: "file_share",
+		ThreadTimeStamp: "thread.1", TimeStamp: "100.000002", Text: "read this",
+		Message: &slack.Msg{Files: []slack.File{{
+			ID: "F1", Name: "note.txt", Size: 10, Mimetype: "text/plain",
+			URLPrivateDownload: fileServer.URL,
+		}}},
+	})
+	select {
+	case <-downloadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("attachment download did not start")
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		bot.finishActiveTurn("C1", "thread.1", source)
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		t.Fatal("terminal overtook an attachment received during the active turn")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseDownload)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("attachment admission did not release after download")
+	}
+	cancel()
+	bot.releaseThreadReservation("C1", "thread.1", hold)
+}
+
+func TestStopCancelsActiveThreadAttachmentDownload(t *testing.T) {
+	withTempUploadDir(t)
+	downloadStarted := make(chan struct{})
+	downloadCancelled := make(chan struct{})
+	releaseDownload := make(chan struct{})
+	fileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(downloadStarted)
+		select {
+		case <-r.Context().Done():
+			close(downloadCancelled)
+		case <-releaseDownload:
+			_, _ = w.Write([]byte("attachment"))
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseDownload)
+		fileServer.Close()
+	})
+
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	bot.botToken = "xoxb-test"
+	bot.userCache["U123"] = "Alice"
+
+	hold := bot.reserveThread("C1", "thread.1")
+	hold.Wait()
+	_, cancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", cancel)
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel", SubType: "file_share",
+		ThreadTimeStamp: "thread.1", TimeStamp: "100.000002", Text: "read this",
+		Message: &slack.Msg{Files: []slack.File{{
+			ID: "F1", Name: "note.txt", Size: 10, Mimetype: "text/plain",
+			URLPrivateDownload: fileServer.URL,
+		}}},
+	})
+	select {
+	case <-downloadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("attachment download did not start")
+	}
+
+	source.requestStop()
+	finished := make(chan struct{})
+	go func() {
+		bot.finishActiveTurn("C1", "thread.1", source)
+		close(finished)
+	}()
+	select {
+	case <-downloadCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not cancel attachment HTTP request")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled attachment download kept terminal sealing blocked")
+	}
+	bot.releaseThreadReservation("C1", "thread.1", hold)
+}
+
+func TestSlackSteerTimeoutReleasesTerminalAndFallsBack(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	bot.steerTimeout = 10 * time.Millisecond
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1), waitContext: true}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	hold := bot.reserveThread("C1", "thread.1")
+	hold.Wait()
+	_, cancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", cancel)
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "do not hang", "U123")
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("steer was not attempted")
+	}
+
+	finished := make(chan struct{})
+	go func() {
+		bot.finishActiveTurn("C1", "thread.1", source)
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out steer pinned terminal sealing")
+	}
+	cancel()
+	bot.releaseThreadReservation("C1", "thread.1", hold)
+}
+
+func TestSlackSteerAdmissionIsBounded(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+
+	reservations := make([]*activeSteerReservation, 0, maxPendingSteerAdmissions)
+	for range maxPendingSteerAdmissions {
+		gotTurn, reservation, full := bot.reserveActiveAdmission("C1", "thread.1")
+		if gotTurn != turn || reservation == nil || full {
+			t.Fatalf("admission unexpectedly rejected at %d", len(reservations))
+		}
+		reservations = append(reservations, reservation)
+	}
+	if gotTurn, reservation, full := bot.reserveActiveAdmission("C1", "thread.1"); gotTurn != turn || reservation != nil || !full {
+		t.Fatalf("overflow admission = turn:%v reservation:%v full:%v", gotTurn, reservation, full)
+	}
+	for _, reservation := range reservations {
+		reservation.Release()
+	}
+}
+
+func TestProcessIncomingHandlesFullSecondAdmissionCheck(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	bot.userCache["U123"] = "Alice"
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+
+	reservations := make([]*activeSteerReservation, 0, maxPendingSteerAdmissions)
+	for range maxPendingSteerAdmissions {
+		_, reservation, full := bot.reserveActiveAdmission("C1", "thread.1")
+		if reservation == nil || full {
+			t.Fatal("failed to fill active admission queue")
+		}
+		reservations = append(reservations, reservation)
+	}
+	defer func() {
+		for _, reservation := range reservations {
+			reservation.Release()
+		}
+	}()
+
+	// This path performs a second admission check after formatting. It must
+	// handle (active, nil, full) without calling admission.Wait on nil.
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "overflow", "U123")
+}
+
+func TestStopCancelsUserLookupHoldingActiveAdmission(t *testing.T) {
+	lookupStarted := make(chan struct{})
+	releaseLookup := make(chan struct{})
+	var lookupOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/users.info" {
+			lookupOnce.Do(func() { close(lookupStarted) })
+			select {
+			case <-r.Context().Done():
+			case <-releaseLookup:
+			}
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"messages":[]}`))
+	}))
+	t.Cleanup(func() {
+		close(releaseLookup)
+		server.Close()
+	})
+
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	bot.api = slack.New("xoxb-test", slack.OptionAPIURL(server.URL+"/"))
+	turnCtx, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	_, admission, full := bot.reserveActiveAdmission("C1", "thread.1")
+	if admission == nil || full {
+		t.Fatal("failed to reserve active admission")
+	}
+
+	processed := make(chan struct{})
+	go func() {
+		bot.processIncomingWithReservedAdmission(context.Background(), "C1", "thread.1", "100.000002",
+			"continue", "U123", nil, true, turn, admission)
+		close(processed)
+	}()
+	select {
+	case <-lookupStarted:
+	case <-time.After(time.Second):
+		t.Fatal("users.info lookup did not start")
+	}
+
+	turn.requestStop()
+	finished := make(chan struct{})
+	go func() {
+		bot.finishActiveTurn("C1", "thread.1", turn)
+		close(finished)
+	}()
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("message processing remained blocked in user lookup")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("user lookup kept terminal sealing blocked")
+	}
+	if turnCtx.Err() == nil {
+		t.Fatal("stop did not cancel active turn context")
+	}
+}
+
+func TestUncertainSlackSteerIsNotRetriedAsTurn(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1), err: agent.ErrSteerDeliveryUncertain}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	_, cancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.1", cancel)
+	defer cancel()
+	defer bot.unregisterActiveTurn("C1", "thread.1", turn)
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "maybe once", "U123")
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("steer was not attempted")
+	}
+	waitSteerQueue(t, turn)
+	if got := mgr.oneShots.Load(); got != 0 {
+		t.Fatalf("uncertain steer was retried as %d ordinary turns", got)
+	}
+	if len(turn.steerHistory) != 1 {
+		t.Fatalf("uncertain steer must remain in canonical history: %+v", turn.steerHistory)
+	}
+}
+
+func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &countingMgr{}
+	bot.mgr = mgr
+
+	sourceReservation, arrivalReservation := bot.reserveThreadPair("C1", "thread.1")
+	_, sourceCancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", sourceCancel)
+	arrival := &slackHandoffReservation{
+		bot: bot, channel: "C1", threadTS: "thread.1",
+		reservation: arrivalReservation, source: source,
+	}
+	if err := arrival.Activate(context.Background(), "continue after handoff", "peer-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	source.requestStop()
+	bot.unregisterActiveTurn("C1", "thread.1", source)
+	bot.releaseThreadReservation("C1", "thread.1", sourceReservation)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		bot.activeTurnsMu.Lock()
+		remaining := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+		bot.activeTurnsMu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("handoff arrival remained registered after source stop")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := mgr.oneShots.Load(); got != 0 {
+		t.Fatalf("handoff continuation started %d one-shot turns, want 0", got)
+	}
+}
+
+func TestHandoffArrivalIncludesAcceptedSlackSteers(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &steerTestMgr{calls: make(chan steerCall, 1)}
+	bot.mgr = mgr
+	bot.userCache["U123"] = "Alice"
+
+	sourceReservation, arrivalReservation := bot.reserveThreadPair("C1", "thread.1")
+	_, sourceCancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", sourceCancel)
+	bot.processIncoming(context.Background(), "C1", "thread.1", "100.000002", "carry this", "U123")
+	select {
+	case <-mgr.calls:
+	case <-time.After(time.Second):
+		t.Fatal("steer was not attempted")
+	}
+	waitSteerQueue(t, source)
+
+	arrival := &slackHandoffReservation{
+		bot: bot, channel: "C1", threadTS: "thread.1",
+		reservation: arrivalReservation, source: source,
+		history: []chathistory.HistoryMessage{{MessageID: "100.000001", Text: "source"}},
+	}
+	if err := arrival.Activate(context.Background(), "continue after handoff", "peer-2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(arrival.history) != 2 || arrival.history[1].MessageID != "100.000002" || arrival.history[1].Text != "carry this" {
+		t.Fatalf("arrival history = %+v", arrival.history)
+	}
+
+	// Stop the source so the test does not actually start its synthetic
+	// continuation; the snapshot assertion above is the behavior under test.
+	source.requestStop()
+	bot.finishActiveTurn("C1", "thread.1", source)
+	sourceCancel()
+	bot.releaseThreadReservation("C1", "thread.1", sourceReservation)
+}
+
+func TestHandoffArrivalActiveOrderMatchesReservedFIFO(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	sourceReservation, arrivalReservation := bot.reserveThreadPair("C1", "thread.1")
+	ordinaryReservation := bot.reserveThread("C1", "thread.1")
+	_, sourceCancel := context.WithCancel(context.Background())
+	_, ordinaryCancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", sourceCancel)
+	ordinary := bot.registerActiveTurn("C1", "thread.1", ordinaryCancel)
+	arrival := &slackHandoffReservation{
+		bot: bot, channel: "C1", threadTS: "thread.1",
+		reservation: arrivalReservation, source: source,
+	}
+	if err := arrival.Activate(context.Background(), "continue after handoff", "peer-2"); err != nil {
+		t.Fatal(err)
+	}
+
+	bot.activeTurnsMu.Lock()
+	turns := append([]*activeTurn(nil), bot.activeTurns[activeTurnKey("C1", "thread.1")]...)
+	bot.activeTurnsMu.Unlock()
+	if len(turns) != 3 || turns[0] != source || turns[2] != ordinary {
+		t.Fatalf("active order does not match source→arrival→ordinary reservation: %#v", turns)
+	}
+
+	// Once the source completes, !stop must target the reserved arrival rather
+	// than the later ordinary Slack message.
+	bot.unregisterActiveTurn("C1", "thread.1", source)
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("arrival was not cancellable")
+	}
+	if ordinary.stopRequested() {
+		t.Fatal("ordinary turn overtook reserved handoff arrival in active registry")
+	}
+	bot.releaseThreadReservation("C1", "thread.1", sourceReservation)
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		bot.activeTurnsMu.Lock()
+		remaining := bot.activeTurns[activeTurnKey("C1", "thread.1")]
+		arrivalGone := len(remaining) == 1 && remaining[0] == ordinary
+		bot.activeTurnsMu.Unlock()
+		if arrivalGone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled arrival did not release its FIFO slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ordinaryReservation.Wait()
+	bot.unregisterActiveTurn("C1", "thread.1", ordinary)
+	ordinaryCancel()
+	bot.releaseThreadReservation("C1", "thread.1", ordinaryReservation)
+}
+
+func TestCancelledHandoffArrivalReleasesWhileSemaphoreFull(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+	mgr := &countingMgr{}
+	bot.mgr = mgr
+	for range cap(bot.sem) {
+		bot.sem <- struct{}{}
+	}
+	defer func() {
+		for range cap(bot.sem) {
+			<-bot.sem
+		}
+	}()
+
+	sourceReservation, arrivalReservation := bot.reserveThreadPair("C1", "thread.1")
+	ordinaryReservation := bot.reserveThread("C1", "thread.1")
+	_, sourceCancel := context.WithCancel(context.Background())
+	source := bot.registerActiveTurn("C1", "thread.1", sourceCancel)
+	arrival := &slackHandoffReservation{
+		bot: bot, channel: "C1", threadTS: "thread.1",
+		reservation: arrivalReservation, source: source,
+	}
+	if err := arrival.Activate(context.Background(), "continue after handoff", "peer-2"); err != nil {
+		t.Fatal(err)
+	}
+	bot.unregisterActiveTurn("C1", "thread.1", source)
+	bot.releaseThreadReservation("C1", "thread.1", sourceReservation)
+	if !bot.cancelActiveTurn("C1", "thread.1") {
+		t.Fatal("waiting arrival was not cancellable")
+	}
+
+	unblocked := make(chan struct{})
+	go func() {
+		ordinaryReservation.Wait()
+		close(unblocked)
+	}()
+	select {
+	case <-unblocked:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled arrival did not release its reservation while semaphore was full")
+	}
+	if got := mgr.oneShots.Load(); got != 0 {
+		t.Fatalf("cancelled arrival started %d one-shot turns, want 0", got)
+	}
+	bot.activeTurnsMu.Lock()
+	remaining := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+	bot.activeTurnsMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("cancelled arrival left %d active registrations", remaining)
+	}
+	bot.releaseThreadReservation("C1", "thread.1", ordinaryReservation)
+}
+
+func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
+	var postCalls atomic.Int32
+	var gotThread, gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+			_ = r.ParseForm()
+			gotThread = r.FormValue("thread_ts")
+			gotMarkdown = r.FormValue("markdown_text")
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID: "test-agent", agentDataDir: t.TempDir(),
+		config: agent.SlackBotConfig{Enabled: true, ThreadReplies: false},
+		api:    api, mgr: &mockMgr{}, logger: testLogger, botUserID: "UBOTTEST",
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		threadLocks: make(map[string]*threadLock), activeTurns: make(map[string][]*activeTurn),
+		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	// No history and thread auto-replies are disabled. A normal thread post
+	// would be ignored, but the command must still reach the active registry.
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.123", TimeStamp: "msg.456", Text: "!stop",
+	})
+	select {
+	case <-turnCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("active turn was not cancelled")
+	}
+	if postCalls.Load() != 1 || gotThread != "thread.123" || gotMarkdown != stopCommandAck {
+		t.Fatalf("stop ack calls=%d thread=%q markdown=%q", postCalls.Load(), gotThread, gotMarkdown)
+	}
+}
+
 // --- postMessage / chat.update markdown_text tests ---
 
 // TestBotPostMessageSendsMarkdownTextOnly verifies that postMessage emits
@@ -309,6 +1187,61 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 	}
 	if got.text != "" {
 		t.Errorf("text must be empty to avoid markdown_text_conflict, got %q", got.text)
+	}
+}
+
+func TestBotPostMessageFallsBackToLegacyTextOnMarkdownTextErrors(t *testing.T) {
+	for _, slackError := range []string{"invalid_blocks_format", "markdown_text_conflict"} {
+		t.Run(slackError, func(t *testing.T) {
+			type captured struct{ text, markdownText, threadTS string }
+			var calls []captured
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = r.ParseForm()
+				calls = append(calls, captured{r.FormValue("text"), r.FormValue("markdown_text"), r.FormValue("thread_ts")})
+				if len(calls) == 1 {
+					fmt.Fprintf(w, `{"ok":false,"error":%q}`, slackError)
+					return
+				}
+				fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"123.456"}`)
+			}))
+			defer srv.Close()
+
+			bot := &Bot{api: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), logger: testLogger}
+			body := "## Heading\n\n**bold** and [link](https://example.com)"
+			if !bot.postMessage(context.Background(), "C1", "thread.999", body) {
+				t.Fatal("postMessage should succeed via legacy text fallback")
+			}
+			if len(calls) != 2 {
+				t.Fatalf("chat.postMessage called %d times, want 2", len(calls))
+			}
+			if calls[0].markdownText != body || calls[0].text != "" {
+				t.Errorf("first call = %+v, want markdown_text only", calls[0])
+			}
+			if calls[1].markdownText != "" || calls[1].text != PlainToSlack(body) {
+				t.Errorf("fallback call = %+v, want legacy converted text", calls[1])
+			}
+			if calls[0].threadTS != "thread.999" || calls[1].threadTS != "thread.999" {
+				t.Errorf("thread_ts was not preserved: %+v", calls)
+			}
+		})
+	}
+}
+
+func TestBotPostMessageDoesNotFallbackToLegacyTextOnUnrelatedSlackError(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":false,"error":"channel_not_found"}`)
+	}))
+	defer srv.Close()
+	bot := &Bot{api: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), logger: testLogger}
+	if bot.postMessage(context.Background(), "C1", "thread.999", "hello") {
+		t.Fatal("postMessage unexpectedly succeeded")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("chat.postMessage calls = %d, want 1", calls.Load())
 	}
 }
 
@@ -473,6 +1406,41 @@ type scriptedMgr struct {
 	lastOneShotOpts agent.OneShotOpts
 }
 
+type countingMgr struct{ oneShots atomic.Int32 }
+
+func (m *countingMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
+	ch := make(chan agent.ChatEvent)
+	close(ch)
+	return ch, nil
+}
+
+func (m *countingMgr) ChatOneShot(_ context.Context, _, _ string, _ agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	m.oneShots.Add(1)
+	ch := make(chan agent.ChatEvent)
+	close(ch)
+	return ch, nil
+}
+
+// interruptedRelayMgr models the peer relay contract: text already decoded on
+// the Hub is delivered, then cancelling the HTTP request closes the stream
+// without an authoritative terminal event.
+type interruptedRelayMgr struct{ started chan struct{} }
+
+func (m *interruptedRelayMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
+	panic("unexpected Chat call")
+}
+
+func (m *interruptedRelayMgr) ChatOneShot(ctx context.Context, _, _ string, _ agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+	ch := make(chan agent.ChatEvent, 1)
+	ch <- agent.ChatEvent{Type: "text", Delta: "partial from holder"}
+	close(m.started)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
 func (m *scriptedMgr) Chat(_ context.Context, _, _, _ string, _ []agent.MessageAttachment, _ ...agent.BusySource) (<-chan agent.ChatEvent, error) {
 	ch := make(chan agent.ChatEvent, len(m.events)+1)
 	for _, e := range m.events {
@@ -518,6 +1486,8 @@ type streamScript struct {
 	issuedTS     []string // ts values returned by chat.startStream
 	stoppedTS    []string // ts values seen by chat.stopStream
 	deletedTS    []string // ts values seen by chat.delete (dead-stream cleanup)
+	startSeen    chan struct{}
+	startOnce    sync.Once
 	appendOnTS   []string // ts the bot tried to append to (in order)
 	lastUpdateTS string
 	lastUpdateMD string
@@ -541,6 +1511,9 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 			}
 			ts := script.streamTSs[idx]
 			script.issuedTS = append(script.issuedTS, ts)
+			if script.startSeen != nil {
+				script.startOnce.Do(func() { close(script.startSeen) })
+			}
 			fmt.Fprintf(w, `{"ok":true,"channel":"C1","ts":%q}`, ts)
 		case "/chat.appendStream":
 			idx := script.appendCalls
@@ -722,6 +1695,86 @@ func TestSendToAgentNeverLeaksNoReplyTokenOnError(t *testing.T) {
 	}
 	if strings.Contains(script.lastPostMD, noReplyToken) {
 		t.Fatalf("no-reply token leaked in failure message: %q", script.lastPostMD)
+	}
+}
+
+func TestSendToAgentPreservesCancelledDoneContent(t *testing.T) {
+	script := &streamScript{}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "text", Delta: "partial"},
+		{Type: "done", Message: &agent.Message{Content: "partial work completed before stop"}, ErrorMessage: agent.ErrMsgCancelled},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+	if script.postCalls != 1 || script.lastPostMD != "partial work completed before stop" {
+		t.Fatalf("cancelled partial not delivered: posts=%d body=%q", script.postCalls, script.lastPostMD)
+	}
+}
+
+func TestSendToAgentPreservesHubDecodedPartialWhenPeerRelayIsCancelled(t *testing.T) {
+	streamStarted := make(chan struct{})
+	script := &streamScript{streamTSs: []string{"stream.1"}, startSeen: streamStarted}
+	srv := newStreamServer(t, script)
+	mgr := &interruptedRelayMgr{started: make(chan struct{})}
+	bot := newBotWithStream(t, mgr, srv)
+
+	done := make(chan struct{})
+	go func() {
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+		close(done)
+	}()
+	select {
+	case <-streamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Hub did not decode and stream the relay partial")
+	}
+	if !bot.cancelActiveTurn("C1", "thread.123") {
+		t.Fatal("peer-relayed turn was not registered for cancellation")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer-relayed turn did not finalize after cancellation")
+	}
+	got := script.lastUpdateMD
+	if got == "" {
+		got = script.lastPostMD
+	}
+	if got != "partial from holder" {
+		t.Fatalf("Hub-decoded partial was not finalized: updates=%d posts=%d update=%q post=%q",
+			script.updateCalls, script.postCalls, script.lastUpdateMD, script.lastPostMD)
+	}
+}
+
+func TestSendToAgentReportsStoppedWhenCancelledWithoutContent(t *testing.T) {
+	script := &streamScript{}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{{Type: "done", ErrorMessage: agent.ErrMsgCancelled}}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+	if script.postCalls != 1 || script.lastPostMD != stopCommandDone {
+		t.Fatalf("cancelled empty turn posts=%d body=%q", script.postCalls, script.lastPostMD)
+	}
+}
+
+func TestSendToAgentDeletesProgressOnlyStreamAfterStopNotice(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.1"}}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{
+		{Type: "tool_use", ToolName: "Bash"},
+		{Type: "done", ErrorMessage: agent.ErrMsgCancelled},
+	}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+	if script.postCalls != 1 || script.lastPostMD != stopCommandDone {
+		t.Fatalf("stop notice posts=%d body=%q", script.postCalls, script.lastPostMD)
+	}
+	if !containsString(script.deletedTS, "stream.1") {
+		t.Fatalf("progress-only stream was not deleted: %v", script.deletedTS)
 	}
 }
 
@@ -1230,6 +2283,21 @@ func TestSendToAgentBoundsDeadStreamArtifactsDuringSlowRotation(t *testing.T) {
 		if !containsString(script.stoppedTS, ts) {
 			t.Errorf("retained failure artifact %q was not stopped; stoppedTS=%v", ts, script.stoppedTS)
 		}
+	}
+}
+
+func TestSendToAgentDeletesStreamWhenUpdateFailsAndFreshPostSucceeds(t *testing.T) {
+	script := &streamScript{streamTSs: []string{"stream.1"}, failUpdate: true}
+	srv := newStreamServer(t, script)
+	mgr := &scriptedMgr{events: []agent.ChatEvent{{Type: "text", Delta: "hello world"}}}
+	bot := newBotWithStream(t, mgr, srv)
+
+	bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+	if script.postCalls == 0 {
+		t.Fatal("expected fresh post fallback after chat.update failure")
+	}
+	if !containsString(script.deletedTS, "stream.1") {
+		t.Fatalf("stale live stream was not deleted; deletedTS=%v", script.deletedTS)
 	}
 }
 

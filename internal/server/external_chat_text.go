@@ -35,7 +35,11 @@ const (
 	defaultExternalChatHandoffWait = 30 * time.Second
 	defaultExternalChatPoll        = 250 * time.Millisecond
 	defaultExternalChatProbe       = 2 * time.Second
+	maxConcurrentLocalSteers       = 8
+	localSteerAdmissionWait        = 5 * time.Second
 )
+
+var fallbackLocalSteerSem = make(chan struct{}, maxConcurrentLocalSteers)
 
 // externalChatRouter keeps Slack transport ownership on the Hub while
 // dispatching only the agent turn to the machine that currently owns the
@@ -47,9 +51,10 @@ type externalChatRouter struct {
 	mu     sync.RWMutex
 	routes map[string]string // agent ID -> most recently confirmed holder
 
-	handoffWait  time.Duration
-	pollInterval time.Duration
-	probeTimeout time.Duration
+	handoffWait   time.Duration
+	pollInterval  time.Duration
+	probeTimeout  time.Duration
+	localSteerSem chan struct{}
 }
 
 type externalChatTextRequest struct {
@@ -65,6 +70,7 @@ type externalChatTextRequest struct {
 	ResponseAttachmentGroupID   string                    `json:"responseAttachmentGroupId,omitempty"`
 	ResponseAttachmentMessageID string                    `json:"responseAttachmentMessageId,omitempty"`
 	HandoffCapability           string                    `json:"-"`
+	PreserveTerminalOnCancel    bool                      `json:"-"`
 }
 
 type externalChatSteerRequest struct {
@@ -186,11 +192,12 @@ type externalChatDispatchResult struct {
 
 func newExternalChatRouter(s *Server) *externalChatRouter {
 	return &externalChatRouter{
-		server:       s,
-		routes:       make(map[string]string),
-		handoffWait:  defaultExternalChatHandoffWait,
-		pollInterval: defaultExternalChatPoll,
-		probeTimeout: defaultExternalChatProbe,
+		server:        s,
+		routes:        make(map[string]string),
+		handoffWait:   defaultExternalChatHandoffWait,
+		pollInterval:  defaultExternalChatPoll,
+		probeTimeout:  defaultExternalChatProbe,
+		localSteerSem: make(chan struct{}, maxConcurrentLocalSteers),
 	}
 }
 
@@ -240,6 +247,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		ForceFreshSession:           opts.ForceFreshSession,
 		ResponseAttachmentGroupID:   opts.ResponseAttachmentGroupID,
 		ResponseAttachmentMessageID: opts.ResponseAttachmentMessageID,
+		PreserveTerminalOnCancel:    opts.PreserveTerminalOnCancel,
 	}
 	if opts.SessionKey != "" && opts.HandoffArrivalReservation != nil {
 		req.HandoffCapability = r.server.mintHandoffArrivalCapability(agentID, opts.SessionKey, opts.HandoffArrivalReservation)
@@ -252,7 +260,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 			r.server.finishHandoffArrivalTurn(req.HandoffCapability)
 			return
 		}
-		events = r.trackHandoffCapabilityStream(ctx, req.HandoffCapability, events)
+		events = r.trackHandoffCapabilityStream(ctx, req.HandoffCapability, events, req.PreserveTerminalOnCancel)
 	}()
 
 	// A handoff arrival is fenced to the holder that finalized that exact
@@ -358,7 +366,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 // reservation snapshot to the source turn lifetime. Successful handoff
 // admission compacts it to a small idempotency tombstone; an ordinary turn
 // removes it when its event stream ends.
-func (r *externalChatRouter) trackHandoffCapabilityStream(ctx context.Context, capability string, in <-chan agent.ChatEvent) <-chan agent.ChatEvent {
+func (r *externalChatRouter) trackHandoffCapabilityStream(ctx context.Context, capability string, in <-chan agent.ChatEvent, preserveTerminalOnCancel bool) <-chan agent.ChatEvent {
 	out := make(chan agent.ChatEvent, 64)
 	go func() {
 		defer close(out)
@@ -372,14 +380,36 @@ func (r *externalChatRouter) trackHandoffCapabilityStream(ctx context.Context, c
 				select {
 				case out <- event:
 				case <-ctx.Done():
+					forwardTrackedTerminalAfterCancel(in, out, event, preserveTerminalOnCancel)
 					return
 				}
 			case <-ctx.Done():
+				forwardTrackedTerminalAfterCancel(in, out, agent.ChatEvent{}, preserveTerminalOnCancel)
 				return
 			}
 		}
 	}()
 	return out
+}
+
+func forwardTrackedTerminalAfterCancel(in <-chan agent.ChatEvent, out chan<- agent.ChatEvent, current agent.ChatEvent, preserve bool) {
+	if !preserve {
+		return
+	}
+	for {
+		if current.Type == "done" || current.Type == "error" {
+			out <- current
+			return
+		}
+		if current.Type == "attachment" && current.BeginAttachmentOwnership() {
+			current.FinishAttachmentOwnership(false)
+		}
+		event, ok := <-in
+		if !ok {
+			return
+		}
+		current = event
+	}
 }
 
 // SteerOneShot follows a WebUI thread turn to its current holder and injects
@@ -411,7 +441,9 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 			if !ready.Ready {
 				return fmt.Errorf("agent thread holder is unavailable: %s", ready.Unavailable)
 			}
-			return r.server.agents.SteerOneShotForAgent(agentID, sessionKey, content)
+			return steerOneShotWithContext(ctx, r.localSteerSem, localSteerAdmissionWait, func() error {
+				return r.server.agents.SteerOneShotForAgent(agentID, sessionKey, content)
+			})
 		}
 
 		ready, err := r.probeHolder(ctx, agentID, holder)
@@ -471,6 +503,52 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 	return errors.New("thread holder changed too many times before steer admission")
 }
 
+// Manager's holder-local SteerFunc predates context-aware transports. Run it
+// behind a buffered result so Slack stop/timeout can release its ordered
+// admission even if a backend write wedges. Once the call has started,
+// cancellation is necessarily delivery-uncertain: the backend may accept the
+// input after the caller stops waiting, so the transport must not retry it as a
+// normal turn.
+func steerOneShotWithContext(ctx context.Context, sem chan struct{}, admissionWait time.Duration, steer func() error) error {
+	if sem == nil {
+		sem = fallbackLocalSteerSem
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	admissionCtx, cancelAdmission := context.WithTimeout(ctx, admissionWait)
+	defer cancelAdmission()
+	select {
+	case sem <- struct{}{}:
+	case <-admissionCtx.Done():
+		// No backend call started, so the caller may safely fall back to an
+		// ordinary turn rather than treating delivery as uncertain.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.New("local steer admission timed out before backend call")
+	}
+	if err := admissionCtx.Err(); err != nil {
+		<-sem
+		if parentErr := ctx.Err(); parentErr != nil {
+			return parentErr
+		}
+		return errors.New("local steer admission timed out before backend call")
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := steer()
+		<-sem
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: local steer did not finish before cancellation: %v", agent.ErrSteerDeliveryUncertain, ctx.Err())
+	}
+}
+
 func (r *externalChatRouter) initialRoute(ctx context.Context, agentID string) (holder string, local bool, err error) {
 	s := r.server
 	self := r.selfPeerID()
@@ -526,6 +604,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			HandoffCapability:                 req.HandoffCapability,
 			ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
 			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
+			PreserveTerminalOnCancel:          req.PreserveTerminalOnCancel,
 		})
 		if err != nil {
 			if errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID) {

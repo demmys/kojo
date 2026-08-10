@@ -72,7 +72,7 @@ func TestTrackHandoffCapabilityStreamDropsUnusedCapability(t *testing.T) {
 	close(source)
 
 	var got []agent.ChatEvent
-	for event := range router.trackHandoffCapabilityStream(context.Background(), capability, source) {
+	for event := range router.trackHandoffCapabilityStream(context.Background(), capability, source, false) {
 		got = append(got, event)
 	}
 	if len(got) != 1 || got[0].Delta != "done" {
@@ -82,6 +82,31 @@ func TestTrackHandoffCapabilityStreamDropsUnusedCapability(t *testing.T) {
 	defer srv.handoffArrivalMu.Unlock()
 	if _, ok := srv.handoffArrivalCaps[capability]; ok {
 		t.Fatal("capability survived closed source stream")
+	}
+}
+
+func TestTrackHandoffCapabilityStreamPreservesTerminalAfterCancel(t *testing.T) {
+	srv := &Server{}
+	capability := srv.mintHandoffArrivalCapability("ag_1", "slack:C:T",
+		&fakeArrivalReservation{started: make(chan struct{}, 1)})
+	router := &externalChatRouter{server: srv}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	source := make(chan agent.ChatEvent, 2)
+	source <- agent.ChatEvent{Type: "text", Delta: "lossy partial"}
+	source <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "authoritative partial"}, ErrorMessage: agent.ErrMsgCancelled}
+	close(source)
+
+	var got []agent.ChatEvent
+	for event := range router.trackHandoffCapabilityStream(ctx, capability, source, true) {
+		got = append(got, event)
+	}
+	if len(got) == 0 {
+		t.Fatal("terminal event was dropped")
+	}
+	last := got[len(got)-1]
+	if last.Type != "done" || last.Message == nil || last.Message.Content != "authoritative partial" {
+		t.Fatalf("events = %#v", got)
 	}
 }
 
@@ -271,6 +296,64 @@ func TestExternalChatRouterMarksLostSteerResponseUncertain(t *testing.T) {
 	if !errors.Is(err, agent.ErrSteerDeliveryUncertain) {
 		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
 	}
+}
+
+func TestSteerOneShotWithContextReturnsUncertainWithoutWaitingForLocalBackend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- steerOneShotWithContext(ctx, make(chan struct{}, 1), time.Second, func() error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, agent.ErrSteerDeliveryUncertain) {
+			t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled local steer remained blocked")
+	}
+	close(release)
+}
+
+func TestSteerOneShotWithContextBoundsAbandonedLocalCalls(t *testing.T) {
+	sem := make(chan struct{}, 1)
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- steerOneShotWithContext(firstCtx, sem, time.Second, func() error {
+			close(firstStarted)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstStarted
+	cancelFirst()
+	if err := <-firstDone; !errors.Is(err, agent.ErrSteerDeliveryUncertain) {
+		t.Fatalf("first err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+
+	secondCalled := false
+	err := steerOneShotWithContext(context.Background(), sem, 10*time.Millisecond, func() error {
+		secondCalled = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "admission timed out") {
+		t.Fatalf("second err = %v, want bounded admission timeout", err)
+	}
+	if secondCalled {
+		t.Fatal("second local backend call started while abandoned call occupied limiter")
+	}
+	close(releaseFirst)
 }
 
 func TestExternalChatRouterDoesNotMarkDialFailureUncertain(t *testing.T) {

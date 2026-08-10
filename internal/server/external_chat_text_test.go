@@ -62,6 +62,29 @@ func writeExternalChatTestStream(t *testing.T, w http.ResponseWriter, events ...
 	}
 }
 
+func TestTrackHandoffCapabilityStreamDropsUnusedCapability(t *testing.T) {
+	srv := &Server{}
+	capability := srv.mintHandoffArrivalCapability("ag_1", "slack:C:T",
+		&fakeArrivalReservation{started: make(chan struct{}, 1)})
+	router := &externalChatRouter{server: srv}
+	source := make(chan agent.ChatEvent, 1)
+	source <- agent.ChatEvent{Type: "text", Delta: "done"}
+	close(source)
+
+	var got []agent.ChatEvent
+	for event := range router.trackHandoffCapabilityStream(context.Background(), capability, source) {
+		got = append(got, event)
+	}
+	if len(got) != 1 || got[0].Delta != "done" {
+		t.Fatalf("events = %#v", got)
+	}
+	srv.handoffArrivalMu.Lock()
+	defer srv.handoffArrivalMu.Unlock()
+	if _, ok := srv.handoffArrivalCaps[capability]; ok {
+		t.Fatal("capability survived closed source stream")
+	}
+}
+
 func TestExternalChatRouterStreamsRemoteTextTurn(t *testing.T) {
 	requestSeen := make(chan externalChatTextRequest, 1)
 	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -747,7 +770,7 @@ func TestExternalChatReadyAdvertisesOriginAwareArrival(t *testing.T) {
 	}
 }
 
-func TestDispatchFinalizeDowngradesWhenOldTargetRejectsContinuation(t *testing.T) {
+func TestDispatchFinalizeSignalsDowngradeWhenOldTargetRejectsContinuation(t *testing.T) {
 	var calls int
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -765,10 +788,134 @@ func TestDispatchFinalizeDowngradesWhenOldTargetRejectsContinuation(t *testing.T
 	srv := &Server{peerID: &peer.Identity{DeviceID: "source"}, logger: slog.Default()}
 	err := srv.dispatchPeerAgentSyncFinalize(context.Background(), target.URL, "target", "ag_x", "op_x", nil,
 		&handoffContinuation{SessionKey: "groupdm:g", OriginPeerID: "hub", Capability: "cap"})
+	if !errors.Is(err, errFinalizeContinuationDowngrade) {
+		t.Fatalf("err = %v, want continuation downgrade", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want only capability finalize before caller applies barrier", calls)
+	}
+}
+
+func TestExternalChatRouterAcknowledgesAttachmentAfterConsumerAccepts(t *testing.T) {
+	ackSeen := make(chan struct{}, 1)
+	ackCalled := make(chan struct{}, 1)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet:
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder"})
+		case strings.HasSuffix(r.URL.Path, "/external-chat/attachment-ack"):
+			var in externalChatAttachmentAckRequest
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Token != "ack-token" {
+				t.Errorf("attachment ack = %#v err=%v", in, err)
+				http.Error(w, "bad ack", http.StatusBadRequest)
+				return
+			}
+			ackSeen <- struct{}{}
+			ackCalled <- struct{}{}
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		case strings.HasSuffix(r.URL.Path, "/external-chat"):
+			w.Header().Set("Content-Type", externalChatTextContentType)
+			w.WriteHeader(http.StatusOK)
+			enc := json.NewEncoder(w)
+			evt := agent.ChatEvent{Type: "attachment", Attachments: []agent.MessageAttachment{{Path: "blob:result"}}}
+			if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &evt, AttachmentAckToken: "ack-token"}); err != nil {
+				t.Error(err)
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			done := agent.ChatEvent{Type: "done"}
+			if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &done}); err != nil {
+				t.Error(err)
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			select {
+			case <-ackSeen:
+			case <-time.After(time.Second):
+				t.Error("Hub did not acknowledge accepted attachment")
+				return
+			}
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(holder.Close)
+
+	_, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	events, err := router.ChatOneShot(context.Background(), agentID, "create file", agent.OneShotOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("calls = %d, want capability finalize + legacy retry", calls)
+	seenDone := false
+	var attachmentClaims []agent.ChatEvent
+	for evt := range events {
+		switch evt.Type {
+		case "attachment":
+			if !evt.BeginAttachmentOwnership() {
+				t.Fatal("could not claim remote attachment")
+			}
+			attachmentClaims = append(attachmentClaims, evt)
+		case "done":
+			seenDone = true
+		}
+	}
+	if !seenDone {
+		t.Fatal("stream did not reach terminal event before persistence")
+	}
+	// The response adapter acknowledges only after its durable append succeeds.
+	for i := range attachmentClaims {
+		attachmentClaims[i].FinishAttachmentOwnership(true)
+	}
+	select {
+	case <-ackCalled:
+	case <-time.After(time.Second):
+		t.Fatal("holder did not receive post-persistence acknowledgement")
+	}
+}
+
+func TestExternalChatAttachmentAckIsBoundToAgentAndPeer(t *testing.T) {
+	s := &Server{}
+	token, entry, err := s.externalChatAttachmentAcks.register("ag_test", "hub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := entry.done
+	call := func(agentID, peerID string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(externalChatAttachmentAckRequest{Token: token})
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/external-chat/attachment-ack", bytes.NewReader(body))
+		req.SetPathValue("id", agentID)
+		req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Role: auth.RolePeer, PeerID: peerID}))
+		rr := httptest.NewRecorder()
+		s.handleExternalChatAttachmentAck(rr, req)
+		return rr
+	}
+	if rr := call("ag_other", "hub"); rr.Code != http.StatusConflict {
+		t.Fatalf("wrong agent status = %d", rr.Code)
+	}
+	if rr := call("ag_test", "other"); rr.Code != http.StatusConflict {
+		t.Fatalf("wrong peer status = %d", rr.Code)
+	}
+	select {
+	case <-done:
+		t.Fatal("invalid caller acknowledged attachment")
+	default:
+	}
+	if rr := call("ag_test", "hub"); rr.Code != http.StatusOK {
+		t.Fatalf("matching ack status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !s.externalChatAttachmentAcks.finish(token, entry) {
+		t.Fatal("acknowledged entry was not accepted")
+	}
+	if rr := call("ag_test", "hub"); rr.Code != http.StatusOK {
+		t.Fatalf("idempotent retry status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("matching acknowledgement did not release holder")
 	}
 }

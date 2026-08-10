@@ -1795,6 +1795,18 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	var thinking string
 	var toolUses []ToolUse
 	var replyAttachments []MessageAttachment
+	var attachmentClaims []ChatEvent
+	attachmentClaimsFinished := false
+	finishAttachmentClaims := func(accepted bool) {
+		if attachmentClaimsFinished {
+			return
+		}
+		attachmentClaimsFinished = true
+		for i := range attachmentClaims {
+			attachmentClaims[i].FinishAttachmentOwnership(accepted)
+		}
+	}
+	defer func() { finishAttachmentClaims(false) }()
 	for ev := range events {
 		// Subagent (Task tool) events route into the matching top-level
 		// ToolUse's Children in the live snapshot instead of the main
@@ -1829,7 +1841,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 				continue
 			}
 			replyAttachments = append(replyAttachments, ev.Attachments...)
-			ev.FinishAttachmentOwnership(true)
+			attachmentClaims = append(attachmentClaims, ev)
 		case "done":
 			// The done event's assembled message is the authoritative
 			// reply text: it merges assistant-event text that never
@@ -1952,7 +1964,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		// Preserve whatever the turn produced before failing, then post
 		// the visible failure notice / dead-letter as before.
 		if text != "" || thinking != "" || len(toolUses) > 0 || len(replyAttachments) > 0 {
-			if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true, replyMessageID, replyAttachments); err != nil {
+			if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, true, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 				m.logger.Warn("failed to post partial thread reply", "group", groupID, "agent", agentID, "err", err)
 			}
 		}
@@ -1972,7 +1984,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	if firstUserMessage != "" {
 		m.maybeAutoTitleThread(groupID, agentID, firstUserMessage)
 	}
-	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments); err != nil {
+	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)
 	}
 }
@@ -2050,13 +2062,13 @@ func (m *GroupDMManager) threadConversationSnapshot(ctx context.Context, groupID
 // agent's behalf, bypassing CAS and suppressing notify. Daemon-authored: the
 // agent produced the text via a one-shot turn, not a direct API post.
 func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool) (*GroupMessage, error) {
-	return m.postThreadReplyWithAttachments(groupID, agentID, content, model, effort, usage, thinking, toolUses, interrupted, "", nil)
+	return m.postThreadReplyWithAttachments(groupID, agentID, content, model, effort, usage, thinking, toolUses, interrupted, "", nil, nil)
 }
 
 // postThreadReplyWithAttachments is the attachment-aware thread reply path.
 // messageID is allocated before the one-shot stream starts so attachment blob
 // ownership and the persisted group message use the same stable ID.
-func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment) (*GroupMessage, error) {
+func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment, onPersisted func()) (*GroupMessage, error) {
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
@@ -2092,6 +2104,9 @@ func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, conten
 	g.UpdatedAt = time.Now().Format(time.RFC3339)
 	updatedAt := g.UpdatedAt
 	m.mu.Unlock()
+	if onPersisted != nil {
+		onPersisted()
+	}
 	m.touchStore(groupID, updatedAt)
 	return msg, nil
 }

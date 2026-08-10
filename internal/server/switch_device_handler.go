@@ -1098,6 +1098,26 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			if finalizeErr == nil {
 				break
 			}
+			if errors.Is(finalizeErr, errFinalizeContinuationDowngrade) {
+				// The target rolled back after its capability probe. For a
+				// one-shot self-call, legacy main arrival must remain behind the
+				// source turn that is still waiting for this HTTP response.
+				continuation = nil
+				if selfCall && callerOneShot.ID != 0 {
+					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID)
+					finalizeErr = nil
+					break
+				}
+				// No live response-surface turn needs a barrier. Send the legacy
+				// finalize immediately rather than consuming another loop attempt:
+				// the capability downgrade can be discovered on the final attempt.
+				legacyCtx, legacyCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+				finalizeErr = s.dispatchPeerAgentSyncFinalize(legacyCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, nil)
+				legacyCancel()
+				if finalizeErr == nil {
+					break
+				}
+			}
 			// Only retry the lock-not-self race; everything else is
 			// either fatal (4xx that won't fix itself) or fits the
 			// "operator manual retry / force-reclaim" path.
@@ -1292,8 +1312,9 @@ func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID,
 	err := s.agents.WaitOneShotDone(waitCtx, agentID, oneShotID)
 	cancel()
 	if err != nil {
-		s.logger.Warn("switch-device: downgraded source one-shot did not exit before finalize",
+		s.logger.Warn("switch-device: downgraded source one-shot did not exit; leaving target finalize pending",
 			"agent", agentID, "op_id", opID, "err", err)
+		return
 	}
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -1328,6 +1349,8 @@ func retryableFinalizeError(err error) bool {
 // in sync with the receiver-side 16<<20 in
 // peer_agent_sync_finalize_handler.go.
 const finalizeWireBodyCap = 16 << 20
+
+var errFinalizeContinuationDowngrade = errors.New("target rejected origin-aware finalize continuation")
 
 // dispatchPeerAgentSyncFinalize tells target to commit the
 // runtime side effects (TokenStore adopt, AgentLockGuard
@@ -1379,17 +1402,11 @@ func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, 
 		return err
 	}
 	// The target may have restarted or rolled back after the capability probe.
-	// Old strict decoders reject the new field; retry the still-pending finalize
-	// without it so runtime activation and legacy main arrival are not stranded.
-	s.logger.Warn("switch-device: target rejected continuation field; retrying legacy finalize",
+	// Return a distinct downgrade signal so the orchestrator can preserve the
+	// source one-shot barrier before it retries the still-pending legacy finalize.
+	s.logger.Warn("switch-device: target rejected continuation field; requesting legacy downgrade",
 		"agent", agentID, "op_id", opID, "target", targetDeviceID)
-	body.Continuation = nil
-	raw, marshalErr := json.Marshal(body)
-	if marshalErr != nil {
-		return fmt.Errorf("marshal legacy finalize body: %w", marshalErr)
-	}
-	return s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
-		"/api/v1/peers/agent-sync/finalize", raw)
+	return fmt.Errorf("%w: %v", errFinalizeContinuationDowngrade, err)
 }
 
 // dispatchPeerAgentSyncDrop tells target to discard any pending

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -17,6 +19,8 @@ import (
 // file, atomicfile's tmp+rename, an editor's multi-write save) into a
 // single disk→DB flush per agent.
 const fileWatchDebounce = 750 * time.Millisecond
+
+var errFileWatcherAdd = errors.New("file watcher add failed")
 
 // fileWatcher reflects an agent CLI's direct disk writes (MEMORY.md,
 // memory/**/*.md, persona.md, user.md, checkin.md) into the DB promptly,
@@ -79,15 +83,16 @@ func newFileWatcher(mgr *Manager) (*fileWatcher, error) {
 	return fw, nil
 }
 
-// addTree registers dir and every subdirectory under it. fsnotify is
-// non-recursive, so each directory is added individually; new
-// directories are picked up on their CREATE event in handle().
+// addTree registers only directories that can contain canonical workspace
+// mirrors: the agents root, each direct agent directory, and memory/**.
+// fsnotify is non-recursive, so each relevant directory is added
+// individually; new directories are picked up on their CREATE event in
+// handle().
 //
-// The per-agent index/ (embedding SQLite) and .kojo/ (attach staging)
-// dirs are skipped — they hold no canonical .md the DB mirrors. The
-// skip is scoped to the agent-root child (agents/<id>/index,
-// agents/<id>/.kojo) so a legitimately-named memory subdir like
-// memory/index/ is still watched.
+// Agent directories also contain arbitrary workspaces, repositories,
+// node_modules, and CLI state. Recursively watching those trees can exhaust
+// Linux's per-user inotify watch limit (ENOSPC) without improving DB
+// freshness, because none of their files are mirrored by this watcher.
 func (fw *fileWatcher) addTree(dir string) error {
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -96,19 +101,28 @@ func (fw *fileWatcher) addTree(dir string) error {
 		if !d.IsDir() {
 			return nil
 		}
-		if name := d.Name(); name == "index" || name == ".kojo" {
-			// rel == "<agentID>/<name>" → exactly the agent-root child.
-			if rel, rerr := filepath.Rel(fw.root, path); rerr == nil {
-				if segs := strings.Split(rel, string(filepath.Separator)); len(segs) == 2 {
-					return filepath.SkipDir
-				}
-			}
+		if !fw.shouldWatchDir(path) {
+			return filepath.SkipDir
 		}
-		if aerr := fw.w.Add(path); aerr != nil && fw.logger != nil {
-			fw.logger.Debug("file-watch: add dir failed", "path", path, "err", aerr)
+		if aerr := fw.w.Add(path); aerr != nil {
+			return fmt.Errorf("%w: %s: %w", errFileWatcherAdd, path, aerr)
 		}
 		return nil
 	})
+}
+
+// shouldWatchDir reports whether path is one of the narrow directory classes
+// whose contents can affect the DB mirror.
+func (fw *fileWatcher) shouldWatchDir(path string) bool {
+	rel, err := filepath.Rel(fw.root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	segs := strings.Split(rel, string(filepath.Separator))
+	return len(segs) == 1 || (len(segs) >= 2 && segs[1] == "memory")
 }
 
 // run is the event loop. Exits when the watcher's channels close
@@ -141,7 +155,12 @@ func (fw *fileWatcher) handle(ev fsnotify.Event) {
 	// agent — the disk→DB sync walks the tree and picks them all up.
 	if ev.Op&fsnotify.Create != 0 {
 		if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-			_ = fw.addTree(ev.Name)
+			if !fw.shouldWatchDir(ev.Name) {
+				return
+			}
+			if err := fw.addTree(ev.Name); err != nil && fw.logger != nil {
+				fw.logger.Warn("file-watch: add dir failed", "path", ev.Name, "err", err)
+			}
 			if aid := fw.agentIDFor(ev.Name); aid != "" {
 				fw.schedule(aid)
 			}

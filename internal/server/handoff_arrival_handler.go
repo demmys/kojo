@@ -20,7 +20,16 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-const handoffArrivalBodyLimit = 1 << 20
+const (
+	handoffArrivalBodyLimit       = 1 << 20
+	maxHandoffArrivalCapabilities = 4096
+)
+
+var (
+	errHandoffCapabilityInvalid  = errors.New("arrival capability is missing, expired, or bound to another conversation")
+	errHandoffCapabilityMismatch = errors.New("arrival capability is not bound to this handoff")
+	errHandoffArrivalUncertain   = errors.New("origin conversation arrival delivery is uncertain")
+)
 
 type handoffArrivalRequest struct {
 	HolderDeviceID string             `json:"holder_device_id"`
@@ -37,6 +46,8 @@ type handoffArrivalCapability struct {
 	ExpiresAt           time.Time
 	OpID, HolderID      string
 	Accepted, Admitting bool
+	TurnDone            bool
+	AdmissionDone       chan struct{}
 	Reservation         agent.HandoffArrivalReservation
 }
 
@@ -64,15 +75,117 @@ func (s *Server) mintHandoffArrivalCapability(agentID, sessionKey string, reserv
 		s.handoffArrivalCaps = make(map[string]*handoffArrivalCapability)
 	}
 	for key, entry := range s.handoffArrivalCaps {
-		if entry == nil || now.After(entry.ExpiresAt) {
+		// Accepted entries are compact idempotency tombstones. Keep them while
+		// the process has room because finalize is durably retryable and can
+		// legitimately replay the callback long after the admission window.
+		// Never reap an admission while Reservation.Activate is in flight.
+		if entry == nil || (!entry.Accepted && !entry.Admitting && now.After(entry.ExpiresAt)) {
 			delete(s.handoffArrivalCaps, key)
 		}
+	}
+	if len(s.handoffArrivalCaps) >= maxHandoffArrivalCapabilities {
+		// Never evict an accepted tombstone: target finalize may still be
+		// pending after its arrival was admitted, and forgetting it could replay
+		// the arrival. Degrade new turns to legacy main-WebUI continuation
+		// instead. A daemon restart already clears this in-memory ledger.
+		s.handoffArrivalMu.Unlock()
+		return ""
 	}
 	s.handoffArrivalCaps[capability] = &handoffArrivalCapability{
 		AgentID: agentID, SessionKey: sessionKey, ExpiresAt: now.Add(time.Hour), Reservation: reservation,
 	}
 	s.handoffArrivalMu.Unlock()
 	return capability
+}
+
+// finishHandoffArrivalTurn releases the capability when its ordinary source
+// turn ends without starting a handoff. If a callback is concurrently being
+// admitted, that callback owns the final cleanup decision.
+func (s *Server) finishHandoffArrivalTurn(capability string) {
+	if s == nil || capability == "" {
+		return
+	}
+	s.handoffArrivalMu.Lock()
+	defer s.handoffArrivalMu.Unlock()
+	entry := s.handoffArrivalCaps[capability]
+	if entry == nil {
+		return
+	}
+	entry.TurnDone = true
+	if !entry.Accepted && !entry.Admitting {
+		delete(s.handoffArrivalCaps, capability)
+	}
+}
+
+func (s *Server) completeHandoffArrivalAdmission(capability string, expected *handoffArrivalCapability, accepted bool) {
+	s.handoffArrivalMu.Lock()
+	defer s.handoffArrivalMu.Unlock()
+	entry := s.handoffArrivalCaps[capability]
+	if entry != expected {
+		return
+	}
+	entry.Admitting = false
+	done := entry.AdmissionDone
+	entry.AdmissionDone = nil
+	if accepted {
+		entry.Accepted = true
+		// The adapter owns the reservation lifecycle. Once activation succeeds,
+		// retain only the small dedup identity rather than the full history
+		// snapshot captured by the reservation.
+		entry.Reservation = nil
+		entry.ExpiresAt = time.Time{}
+	} else if entry.TurnDone {
+		delete(s.handoffArrivalCaps, capability)
+	}
+	if done != nil {
+		close(done)
+	}
+}
+
+func (s *Server) activateHandoffArrivalCapability(ctx context.Context, req handoffArrivalRequest, prompt string) error {
+	for {
+		s.handoffArrivalMu.Lock()
+		entry := s.handoffArrivalCaps[req.Capability]
+		if entry == nil || entry.AgentID != req.AgentID || entry.SessionKey != req.SessionKey {
+			s.handoffArrivalMu.Unlock()
+			return errHandoffCapabilityInvalid
+		}
+		if entry.OpID != req.OpID || entry.HolderID != req.HolderDeviceID {
+			s.handoffArrivalMu.Unlock()
+			return errHandoffCapabilityMismatch
+		}
+		if entry.Accepted {
+			s.handoffArrivalMu.Unlock()
+			return nil
+		}
+		if time.Now().After(entry.ExpiresAt) {
+			delete(s.handoffArrivalCaps, req.Capability)
+			s.handoffArrivalMu.Unlock()
+			return errHandoffCapabilityInvalid
+		}
+		if entry.Admitting {
+			done := entry.AdmissionDone
+			s.handoffArrivalMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-done:
+				continue
+			}
+		}
+		if entry.Reservation == nil {
+			s.handoffArrivalMu.Unlock()
+			return errHandoffCapabilityInvalid
+		}
+		entry.Admitting = true
+		entry.AdmissionDone = make(chan struct{})
+		reservation := entry.Reservation
+		s.handoffArrivalMu.Unlock()
+
+		err := reservation.Activate(ctx, prompt, req.HolderDeviceID)
+		s.completeHandoffArrivalAdmission(req.Capability, entry, err == nil)
+		return err
+	}
 }
 
 type handoffArrivalResponse struct {
@@ -236,53 +349,19 @@ func (s *Server) handleHandoffArrivalContinuation(w http.ResponseWriter, r *http
 		writeError(w, http.StatusConflict, "holder_not_current", "signer is not the current agent holder")
 		return
 	}
-
-	s.handoffArrivalMu.Lock()
-	capEntry := s.handoffArrivalCaps[req.Capability]
-	if capEntry == nil || time.Now().After(capEntry.ExpiresAt) ||
-		capEntry.AgentID != req.AgentID || capEntry.SessionKey != req.SessionKey {
-		s.handoffArrivalMu.Unlock()
-		writeError(w, http.StatusForbidden, "invalid_capability", "arrival capability is missing, expired, or bound to another conversation")
-		return
-	}
-	if capEntry.OpID != req.OpID || capEntry.HolderID != req.HolderDeviceID {
-		s.handoffArrivalMu.Unlock()
-		writeError(w, http.StatusForbidden, "capability_mismatch", "arrival capability is not bound to this handoff")
-		return
-	}
-	if capEntry.Accepted {
-		if capEntry.OpID == req.OpID && capEntry.HolderID == req.HolderDeviceID {
-			s.handoffArrivalMu.Unlock()
-			writeJSONResponse(w, http.StatusOK, handoffArrivalResponse{Accepted: true})
+	prompt := s.agents.BuildExternalDeviceSwitchArrivalPrompt(s.peerDisplayName(r.Context(), req.SourceDeviceID), req.Notes)
+	if err := s.activateHandoffArrivalCapability(r.Context(), req, prompt); err != nil {
+		if errors.Is(err, errHandoffCapabilityInvalid) {
+			writeError(w, http.StatusForbidden, "invalid_capability", err.Error())
 			return
 		}
-		s.handoffArrivalMu.Unlock()
-		writeError(w, http.StatusForbidden, "capability_consumed", "arrival capability was already consumed")
-		return
-	}
-	if capEntry.Admitting {
-		s.handoffArrivalMu.Unlock()
-		writeError(w, http.StatusConflict, "arrival_pending", "arrival callback is still being admitted")
-		return
-	}
-	capEntry.Admitting = true
-	s.handoffArrivalMu.Unlock()
-
-	prompt := s.agents.BuildExternalDeviceSwitchArrivalPrompt(s.peerDisplayName(r.Context(), req.SourceDeviceID), req.Notes)
-	if err := capEntry.Reservation.Activate(r.Context(), prompt, req.HolderDeviceID); err != nil {
-		s.handoffArrivalMu.Lock()
-		if entry := s.handoffArrivalCaps[req.Capability]; entry == capEntry && !entry.Accepted {
-			entry.Admitting = false
+		if errors.Is(err, errHandoffCapabilityMismatch) {
+			writeError(w, http.StatusForbidden, "capability_mismatch", err.Error())
+			return
 		}
-		s.handoffArrivalMu.Unlock()
 		writeError(w, http.StatusConflict, "conversation_unavailable", err.Error())
 		return
 	}
-	s.handoffArrivalMu.Lock()
-	if entry := s.handoffArrivalCaps[req.Capability]; entry == capEntry {
-		entry.Accepted, entry.Admitting = true, false
-	}
-	s.handoffArrivalMu.Unlock()
 	writeJSONResponse(w, http.StatusOK, handoffArrivalResponse{Accepted: true})
 }
 
@@ -330,7 +409,7 @@ func (s *Server) dispatchHandoffArrivalContinuation(ctx context.Context, originP
 	// arrival on a different surface. Prefer a visible degraded error to a
 	// duplicate agent turn.
 	if deliveryUncertain {
-		return fmt.Errorf("origin conversation arrival delivery is uncertain; fallback suppressed: %w", lastErr)
+		return fmt.Errorf("%w; fallback suppressed: %v", errHandoffArrivalUncertain, lastErr)
 	}
 	current, holderErr := s.isCurrentHolder(ctx, req.AgentID, req.HolderDeviceID)
 	if holderErr != nil {
@@ -371,7 +450,11 @@ func (s *Server) peerDisplayName(ctx context.Context, peerID string) string {
 
 func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerID string, payload handoffArrivalRequest) (bool, error) {
 	if s.peerID != nil && originPeerID == s.peerID.DeviceID {
-		return false, s.activateLocalHandoffCapability(ctx, payload)
+		err := s.activateLocalHandoffCapability(ctx, payload)
+		// A missing in-memory capability after restart is ambiguous: the
+		// adapter may have admitted the arrival immediately before the crash.
+		// Fail closed instead of launching a duplicate legacy fallback.
+		return errors.Is(err, errHandoffCapabilityInvalid), err
 	}
 	if s.agents == nil || s.agents.Store() == nil {
 		return false, errors.New("peer registry is unavailable")
@@ -405,38 +488,22 @@ func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerI
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		return false, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		var errorBody struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(body, &errorBody)
+		// invalid_capability cannot distinguish "never admitted" from
+		// "admitted, then the origin restarted before finalize committed".
+		// Treat it like a lost response and suppress fallback (at-most-once).
+		uncertain := errorBody.Error.Code == "invalid_capability"
+		return uncertain, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return false, nil
 }
 
 func (s *Server) activateLocalHandoffCapability(ctx context.Context, req handoffArrivalRequest) error {
-	s.handoffArrivalMu.Lock()
-	entry := s.handoffArrivalCaps[req.Capability]
-	if entry == nil || entry.AgentID != req.AgentID || entry.SessionKey != req.SessionKey ||
-		entry.OpID != req.OpID || entry.HolderID != req.HolderDeviceID {
-		s.handoffArrivalMu.Unlock()
-		return errors.New("local arrival capability is unavailable")
-	}
-	if entry.Accepted {
-		s.handoffArrivalMu.Unlock()
-		return nil
-	}
-	if entry.Admitting {
-		s.handoffArrivalMu.Unlock()
-		return errors.New("local arrival capability is being admitted")
-	}
-	entry.Admitting = true
-	s.handoffArrivalMu.Unlock()
 	prompt := s.agents.BuildExternalDeviceSwitchArrivalPrompt(s.peerDisplayName(ctx, req.SourceDeviceID), req.Notes)
-	if err := entry.Reservation.Activate(ctx, prompt, req.HolderDeviceID); err != nil {
-		s.handoffArrivalMu.Lock()
-		entry.Admitting = false
-		s.handoffArrivalMu.Unlock()
-		return err
-	}
-	s.handoffArrivalMu.Lock()
-	entry.Accepted, entry.Admitting = true, false
-	s.handoffArrivalMu.Unlock()
-	return nil
+	return s.activateHandoffArrivalCapability(ctx, req, prompt)
 }

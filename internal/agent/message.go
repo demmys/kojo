@@ -139,6 +139,22 @@ func newAttachmentOwnership() *attachmentOwnership {
 	return &attachmentOwnership{done: make(chan struct{})}
 }
 
+// PrepareAttachmentOwnership installs an ownership handshake on an attachment
+// event received across a transport boundary. The producer-side event already
+// has one; decoded copies need a fresh local claim so the transport can wait
+// until the response adapter has durably accepted the attachment metadata.
+func (e *ChatEvent) PrepareAttachmentOwnership() {
+	if e != nil && e.attachmentClaim == nil {
+		e.attachmentClaim = newAttachmentOwnership()
+	}
+}
+
+// WaitAttachmentOwnership waits for the response adapter to accept or reject
+// an attachment event prepared with PrepareAttachmentOwnership.
+func (e *ChatEvent) WaitAttachmentOwnership(ctx context.Context) bool {
+	return e.waitAttachmentOwnership(ctx)
+}
+
 // BeginAttachmentOwnership reserves the ownership decision before a consumer
 // performs an irreversible append/encode. Cancellation can reject only while
 // the claim is still pending.

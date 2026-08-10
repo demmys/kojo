@@ -187,6 +187,11 @@ type Server struct {
 	// the private Hub→holder turn and holder→Hub callback paths.
 	handoffArrivalMu   sync.Mutex
 	handoffArrivalCaps map[string]*handoffArrivalCapability
+	// pendingFinalizeLocks serializes retries of one target-side finalize op.
+	// Without this, overlapping requests can make one path choose legacy
+	// fallback while another concurrently admits the origin conversation.
+	pendingFinalizeMu    sync.Mutex
+	pendingFinalizeLocks map[pendingSyncKey]*pendingFinalizeLock
 	// onAgentRuntimePurged fires after the inter-peer state
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
@@ -251,6 +256,11 @@ type Server struct {
 	// externalChatRelays authorizes short-lived Hub callbacks for files
 	// produced by an agent during a remotely dispatched Slack turn.
 	externalChatRelays *externalChatRelayRegistry
+	// externalChatAttachmentAcks holds the application-level acknowledgement
+	// for holder-produced attachment events until the Hub response adapter has
+	// accepted their metadata. It is an embedded value so zero-value test
+	// Servers get the same safe lazy initialization as production Servers.
+	externalChatAttachmentAcks externalChatAttachmentAckRegistry
 	// identityMu guards nodeKeyResolver + selfNodeKey, both of
 	// which can be (re)wired after server construction.
 	identityMu sync.RWMutex
@@ -809,6 +819,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/steer", s.handleExternalChatSteer)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/attachment-ack", s.handleExternalChatAttachmentAck)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/file", s.handleExternalChatFile)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
@@ -1369,12 +1380,19 @@ type pendingSyncKey struct {
 	OpID    string
 }
 
-// pendingSyncEntry is the per-op state captured at agent-sync
-// time. RawToken is the only field today; structuring as a
-// struct leaves room for future per-op state (claude session
-// digests, sync timestamps) without another schema change.
+// pendingSyncEntry is the per-op state captured at agent-sync time and updated
+// as finalize commits side effects. It is sealed as one value so token,
+// delivery-decision, and degraded-transfer metadata survive target restarts
+// without separate partially-updated rows.
 type pendingSyncEntry struct {
 	RawToken string `json:"raw_token"`
+	// ArrivalHandled records that origin continuation admission or its legacy
+	// fallback already succeeded. ArrivalUncertain records an attempted origin
+	// delivery whose outcome cannot be distinguished after a transport loss.
+	// Both survive target restart so a later finalize retry never duplicates an
+	// earlier arrival decision.
+	ArrivalHandled   bool `json:"arrival_handled,omitempty"`
+	ArrivalUncertain bool `json:"arrival_uncertain,omitempty"`
 	// DegradedFlushes / TransferSkips carry the per-switch loss
 	// metadata from the agent-sync payload to the finalize step,
 	// where they feed the arrival prompt's caveat block.
@@ -1481,6 +1499,37 @@ func (s *Server) recordPendingAgentSync(ctx context.Context, agentID, opID strin
 	s.pendingAgentSyncs[pendingSyncKey{AgentID: agentID, OpID: opID}] = entry
 	s.pendingTokensMu.Unlock()
 	return nil
+}
+
+// updatePendingAgentSyncAfterSideEffect checkpoints an idempotency decision
+// made after the pending row was created. Unlike initial record, the in-memory
+// cache is updated even if durable persistence fails: the side effect already
+// happened, so same-process retries must not replay it. The error still keeps
+// finalize from reporting success and surfaces the durability failure.
+func (s *Server) updatePendingAgentSyncAfterSideEffect(ctx context.Context, agentID, opID string, entry pendingSyncEntry) error {
+	var persistErr error
+	if st := s.pendingSyncStore(); st != nil && len(s.pendingSyncKEK) > 0 {
+		sealed, err := s.sealPendingSync(agentID, opID, entry)
+		if err != nil {
+			persistErr = err
+		} else if _, err := st.PutKV(ctx, &store.KVRecord{
+			Namespace:      pendingAgentSyncNamespace,
+			Key:            pendingAgentSyncKey(agentID, opID),
+			ValueEncrypted: sealed,
+			Type:           store.KVTypeBinary,
+			Scope:          store.KVScopeMachine,
+			Secret:         true,
+		}, store.KVPutOptions{}); err != nil {
+			persistErr = fmt.Errorf("updatePendingAgentSyncAfterSideEffect: put kv: %w", err)
+		}
+	}
+	s.pendingTokensMu.Lock()
+	if s.pendingAgentSyncs == nil {
+		s.pendingAgentSyncs = make(map[pendingSyncKey]pendingSyncEntry)
+	}
+	s.pendingAgentSyncs[pendingSyncKey{AgentID: agentID, OpID: opID}] = entry
+	s.pendingTokensMu.Unlock()
+	return persistErr
 }
 
 // consumePendingAgentSync returns the stashed entry for the

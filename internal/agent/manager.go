@@ -2696,15 +2696,28 @@ func (m *Manager) captureOneShotResponseAttachments(ctx context.Context, agentID
 					abortCleanup(attachments)
 					return
 				}
-				if !attachmentEvent.waitAttachmentOwnership(ctx) {
-					abortCleanup(attachments)
+				settleOwnership := func() {
+					// The response adapter may commit only after the terminal event
+					// closes its stream. Do not let the producer turn's cancellation
+					// reject a correctly-delivered attachment before the adapter can
+					// claim it; an unclaimed event is still reclaimed after a bound.
+					ownershipCtx, ownershipCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+					accepted := attachmentEvent.waitAttachmentOwnership(ownershipCtx)
+					ownershipCancel()
+					if !accepted {
+						abortCleanup(attachments)
+					}
+				}
+				if !ctxSend(ctx, out, ev) {
+					go settleOwnership()
 					return
 				}
+				// Ownership may resolve only after the response adapter has
+				// persisted the reply, so it cannot block the terminal event or
+				// channel close that let the adapter reach that commit point.
+				go settleOwnership()
+				return
 			}
-			// A successful attachment event transfers blob ownership to the
-			// response adapter. If the following terminal event loses a
-			// cancellation race, the adapter may still persist a stopped partial
-			// reply with those attachments, so they must not be deleted here.
 			ctxSend(ctx, out, ev)
 			return
 		}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -93,6 +94,36 @@ type peerAgentSyncFinalizeResponse struct {
 	AgentID string `json:"agent_id"`
 }
 
+type pendingFinalizeLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (s *Server) lockPendingFinalize(key pendingSyncKey) func() {
+	s.pendingFinalizeMu.Lock()
+	if s.pendingFinalizeLocks == nil {
+		s.pendingFinalizeLocks = make(map[pendingSyncKey]*pendingFinalizeLock)
+	}
+	entry := s.pendingFinalizeLocks[key]
+	if entry == nil {
+		entry = &pendingFinalizeLock{}
+		s.pendingFinalizeLocks[key] = entry
+	}
+	entry.refs++
+	s.pendingFinalizeMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.pendingFinalizeMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(s.pendingFinalizeLocks, key)
+		}
+		s.pendingFinalizeMu.Unlock()
+	}
+}
+
 func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Request) {
 	p, ok := requirePeerOrOwner(w, r)
 	if !ok {
@@ -132,6 +163,11 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"signer peer device_id does not match source_device_id")
 		return
 	}
+	// Serialize the entire consume → arrival decision → commit sequence for
+	// this operation. In particular, only one retry may decide between origin
+	// admission and legacy fallback; later retries observe the committed 404.
+	unlockFinalize := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID, OpID: req.OpID})
+	defer unlockFinalize()
 
 	entry, ok, err := s.consumePendingAgentSync(r.Context(), req.AgentID, req.OpID)
 	if err != nil {
@@ -273,6 +309,14 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	if s.agents != nil {
 		if req.Continuation == nil {
 			s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+		} else if entry.ArrivalUncertain {
+			writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted",
+				"a previous origin-conversation delivery was uncertain; fallback remains suppressed")
+			return
+		} else if entry.ArrivalHandled {
+			// A prior finalize admitted the origin turn (or its definite-failure
+			// fallback) but failed while committing the pending row. Do not replay
+			// the arrival; continue directly to the idempotent commit below.
 		} else {
 			arrivalReq := handoffArrivalRequest{
 				HolderDeviceID: s.peerID.DeviceID,
@@ -284,9 +328,23 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 				s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
 			}
 			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
+				if errors.Is(err, errHandoffArrivalUncertain) {
+					entry.ArrivalUncertain = true
+					if persistErr := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); persistErr != nil {
+						err = fmt.Errorf("%w; persist uncertain state: %v", err, persistErr)
+					}
+				}
 				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
 					"agent", req.AgentID, "op_id", req.OpID, "err", err)
 				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())
+				return
+			}
+			entry.ArrivalHandled = true
+			if err := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+				s.logger.Error("peer agent-sync finalize: arrival decision persistence failed; pending retained",
+					"agent", req.AgentID, "op_id", req.OpID, "err", err)
+				writeError(w, http.StatusInternalServerError, "internal",
+					"persist arrival decision: "+err.Error())
 				return
 			}
 		}

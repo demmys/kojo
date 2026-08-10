@@ -1092,6 +1092,49 @@ UPDATE groupdm_messages
 	return n, nil
 }
 
+// RollbackGroupDMMessage tombstones one daemon-created message and returns the
+// remaining live head ID. It is used when persist-first steer injection fails;
+// grouping the tombstone and head lookup in one transaction keeps the
+// manager's latestMsgID cache repairable without a visibility gap.
+func (s *Store) RollbackGroupDMMessage(ctx context.Context, groupID, messageID string) (string, error) {
+	if groupID == "" || messageID == "" {
+		return "", errors.New("store.RollbackGroupDMMessage: groupdm_id and message_id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := NowMillis()
+	res, err := tx.ExecContext(ctx, `
+UPDATE groupdm_messages
+   SET deleted_at = ?, updated_at = ?, version = version + 1
+ WHERE id = ? AND groupdm_id = ? AND deleted_at IS NULL`, now, now, messageID, groupID)
+	if err != nil {
+		return "", err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return "", err
+	} else if n != 1 {
+		return "", ErrNotFound
+	}
+	var head string
+	err = tx.QueryRowContext(ctx, `
+SELECT id FROM groupdm_messages
+ WHERE groupdm_id = ? AND deleted_at IS NULL
+ ORDER BY seq DESC LIMIT 1`, groupID).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		head, err = "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return head, nil
+}
+
 func scanGroupDMMessageRow(r rowScanner) (*GroupDMMessageRecord, error) {
 	var (
 		rec         GroupDMMessageRecord

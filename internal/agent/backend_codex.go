@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -86,6 +87,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
@@ -126,8 +128,14 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			data = append(data, '\n')
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			_, werr := stdin.Write(data)
-			return werr
+			n, werr := stdin.Write(data)
+			if werr == nil && n != len(data) {
+				werr = io.ErrShortWrite
+			}
+			if werr != nil {
+				return &codexRPCWriteError{Written: n, Err: werr}
+			}
+			return nil
 		}
 		respondServerRequest := newCodexServerRequestResponder(writeLine)
 		sendRPCErr := func(method string, params any) (int64, error) {

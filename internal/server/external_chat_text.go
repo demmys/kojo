@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
@@ -44,14 +46,23 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
-	Message              string                    `json:"message"`
-	SessionKey           string                    `json:"sessionKey,omitempty"`
-	FreshSessionContext  string                    `json:"freshSessionContext,omitempty"`
-	ResumeSessionContext string                    `json:"resumeSessionContext,omitempty"`
-	SystemPromptExtra    string                    `json:"systemPromptExtra,omitempty"`
-	DisableAttachments   bool                      `json:"disableAttachments,omitempty"`
-	Attachments          []agent.MessageAttachment `json:"attachments,omitempty"`
-	HubMCPBaseURL        string                    `json:"hubMcpBaseUrl,omitempty"`
+	Message                     string                    `json:"message"`
+	SessionKey                  string                    `json:"sessionKey,omitempty"`
+	FreshSessionContext         string                    `json:"freshSessionContext,omitempty"`
+	ResumeSessionContext        string                    `json:"resumeSessionContext,omitempty"`
+	SystemPromptExtra           string                    `json:"systemPromptExtra,omitempty"`
+	DisableAttachments          bool                      `json:"disableAttachments,omitempty"`
+	Attachments                 []agent.MessageAttachment `json:"attachments,omitempty"`
+	HubMCPBaseURL               string                    `json:"hubMcpBaseUrl,omitempty"`
+	ForceFreshSession           bool                      `json:"forceFreshSession,omitempty"`
+	ResponseAttachmentGroupID   string                    `json:"responseAttachmentGroupId,omitempty"`
+	ResponseAttachmentMessageID string                    `json:"responseAttachmentMessageId,omitempty"`
+	HandoffCapability           string                    `json:"-"`
+}
+
+type externalChatSteerRequest struct {
+	SessionKey string `json:"sessionKey"`
+	Content    string `json:"content"`
 }
 
 type externalChatTextEnvelope struct {
@@ -60,10 +71,11 @@ type externalChatTextEnvelope struct {
 }
 
 type externalChatReadyResponse struct {
-	Ready       bool   `json:"ready"`
-	Switching   bool   `json:"switching,omitempty"`
-	HolderPeer  string `json:"holderPeer,omitempty"`
-	Unavailable string `json:"unavailable,omitempty"`
+	Ready                bool   `json:"ready"`
+	Switching            bool   `json:"switching,omitempty"`
+	HolderPeer           string `json:"holderPeer,omitempty"`
+	Unavailable          string `json:"unavailable,omitempty"`
+	OriginAwareArrivalV1 bool   `json:"originAwareArrivalV1,omitempty"`
 }
 
 type externalChatDispatchState int
@@ -127,13 +139,36 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		freshContext, resumeContext = agent.FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
 	}
 	req := externalChatTextRequest{
-		Message:              message,
-		SessionKey:           opts.SessionKey,
-		FreshSessionContext:  freshContext,
-		ResumeSessionContext: resumeContext,
-		SystemPromptExtra:    opts.SystemPromptExtra,
-		DisableAttachments:   opts.DisableKojoAttachmentInstructions,
-		Attachments:          append([]agent.MessageAttachment(nil), opts.Attachments...),
+		Message:                     message,
+		SessionKey:                  opts.SessionKey,
+		FreshSessionContext:         freshContext,
+		ResumeSessionContext:        resumeContext,
+		SystemPromptExtra:           opts.SystemPromptExtra,
+		DisableAttachments:          opts.DisableKojoAttachmentInstructions,
+		Attachments:                 append([]agent.MessageAttachment(nil), opts.Attachments...),
+		ForceFreshSession:           opts.ForceFreshSession,
+		ResponseAttachmentGroupID:   opts.ResponseAttachmentGroupID,
+		ResponseAttachmentMessageID: opts.ResponseAttachmentMessageID,
+	}
+	if opts.SessionKey != "" && opts.HandoffArrivalReservation != nil {
+		req.HandoffCapability = r.server.mintHandoffArrivalCapability(agentID, opts.SessionKey, opts.HandoffArrivalReservation)
+	}
+
+	// A handoff arrival is fenced to the holder that finalized that exact
+	// operation. Do not consult the ordinary in-memory route hint here: it can
+	// still name the source while the target arrival is waiting behind the
+	// initiating turn's FIFO reservation. Likewise, never discover/replay this
+	// synthetic turn on a newer holder; that newer handoff owns its own arrival.
+	if opts.ExpectedHolderPeer != "" {
+		holder := opts.ExpectedHolderPeer
+		result := r.dispatch(ctx, ctx, agentID, holder, holder == r.selfPeerID(), req)
+		if result.events != nil {
+			return result.events, result.err
+		}
+		if result.err != nil {
+			return nil, fmt.Errorf("stale handoff arrival for holder %q: %w", holder, result.err)
+		}
+		return nil, fmt.Errorf("stale handoff arrival: holder %q did not admit the turn", holder)
 	}
 
 	holder, local, err := r.initialRoute(ctx, agentID)
@@ -218,6 +253,95 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	}
 }
 
+// SteerOneShot follows a WebUI thread turn to its current holder and injects
+// text into that exact response-surface session. Unlike a normal turn, steer
+// is not replayable after POST: the holder may have accepted the text before
+// a transport error becomes visible to the Hub.
+func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error {
+	if r == nil || r.server == nil || r.server.agents == nil {
+		return errors.New("external chat router is unavailable")
+	}
+	holder, local, err := r.initialRoute(ctx, agentID)
+	if err != nil {
+		return err
+	}
+	// Readiness is also a pre-admission holder fence. A cached route may still
+	// name the source immediately after handoff; follow the holder advertised by
+	// that source before issuing any POST. Once a POST is attempted we never
+	// replay the steer, because the target may have accepted it before a response
+	// was lost.
+	for redirects := 0; redirects < 4; redirects++ {
+		if local || holder == "" {
+			ready := r.server.externalChatReadiness(ctx, agentID)
+			if ready.HolderPeer != "" && ready.HolderPeer != r.selfPeerID() {
+				r.forgetRoute(agentID, holder)
+				holder = ready.HolderPeer
+				local = false
+				continue
+			}
+			if !ready.Ready {
+				return fmt.Errorf("agent thread holder is unavailable: %s", ready.Unavailable)
+			}
+			return r.server.agents.SteerOneShotForAgent(agentID, sessionKey, content)
+		}
+
+		ready, err := r.probeHolder(ctx, agentID, holder)
+		if err != nil {
+			return fmt.Errorf("probe thread holder before steer: %w", err)
+		}
+		if ready.HolderPeer != "" && ready.HolderPeer != holder {
+			r.forgetRoute(agentID, holder)
+			holder = ready.HolderPeer
+			local = holder == r.selfPeerID()
+			continue
+		}
+		if !ready.Ready {
+			r.forgetRoute(agentID, holder)
+			return fmt.Errorf("thread holder %s is not ready: %s", holder, ready.Unavailable)
+		}
+		resp, attempted, err := r.postRemoteSteer(ctx, agentID, holder, externalChatSteerRequest{
+			SessionKey: sessionKey,
+			Content:    content,
+		})
+		if err != nil {
+			if attempted {
+				return fmt.Errorf("%w: %v", agent.ErrSteerDeliveryUncertain, err)
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			r.rememberRoute(agentID, holder)
+			return nil
+		}
+		var body struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body)
+		msg := strings.TrimSpace(body.Error.Message)
+		if msg == "" {
+			msg = resp.Status
+		}
+		switch body.Error.Code {
+		case "not_busy":
+			return fmt.Errorf("%w: %s", agent.ErrAgentNotBusy, msg)
+		case "unsupported":
+			return fmt.Errorf("%w: %s", agent.ErrSteerUnsupported, msg)
+		case "delivery_uncertain":
+			return fmt.Errorf("%w: %s", agent.ErrSteerDeliveryUncertain, msg)
+		case "wrong_holder", "runtime_not_ready", "switching":
+			r.forgetRoute(agentID, holder)
+			return fmt.Errorf("thread holder changed before steer admission: %s", msg)
+		default:
+			return fmt.Errorf("holder rejected thread steer (%s): %s", resp.Status, msg)
+		}
+	}
+	return errors.New("thread holder changed too many times before steer admission")
+}
+
 func (r *externalChatRouter) initialRoute(ctx context.Context, agentID string) (holder string, local bool, err error) {
 	s := r.server
 	self := r.selfPeerID()
@@ -268,6 +392,11 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			SystemPromptExtra:                 req.SystemPromptExtra,
 			DisableKojoAttachmentInstructions: req.DisableAttachments,
 			Attachments:                       req.Attachments,
+			OriginPeerID:                      r.selfPeerID(),
+			ForceFreshSession:                 req.ForceFreshSession,
+			HandoffCapability:                 req.HandoffCapability,
+			ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
+			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
 		})
 		if err != nil {
 			if errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID) {
@@ -376,9 +505,45 @@ func (r *externalChatRouter) postRemote(ctx context.Context, agentID, holder str
 		return nil, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if payload.HandoffCapability != "" {
+		req.Header.Set("X-Kojo-Handoff-Capability", payload.HandoffCapability)
+	}
 	resp, err := peer.NoKeepAliveHTTPClient(0).Do(req)
 	if err != nil {
 		return nil, true, fmt.Errorf("dispatch Slack turn to holder: %w", err)
+	}
+	return resp, true, nil
+}
+
+func (r *externalChatRouter) postRemoteSteer(ctx context.Context, agentID, holder string, payload externalChatSteerRequest) (*http.Response, bool, error) {
+	rec, err := r.server.agents.Store().GetPeer(ctx, holder)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve thread holder peer: %w", err)
+	}
+	if rec.Status != store.PeerStatusOnline {
+		return nil, false, fmt.Errorf("thread holder peer is %s", rec.Status)
+	}
+	addr, err := peer.NormalizeAddress(rec.URL)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve thread holder address: %w", err)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode thread steer: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		addr+"/api/v1/agents/"+agentID+"/external-chat/steer", bytes.NewReader(body))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	var wroteRequest atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) },
+	}))
+	resp, err := peer.NoKeepAliveHTTPClient(0).Do(req)
+	if err != nil {
+		return nil, wroteRequest.Load(), fmt.Errorf("dispatch thread steer to holder: %w", err)
 	}
 	return resp, true, nil
 }
@@ -503,7 +668,12 @@ func (s *Server) handleExternalChatReady(w http.ResponseWriter, r *http.Request)
 	if !s.externalChatPeerAllowed(w, r) {
 		return
 	}
-	writeJSONResponse(w, http.StatusOK, s.externalChatReadiness(r.Context(), r.PathValue("id")))
+	ready := s.externalChatReadiness(r.Context(), r.PathValue("id"))
+	// This doubles as pre-handoff capability negotiation. Old targets either
+	// lack this route or omit the field, so a new source can downgrade to the
+	// legacy main-WebUI arrival before it transfers the lock.
+	ready.OriginAwareArrivalV1 = true
+	writeJSONResponse(w, http.StatusOK, ready)
 }
 
 func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) {
@@ -572,6 +742,11 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 		DisableKojoAttachmentInstructions: req.DisableAttachments,
 		Attachments:                       req.Attachments,
 		SlackMCPBaseURL:                   hubAddr,
+		OriginPeerID:                      hubPeerID,
+		ForceFreshSession:                 req.ForceFreshSession,
+		HandoffCapability:                 strings.TrimSpace(r.Header.Get("X-Kojo-Handoff-Capability")),
+		ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
+		ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
 	})
 	if err != nil {
 		switch {
@@ -629,10 +804,30 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			if evt.Type == "done" || evt.Type == "error" {
 				terminal = true
 			}
-			if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &evt}); err != nil {
+			attachmentFlushed := false
+			if evt.Type == "attachment" {
+				if !evt.BeginAttachmentOwnership() {
+					continue
+				}
+				// Once ownership enters committing state, cancellation waits for
+				// this encode decision. Bound the socket write so a stalled Hub
+				// cannot wedge the holder's one-shot forever.
+				controller := http.NewResponseController(w)
+				_ = controller.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &evt})
+				if err == nil {
+					err = controller.Flush()
+					attachmentFlushed = err == nil
+				}
+				_ = controller.SetWriteDeadline(time.Time{})
+				evt.FinishAttachmentOwnership(err == nil)
+				if err != nil {
+					return
+				}
+			} else if err := enc.Encode(externalChatTextEnvelope{Kind: "event", Event: &evt}); err != nil {
 				return
 			}
-			if flusher != nil {
+			if flusher != nil && !attachmentFlushed {
 				flusher.Flush()
 			}
 			if terminal {
@@ -647,6 +842,62 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 	}
+}
+
+func (s *Server) handleExternalChatSteer(w http.ResponseWriter, r *http.Request) {
+	if !s.externalChatPeerAllowed(w, r) {
+		return
+	}
+	agentID := r.PathValue("id")
+	ready := s.externalChatReadiness(r.Context(), agentID)
+	if !ready.Ready {
+		if ready.HolderPeer != "" {
+			w.Header().Set("X-Kojo-Holder-Peer", ready.HolderPeer)
+		}
+		code := "runtime_not_ready"
+		if ready.Switching {
+			code = "switching"
+		} else if ready.HolderPeer != "" && s.peerID != nil && ready.HolderPeer != s.peerID.DeviceID {
+			code = "wrong_holder"
+		}
+		writeError(w, http.StatusConflict, code, ready.Unavailable)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req externalChatSteerRequest
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid external steer request: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.SessionKey) == "" || strings.TrimSpace(req.Content) == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "sessionKey and content are required")
+		return
+	}
+	p := auth.FromContext(r.Context())
+	var err error
+	if s.unsafePeer && p.IsOwner() {
+		err = s.agents.SteerOneShotForAgent(agentID, req.SessionKey, req.Content)
+	} else {
+		err = s.agents.SteerOneShotFromOrigin(agentID, req.SessionKey, p.PeerID, req.Content)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrSteerOriginForbidden):
+			writeError(w, http.StatusForbidden, "forbidden", "external steer caller did not open this turn")
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", err.Error())
+		case errors.Is(err, agent.ErrAgentNotBusy):
+			writeError(w, http.StatusConflict, "not_busy", "agent thread has no turn in progress")
+		case errors.Is(err, agent.ErrSteerUnsupported):
+			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) externalChatPeerAllowed(w http.ResponseWriter, r *http.Request) bool {

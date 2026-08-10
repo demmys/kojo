@@ -1,10 +1,19 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
+
+type codexRPCWriteError struct {
+	Written int
+	Err     error
+}
+
+func (e *codexRPCWriteError) Error() string { return e.Err.Error() }
+func (e *codexRPCWriteError) Unwrap() error { return e.Err }
 
 // codexSteerTurnWait bounds how long a steer call waits for the active
 // turn id to become known. The turn/start RPC response normally arrives
@@ -99,9 +108,10 @@ func (s *codexSteerer) close() {
 	}
 	s.mu.Unlock()
 	for _, ch := range pending {
-		// The turn is over, so map to ErrAgentNotBusy — the HTTP handler
-		// turns that into 409 not_busy instead of a 500.
-		ch <- fmt.Errorf("codex: turn ended before turn/steer was acknowledged: %w", ErrAgentNotBusy)
+		// These requests were already written. Completion before their RPC
+		// responses arrive cannot prove rejection, so canonical history must
+		// retain the input instead of offering a duplicate-producing fallback.
+		ch <- fmt.Errorf("%w: codex turn ended before turn/steer was acknowledged", ErrSteerDeliveryUncertain)
 	}
 }
 
@@ -169,7 +179,14 @@ func (s *codexSteerer) steer(text string) error {
 		})
 		if err != nil {
 			s.mu.Unlock()
-			return fmt.Errorf("codex turn/steer write: %w", err)
+			var writeErr *codexRPCWriteError
+			if errors.As(err, &writeErr) && writeErr.Written == 0 {
+				return fmt.Errorf("%w: codex turn/steer write: %v", ErrAgentNotBusy, err)
+			}
+			// The app-server may have received the full JSON-RPC frame before
+			// the pipe surfaced a write error; do not let canonical history
+			// roll back input whose delivery cannot be disproved.
+			return fmt.Errorf("%w: codex turn/steer write: %v", ErrSteerDeliveryUncertain, err)
 		}
 		respCh := make(chan error, 1)
 		s.pending[id] = respCh
@@ -182,7 +199,7 @@ func (s *codexSteerer) steer(text string) error {
 			s.mu.Lock()
 			delete(s.pending, id)
 			s.mu.Unlock()
-			return fmt.Errorf("codex: turn/steer was not acknowledged within %s", codexSteerRespWait)
+			return fmt.Errorf("%w: codex turn/steer was not acknowledged within %s", ErrSteerDeliveryUncertain, codexSteerRespWait)
 		}
 	}
 }

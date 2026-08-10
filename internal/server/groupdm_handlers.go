@@ -583,6 +583,8 @@ func (s *Server) handleSteerGroupDM(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "not_busy", "no thread turn in progress")
 		case errors.Is(err, agent.ErrSteerUnsupported):
 			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", "the steer may have reached the remote holder; the message was retained")
 		default:
 			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		}

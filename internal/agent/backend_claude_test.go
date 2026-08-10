@@ -214,6 +214,19 @@ func TestClaudeStdinWriter_WriteAndClose(t *testing.T) {
 	}
 }
 
+type partialErrorWriteCloser struct{}
+
+func (partialErrorWriteCloser) Write(p []byte) (int, error) { return len(p) / 2, io.ErrUnexpectedEOF }
+func (partialErrorWriteCloser) Close() error                { return nil }
+
+func TestClaudeStdinWriter_PartialWriteIsDeliveryUncertain(t *testing.T) {
+	sw := &claudeStdinWriter{w: partialErrorWriteCloser{}}
+	err := sw.writeUserLine("possibly delivered")
+	if !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+}
+
 // TestClaudeTurnSteer_MarkOver verifies the fire-and-forget-window fix: on a
 // persistent session the stdin pipe stays open across turns, so the per-turn
 // steer gate — not claudeStdinWriter.closed — is what refuses a steer once the

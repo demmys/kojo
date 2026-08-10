@@ -744,7 +744,21 @@ export function AgentChat() {
       }
       // mode === "steer": injected into the running turn; nothing to do, the
       // turn keeps streaming and the bubble stays.
-    }).catch(() => {
+    }).catch((e) => {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      if (/^502:.*delivery_uncertain/.test(errorMessage)) {
+        if (sentForId !== idRef.current) return;
+        // The canonical row was retained and the backend may have consumed
+        // it. Keep the optimistic bubble (a live/refetch message will replace
+        // its pending id) and never restore the composer for a duplicate send.
+        setMessages((prev) => appendSystemErrorIfNew(
+          prev,
+          t("chat.steerDeliveryUncertain"),
+          Date.now,
+          localRFC3339,
+        ));
+        return;
+      }
       // Genuine refusal — never drop the text.
       if (sentForId !== idRef.current) {
         // The user navigated to a different agent: restoring the text into

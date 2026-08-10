@@ -367,12 +367,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// skip the busy-cancel while still cancelling one-shots and
 	// draining all other concurrent writers.
 	//
-	// Trust model (v1): selfCall is decided by the bearer
-	// identity alone — there is no per-chat run-id binding the
-	// HTTP call to a specific busy entry. The agent token lives
-	// in kv under namespace=auth and is readable only by the
-	// owner-trusted process, so possessing it is already owner-
-	// equivalent.
+	// External/thread self-calls additionally carry KOJO_SESSION_KEY, which
+	// resolves the exact tracked one-shot so only that caller survives the
+	// drain. Keyless main-WebUI self-calls retain the bearer-only legacy path.
 	//
 	// Caveat (claude session JSONL): on selfCall the snapshot
 	// captures the JSONL while a tool_use (this curl) is mid-
@@ -380,6 +377,35 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// turn. Pre-existing limitation — the non-selfCall path also
 	// produces a torn turn at the SIGTERM point.
 	selfCall := p.IsAgent() && p.AgentID == agentID
+	var callerOneShot agent.OneShotOrigin
+	var continuation *handoffContinuation
+	if selfCall {
+		sessionKey := strings.TrimSpace(r.Header.Get("X-Kojo-Session-Key"))
+		if len(sessionKey) > 1024 {
+			writeError(w, http.StatusBadRequest, "bad_request", "X-Kojo-Session-Key is too long")
+			return
+		}
+		if sessionKey != "" {
+			var ok bool
+			callerOneShot, ok = s.agents.InFlightOneShotOrigin(agentID, sessionKey)
+			if !ok {
+				writeError(w, http.StatusConflict, "caller_not_active",
+					"the conversation that requested this switch is no longer the active one-shot turn")
+				return
+			}
+			if callerOneShot.OriginPeerID != "" && callerOneShot.HandoffCapability != "" {
+				continuation = &handoffContinuation{
+					SessionKey: callerOneShot.SessionKey, OriginPeerID: callerOneShot.OriginPeerID,
+					Capability: callerOneShot.HandoffCapability,
+				}
+			}
+		}
+	}
+	if continuation != nil && !s.targetSupportsOriginAwareArrival(r.Context(), targetAddr, agentID) {
+		s.logger.Warn("switch-device: target lacks origin-aware arrival capability; using legacy main WebUI arrival",
+			"agent", agentID, "target", req.TargetPeerID)
+		continuation = nil
+	}
 
 	// Step -1: quiesce the local PTY AND set the switching
 	// flag so no NEW Chat starts on this peer for the duration
@@ -409,14 +435,22 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 		defer s.agents.SetSwitching(agentID, false)
 		if selfCall {
-			s.agents.CancelOneShotsForAgent(agentID)
+			if callerOneShot.ID != 0 {
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+			} else {
+				s.agents.CancelOneShotsForAgent(agentID)
+			}
 		} else {
 			s.agents.Abort(agentID)
 		}
 		quiesceCtx, quiesceCancel := context.WithTimeout(ctx, 3*time.Second)
 		var err error
 		if selfCall {
-			err = s.agents.WaitChatIdleSelfCall(quiesceCtx, agentID)
+			if callerOneShot.ID != 0 {
+				err = s.agents.WaitChatIdleExceptOneShot(quiesceCtx, agentID, callerOneShot.ID)
+			} else {
+				err = s.agents.WaitChatIdleSelfCall(quiesceCtx, agentID)
+			}
 		} else {
 			err = s.agents.WaitChatIdle(quiesceCtx, agentID)
 		}
@@ -622,6 +656,23 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// a prior attempt can't collide with a fresh retry's
 	// pending-sync entry on target.
 	syncReq.OpID = uuid.NewString()
+	if continuation != nil {
+		bindCtx, bindCancel := context.WithTimeout(ctx, 5*time.Second)
+		bindErr := s.bindHandoffArrivalAtOrigin(bindCtx, continuation.OriginPeerID, handoffArrivalBindRequest{
+			SourceDeviceID: s.peerID.DeviceID,
+			TargetDeviceID: req.TargetPeerID,
+			AgentID:        agentID,
+			OpID:           syncReq.OpID,
+			SessionKey:     continuation.SessionKey,
+			Capability:     continuation.Capability,
+		})
+		bindCancel()
+		if bindErr != nil {
+			s.logger.Warn("switch-device: origin conversation could not bind handoff; using legacy main arrival",
+				"agent", agentID, "target", req.TargetPeerID, "op_id", syncReq.OpID, "err", bindErr)
+			continuation = nil
+		}
+	}
 	keptSessions, capacitySkips, budgetErr := fitAgentSyncSessions(syncReq, int64(peerAgentSyncMaxBody))
 	if budgetErr != nil {
 		s.noteSwitchFailure(agentID, "fit session transfer budget: "+budgetErr.Error())
@@ -867,6 +918,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				s.logger.Warn("switch-device: complete errored but lock observed at target; releasing source",
 					"agent", agentID, "target", req.TargetPeerID, "op_id", syncReq.OpID)
 				if s.onAgentReleasedAsSource != nil {
+					if selfCall {
+						s.agents.DetachOneShot(agentID, callerOneShot.ID)
+					}
 					releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 					s.onAgentReleasedAsSource(releaseCtx, agentID)
 					releaseCancel()
@@ -908,6 +962,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			resp.Reason = fmt.Sprintf("complete: blob %s left in %s state: %s",
 				b.URI, b.Status, b.Error)
 			if s.onAgentReleasedAsSource != nil {
+				if selfCall {
+					s.agents.DetachOneShot(agentID, callerOneShot.ID)
+				}
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 				s.onAgentReleasedAsSource(releaseCtx, agentID)
 				releaseCancel()
@@ -937,13 +994,21 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// entry that still holds the open response would kill
 		// the curl before writeJSONResponse reaches it.
 		if selfCall {
-			s.agents.CancelOneShotsForAgent(agentID)
+			if callerOneShot.ID != 0 {
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+			} else {
+				s.agents.CancelOneShotsForAgent(agentID)
+			}
 		} else {
 			s.agents.Abort(agentID)
 		}
 		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
 		if selfCall {
-			drainErr = s.agents.WaitChatIdleSelfCall(drainCtx, agentID)
+			if callerOneShot.ID != 0 {
+				drainErr = s.agents.WaitChatIdleExceptOneShot(drainCtx, agentID, callerOneShot.ID)
+			} else {
+				drainErr = s.agents.WaitChatIdleSelfCall(drainCtx, agentID)
+			}
 		} else {
 			drainErr = s.agents.WaitChatIdle(drainCtx, agentID)
 		}
@@ -964,6 +1029,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// activates) is the same as the finalize-failed path;
 		// operator drives a manual finalize retry.
 		if s.onAgentReleasedAsSource != nil {
+			if selfCall {
+				s.agents.DetachOneShot(agentID, callerOneShot.ID)
+			}
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 			s.onAgentReleasedAsSource(releaseCtx, agentID)
 			releaseCancel()
@@ -979,20 +1047,20 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// operator can drive a manual finalize retry. The drop
 	// counterpart fires only on the abort paths above.
 	//
-	// selfCall path defers finalize into a background goroutine
-	// that first waits for source's claude to emit its
+	// A legacy/main selfCall defers finalize into a background goroutine that
+	// first waits for source's claude to emit its
 	// post-tool-result `done` event. The captured assistant
 	// Message rides as the TailMessage payload of finalize so
-	// target appends it BEFORE NotifyDeviceSwitchArrival fires —
+	// target appends it BEFORE the arrival continuation fires —
 	// the LLM on target then sees its own commitment text in
 	// transcript (e.g. "到着したらセキュリティチェックを実施する"),
 	// which the pre-A architecture silently dropped because the
 	// §3.7 release guard skipped persistDoneEvent on source.
 	//
-	// Non-selfCall path runs the synchronous finalize loop as
-	// before — there's no in-flight chat turn to defer for.
+	// Origin-aware external selfCalls finalize synchronously while the adapter's
+	// FIFO reservation is still alive; non-selfCalls are synchronous as before.
 	var finalizeErr error
-	if selfCall {
+	if selfCall && continuation == nil && callerOneShot.SessionKey == "" {
 		// Defer finalize: response returns to claude immediately
 		// (curl unblocks → claude continues turn → done event
 		// fires → goroutine ships finalize with tail). Outcome is
@@ -1002,6 +1070,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// silent on completed so a missing finalize_error surface
 		// here doesn't leak to the user.
 		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
+	} else if selfCall && continuation == nil && callerOneShot.ID != 0 {
+		// The response adapter identified this as a one-shot, but the target
+		// could not negotiate origin-aware continuation (old target or failed
+		// capability bind). Preserve legacy main-chat arrival without letting it
+		// overlap the source turn that is still blocked inside this curl.
+		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID)
 	} else {
 		// Uses a fresh background ctx so a wedged target doesn't
 		// stall past switchDeviceOpTimeout — the switch is already
@@ -1019,7 +1093,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		const finalizeRetryBackoff = 500 * time.Millisecond
 		for attempt := 0; attempt < finalizeAttempts; attempt++ {
 			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil)
+			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, continuation)
 			finalizeCancel()
 			if finalizeErr == nil {
 				break
@@ -1027,7 +1101,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			// Only retry the lock-not-self race; everything else is
 			// either fatal (4xx that won't fix itself) or fits the
 			// "operator manual retry / force-reclaim" path.
-			if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+			if !retryableFinalizeError(finalizeErr) {
 				break
 			}
 			if attempt+1 < finalizeAttempts {
@@ -1058,20 +1132,21 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//
 	// SELFCALL ORDERING: release MUST happen AFTER the deferred-
 	// finalize goroutine is spawned (above) but the goroutine
-	// itself accesses the busy entry's accumulator, which
-	// releaseAgentLocallyCore does NOT touch (only m.agents and
-	// the cron/one-shot side channels), so the goroutine's
-	// WaitChatDone keeps working across the release. The chat
-	// goroutine that feeds the accumulator likewise survives —
-	// it exits via its own defer chain once backendCh closes.
+	// itself may need the caller to finish unwinding. Source release
+	// normally cancels one-shots, so DetachOneShot removes only this
+	// identified caller from lifecycle cancellation first. The caller
+	// then exits via its own defer chain once backendCh closes.
 	if s.onAgentReleasedAsSource != nil {
+		if selfCall {
+			s.agents.DetachOneShot(agentID, callerOneShot.ID)
+		}
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 		s.onAgentReleasedAsSource(releaseCtx, agentID)
 		releaseCancel()
 	}
 
 	switch {
-	case selfCall && completeResp.LockTransferred:
+	case selfCall && continuation == nil && completeResp.LockTransferred:
 		// Deferred finalize: we don't synchronously know whether
 		// finalize succeeded, so report "completed" optimistically.
 		// A failure surfaces in the server log; the SKILL.md tells
@@ -1103,6 +1178,32 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	writeJSONResponse(w, http.StatusOK, resp)
 }
 
+// targetSupportsOriginAwareArrival negotiates the optional continuation wire
+// extension before begin transfers any ownership. A missing route/field is an
+// expected old-target downgrade, not a switch failure.
+func (s *Server) targetSupportsOriginAwareArrival(ctx context.Context, targetAddr, agentID string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, defaultExternalChatProbe)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet,
+		targetAddr+"/api/v1/agents/"+agentID+"/external-chat/ready", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := peer.NoKeepAliveHTTPClient(defaultExternalChatProbe).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var ready externalChatReadyResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ready); err != nil {
+		return false
+	}
+	return ready.OriginAwareArrivalV1
+}
+
 // deferredFinalizeTailWaitBudget bounds how long the selfCall finalize
 // goroutine waits for source's claude to emit a `done` event before
 // shipping finalize without the tail. Set generously enough that a
@@ -1117,15 +1218,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 // silently dropping finalize altogether).
 const deferredFinalizeTailWaitBudget = 30 * time.Second
 
-// runDeferredFinalize is the goroutine the selfCall switch path
-// spawns after /handoff/complete returns to claude. It waits for
-// source's claude to finish the in-flight turn (so the post-tool-
-// result assistant Message becomes available via the chat
-// accumulator), then POSTs /handoff/finalize to target with the
-// captured Message as the optional TailMessage payload. Target's
-// finalize handler upserts the row to agent_messages BEFORE firing
-// NotifyDeviceSwitchArrival so the LLM sees its own commitment text
-// in the arrival prompt's transcript scan.
+// runDeferredFinalize is the goroutine the legacy/main selfCall switch path
+// spawns after /handoff/complete. It waits for the post-tool-result done event
+// and ships it as TailMessage. Origin-aware Slack/thread callers finalize
+// synchronously instead, while their adapter reservation is still alive.
 //
 // Failure modes (all surfaced as Warn-level logs, never propagated
 // back to the agent — the agent's claude has already disconnected
@@ -1173,12 +1269,12 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	var finalizeErr error
 	for attempt := 0; attempt < finalizeAttempts; attempt++ {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail)
+		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail, nil)
 		finalizeCancel()
 		if finalizeErr == nil {
 			break
 		}
-		if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+		if !retryableFinalizeError(finalizeErr) {
 			break
 		}
 		if attempt+1 < finalizeAttempts {
@@ -1189,6 +1285,39 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 		s.logger.Warn("switch-device: deferred finalize failed; target arrival may not fire (operator can manually retry)",
 			"agent", agentID, "op_id", opID, "err", finalizeErr)
 	}
+}
+
+func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64) {
+	waitCtx, cancel := context.WithTimeout(context.Background(), deferredFinalizeTailWaitBudget)
+	err := s.agents.WaitOneShotDone(waitCtx, agentID, oneShotID)
+	cancel()
+	if err != nil {
+		s.logger.Warn("switch-device: downgraded source one-shot did not exit before finalize",
+			"agent", agentID, "op_id", opID, "err", err)
+	}
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+		finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil)
+		finalizeCancel()
+		if finalizeErr == nil {
+			return
+		}
+		if !retryableFinalizeError(finalizeErr) || attempt+1 == attempts {
+			s.logger.Warn("switch-device: downgraded one-shot finalize failed",
+				"agent", agentID, "op_id", opID, "err", finalizeErr)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func retryableFinalizeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "lock_not_self") || strings.Contains(msg, "arrival_not_admitted")
 }
 
 // finalizeWireBodyCap mirrors the MaxBytesReader limit on target's
@@ -1217,12 +1346,13 @@ const finalizeWireBodyCap = 16 << 20
 // cap (oversized tail is silently dropped + finalize still proceeds,
 // preferring "target runtime activates without the commitment text"
 // over "target never activates because finalize itself 413'd").
-func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord) error {
+func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation) error {
 	body := peerAgentSyncFinalizeRequest{
 		SourceDeviceID: s.peerID.DeviceID,
 		AgentID:        agentID,
 		OpID:           opID,
 		TailMessage:    tail,
+		Continuation:   continuation,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -1241,6 +1371,22 @@ func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, 
 		if err != nil {
 			return fmt.Errorf("re-marshal finalize body (tail dropped): %w", err)
 		}
+	}
+	err = s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
+		"/api/v1/peers/agent-sync/finalize", raw)
+	if err == nil || continuation == nil ||
+		!strings.Contains(err.Error(), "phase-2 HTTP 400") || !strings.Contains(err.Error(), "continuation") {
+		return err
+	}
+	// The target may have restarted or rolled back after the capability probe.
+	// Old strict decoders reject the new field; retry the still-pending finalize
+	// without it so runtime activation and legacy main arrival are not stranded.
+	s.logger.Warn("switch-device: target rejected continuation field; retrying legacy finalize",
+		"agent", agentID, "op_id", opID, "target", targetDeviceID)
+	body.Continuation = nil
+	raw, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		return fmt.Errorf("marshal legacy finalize body: %w", marshalErr)
 	}
 	return s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
 		"/api/v1/peers/agent-sync/finalize", raw)

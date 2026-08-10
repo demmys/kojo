@@ -216,6 +216,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 
 	cmd := exec.CommandContext(ctx, grokPath, args...)
 	cmd.Env = grokCommandEnv(agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	cmd.Dir = dir
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)

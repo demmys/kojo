@@ -112,6 +112,7 @@ single-binary ` + "`Bash(curl:*)`" + ` pre-approval matcher (mixing in
 ` + "```bash" + `
 curl -skS -X POST \
   -H "X-Kojo-Token: ${KOJO_AGENT_TOKEN}" \
+  -H "X-Kojo-Session-Key: ${KOJO_SESSION_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"target_peer_id":"<DEVICE_ID>"}' \
   -w '\nHTTP_STATUS:%{http_code}\n' \
@@ -229,7 +230,8 @@ Once the target device_id is selected, POST it to the handoff
 endpoint. Replace ` + "`<DEVICE_ID>`" + ` with the resolved value:
 
 ` + "```" + `
-curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
+if not defined KOJO_SESSION_KEY set "KOJO_SESSION_KEY="
+curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "X-Kojo-Session-Key: %KOJO_SESSION_KEY%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
 ` + "```" + `
 
 The last line of stdout is ` + "`HTTP_STATUS:<code>`" + `; everything
@@ -349,6 +351,7 @@ resolved value:
 ` + "```bash" + `
 curl -skS -X POST \
   -H "X-Kojo-Token: ${KOJO_AGENT_TOKEN}" \
+  -H "X-Kojo-Session-Key: ${KOJO_SESSION_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"target_peer_id":"<DEVICE_ID>"}' \
   -w '\nHTTP_STATUS:%{http_code}\n' \
@@ -456,7 +459,8 @@ Once the target device_id is selected, POST it to the handoff
 endpoint. Replace ` + "`<DEVICE_ID>`" + ` with the resolved value:
 
 ` + "```" + `
-curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
+if not defined KOJO_SESSION_KEY set "KOJO_SESSION_KEY="
+curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "X-Kojo-Session-Key: %KOJO_SESSION_KEY%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
 ` + "```" + `
 
 The last line of stdout is ` + "`HTTP_STATUS:<code>`" + `; everything

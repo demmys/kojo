@@ -7,8 +7,8 @@ import (
 
 // Sentinel errors for the agent package.
 var (
-	ErrAgentNotFound  = errors.New("agent not found")
-	ErrAgentBusy      = errors.New("agent is busy")
+	ErrAgentNotFound = errors.New("agent not found")
+	ErrAgentBusy     = errors.New("agent is busy")
 
 	// ErrQuiescing is returned by the chat/mutation admission gates
 	// (acquirePreparing / AcquireMutation / SetSwitching / acquireResetGuard)
@@ -17,7 +17,7 @@ var (
 	// HTTP 409 mapping) keep working, while errors.Is(err, ErrQuiescing) lets
 	// callers distinguish "server is restarting" from a plain busy agent and
 	// surface the dedicated "quiescing" error code.
-	ErrQuiescing = fmt.Errorf("%w: server is restarting", ErrAgentBusy)
+	ErrQuiescing      = fmt.Errorf("%w: server is restarting", ErrAgentBusy)
 	ErrAgentResetting = errors.New("agent is being reset")
 	ErrAgentArchived  = errors.New("agent is archived")
 
@@ -39,6 +39,12 @@ var (
 	// ErrAgentNotBusy is returned by Steer / SteerOneShot when there is no
 	// turn currently running to steer.
 	ErrAgentNotBusy = errors.New("agent has no turn in progress")
+	// ErrSteerDeliveryUncertain means a steer may have reached the backend or
+	// remote holder before its acknowledgement was lost. Callers must not
+	// delete the already-persisted canonical message: the model may have
+	// observed it.
+	ErrSteerDeliveryUncertain = errors.New("steer delivery outcome is uncertain")
+	ErrSteerOriginForbidden   = errors.New("steer origin is not allowed for this turn")
 
 	// ErrQuestionNotFound is returned by Manager.AnswerQuestion when the
 	// given requestID does not match any pending user_question on the

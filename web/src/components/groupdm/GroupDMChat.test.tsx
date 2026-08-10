@@ -485,6 +485,23 @@ describe("GroupDMChat steering", () => {
       expect(mocks.postUserMessage).toHaveBeenCalledWith("g1", "fallback text", undefined),
     );
   });
+
+  it("clears the draft without retrying when remote steer delivery is uncertain", async () => {
+    withAwaitingReply();
+    mocks.steer.mockRejectedValue(
+      new Error('502: {"error":{"code":"delivery_uncertain","message":"maybe delivered"}}'),
+    );
+    renderGroup();
+
+    const input = await screen.findByPlaceholderText(/Steer the running reply/);
+    fireEvent.change(input, { target: { value: "do not duplicate" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    await waitFor(() => expect(mocks.steer).toHaveBeenCalledWith("g1", "do not duplicate"));
+    await waitFor(() => expect(input).toHaveValue(""));
+    expect(mocks.postUserMessage).not.toHaveBeenCalled();
+    expect(await screen.findByText(/may have arrived/i)).toBeInTheDocument();
+  });
 });
 
 describe("GroupDMChat draft (lazy thread creation)", () => {

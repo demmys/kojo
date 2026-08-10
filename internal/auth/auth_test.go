@@ -355,6 +355,14 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		{http.MethodPost, "/api/v1/peers/agent-sync/drop", ag, false},
 		{http.MethodPost, "/api/v1/peers/agent-sync/drop", guest, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodGet, "/api/v1/peers/handoff/arrival",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival", ag, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival", guest, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival/bind",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		// daemon self-restart — privileged agents only (Owner via the
 		// IsOwner short-circuit). Regular agents / guests / peers and
 		// GET (status endpoint) is likewise privileged-only.

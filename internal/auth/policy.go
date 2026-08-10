@@ -205,6 +205,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// run inside the handler.
 			return true
 		}
+		if method == http.MethodPost && (path == "/api/v1/peers/handoff/arrival" || path == "/api/v1/peers/handoff/arrival/bind") {
+			// Target holder asks the origin Hub to resume the exact external
+			// conversation that initiated a completed device switch. The
+			// handler binds holder_device_id to the authenticated PeerID.
+			return true
+		}
 		// kojo-attach hub-ingest path.
 		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
 			return true

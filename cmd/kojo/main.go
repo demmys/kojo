@@ -1192,8 +1192,8 @@ func main() {
 			// against a transcript missing the agent's own
 			// commitment text. See peer_agent_sync_finalize_handler.go
 			// for the new ordering: hook → UpdateAgentLockAllowedProxy
-			// → applyFinalizeTailMessage → NotifyDeviceSwitchArrival
-			// → commitPendingAgentSync.
+			// → applyFinalizeTailMessage → origin-aware arrival admission
+			// (or legacy main arrival) → commitPendingAgentSync.
 			if agentMgr != nil {
 				agentMgr.ActivateAgentRuntime(agentID)
 			}

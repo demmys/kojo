@@ -52,17 +52,17 @@ func TestBotThreadLockRefCount(t *testing.T) {
 	defer bot.cancel()
 
 	// Acquire lock for a thread.
-	tl1 := bot.acquireThreadLock("C1", "1234.5678")
-	tl1.mu.Lock()
+	r1 := bot.reserveThread("C1", "1234.5678")
+	r1.Wait()
 
 	// Acquire again for the same thread — same lock, higher refcount.
-	tl2 := bot.acquireThreadLock("C1", "1234.5678")
-	if tl1 != tl2 {
+	r2 := bot.reserveThread("C1", "1234.5678")
+	if r1.tl != r2.tl {
 		t.Fatal("expected same lock for same thread")
 	}
 
 	// Release once — should still exist (refcount > 0).
-	bot.releaseThreadLock("C1", "1234.5678", tl1)
+	bot.releaseThreadReservation("C1", "1234.5678", r1)
 	bot.threadLocksMu.Lock()
 	_, exists := bot.threadLocks["C1:1234.5678"]
 	bot.threadLocksMu.Unlock()
@@ -70,10 +70,9 @@ func TestBotThreadLockRefCount(t *testing.T) {
 		t.Fatal("lock should still exist after one release")
 	}
 
-	tl1.mu.Unlock()
-
 	// Release again — refcount hits 0, entry removed.
-	bot.releaseThreadLock("C1", "1234.5678", tl2)
+	r2.Wait()
+	bot.releaseThreadReservation("C1", "1234.5678", r2)
 	bot.threadLocksMu.Lock()
 	_, exists = bot.threadLocks["C1:1234.5678"]
 	bot.threadLocksMu.Unlock()
@@ -86,17 +85,61 @@ func TestBotThreadLockIsolation(t *testing.T) {
 	bot := newTestBot(t, agent.SlackBotConfig{})
 	defer bot.cancel()
 
-	tl1 := bot.acquireThreadLock("C1", "ts1")
-	tl2 := bot.acquireThreadLock("C1", "ts2")
-	tl3 := bot.acquireThreadLock("C2", "ts1")
+	r1 := bot.reserveThread("C1", "ts1")
+	r2 := bot.reserveThread("C1", "ts2")
+	r3 := bot.reserveThread("C2", "ts1")
 
-	if tl1 == tl2 || tl1 == tl3 || tl2 == tl3 {
+	if r1.tl == r2.tl || r1.tl == r3.tl || r2.tl == r3.tl {
 		t.Fatal("different channel/thread combos should get different locks")
 	}
 
-	bot.releaseThreadLock("C1", "ts1", tl1)
-	bot.releaseThreadLock("C1", "ts2", tl2)
-	bot.releaseThreadLock("C2", "ts1", tl3)
+	bot.releaseThreadReservation("C1", "ts1", r1)
+	bot.releaseThreadReservation("C1", "ts2", r2)
+	bot.releaseThreadReservation("C2", "ts1", r3)
+}
+
+func TestBotThreadPairKeepsArrivalAheadOfNextTurn(t *testing.T) {
+	bot := newTestBot(t, agent.SlackBotConfig{})
+	defer bot.cancel()
+
+	turn, arrival := bot.reserveThreadPair("C1", "T1")
+	next := bot.reserveThread("C1", "T1")
+	turn.Wait()
+	bot.releaseThreadReservation("C1", "T1", turn)
+	arrival.Wait()
+
+	nextReady := make(chan struct{})
+	go func() {
+		next.Wait()
+		close(nextReady)
+	}()
+	select {
+	case <-nextReady:
+		t.Fatal("next human turn overtook the reserved arrival slot")
+	case <-time.After(20 * time.Millisecond):
+	}
+	bot.releaseThreadReservation("C1", "T1", arrival)
+	select {
+	case <-nextReady:
+	case <-time.After(time.Second):
+		t.Fatal("next turn did not unblock after arrival release")
+	}
+	bot.releaseThreadReservation("C1", "T1", next)
+}
+
+func TestSlackHistoryAtTurnStartExcludesLaterUserButKeepsPriorReply(t *testing.T) {
+	history := []chathistory.HistoryMessage{
+		{MessageID: incompleteMessageID, Text: "diagnostic"},
+		{MessageID: "1786092800.000001", Text: "prior"},
+		{MessageID: "1786092826.330419", Text: "trigger"},
+		{MessageID: "1786092827.000001", Text: "future"},
+		{MessageID: "1786092828.000001", UserID: "B1", Text: "reply to prior", IsBot: true},
+		{MessageID: "1786092829.000001", UserID: "B2", Text: "future external bot", IsBot: true},
+	}
+	got := slackHistoryAtTurnStart(history, "1786092826.330419", "B1")
+	if len(got) != 4 || got[0].Text != "diagnostic" || got[1].Text != "prior" || got[2].Text != "trigger" || got[3].Text != "reply to prior" {
+		t.Fatalf("history = %+v, want diagnostic, prior, trigger, and prior reply only", got)
+	}
 }
 
 // --- Semaphore tests ---

@@ -76,6 +76,16 @@ func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEve
 // goroutine removes itself via untrackOneShot. Idempotent — a
 // second Abort on a finished chat is a no-op for both halves.
 func (m *Manager) Abort(agentID string) {
+	m.abortExceptOneShot(agentID, 0)
+}
+
+// AbortExceptOneShot cancels the main chat and every external turn except the
+// one-shot that is itself blocked on the handoff HTTP response.
+func (m *Manager) AbortExceptOneShot(agentID string, preserveOneShotID int64) {
+	m.abortExceptOneShot(agentID, preserveOneShotID)
+}
+
+func (m *Manager) abortExceptOneShot(agentID string, preserveOneShotID int64) {
 	// Call the cancel OUTSIDE busyMu: an unsolicited turn's cancel is
 	// wrapped with the backend abort (session mutex + stdin write) — running
 	// it under the global busy lock would let one wedged session stall every
@@ -90,7 +100,7 @@ func (m *Manager) Abort(agentID string) {
 	if cancel != nil {
 		cancel()
 	}
-	m.cancelOneShots(agentID)
+	m.cancelOneShotsExcept(agentID, preserveOneShotID)
 }
 
 // Steer injects an additional user message into the agent's currently
@@ -202,23 +212,24 @@ func (m *Manager) fallbackChat(ctx context.Context, agentID, text string) (<-cha
 // injectSteer persists the steer row and injects the text into the running
 // turn behind entry. Persist-first reserves the row so an injection failure
 // can't leave the model having consumed input that never persisted (a retry
-// would then double-inject). On any injection error the reserved row is rolled
-// back and the error returned (notably ErrAgentNotBusy, which Steer maps to a
-// fallback turn). On success it pushes a live "message" event so subscribed
-// clients see the steered line inline.
+// would then double-inject). Definite injection failures roll the row back;
+// ErrSteerDeliveryUncertain retains and publishes it because the backend may
+// have consumed it. On accepted/uncertain delivery it pushes a live "message"
+// event so subscribed clients see the canonical line inline.
 func (m *Manager) injectSteer(agentID string, entry busyEntry, text string) error {
 	msg := newUserMessage(text, nil)
 	if appendErr := appendMessage(agentID, msg); appendErr != nil {
 		m.logger.Warn("failed to save steer message", "agent", agentID, "err", appendErr)
 		return fmt.Errorf("steer accepted but not persisted: %w", appendErr)
 	}
-	if err := entry.steer(text); err != nil {
+	injectErr := entry.steer(text)
+	if injectErr != nil && !errors.Is(injectErr, ErrSteerDeliveryUncertain) {
 		if delErr := deleteMessage(agentID, msg.ID, ""); delErr != nil &&
 			!errors.Is(delErr, ErrMessageNotFound) {
 			m.logger.Warn("failed to roll back steer message after injection failure",
 				"agent", agentID, "err", delErr)
 		}
-		return err
+		return injectErr
 	}
 	// Re-acquire busyMu for the live-event push. clearBusy removes the
 	// entry under busyMu BEFORE close(outCh), so an entry re-observed here
@@ -233,7 +244,7 @@ func (m *Manager) injectSteer(agentID string, entry busyEntry, text string) erro
 		}
 	}
 	m.busyMu.Unlock()
-	return nil
+	return injectErr
 }
 
 // AnswerQuestion resolves a pending interactive AskUserQuestion raised by the
@@ -481,7 +492,7 @@ func (m *Manager) awaitSteerHandle(ctx context.Context, agentID string) (busyEnt
 // 1.5 s caller default is generous; in practice typical aborts
 // drain in well under 100 ms.
 func (m *Manager) WaitChatIdle(ctx context.Context, agentID string) error {
-	return m.waitChatIdle(ctx, agentID, false)
+	return m.waitChatIdle(ctx, agentID, false, 0)
 }
 
 // WaitChatIdleSelfCall is the §3.7 device-switch variant used
@@ -501,10 +512,16 @@ func (m *Manager) WaitChatIdle(ctx context.Context, agentID string) error {
 // Pair with CancelOneShotsForAgent (not Abort) on entry so we
 // don't cancel the busy entry making the call.
 func (m *Manager) WaitChatIdleSelfCall(ctx context.Context, agentID string) error {
-	return m.waitChatIdle(ctx, agentID, true)
+	return m.waitChatIdle(ctx, agentID, true, 0)
 }
 
-func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy bool) error {
+// WaitChatIdleExceptOneShot drains the main chat and all writers while
+// excluding only the identified one-shot caller.
+func (m *Manager) WaitChatIdleExceptOneShot(ctx context.Context, agentID string, preserveOneShotID int64) error {
+	return m.waitChatIdle(ctx, agentID, false, preserveOneShotID)
+}
+
+func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy bool, preserveOneShotID int64) error {
 	for {
 		m.busyMu.Lock()
 		_, busyOK := m.busy[agentID]
@@ -516,6 +533,11 @@ func (m *Manager) waitChatIdle(ctx context.Context, agentID string, skipBusy boo
 		m.busyMu.Unlock()
 		m.oneShotCancelsMu.Lock()
 		oneShotN := len(m.oneShotCancels[agentID])
+		if preserveOneShotID != 0 {
+			if _, ok := m.oneShotCancels[agentID][preserveOneShotID]; ok {
+				oneShotN--
+			}
+		}
 		m.oneShotCancelsMu.Unlock()
 		// profileGen tracks in-flight regeneratePublicProfile
 		// goroutines. The entry-gate refuses new regens during

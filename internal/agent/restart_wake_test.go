@@ -142,19 +142,19 @@ func TestInFlightOneShotSessionKey(t *testing.T) {
 	}
 
 	// One thread turn in flight → its key.
-	id1 := m.trackOneShot("ag_x", func() {}, "groupdm:g_1")
+	id1 := m.trackOneShot("ag_x", func() {}, "groupdm:g_1", "", "")
 	if got := m.InFlightOneShotSessionKey("ag_x"); got != "groupdm:g_1" {
 		t.Fatalf("single thread: got %q", got)
 	}
 
 	// A concurrent keyless one-shot must not shadow the thread key.
-	id2 := m.trackOneShot("ag_x", func() {}, "")
+	id2 := m.trackOneShot("ag_x", func() {}, "", "", "")
 	if got := m.InFlightOneShotSessionKey("ag_x"); got != "groupdm:g_1" {
 		t.Fatalf("thread + keyless: got %q", got)
 	}
 
 	// Two distinct thread keys → ambiguous → "".
-	id3 := m.trackOneShot("ag_x", func() {}, "groupdm:g_2")
+	id3 := m.trackOneShot("ag_x", func() {}, "groupdm:g_2", "", "")
 	if got := m.InFlightOneShotSessionKey("ag_x"); got != "" {
 		t.Fatalf("ambiguous: got %q", got)
 	}
@@ -164,6 +164,50 @@ func TestInFlightOneShotSessionKey(t *testing.T) {
 	m.untrackOneShot("ag_x", id3)
 	if got := m.InFlightOneShotSessionKey("ag_x"); got != "" {
 		t.Fatalf("after untrack: got %q", got)
+	}
+}
+
+func TestOneShotOriginAndSelectiveCancellation(t *testing.T) {
+	m := &Manager{
+		busy:            make(map[string]busyEntry),
+		oneShotCancels:  make(map[string]map[int64]context.CancelFunc),
+		oneShotSessions: make(map[string]map[int64]string),
+		oneShotOrigins:  make(map[string]map[int64]string),
+		oneShotArmed:    make(map[string]map[int64]time.Time),
+	}
+	preserved := make(chan struct{})
+	other := make(chan struct{})
+	mainCancelled := make(chan struct{})
+	m.busy["ag_x"] = busyEntry{cancel: func() { close(mainCancelled) }}
+	id := m.trackOneShot("ag_x", func() { close(preserved) }, "ag_x:slack:C1:T1", "hub", "cap")
+	otherID := m.trackOneShot("ag_x", func() { close(other) }, "groupdm:g_2", "hub", "other-cap")
+
+	origin, ok := m.InFlightOneShotOrigin("ag_x", "ag_x:slack:C1:T1")
+	if !ok || origin.ID != id || origin.OriginPeerID != "hub" {
+		t.Fatalf("origin = %#v, ok=%v", origin, ok)
+	}
+	m.AbortExceptOneShot("ag_x", id)
+	select {
+	case <-mainCancelled:
+	default:
+		t.Fatal("main chat was not cancelled")
+	}
+	select {
+	case <-other:
+	default:
+		t.Fatal("other one-shot was not cancelled")
+	}
+	select {
+	case <-preserved:
+		t.Fatal("caller one-shot was cancelled")
+	default:
+	}
+	m.untrackOneShot("ag_x", otherID)
+	delete(m.busy, "ag_x")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := m.WaitChatIdleExceptOneShot(ctx, "ag_x", id); err != nil {
+		t.Fatalf("wait with preserved caller: %v", err)
 	}
 }
 

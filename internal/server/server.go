@@ -183,6 +183,10 @@ type Server struct {
 	// the claim (the drain re-checks row existence and skips) or is
 	// told delivery is already in flight. Guarded by handoffDrainMu.
 	handoffDelivering map[string]struct{}
+	// handoffArrivalCaps are one-time Hub-minted capabilities carried only on
+	// the private Hub→holder turn and holder→Hub callback paths.
+	handoffArrivalMu   sync.Mutex
+	handoffArrivalCaps map[string]*handoffArrivalCapability
 	// onAgentRuntimePurged fires after the inter-peer state
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
@@ -520,6 +524,10 @@ func New(cfg Config) *Server {
 	if s.agents != nil && !cfg.PeerOnly {
 		creds := s.agents.Credentials()
 		s.externalChat = newExternalChatRouter(s)
+		if s.groupdms != nil {
+			s.groupdms.SetOneShotRouter(s.externalChat.ChatOneShot)
+			s.groupdms.SetOneShotSteerRouter(s.externalChat.SteerOneShot)
+		}
 		s.slackHub = slackbot.NewHub(
 			s.externalChat, creds,
 			func(id string) string { return agent.AgentDir(id) },
@@ -800,6 +808,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// exposes only the fenced agent-turn endpoint used by the Hub.
 		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/steer", s.handleExternalChatSteer)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/file", s.handleExternalChatFile)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
@@ -903,6 +912,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// them after the orchestrator's complete succeeds, drop
 		// rolls them back on abort.
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/finalize", s.handlePeerAgentSyncFinalize)
+		mux.HandleFunc("POST /api/v1/peers/handoff/arrival/bind", s.handleHandoffArrivalBind)
+		mux.HandleFunc("POST /api/v1/peers/handoff/arrival", s.handleHandoffArrivalContinuation)
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/drop", s.handlePeerAgentSyncDrop)
 	}
 

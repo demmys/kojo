@@ -84,12 +84,20 @@ func writeCodexThreadRef(agentID, sessionKey string, ref codexThreadRef, logger 
 }
 
 func deleteCodexThreadRef(agentID, sessionKey string, logger *slog.Logger) {
-	if err := os.Remove(codexThreadRefPath(agentID, sessionKey)); err != nil && !os.IsNotExist(err) {
+	if err := deleteCodexThreadRefStrict(agentID, sessionKey); err != nil {
 		if logger == nil {
 			logger = slog.Default()
 		}
 		logger.Warn("codex: remove stale thread ref failed", "agent", agentID, "err", err)
 	}
+}
+
+func deleteCodexThreadRefStrict(agentID, sessionKey string) error {
+	err := os.Remove(codexThreadRefPath(agentID, sessionKey))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func cloneStringAnyMap(in map[string]any) map[string]any {

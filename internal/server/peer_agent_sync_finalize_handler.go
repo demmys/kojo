@@ -68,9 +68,8 @@ type peerAgentSyncFinalizeRequest struct {
 	//      a FencingPredicate keyed on the post-hook lock token,
 	//      so a force-reclaim race aborts the apply with
 	//      errTailLockNotSelf (caller 503s, source retries).
-	//   4. NotifyDeviceSwitchArrival — arrival prompt's transcript
-	//      scan now sees the agent's own "I'll do X on arrival"
-	//      commitment alongside the user's last instruction.
+	//   4. admit the arrival either to the initiating Slack/WebUI
+	//      thread or, for legacy/main turns, to main WebUI
 	//   5. commitPendingAgentSync
 	//
 	// Nil/empty on non-self-call paths and on self-call paths where
@@ -78,6 +77,16 @@ type peerAgentSyncFinalizeRequest struct {
 	// budget — the finalize still proceeds; target's arrival just
 	// lacks the tail (degraded but functional).
 	TailMessage *store.MessageRecord `json:"tail_message,omitempty"`
+	// Continuation routes the arrival system turn back through the Hub-owned
+	// response adapter that initiated the switch. Nil preserves the legacy main
+	// WebUI arrival chat.
+	Continuation *handoffContinuation `json:"continuation,omitempty"`
+}
+
+type handoffContinuation struct {
+	SessionKey   string `json:"session_key"`
+	OriginPeerID string `json:"origin_peer_id"`
+	Capability   string `json:"capability"`
 }
 
 type peerAgentSyncFinalizeResponse struct {
@@ -111,6 +120,11 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	if req.SourceDeviceID == "" || req.AgentID == "" || req.OpID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source_device_id, agent_id, and op_id required")
+		return
+	}
+	if req.Continuation != nil && (req.Continuation.SessionKey == "" || req.Continuation.OriginPeerID == "" || req.Continuation.Capability == "") {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"continuation.session_key, continuation.origin_peer_id, and continuation.capability required")
 		return
 	}
 	if !verifySignerIsSource(p, req.SourceDeviceID) {
@@ -183,8 +197,8 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	// agentHolderAdmitMiddleware gates agents/* on
 	// `holder_peer == self AND allowed_proxy_peer == signer`.
 	// AcquireAgentLock fresh-row insert lands allowed_proxy_peer
-	// = self; we rewrite it to source here so the Hub→target
-	// proxy admits. Scoped to a single agent — no
+	// = self; we rewrite it to the response-surface Hub (or the
+	// legacy source peer) so Hub→target proxying admits. Scoped to a single agent — no
 	// peer_registry.trusted flip, so a paired-but-untrusted
 	// source can NOT use this as a stepping-stone to
 	// sessions/files/git.
@@ -192,7 +206,7 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		err := s.agents.Store().UpdateAgentLockAllowedProxy(
 			r.Context(), req.AgentID,
 			s.peerID.DeviceID, // expected holder
-			req.SourceDeviceID,
+			allowedProxyPeer(req),
 		)
 		switch {
 		case err == nil:
@@ -236,28 +250,49 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Arrival prompt fire is deliberately AFTER the tail apply.
-	// NotifyDeviceSwitchArrival's buildArrivalPrompt reads
-	// agent_messages via ListMessages; firing it before the tail
-	// landed would build the prompt against an incomplete transcript
-	// and quote only the user instruction without the commitment
-	// text. Hook-side firing was removed for this reason
-	// (cmd/kojo/main.go SetOnAgentSyncFinalized).
+	// Build the arrival only AFTER the tail apply. The external continuation
+	// carries this exact prompt to the Hub; the legacy path below asks Manager
+	// to build the same prompt for main WebUI delivery.
+	sourceName := req.SourceDeviceID
+	notes := agent.ArrivalNotes{
+		TokenReissued: tokenReissued, DegradedFlushes: entry.DegradedFlushes, TransferSkips: entry.TransferSkips,
+	}
 	if s.agents != nil {
-		sourceName := req.SourceDeviceID
 		if req.SourceDeviceID != "" && s.agents.Store() != nil {
 			if rec, gerr := s.agents.Store().GetPeer(r.Context(), req.SourceDeviceID); gerr == nil && rec.Name != "" {
 				sourceName = rec.Name
 			}
 		}
-		s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, agent.ArrivalNotes{
-			TokenReissued:   tokenReissued,
-			DegradedFlushes: entry.DegradedFlushes,
-			TransferSkips:   entry.TransferSkips,
-		})
+	}
+	// Admit the arrival before consuming the pending finalize marker. This
+	// preserves the legacy crash-safety property: once finalize commits, either
+	// the response adapter owns an admitted in-process FIFO reservation or Manager
+	// has registered the main-WebUI arrival. Callback retries are idempotent by
+	// capability+op_id, and Manager deduplicates the fallback by op_id, so a kv
+	// delete failure can safely retry the whole finalize.
+	if s.agents != nil {
+		if req.Continuation == nil {
+			s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+		} else {
+			arrivalReq := handoffArrivalRequest{
+				HolderDeviceID: s.peerID.DeviceID,
+				AgentID:        req.AgentID, OpID: req.OpID,
+				SessionKey: req.Continuation.SessionKey, SourceDeviceID: req.SourceDeviceID,
+				Notes: notes, Capability: req.Continuation.Capability,
+			}
+			fallback := func() {
+				s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+			}
+			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
+				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
+					"agent", req.AgentID, "op_id", req.OpID, "err", err)
+				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())
+				return
+			}
+		}
 	}
 
-	// Hook + admit gate + tail + arrival all succeeded — NOW remove
+	// Hook + admit gate + tail + arrival admission all succeeded — NOW remove
 	// the pending entry so a subsequent retry surfaces as the 404
 	// idempotent path. A kv delete failure still surfaces as 500:
 	// leaving the sealed token in place while telling the
@@ -279,6 +314,13 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	s.kickHandoffQueueDrain()
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
+}
+
+func allowedProxyPeer(req peerAgentSyncFinalizeRequest) string {
+	if req.Continuation != nil && req.Continuation.OriginPeerID != "" {
+		return req.Continuation.OriginPeerID
+	}
+	return req.SourceDeviceID
 }
 
 // errTailLockNotSelf signals that the tail apply could not proceed

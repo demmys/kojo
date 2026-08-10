@@ -94,6 +94,9 @@ func newSwitchTestServer(t *testing.T, targetURL string) (*Server, string) {
 	}); err != nil {
 		t.Fatalf("upsert target peer: %v", err)
 	}
+	if _, err := st.AcquireAgentLock(ctx, agentID, "dev_src", now, 60_000); err != nil {
+		t.Fatalf("acquire source lock: %v", err)
+	}
 
 	srv := &Server{
 		agents: mgr,

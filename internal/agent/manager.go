@@ -2370,6 +2370,12 @@ func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
 // pass OneShotOpts{} for the legacy ephemeral-session behaviour.
 type OneShotOpts struct {
+	// PreserveTerminalOnCancel keeps a cancelled terminal event pending until
+	// the response adapter consumes it. Slack enables this because its live text
+	// deltas are intentionally lossy and the terminal message is authoritative.
+	// Leave false for transports that may abandon the returned channel on cancel.
+	PreserveTerminalOnCancel bool
+
 	// SessionKey, when non-empty, opts INTO Claude session resumption keyed
 	// by this string instead of staying purely ephemeral. Slack sets this
 	// to a stable hash of (agentID, channel, threadTS) so repeated DMs in
@@ -2655,7 +2661,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 				m.oneShotSteersMu.Unlock()
 			}()
 		}
-		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
+		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh, opts.PreserveTerminalOnCancel)
 	}()
 
 	return outCh, nil
@@ -2801,7 +2807,7 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 
 // processOneShotEvents is like processChatEvents but does not persist
 // messages to the transcript. It still forwards events to outCh.
-func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserveTerminalOnCancel bool) {
 	for {
 		select {
 		case event, ok := <-backendCh:
@@ -2816,6 +2822,7 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				case outCh <- event:
 				case <-ctx.Done():
 					event.rejectAttachmentOwnership()
+					m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
 					return
 				}
 			} else if event.Type == "done" || event.Type == "error" {
@@ -2823,9 +2830,27 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				if event.Type == "done" {
 					m.syncPersona(agentID)
 				}
+				// Prefer the terminal event when the caller is still draining
+				// outCh, even if cancellation became ready at the same instant.
+				// This preserves an authoritative cancelled partial for local
+				// backends. A peer relay intentionally couples cancellation to its
+				// HTTP stream, so only deltas already decoded on the Hub are
+				// available there; the Slack adapter preserves those separately.
+				select {
+				case outCh <- event:
+					continue
+				default:
+				}
+				if ctx.Err() != nil {
+					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					drainOneShotAfterCancel(backendCh)
+					return
+				}
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
+					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					drainOneShotAfterCancel(backendCh)
 					return
 				}
 			} else {
@@ -2835,11 +2860,38 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				}
 			}
 		case <-ctx.Done():
-			for event := range backendCh {
-				if event.Type == "attachment" {
-					event.rejectAttachmentOwnership()
-				}
+			m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
+			return
+		}
+	}
+}
+
+func forwardOneShotTerminalAfterCancel(outCh chan<- ChatEvent, event ChatEvent, preserve bool) {
+	if preserve {
+		outCh <- event
+	}
+}
+
+func drainOneShotAfterCancel(backendCh <-chan ChatEvent) {
+	for event := range backendCh {
+		if event.Type == "attachment" {
+			event.rejectAttachmentOwnership()
+		}
+	}
+}
+
+func (m *Manager) drainOneShotUntilTerminalAfterCancel(agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserve bool) {
+	for event := range backendCh {
+		if event.Type == "attachment" {
+			event.rejectAttachmentOwnership()
+			continue
+		}
+		if event.Type == "done" || event.Type == "error" {
+			if event.Type == "done" {
+				m.syncPersona(agentID)
 			}
+			forwardOneShotTerminalAfterCancel(outCh, event, preserve)
+			drainOneShotAfterCancel(backendCh)
 			return
 		}
 	}

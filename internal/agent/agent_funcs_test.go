@@ -167,18 +167,21 @@ func TestValidModelEffort(t *testing.T) {
 	if !ValidModelEffort("claude-opus-5", "max") {
 		t.Errorf("expected max to be valid for claude-opus-5")
 	}
-	// grok 0.2.91 advertises only low/medium/high (grok-4.5) or an empty
-	// efforts list (composer); xhigh/max are no longer valid here.
-	for _, m := range []string{"grok-4.5", "grok-composer-2.5-fast"} {
-		if ValidModelEffort(m, "xhigh") {
-			t.Errorf("expected xhigh to be invalid for grok model %q", m)
-		}
+	// grok 1.0.3: grok-4.6 advertises low/medium/high/xhigh, grok-4.5 stops
+	// at high. Neither advertises max.
+	for _, m := range []string{"grok-4.6", "grok-4.5"} {
 		if ValidModelEffort(m, "max") {
 			t.Errorf("expected max to be invalid for grok model %q", m)
 		}
 		if !ValidModelEffort(m, "high") {
 			t.Errorf("expected high to be valid for grok model %q", m)
 		}
+	}
+	if !ValidModelEffort("grok-4.6", "xhigh") {
+		t.Errorf("expected xhigh to be valid for grok-4.6")
+	}
+	if ValidModelEffort("grok-4.5", "xhigh") {
+		t.Errorf("expected xhigh to be invalid for grok-4.5")
 	}
 	// Fable 5 supports max effort (Mythos-class, like opus)
 	if !ValidModelEffort("claude-fable-5", "max") {

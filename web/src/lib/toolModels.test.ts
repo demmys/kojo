@@ -103,21 +103,20 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("gpt-5.6-luna")).toBe("medium");
   });
 
-  it("lists both grok models", () => {
-    expect(modelsForTool("grok")).toEqual(["grok-4.5", "grok-composer-2.5-fast"]);
-    expect(defaultModelForTool("grok")).toBe("grok-4.5");
+  it("lists both grok models, newest first", () => {
+    expect(modelsForTool("grok")).toEqual(["grok-4.6", "grok-4.5"]);
+    expect(defaultModelForTool("grok")).toBe("grok-4.6");
+  });
+
+  it("grok-4.6 offers xhigh but not max, and defaults to high", () => {
+    expect(effortLevelsForModel("grok-4.6")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(defaultEffortForModel("grok-4.6")).toBe("high");
   });
 
   it("grok-4.5 offers only low/medium/high and defaults to high", () => {
     expect(effortLevelsForModel("grok-4.5")).not.toContain("xhigh");
     expect(effortLevelsForModel("grok-4.5")).not.toContain("max");
     expect(defaultEffortForModel("grok-4.5")).toBe("high");
-  });
-
-  it("grok-composer-2.5-fast offers only low/medium/high and defaults to high", () => {
-    expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("xhigh");
-    expect(effortLevelsForModel("grok-composer-2.5-fast")).not.toContain("max");
-    expect(defaultEffortForModel("grok-composer-2.5-fast")).toBe("high");
   });
 });
 

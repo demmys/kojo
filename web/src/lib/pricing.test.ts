@@ -25,12 +25,18 @@ describe("priceModel", () => {
     expect(priceModel("claude-sonnet-4-6")?.output).toBe(15);
   });
 
-  it("prices xAI grok-4.5 with explicit cache-read rate", () => {
-    expect(priceModel("grok-4.5")).toEqual({
+  it("prices xAI grok models with their explicit cache-read rates", () => {
+    expect(priceModel("grok-4.6")).toEqual({
       input: 2,
       output: 6,
       cacheRead: 0.5,
       cacheWrite: 2, // no cache-write surcharge — plain input rate
+    });
+    expect(priceModel("grok-4.5")).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.3,
+      cacheWrite: 2,
     });
   });
 
@@ -65,10 +71,10 @@ describe("estimateTurnCost", () => {
     expect(cost).toBeCloseTo(0.3 + 3.0, 6);
   });
 
-  it("estimates grok-4.5 with xAI cache rates", () => {
-    // grok-4.5: input 2, output 6, cacheRead 0.5, cacheWrite 2 per 1M.
+  it("estimates grok-4.6 with xAI cache rates", () => {
+    // grok-4.6: input 2, output 6, cacheRead 0.5, cacheWrite 2 per 1M.
     // 1M in, 1M out, 1M cacheRead, 1M cacheWrite = 2 + 6 + 0.5 + 2 = 10.5
-    const cost = estimateTurnCost("grok-4.5", {
+    const cost = estimateTurnCost("grok-4.6", {
       inputTokens: 1_000_000,
       outputTokens: 1_000_000,
       cacheReadInputTokens: 1_000_000,

@@ -18,15 +18,19 @@
 //   claude-sonnet-4-6:  3 / 15
 //   claude-haiku-4-5 :  1 /  5
 //
-// xAI source: https://docs.x.ai/developers/models/grok-4.5 and
-// https://docs.x.ai/developers/pricing (fetched 2026-07-10).
+// xAI source: https://docs.x.ai/developers/pricing plus the per-model pages
+// https://docs.x.ai/developers/models/grok-4.6 and .../grok-4.5
+// (fetched 2026-08-13).
 // xAI publishes an explicit cached-input rate and has no cache-write surcharge
 // (cacheCreation tokens bill at the plain input rate when reported).
-//   grok-4.5: input $2.00 / cached input $0.50 / output $6.00 per 1M
+//   grok-4.6: input $2.00 / cached input $0.50 / output $6.00 per 1M
+//   grok-4.5: input $2.00 / cached input $0.30 / output $6.00 per 1M
+// Both models double every rate for requests whose prompt reaches 200k tokens
+// (the whole request bills at the long-context tier). kojo prices the short-
+// context tier only, so estimates understate very large turns by up to 2x.
 //
-// Models not in the table (fable-5 bare alias, grok-composer-*, gpt-*, custom,
-// llama.cpp, "") return undefined from priceModel → no cost is shown.
-// grok-composer-2.5-fast has no authoritative public API rate as of 2026-07-10.
+// Models not in the table (fable-5 bare alias, gpt-*, custom, llama.cpp, "")
+// return undefined from priceModel → no cost is shown.
 
 export interface ModelPricing {
   /** USD per 1M input (uncached) tokens. */
@@ -76,8 +80,9 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-sonnet-5": pricedAnthropic(3, 15),
   "claude-sonnet-4-6": pricedAnthropic(3, 15),
   "claude-haiku-4-5": pricedAnthropic(1, 5),
-  // xAI — https://docs.x.ai/developers/models/grok-4.5 (2026-07-10)
-  "grok-4.5": pricedXai(2, 6, 0.5),
+  // xAI — https://docs.x.ai/developers/pricing (2026-08-13)
+  "grok-4.6": pricedXai(2, 6, 0.5),
+  "grok-4.5": pricedXai(2, 6, 0.3),
 };
 
 // kojo agent.model aliases (see web/src/lib/toolModels.ts) mapped to a
@@ -90,7 +95,7 @@ const ALIASES: Record<string, string> = {
 
 /**
  * Resolve a kojo agent.model value to its pricing, or undefined when the
- * model is unpriced (composer/gpt/codex, custom, llama.cpp, unknown aliases).
+ * model is unpriced (gpt/codex, custom, llama.cpp, unknown aliases).
  */
 export function priceModel(model: string | undefined): ModelPricing | undefined {
   if (!model) return undefined;

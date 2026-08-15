@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/url"
 	"strings"
+
+	"github.com/loppo-llc/kojo/internal/customapi"
 )
 
 // LlamaCppBackend implements ChatBackend by talking directly to llama-server's
@@ -19,13 +19,13 @@ import (
 // No CLI dependency — just needs HTTP access to the server.
 type LlamaCppBackend struct {
 	logger *slog.Logger
-	client *http.Client
+	creds  *CredentialStore
 }
 
-func NewLlamaCppBackend(logger *slog.Logger) *LlamaCppBackend {
+func NewLlamaCppBackend(logger *slog.Logger, creds *CredentialStore) *LlamaCppBackend {
 	return &LlamaCppBackend{
 		logger: logger,
-		client: &http.Client{Timeout: 0},
+		creds:  creds,
 	}
 }
 
@@ -38,8 +38,14 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 	if agent.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for llama.cpp backend")
 	}
-	if err := validateLoopbackURL(agent.CustomBaseURL); err != nil {
+	client, err := customapi.NewLocalOrTailnetClient(ctx, agent.CustomBaseURL, 0)
+	if err != nil {
 		return nil, fmt.Errorf("llama.cpp customBaseURL: %w", err)
+	}
+	apiKey, err := LoadCustomAPIKey(b.creds, agent.ID, agent.CustomBaseURL)
+	if err != nil {
+		client.CloseIdleConnections()
+		return nil, fmt.Errorf("load custom API key: %w", err)
 	}
 
 	effectivePrompt := systemPrompt
@@ -79,24 +85,31 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	endpoint := strings.TrimRight(agent.CustomBaseURL, "/") + "/v1/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer no-key")
+	if apiKey == "" {
+		apiKey = "no-key"
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		client.CloseIdleConnections()
 		return nil, fmt.Errorf("request to %s: %w", endpoint, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		client.CloseIdleConnections()
 		return nil, fmt.Errorf("llama-server returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -104,28 +117,12 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 
 	go func() {
 		defer close(ch)
+		defer client.CloseIdleConnections()
 		defer resp.Body.Close()
 		b.streamSSE(ctx, ch, resp.Body, thinkOff)
 	}()
 
 	return ch, nil
-}
-
-// validateLoopbackURL checks that the URL points to a loopback address.
-func validateLoopbackURL(rawURL string) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-	host := parsed.Hostname()
-	if host == "localhost" {
-		return nil
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return fmt.Errorf("only loopback addresses are allowed, got %q", host)
-	}
-	return nil
 }
 
 func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {

@@ -1793,15 +1793,24 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// don't touch your rows" so a broken credentials.key / older binary
 	// can't silently wipe target's credentials. Mirrors how the
 	// best-effort LookupAgentToken below behaves on missing state.
+	tool := agentRecordTool(rec)
 	if s.agents != nil && s.agents.HasCredentials() {
 		creds, cerr := s.agents.Credentials().ExportCredentials(agentID)
 		if cerr != nil {
 			return nil, fmt.Errorf("export credentials: %w", cerr)
 		}
 		req.Credentials = &creds
+		customKey, kerr := agent.LoadCustomAPIKey(s.agents.Credentials(), agentID, agentRecordCustomBaseURL(rec))
+		if kerr != nil {
+			return nil, fmt.Errorf("export custom API key: %w", kerr)
+		}
+		// Non-nil even when empty: once the source credential store is
+		// authoritative, the target must clear any stale key retained from an
+		// earlier stay. Omitting the field for a keyless non-custom agent could
+		// resurrect a revoked key when that agent later selects custom again.
+		req.CustomAPIKey = &customKey
 	}
 
-	tool := agentRecordTool(rec)
 	// Transfer only the configured backend's active native sessions. Stale
 	// artifacts left by a previous backend are not part of the running
 	// agent state and previously accounted for tens of MiB of duplicate

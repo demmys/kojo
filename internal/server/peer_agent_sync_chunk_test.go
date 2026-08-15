@@ -484,10 +484,12 @@ func TestSplitAgentSyncIntoChunks_RespectsBudget(t *testing.T) {
 // singletons returns zero data chunks. The orchestrator still
 // commits — begin alone applies the singletons.
 func TestSplitAgentSyncIntoChunks_EmptyPayload(t *testing.T) {
+	customKey := "sk-unsloth-transfer"
 	payload := &peerAgentSyncRequest{
 		SourceDeviceID: testChunkedSource,
 		OpID:           "op-empty",
 		Agent:          &store.AgentRecord{ID: testChunkedAgentID, Name: "empty"},
+		CustomAPIKey:   &customKey,
 	}
 	begin, chunks, err := splitAgentSyncIntoChunks(payload, 1024)
 	if err != nil {
@@ -495,6 +497,9 @@ func TestSplitAgentSyncIntoChunks_EmptyPayload(t *testing.T) {
 	}
 	if begin == nil {
 		t.Fatalf("begin nil")
+	}
+	if begin.CustomAPIKey == nil || *begin.CustomAPIKey != customKey {
+		t.Fatalf("custom API key not carried in begin: %#v", begin.CustomAPIKey)
 	}
 	if len(chunks) != 0 {
 		t.Errorf("chunks len = %d want 0", len(chunks))

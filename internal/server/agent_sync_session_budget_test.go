@@ -12,6 +12,7 @@ import (
 
 func TestExactAgentSyncNonSessionJSONSize_MatchesEncodingJSON(t *testing.T) {
 	emptyCredentials := []*agent.Credential{}
+	customKey := "sk-unsloth-size"
 	req := &peerAgentSyncRequest{
 		SourceDeviceID: "src", OpID: "op", Agent: &store.AgentRecord{ID: "ag_x"},
 		Messages: []*store.MessageRecord{
@@ -20,6 +21,7 @@ func TestExactAgentSyncNonSessionJSONSize_MatchesEncodingJSON(t *testing.T) {
 		},
 		AgentToken: "token", SinceMessageSeq: 7,
 		Credentials:     &emptyCredentials,
+		CustomAPIKey:    &customKey,
 		DegradedFlushes: []string{"memory_flush"},
 		TransferSkips:   []agent.SkippedSessionFile{{Path: "old.jsonl", Reason: "capacity", SizeBytes: 42}},
 	}

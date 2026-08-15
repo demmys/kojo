@@ -115,6 +115,14 @@ export function AgentSettings() {
   const location = useLocation();
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
+  const agentIDRef = useRef(id);
+  agentIDRef.current = id;
+  const customKeyLastAgentIDRef = useRef(id);
+  const customKeyOperationRef = useRef(0);
+  if (customKeyLastAgentIDRef.current !== id) {
+    customKeyLastAgentIDRef.current = id;
+    customKeyOperationRef.current += 1;
+  }
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
@@ -127,6 +135,10 @@ export function AgentSettings() {
   const [autoEffort, setAutoEffort] = useState(true);
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
+  const [customAPIKey, setCustomAPIKey] = useState("");
+  const [customAPIKeyConfigured, setCustomAPIKeyConfigured] = useState(false);
+  const [customAPIKeySaving, setCustomAPIKeySaving] = useState(false);
+  const [customAPIKeyVersion, setCustomAPIKeyVersion] = useState(0);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [cronExpr, setCronExpr] = useState("");
@@ -347,6 +359,12 @@ export function AgentSettings() {
 
   useEffect(() => {
     if (!id) return;
+    let cancelled = false;
+    // Secret state must never survive route reuse for another agent while the
+    // replacement requests are still in flight.
+    setCustomAPIKey("");
+    setCustomAPIKeyConfigured(false);
+    setCustomAPIKeySaving(false);
     // Run agent + workspace-file fetches in parallel via allSettled so a
     // 404 on one endpoint (e.g. /user-context against a server that
     // hasn't been rebuilt) doesn't blank out the rest of the form. The
@@ -359,7 +377,9 @@ export function AgentSettings() {
       agentApi.getUserContext(id),
       agentApi.getAgentStatus(id),
       agentApi.getAgentAnchor(id),
-    ]).then(([agentRes, checkinRes, userCtxRes, statusRes, anchorRes]) => {
+      agentApi.customApiKey.get(id),
+    ]).then(([agentRes, checkinRes, userCtxRes, statusRes, anchorRes, customKeyRes]) => {
+      if (cancelled) return;
       if (agentRes.status !== "fulfilled") {
         navigateRef.current("/");
         return;
@@ -427,8 +447,12 @@ export function AgentSettings() {
         setLoadedAnchor("");
         setAnchorEtag("");
       }
+      setCustomAPIKeyConfigured(
+        customKeyRes.status === "fulfilled" && customKeyRes.value.configured,
+      );
       setStatusLoadGen((g) => g + 1);
     });
+    return () => { cancelled = true; };
   }, [id]);
 
   // Keep nextCronAt fresh. The initial GET captures a snapshot; without
@@ -509,7 +533,59 @@ export function AgentSettings() {
     };
   }, [id, agent?.nextCronAt]);
 
-  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel);
+  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel, {
+    agentId: id,
+    ...(customAPIKey ? { apiKey: customAPIKey } : {}),
+    credentialVersion: customAPIKeyVersion,
+  });
+  const customAPIKeyURLSaved =
+    !!agent && customBaseURL.trim() === (agent.customBaseURL ?? "").trim();
+
+  const handleSaveCustomAPIKey = async () => {
+    if (!id || !customAPIKey.trim()) return;
+    const requestID = id;
+    const operation = ++customKeyOperationRef.current;
+    setCustomAPIKeySaving(true);
+    setError("");
+    try {
+      await agentApi.customApiKey.set(id, customBaseURL.trim(), customAPIKey.trim());
+      if (agentIDRef.current !== requestID || customKeyOperationRef.current !== operation) return;
+      setCustomAPIKey("");
+      setCustomAPIKeyConfigured(true);
+      setCustomAPIKeyVersion((v) => v + 1);
+    } catch (err) {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setError(errMsg(err));
+      }
+    } finally {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setCustomAPIKeySaving(false);
+      }
+    }
+  };
+
+  const handleDeleteCustomAPIKey = async () => {
+    if (!id || !confirm(t("settings.customApiKeyRemoveConfirm"))) return;
+    const requestID = id;
+    const operation = ++customKeyOperationRef.current;
+    setCustomAPIKeySaving(true);
+    setError("");
+    try {
+      await agentApi.customApiKey.delete(id);
+      if (agentIDRef.current !== requestID || customKeyOperationRef.current !== operation) return;
+      setCustomAPIKey("");
+      setCustomAPIKeyConfigured(false);
+      setCustomAPIKeyVersion((v) => v + 1);
+    } catch (err) {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setError(errMsg(err));
+      }
+    } finally {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setCustomAPIKeySaving(false);
+      }
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -536,6 +612,9 @@ export function AgentSettings() {
       // key spacing), so also skip when it still parses to the template.
       const statusDirty = statusContent !== loadedStatus && !statusIsDefault;
       const anchorDirty = anchorContent !== loadedAnchor;
+      const customURLChanged =
+        needsCustomURLFor(tool) &&
+        customBaseURL.trim() !== (agent?.customBaseURL ?? "").trim();
 
       const updated = await agentApi.update(
         id!,
@@ -592,6 +671,10 @@ export function AgentSettings() {
       // TTS model/stylePrompt); without this the dirty diff would compare
       // raw local state against the normalized row and stay true forever.
       hydrateFromAgent(updated);
+      if (customURLChanged) {
+        setCustomAPIKeyConfigured(false);
+        setCustomAPIKeyVersion((v) => v + 1);
+      }
 
       if (checkinDirty) {
         // Thread the etag captured at load time as If-Match. Empty
@@ -1373,14 +1456,57 @@ export function AgentSettings() {
             )}
 
             {needsCustomURL && (
-              <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
-                <Input
-                  mono
-                  value={customBaseURL}
-                  onChange={(e) => setCustomBaseURL(e.target.value)}
-                  placeholder="http://localhost:8080"
-                />
-              </Field>
+              <div className="space-y-4">
+                <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
+                  <Input
+                    mono
+                    value={customBaseURL}
+                    onChange={(e) => setCustomBaseURL(e.target.value)}
+                    disabled={customAPIKeySaving}
+                    placeholder="http://localhost:8080"
+                  />
+                </Field>
+                <Field label={t("settings.customApiKey")} help={t("settings.customApiKeyHelp")}>
+                  <div className="space-y-2">
+                    <Input
+                      mono
+                      type="password"
+                      autoComplete="new-password"
+                      value={customAPIKey}
+                      onChange={(e) => setCustomAPIKey(e.target.value)}
+                      disabled={customAPIKeySaving}
+                      placeholder={customAPIKeyConfigured ? t("settings.customApiKeyConfigured") : "sk-unsloth-…"}
+                    />
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        disabled={customAPIKeySaving || !customAPIKey.trim() || !customAPIKeyURLSaved}
+                        onClick={handleSaveCustomAPIKey}
+                      >
+                        {customAPIKeyConfigured ? t("gs.update") : t("gs.save")}
+                      </Button>
+                      {customAPIKeyConfigured && (
+                        <Button
+                          type="button"
+                          variant="danger"
+                          disabled={customAPIKeySaving}
+                          onClick={handleDeleteCustomAPIKey}
+                        >
+                          {t("settings.customApiKeyRemove")}
+                        </Button>
+                      )}
+                      {customAPIKeyConfigured && (
+                        <span className="text-[12px] text-lamp-run">{t("gs.configured")}</span>
+                      )}
+                    </div>
+                    {!customAPIKeyURLSaved && (
+                      <p className="text-[12px] text-lamp-warn">
+                        {t("settings.customApiKeySaveUrlFirst")}
+                      </p>
+                    )}
+                  </div>
+                </Field>
+              </div>
             )}
 
             {/* Allowed Tools (custom only) */}

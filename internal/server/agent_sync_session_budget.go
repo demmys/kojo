@@ -288,6 +288,11 @@ func exactAgentSyncNonSessionJSONSize(req *peerAgentSyncRequest) (int64, error) 
 			return 0, err
 		}
 	}
+	if req.CustomAPIKey != nil {
+		if err := addValue("custom_api_key", req.CustomAPIKey); err != nil {
+			return 0, err
+		}
+	}
 	if len(req.DegradedFlushes) > 0 {
 		if err := addArray("degraded_flushes", len(req.DegradedFlushes), func(i int) ([]byte, error) { return json.Marshal(req.DegradedFlushes[i]) }); err != nil {
 			return 0, err

@@ -159,10 +159,11 @@ func NormalizeThinkingMode(mode string) string {
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
-	// grok's models_cache.json advertises only low/medium/high for
-	// grok-4.5 and an empty efforts list for grok-composer-2.5-fast, so
-	// neither offers xhigh/max here. Keep this in sync with
-	// web/src/lib/toolModels.ts xhighModels.
+	// grok CLI 1.0.3's models_cache.json advertises xhigh for grok-4.6
+	// but only low/medium/high for grok-4.5; neither offers max. Keep
+	// this in sync with web/src/lib/toolModels.ts xhighModels /
+	// grokXhighModels.
+	"grok-4.6":    true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
@@ -184,12 +185,25 @@ var codexMaxEffortModels = map[string]bool{
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
-// grokEffortModels only advertise low/medium/high (grok CLI 0.2.91:
-// grok-4.5 lists efforts [high,medium,low]; grok-composer-2.5-fast lists
-// none). xhigh is already excluded via xhighModels; max is rejected here
-// even though it'd otherwise pass the generic non-codex allowance.
+// grokEffortModels lists the grok CLI's models (1.0.3: grok-4.6 lists
+// efforts [xhigh,high,medium,low], grok-4.5 lists [high,medium,low]).
+// Neither advertises max, so max is rejected here even though it'd
+// otherwise pass the generic non-codex allowance; xhigh is gated per
+// model via xhighModels.
 var grokEffortModels = map[string]bool{
-	"grok-4.5": true, "grok-composer-2.5-fast": true,
+	"grok-4.6": true, "grok-4.5": true,
+}
+
+// retiredGrokModels maps model ids the grok CLI no longer accepts onto the
+// current default. The rewrite happens on the read path in normalizeAgent
+// (see store.go). Every retired id points at the newest model rather than
+// its nearest surviving sibling: input/output rates match across the two
+// live grok models (only the cached-input rate differs, and 4.6's is the
+// higher of the two), so the newest id is the choice least likely to
+// strand an agent on a model that retires next.
+var retiredGrokModels = map[string]string{
+	"grok-build":             "grok-4.6",
+	"grok-composer-2.5-fast": "grok-4.6",
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.

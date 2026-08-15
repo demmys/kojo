@@ -24,8 +24,8 @@ export const toolModels: Record<string, ToolModelConfig> = {
     ],
   },
   grok: {
-    default: "grok-4.5",
-    models: ["grok-4.5", "grok-composer-2.5-fast"],
+    default: "grok-4.6",
+    models: ["grok-4.6", "grok-4.5"],
   },
   custom: {
     default: "",
@@ -62,18 +62,20 @@ const codexMaxModels = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
 // gpt-5.6-sol advertises default_reasoning_level "low"; every other codex
 // model defaults to medium.
 const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
-// grok CLI 0.2.91 advertises only low/medium/high for its models
-// (grok-4.5 lists efforts [high,medium,low]; composer lists none), so
-// neither xhigh nor max is offered. Keep in sync with agent.go grokEffortModels.
+// grok CLI 1.0.3 models_cache.json: grok-4.6 lists efforts
+// [xhigh,high,medium,low]; grok-4.5 lists [high,medium,low]. Neither
+// advertises "max". Keep in sync with agent.go grokEffortModels /
+// grokXhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
+const grokXhighModels = new Set(["grok-4.6"]);
 
 /**
  * Models whose default effort is xhigh (rather than high).
  * Opus 5 / 4.8 support xhigh and max but default to high; only Opus 4.7
  * defaults to xhigh. The "opus" alias is treated as Opus 5, so it defaults
- * to high. grok-4.5 advertises low/medium/high (default high) and
- * grok-composer-2.5-fast advertises an empty efforts list, so neither offers
- * xhigh and both default to high.
+ * to high. grok-4.6 advertises low/medium/high/xhigh and grok-4.5
+ * low/medium/high; both carry reasoning_effort "high" as the CLI default,
+ * so neither is listed here.
  */
 const defaultXhighModels = new Set(["claude-opus-4-7"]);
 
@@ -103,6 +105,7 @@ export function sessionEffortLevelsForModel(model: string): string[] {
 export function effortLevelsForModel(model: string): readonly EffortLevel[] {
   if (codexMaxModels.has(model)) return effortLevels;
   if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
+  if (grokXhighModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokEffortModels.has(model)) return ["low", "medium", "high"] as const;
   if (xhighModels.has(model)) return effortLevels;
   return effortLevels.filter((e) => e !== "xhigh");

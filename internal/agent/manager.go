@@ -452,8 +452,8 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			"claude":    NewClaudeBackend(logger),
 			"codex":     NewCodexBackend(logger),
 			"grok":      NewGrokBackend(logger),
-			"custom":    NewCustomBackend(logger),
-			"llama.cpp": NewLlamaCppBackend(logger),
+			"custom":    NewCustomBackend(logger, creds),
+			"llama.cpp": NewLlamaCppBackend(logger, creds),
 		},
 		store:              st,
 		creds:              creds,
@@ -677,6 +677,9 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
+	if len(cfg.CustomAPIKey) > CustomAPIKeyMaxBytes {
+		return nil, fmt.Errorf("customApiKey exceeds %d bytes", CustomAPIKeyMaxBytes)
+	}
 
 	a, err := newAgent(cfg)
 	if err != nil {
@@ -692,6 +695,22 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, err
 	}
 	defer releaseMut()
+
+	customKeyStored := false
+	if strings.TrimSpace(cfg.CustomAPIKey) != "" {
+		if m.creds == nil {
+			return nil, fmt.Errorf("credential store is not available")
+		}
+		if err := StoreCustomAPIKey(m.creds, a.ID, a.CustomBaseURL, cfg.CustomAPIKey); err != nil {
+			return nil, fmt.Errorf("store custom API key: %w", err)
+		}
+		customKeyStored = true
+		defer func() {
+			if customKeyStored {
+				_ = StoreCustomAPIKey(m.creds, a.ID, "", "")
+			}
+		}()
+	}
 
 	if err := ensureAgentDir(a); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
@@ -717,6 +736,8 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	m.mu.Unlock()
 
 	m.save()
+	// The agent row is now durable; retain the encrypted custom key.
+	customKeyStored = false
 
 	// Sync the freshly-minted MEMORY.md / memory/ tree into the DB.
 	// ensureAgentDir already wrote the initial MEMORY.md, but the
@@ -1551,6 +1572,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// substituted curl string (grok seeing a claude body) or
 	// produce wrong wording in the UI.
 	oldTool := a.Tool
+	oldCustomBaseURL := a.CustomBaseURL
 
 	oldPersona := a.Persona
 	oldOverride := a.PublicProfileOverride
@@ -1711,6 +1733,16 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	m.save()
+	customBaseURLChanged := cfg.CustomBaseURL != nil &&
+		strings.TrimSpace(*cfg.CustomBaseURL) != strings.TrimSpace(oldCustomBaseURL)
+	if customBaseURLChanged && m.creds != nil {
+		// Credentials are endpoint-scoped. Once the URL changes, remove the
+		// old binding rather than letting it silently reactivate if the agent is
+		// later pointed back at that host.
+		if err := StoreCustomAPIKey(m.creds, id, "", ""); err != nil && m.logger != nil {
+			m.logger.Warn("failed to clear custom API key after base URL change", "agent", id, "err", err)
+		}
+	}
 
 	// §3.7 device-switch skill: re-sync the SKILL.md on disk now if
 	// either the toggle was touched OR the tool changed (claude↔grok

@@ -237,6 +237,7 @@ export interface AgentConfig {
   effort?: string;
   tool?: string;
   customBaseURL?: string;
+  customApiKey?: string;
   thinkingMode?: string;
   workDir?: string;
   cronExpr?: string;
@@ -573,6 +574,15 @@ export const agentApi = {
   },
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
+
+  customApiKey: {
+    get: (id: string) =>
+      get<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`),
+    set: (id: string, baseURL: string, apiKey: string) =>
+      put<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`, { baseURL, apiKey }),
+    delete: (id: string) =>
+      del<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`),
+  },
 
   // archive: keeps all on-disk data but stops runtime activity. Reversible
   // via unarchive. Hidden from the main list; surfaced in global Settings.

@@ -123,12 +123,13 @@ type peerAgentSyncChunkedBeginRequest struct {
 	SourceDeviceID string `json:"source_device_id"`
 	OpID           string `json:"op_id"`
 
-	Agent       *store.AgentRecord        `json:"agent"`
-	Persona     *store.AgentPersonaRecord `json:"persona,omitempty"`
-	Memory      *store.AgentMemoryRecord  `json:"memory,omitempty"`
-	AgentToken  string                    `json:"agent_token,omitempty"`
-	GrokSession *grokSessionWire          `json:"grok_session,omitempty"`
-	Credentials *[]*agent.Credential      `json:"credentials,omitempty"`
+	Agent        *store.AgentRecord        `json:"agent"`
+	Persona      *store.AgentPersonaRecord `json:"persona,omitempty"`
+	Memory       *store.AgentMemoryRecord  `json:"memory,omitempty"`
+	AgentToken   string                    `json:"agent_token,omitempty"`
+	GrokSession  *grokSessionWire          `json:"grok_session,omitempty"`
+	Credentials  *[]*agent.Credential      `json:"credentials,omitempty"`
+	CustomAPIKey *string                   `json:"custom_api_key,omitempty"`
 
 	SinceMessageSeq           int64 `json:"since_message_seq,omitempty"`
 	SinceMemoryEntrySeq       int64 `json:"since_memory_entry_seq,omitempty"`
@@ -201,6 +202,7 @@ func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.
 		AgentToken:                bReq.AgentToken,
 		GrokSession:               bReq.GrokSession,
 		Credentials:               bReq.Credentials,
+		CustomAPIKey:              bReq.CustomAPIKey,
 		SinceMessageSeq:           bReq.SinceMessageSeq,
 		SinceMemoryEntrySeq:       bReq.SinceMemoryEntrySeq,
 		SinceMemoryEntryUpdatedAt: bReq.SinceMemoryEntryUpdatedAt,

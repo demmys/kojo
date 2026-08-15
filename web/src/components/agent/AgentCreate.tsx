@@ -53,6 +53,7 @@ export function AgentCreate() {
   const [effort, setEffort] = useState<EffortLevel | "">("");
   const [tool, setTool] = useState("claude");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
+  const [customAPIKey, setCustomAPIKey] = useState("");
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   // cronExpr starts as the default "*/30 * * * *" only for ScheduleEditor's
@@ -96,7 +97,12 @@ export function AgentCreate() {
     listCustomTemplates().then(setCustomTemplates).catch(console.error);
   }, []);
 
-  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel);
+  const { needsCustomURL, customModels } = useCustomModels(
+    tool,
+    customBaseURL,
+    setModel,
+    customAPIKey ? { apiKey: customAPIKey } : undefined,
+  );
 
   const templates = [...builtinTemplates(), ...customTemplates];
 
@@ -335,6 +341,7 @@ export function AgentCreate() {
         effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
         customBaseURL: needsCustomURL ? customBaseURL : undefined,
+        customApiKey: needsCustomURL && customAPIKey.trim() ? customAPIKey.trim() : undefined,
         thinkingMode: tool === "llama.cpp" && thinkingMode ? thinkingMode : undefined,
         workDir: workDir.trim() || undefined,
         cronExpr: cronExprDirty ? cronExpr : undefined,
@@ -647,14 +654,26 @@ export function AgentCreate() {
             />
 
             {needsCustomURL && (
-              <Field label={t("create.apiBaseUrl")}>
-                <Input
-                  mono
-                  value={customBaseURL}
-                  onChange={(e) => setCustomBaseURL(e.target.value)}
-                  placeholder="http://localhost:8080"
-                />
-              </Field>
+              <div className="space-y-4">
+                <Field label={t("create.apiBaseUrl")} help={t("settings.customBaseUrlHelp")}>
+                  <Input
+                    mono
+                    value={customBaseURL}
+                    onChange={(e) => setCustomBaseURL(e.target.value)}
+                    placeholder="http://localhost:8080"
+                  />
+                </Field>
+                <Field label={t("settings.customApiKey")} help={t("settings.customApiKeyHelp")}>
+                  <Input
+                    mono
+                    type="password"
+                    autoComplete="new-password"
+                    value={customAPIKey}
+                    onChange={(e) => setCustomAPIKey(e.target.value)}
+                    placeholder="sk-unsloth-…"
+                  />
+                </Field>
+              </div>
             )}
 
             <ModelPicker

@@ -330,13 +330,15 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 	}
 	procCtx, procCancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(procCtx, claudePath, args...)
-	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agentID, dir)
+	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
+	if b.proxyURL != "" {
+		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
+	}
+	cmd.Env = filterEnv(removeEnv, agentID, dir)
 	cmd.Env = append(cmd.Env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=1", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85")
 	if b.proxyURL != "" {
-		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY=dummy")
-		}
+		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
+		cmd.Env = append(cmd.Env, "NO_PROXY=127.0.0.1,localhost")
 	}
 	cmd.Dir = dir
 	// Run the CLI in its own process group so background-subagent children

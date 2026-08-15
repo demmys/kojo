@@ -508,6 +508,24 @@ func (b *ClaudeBackend) SetProxyURL(url string) {
 	b.proxyURL = url
 }
 
+func appendCustomProxyEnv(env []string, baseURL string) []string {
+	env = append(env, "ANTHROPIC_BASE_URL="+baseURL)
+	// Preserve support for unauthenticated Anthropic-compatible proxies.
+	// Claude Code otherwise opens its login flow instead of making a request.
+	// Authenticated endpoints are handled by kojo's loopback relay; the real
+	// credential deliberately never enters the Claude Code environment.
+	return append(env, "ANTHROPIC_API_KEY=dummy")
+}
+
+func customProxyRemoveEnvPrefixes() []string {
+	return []string{
+		"ANTHROPIC_",
+		"CLAUDE_CODE_USE_",
+		"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY=",
+		"http_proxy=", "https_proxy=", "all_proxy=", "no_proxy=",
+	}
+}
+
 func (b *ClaudeBackend) Name() string { return "claude" }
 
 func (b *ClaudeBackend) Available() bool {
@@ -551,7 +569,15 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
-	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
+	if b.proxyURL != "" {
+		// A custom endpoint must not inherit the daemon's Anthropic cloud
+		// credentials. Besides leaking a secret to another service, an
+		// inherited API key takes precedence over ANTHROPIC_AUTH_TOKEN in
+		// some Claude Code versions.
+		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
+	}
+	cmd.Env = filterEnv(removeEnv, agent.ID, dir)
 	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	// Token conservation: agents persist state in files (MEMORY.md, memory/),
 	// not in Claude's conversation history. 1M context only inflates
@@ -565,10 +591,8 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85",
 	)
 	if b.proxyURL != "" {
-		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY=dummy")
-		}
+		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
+		cmd.Env = append(cmd.Env, "NO_PROXY=127.0.0.1,localhost")
 	}
 	cmd.Dir = dir
 	// Send SIGTERM on context cancellation, then SIGKILL after 10s grace period.

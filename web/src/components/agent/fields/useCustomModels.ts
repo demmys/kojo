@@ -15,6 +15,7 @@ export function useCustomModels(
   tool: string,
   baseURL: string,
   setModel: (updater: (prev: string) => string) => void,
+  options?: { agentId?: string; apiKey?: string; credentialVersion?: number },
 ) {
   const needsCustomURL = needsCustomURLFor(tool);
   const [customModels, setCustomModels] = useState<string[]>([]);
@@ -23,7 +24,13 @@ export function useCustomModels(
     if (!needsCustomURL) return;
     let cancelled = false;
     const timer = setTimeout(() => {
-      api.customModels(baseURL).then((models) => {
+      const requestOptions = options
+        ? {
+            agentId: options.agentId,
+            ...(options.apiKey !== undefined ? { apiKey: options.apiKey } : {}),
+          }
+        : undefined;
+      api.customModels(baseURL, requestOptions).then((models) => {
         if (cancelled) return;
         setCustomModels(models);
         if (models.length > 0) {
@@ -32,7 +39,7 @@ export function useCustomModels(
       }).catch(() => { if (!cancelled) setCustomModels([]); });
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [needsCustomURL, baseURL]);
+  }, [needsCustomURL, baseURL, options?.agentId, options?.apiKey, options?.credentialVersion]);
 
   return { needsCustomURL, customModels };
 }

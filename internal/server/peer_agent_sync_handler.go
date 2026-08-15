@@ -224,6 +224,11 @@ type peerAgentSyncRequest struct {
 	// silently dropping edits across peer clock skew, same rationale
 	// as workspace_files.
 	Credentials *[]*agent.Credential `json:"credentials,omitempty"`
+	// CustomAPIKey is the agent-scoped inference credential in plaintext.
+	// A non-nil pointer is authoritative; an empty string clears the target.
+	// It is separate from Credentials so internal service tokens never appear
+	// in the agent-visible password vault.
+	CustomAPIKey *string `json:"custom_api_key,omitempty"`
 
 	// COMPAT: both fields below are omitempty, so only degraded /
 	// lossy transfers put them on the wire. An OLD target binary
@@ -253,6 +258,14 @@ func agentRecordTool(rec *store.AgentRecord) string {
 		return ""
 	}
 	v, _ := rec.Settings["tool"].(string)
+	return v
+}
+
+func agentRecordCustomBaseURL(rec *store.AgentRecord) string {
+	if rec == nil || rec.Settings == nil {
+		return ""
+	}
+	v, _ := rec.Settings["customBaseURL"].(string)
 	return v
 }
 
@@ -442,6 +455,10 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 	if req.Agent == nil || req.Agent.ID == "" {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"agent record with id required")
+		return false
+	}
+	if req.CustomAPIKey != nil && len(*req.CustomAPIKey) > agent.CustomAPIKeyMaxBytes {
+		writeError(w, http.StatusBadRequest, "bad_request", "custom_api_key exceeds size limit")
 		return false
 	}
 	// Path-safety gate: agent.id flows into filepath.Join for the
@@ -841,6 +858,20 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 				"agent", req.Agent.ID, "err", cerr)
 			writeError(w, http.StatusInternalServerError, "internal",
 				"replace credentials: "+cerr.Error())
+			return
+		}
+	}
+	if req.CustomAPIKey != nil {
+		if s.agents == nil || !s.agents.HasCredentials() {
+			releaseMemSync()
+			writeError(w, http.StatusServiceUnavailable, "unavailable",
+				"target credential store unavailable; cannot land custom API key")
+			return
+		}
+		if cerr := agent.StoreCustomAPIKey(s.agents.Credentials(), req.Agent.ID, agentRecordCustomBaseURL(req.Agent), *req.CustomAPIKey); cerr != nil {
+			releaseMemSync()
+			writeError(w, http.StatusInternalServerError, "internal",
+				"store custom API key: "+cerr.Error())
 			return
 		}
 	}

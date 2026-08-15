@@ -117,8 +117,15 @@ export const api = {
 
   dirSuggest: (prefix: string, peerId?: string) =>
     get<{ dirs: string[] }>(withPeer(`/api/v1/dirs?prefix=${encodeURIComponent(prefix)}`, peerId)).then((r) => r.dirs),
-  customModels: (baseURL: string) =>
-    get<{ models: string[] }>(`/api/v1/custom-models?baseURL=${encodeURIComponent(baseURL)}`).then((r) => r.models),
+  customModels: (baseURL: string, opts?: { agentId?: string; apiKey?: string }) => {
+    const path = opts?.agentId
+      ? `/api/v1/agents/${opts.agentId}/custom-models`
+      : "/api/v1/custom-models";
+    if (opts && Object.prototype.hasOwnProperty.call(opts, "apiKey")) {
+      return post<{ models: string[] }>(path, { baseURL, apiKey: opts.apiKey }).then((r) => r.models);
+    }
+    return get<{ models: string[] }>(`${path}?baseURL=${encodeURIComponent(baseURL)}`).then((r) => r.models);
+  },
 
   sessions: {
     list: (peerId?: string) => get<{ sessions: SessionInfo[] }>(withPeer("/api/v1/sessions", peerId)).then((r) => r.sessions),

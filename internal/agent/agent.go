@@ -595,8 +595,11 @@ type AgentConfig struct {
 	Effort        string `json:"effort"`
 	Tool          string `json:"tool"`
 	CustomBaseURL string `json:"customBaseURL"`
-	ThinkingMode  string `json:"thinkingMode"`
-	WorkDir       string `json:"workDir"`
+	// CustomAPIKey is accepted only on creation and stored in the encrypted
+	// credential database. It is never copied onto Agent or serialized back.
+	CustomAPIKey string `json:"customApiKey"`
+	ThinkingMode string `json:"thinkingMode"`
+	WorkDir      string `json:"workDir"`
 	// CronExpr is the 5-field cron expression for periodic check-ins.
 	// nil    = use default ("*/30 * * * *" with per-agent offset).
 	// ""     = scheduling explicitly disabled.

@@ -400,8 +400,26 @@ const messages = {
   },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
   "settings.customBaseUrlHelp": {
-    ja: "Anthropic Messages API 互換のエンドポイント",
-    en: "Anthropic Messages API compatible endpoint",
+    ja: "Anthropic/OpenAI互換API。localhostまたはTailscaleホストを指定",
+    en: "Anthropic/OpenAI-compatible API on localhost or a Tailscale host",
+  },
+  "settings.customApiKey": { ja: "カスタムAPIキー", en: "Custom API key" },
+  "settings.customApiKeyHelp": {
+    ja: "暗号化してエージェントごとに保存。認証不要なAPIでは空欄でよい",
+    en: "Stored encrypted per agent. Leave blank for APIs that do not require authentication",
+  },
+  "settings.customApiKeyConfigured": {
+    ja: "設定済み（空欄なら維持）",
+    en: "Configured (leave blank to keep)",
+  },
+  "settings.customApiKeyRemove": { ja: "キーを削除", en: "Remove key" },
+  "settings.customApiKeySaveUrlFirst": {
+    ja: "先に下部の保存ボタンでBase URLを保存してください",
+    en: "Save the Base URL with the settings button below first",
+  },
+  "settings.customApiKeyRemoveConfirm": {
+    ja: "カスタムAPIキーを削除しますか？",
+    en: "Remove the custom API key?",
   },
   "settings.allowedTools": { ja: "許可ツール", en: "Allowed Tools" },
   "settings.allEmpty": { ja: "(空 = すべて)", en: "(empty = all)" },

@@ -746,6 +746,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 
 	// Custom API model discovery
 	mux.HandleFunc("GET /api/v1/custom-models", s.handleCustomModels)
+	mux.HandleFunc("POST /api/v1/custom-models", s.handleCustomModels)
 
 	// File browser
 	mux.HandleFunc("GET /api/v1/files", s.handleListFiles)
@@ -1065,6 +1066,11 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
 	mux.HandleFunc("DELETE /api/v1/agents/preview-avatar", s.handleDiscardPreviewAvatar)
 	mux.HandleFunc("GET /api/v1/agents/{id}/credentials", s.handleListCredentials)
+	mux.HandleFunc("GET /api/v1/agents/{id}/custom-api-key", s.handleGetCustomAPIKey)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/custom-api-key", s.handleSetCustomAPIKey)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/custom-api-key", s.handleDeleteCustomAPIKey)
+	mux.HandleFunc("GET /api/v1/agents/{id}/custom-models", s.handleCustomModels)
+	mux.HandleFunc("POST /api/v1/agents/{id}/custom-models", s.handleCustomModels)
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials", s.handleAddCredential)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)

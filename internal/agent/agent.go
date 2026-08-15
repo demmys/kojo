@@ -159,10 +159,11 @@ func NormalizeThinkingMode(mode string) string {
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
-	// grok's models_cache.json advertises only low/medium/high for
-	// grok-4.5 and an empty efforts list for grok-composer-2.5-fast, so
-	// neither offers xhigh/max here. Keep this in sync with
-	// web/src/lib/toolModels.ts xhighModels.
+	// grok CLI 1.0.3's models_cache.json advertises xhigh for grok-4.6
+	// but only low/medium/high for grok-4.5; neither offers max. Keep
+	// this in sync with web/src/lib/toolModels.ts xhighModels /
+	// grokXhighModels.
+	"grok-4.6":    true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
@@ -184,12 +185,38 @@ var codexMaxEffortModels = map[string]bool{
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
-// grokEffortModels only advertise low/medium/high (grok CLI 0.2.91:
-// grok-4.5 lists efforts [high,medium,low]; grok-composer-2.5-fast lists
-// none). xhigh is already excluded via xhighModels; max is rejected here
-// even though it'd otherwise pass the generic non-codex allowance.
+// grokEffortModels lists the grok CLI's models (1.0.3: grok-4.6 lists
+// efforts [xhigh,high,medium,low], grok-4.5 lists [high,medium,low]).
+// Neither advertises max, so max is rejected here even though it'd
+// otherwise pass the generic non-codex allowance; xhigh is gated per
+// model via xhighModels.
 var grokEffortModels = map[string]bool{
-	"grok-4.5": true, "grok-composer-2.5-fast": true,
+	"grok-4.6": true, "grok-4.5": true,
+}
+
+// retiredGrokModels maps model ids the grok CLI no longer accepts onto the
+// current default. The rewrite happens both on persisted reads and on create /
+// update writes. Every retired id points at the newest model rather than its
+// nearest surviving sibling: input/output rates match across the two live grok
+// models (only the cached-input rate differs, and 4.6's is the higher of the
+// two), so the newest id is the choice least likely to strand an agent on a
+// model that retires next.
+var retiredGrokModels = map[string]string{
+	"grok-build":             "grok-4.6",
+	"grok-composer-2.5-fast": "grok-4.6",
+}
+
+// normalizeRetiredGrokModel rewrites model ids retired by the Grok CLI.
+// The tool gate is essential: custom-compatible endpoints may legitimately
+// expose a model with the same id, and kojo must not reinterpret those names.
+func normalizeRetiredGrokModel(tool, model string) string {
+	if tool != "grok" {
+		return model
+	}
+	if current, ok := retiredGrokModels[model]; ok {
+		return current
+	}
+	return model
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.
@@ -208,6 +235,24 @@ func ValidModelEffort(model, effort string) bool {
 		return false
 	}
 	return true
+}
+
+// ValidToolModelEffort applies built-in CLI model constraints only to the
+// built-in backends. Custom-compatible endpoints own their model namespace;
+// a name that happens to match a Grok or Codex model must not inherit kojo's
+// assumptions about that built-in model's effort ladder.
+func ValidToolModelEffort(tool, model, effort string) bool {
+	if tool == "custom" || tool == "llama.cpp" {
+		if !ValidEffort(effort) {
+			return false
+		}
+		// Preserve the pre-tool-aware fallback for an unrecognized model:
+		// Claude-style low/medium/high/max are accepted, while Codex-only
+		// none/minimal and model-gated xhigh remain rejected. In particular,
+		// do not let a coincidental built-in model id alter this ladder.
+		return effort != "none" && effort != "minimal" && effort != "xhigh"
+	}
+	return ValidModelEffort(model, effort)
 }
 
 // MaxCronMessageRunes caps the per-agent cron check-in custom message at
@@ -829,7 +874,8 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if len(cfg.Mission) > maxMissionBytes {
 		return nil, fmt.Errorf("mission exceeds %d bytes", maxMissionBytes)
 	}
-	if !ValidModelEffort(cfg.Model, cfg.Effort) {
+	cfg.Model = normalizeRetiredGrokModel(cfg.Tool, cfg.Model)
+	if !ValidToolModelEffort(cfg.Tool, cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
 	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {

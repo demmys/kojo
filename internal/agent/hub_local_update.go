@@ -242,7 +242,7 @@ func applyHubLocalCfg(a *Agent, cfg AgentUpdateConfig) error {
 	if cfg.Effort != nil {
 		prospEffort = *cfg.Effort
 	}
-	if !ValidModelEffort(a.Model, prospEffort) {
+	if !ValidToolModelEffort(a.Tool, a.Model, prospEffort) {
 		return fmt.Errorf("unsupported effort level %q for model %q", prospEffort, a.Model)
 	}
 	prospSilentS, prospSilentE := a.SilentStart, a.SilentEnd

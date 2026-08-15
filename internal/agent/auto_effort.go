@@ -95,7 +95,7 @@ func heuristicTurnEffort(a *Agent, userMessage string) string {
 		!strings.Contains(userMessage, "```") &&
 		!strings.Contains(userMessage, "http://") &&
 		!strings.Contains(userMessage, "https://") {
-		if ValidModelEffort(a.Model, "low") && rankEffort("low") < rankEffort(a.Effort) {
+		if ValidToolModelEffort(a.Tool, a.Model, "low") && rankEffort("low") < rankEffort(a.Effort) {
 			return "low"
 		}
 	}
@@ -109,7 +109,7 @@ func heuristicTurnEffort(a *Agent, userMessage string) string {
 //   - "high" resolves to "high", except that agents whose static tier
 //     sits ABOVE high (xhigh/max) keep their ceiling on hard tasks.
 //
-// The result is clamped through ValidModelEffort; invalid combos return
+// The result is clamped through ValidToolModelEffort; invalid combos return
 // the static value.
 func mapTierToEffort(a *Agent, tier string) string {
 	if tier == "high" {
@@ -119,7 +119,7 @@ func mapTierToEffort(a *Agent, tier string) string {
 	} else if rankEffort(tier) >= rankEffort(a.Effort) {
 		return a.Effort
 	}
-	if !ValidModelEffort(a.Model, tier) {
+	if !ValidToolModelEffort(a.Tool, a.Model, tier) {
 		return a.Effort
 	}
 	return tier
@@ -143,7 +143,7 @@ func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, system
 	// arrival prompt) are routine bookkeeping — pin them to low with
 	// zero added latency.
 	if systemTurn {
-		if ValidModelEffort(a.Model, "low") && rankEffort("low") < rankEffort(a.Effort) {
+		if ValidToolModelEffort(a.Tool, a.Model, "low") && rankEffort("low") < rankEffort(a.Effort) {
 			return "low", "rule"
 		}
 		return a.Effort, "static"

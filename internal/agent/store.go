@@ -899,11 +899,11 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 	// per-turn spam. The clamp is scoped to grok models: rewriting effort
 	// for every unknown/future model would silently downgrade custom
 	// configurations on their next save.
-	if retired, ok := retiredGrokModels[a.Model]; ok {
-		st.logger.Debug("migrated retired grok model", "agent", a.ID, "from", a.Model, "to", retired)
-		a.Model = retired
+	if current := normalizeRetiredGrokModel(a.Tool, a.Model); current != a.Model {
+		st.logger.Debug("migrated retired grok model", "agent", a.ID, "from", a.Model, "to", current)
+		a.Model = current
 	}
-	if grokEffortModels[a.Model] && a.Effort != "" && !ValidModelEffort(a.Model, a.Effort) {
+	if a.Tool == "grok" && grokEffortModels[a.Model] && a.Effort != "" && !ValidToolModelEffort(a.Tool, a.Model, a.Effort) {
 		st.logger.Debug("stored effort no longer valid for grok model, clamping to high",
 			"agent", a.ID, "model", a.Model, "effort", a.Effort)
 		a.Effort = "high"

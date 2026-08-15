@@ -195,15 +195,28 @@ var grokEffortModels = map[string]bool{
 }
 
 // retiredGrokModels maps model ids the grok CLI no longer accepts onto the
-// current default. The rewrite happens on the read path in normalizeAgent
-// (see store.go). Every retired id points at the newest model rather than
-// its nearest surviving sibling: input/output rates match across the two
-// live grok models (only the cached-input rate differs, and 4.6's is the
-// higher of the two), so the newest id is the choice least likely to
-// strand an agent on a model that retires next.
+// current default. The rewrite happens both on persisted reads and on create /
+// update writes. Every retired id points at the newest model rather than its
+// nearest surviving sibling: input/output rates match across the two live grok
+// models (only the cached-input rate differs, and 4.6's is the higher of the
+// two), so the newest id is the choice least likely to strand an agent on a
+// model that retires next.
 var retiredGrokModels = map[string]string{
 	"grok-build":             "grok-4.6",
 	"grok-composer-2.5-fast": "grok-4.6",
+}
+
+// normalizeRetiredGrokModel rewrites model ids retired by the Grok CLI.
+// The tool gate is essential: custom-compatible endpoints may legitimately
+// expose a model with the same id, and kojo must not reinterpret those names.
+func normalizeRetiredGrokModel(tool, model string) string {
+	if tool != "grok" {
+		return model
+	}
+	if current, ok := retiredGrokModels[model]; ok {
+		return current
+	}
+	return model
 }
 
 // ValidModelEffort returns true if the model+effort combination is valid.
@@ -222,6 +235,24 @@ func ValidModelEffort(model, effort string) bool {
 		return false
 	}
 	return true
+}
+
+// ValidToolModelEffort applies built-in CLI model constraints only to the
+// built-in backends. Custom-compatible endpoints own their model namespace;
+// a name that happens to match a Grok or Codex model must not inherit kojo's
+// assumptions about that built-in model's effort ladder.
+func ValidToolModelEffort(tool, model, effort string) bool {
+	if tool == "custom" || tool == "llama.cpp" {
+		if !ValidEffort(effort) {
+			return false
+		}
+		// Preserve the pre-tool-aware fallback for an unrecognized model:
+		// Claude-style low/medium/high/max are accepted, while Codex-only
+		// none/minimal and model-gated xhigh remain rejected. In particular,
+		// do not let a coincidental built-in model id alter this ladder.
+		return effort != "none" && effort != "minimal" && effort != "xhigh"
+	}
+	return ValidModelEffort(model, effort)
 }
 
 // MaxCronMessageRunes caps the per-agent cron check-in custom message at
@@ -843,7 +874,8 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if len(cfg.Mission) > maxMissionBytes {
 		return nil, fmt.Errorf("mission exceeds %d bytes", maxMissionBytes)
 	}
-	if !ValidModelEffort(cfg.Model, cfg.Effort) {
+	cfg.Model = normalizeRetiredGrokModel(cfg.Tool, cfg.Model)
+	if !ValidToolModelEffort(cfg.Tool, cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
 	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {

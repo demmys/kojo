@@ -1422,6 +1422,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// since Effort / Model can also be patched in this PATCH; we
 	// compute the prospective values and validate the combination
 	// before releasing the lock to the persona-write path.
+	prospTool := a.Tool
+	if cfg.Tool != nil {
+		prospTool = *cfg.Tool
+	}
 	prospEffort := a.Effort
 	if cfg.Effort != nil {
 		prospEffort = *cfg.Effort
@@ -1430,7 +1434,14 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Model != nil {
 		prospModel = *cfg.Model
 	}
-	if !ValidModelEffort(prospModel, prospEffort) {
+	if current := normalizeRetiredGrokModel(prospTool, prospModel); current != prospModel {
+		prospModel = current
+		// cfg is a by-value request copy. Pointing Model at the normalized
+		// local makes the later mutation store exactly what was validated,
+		// including when a tool-only PATCH turns a custom model into Grok.
+		cfg.Model = &prospModel
+	}
+	if !ValidToolModelEffort(prospTool, prospModel, prospEffort) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", prospEffort, prospModel)
 	}
@@ -1450,10 +1461,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// the same PATCH so we have to compute the post-PATCH pair
 	// and validate the combination here, not at the per-field
 	// site below where a.Tool may already be the new value.
-	prospTool := a.Tool
-	if cfg.Tool != nil {
-		prospTool = *cfg.Tool
-	}
 	prospBaseURL := a.CustomBaseURL
 	if cfg.CustomBaseURL != nil {
 		prospBaseURL = *cfg.CustomBaseURL

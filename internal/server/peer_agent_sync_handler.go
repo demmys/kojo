@@ -255,7 +255,22 @@ func agentRecordTool(rec *store.AgentRecord) string {
 		return ""
 	}
 	v, _ := rec.Settings["tool"].(string)
-	return v
+	// Rows written before the backend rename still carry "custom" /
+	// "llama.cpp"; normalize so the transfer branches below match.
+	return agent.NormalizeToolName(v)
+}
+
+// agentRecordUsesCodex reports whether the record's backend drives the
+// codex CLI, and therefore owns codex thread / rollout state that has to
+// be transferred (or purged) on a device switch. custom-codex delegates
+// to the same CLI as codex, so it must not be left out.
+func agentRecordUsesCodex(rec *store.AgentRecord) bool {
+	switch agentRecordTool(rec) {
+	case agent.ToolCodex, agent.ToolCustomCodex:
+		return true
+	default:
+		return false
+	}
 }
 
 // claudeSessionWire is the JSON shape of one transferred JSONL
@@ -659,7 +674,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// chat starts fresh instead of resuming an old local thread.
 	var codexCommit, codexRollback func()
 	var cserr error
-	if req.Agent != nil && agentRecordTool(req.Agent) == "codex" && decodedCodex == nil {
+	if req.Agent != nil && agentRecordUsesCodex(req.Agent) && decodedCodex == nil {
 		codexCommit, codexRollback, cserr = agent.StageCodexSessionCleanup(req.Agent.ID)
 	} else {
 		codexCommit, codexRollback, cserr = agent.StageCodexSession(req.Agent.ID, decodedCodex)

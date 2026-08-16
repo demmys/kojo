@@ -42,12 +42,21 @@ export interface AgentSettingsFormState {
 
 /**
  * True when `tool` requires the operator to supply a CustomBaseURL.
- * "custom" is the generic OpenAI-compatible adapter (LM Studio,
- * llama.cpp's OpenAI server, third-party gateways); "llama.cpp"
- * targets the bespoke llama.cpp server endpoint.
+ * All three custom-* backends point at an operator-supplied endpoint:
+ * custom-claude drives it with the claude CLI (Anthropic Messages API),
+ * custom-codex with the codex CLI (OpenAI-compatible), and custom-bare
+ * has kojo speak OpenAI-compatible HTTP to it directly with no CLI and
+ * no tools. Legacy names ("custom", "llama.cpp") are still accepted here
+ * so a settings screen loaded against an un-migrated agent row behaves.
  */
 export function needsCustomURLFor(tool: string): boolean {
-  return tool === "custom" || tool === "llama.cpp";
+  return (
+    tool === "custom-claude" ||
+    tool === "custom-codex" ||
+    tool === "custom-bare" ||
+    tool === "custom" ||
+    tool === "llama.cpp"
+  );
 }
 
 /**
@@ -62,10 +71,10 @@ export function needsCustomURLFor(tool: string): boolean {
  *     incompatible value).
  *   - customBaseURL: trimmed and included only for tools that need
  *     it; otherwise undefined so the server clears the field.
- *   - thinkingMode: only emitted for llama.cpp.
- *   - allowedTools: only emitted for the "custom" tool (where the
+ *   - thinkingMode: only emitted for custom-bare.
+ *   - allowedTools: only emitted for custom-claude (where the
  *     operator picks per-tool permissions).
- *   - allowProtectedPaths: only emitted for claude / custom — those
+ *   - allowProtectedPaths: only emitted for claude / custom-claude — those
  *     are the only backends whose Bash/Edit gating respects the
  *     server-side allowlist.
  *   - tts: nested object; empty strings collapse to undefined so the
@@ -91,7 +100,7 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     effort: supportsEffort(state.tool) ? state.effort : undefined,
     tool: trimmed.tool,
     customBaseURL: needsCustomURLFor(state.tool) ? state.customBaseURL.trim() : undefined,
-    thinkingMode: state.tool === "llama.cpp" ? state.thinkingMode : undefined,
+    thinkingMode: state.tool === "custom-bare" ? state.thinkingMode : undefined,
     workDir: trimmed.workDir,
     cronExpr: state.cronExpr,
     timeoutMinutes: state.timeoutMinutes,
@@ -100,9 +109,11 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     silentEnd: state.silentEnd,
     notifyDuringSilent: state.notifyDuringSilent,
     cronMessage: state.cronMessage,
-    allowedTools: state.tool === "custom" ? state.allowedTools : undefined,
+    allowedTools: state.tool === "custom-claude" ? state.allowedTools : undefined,
     allowProtectedPaths:
-      state.tool === "claude" || state.tool === "custom" ? state.allowProtectedPaths : undefined,
+      state.tool === "claude" || state.tool === "custom-claude"
+        ? state.allowProtectedPaths
+        : undefined,
     tts: {
       enabled: state.tts.enabled,
       provider: state.tts.provider === "grok" ? "grok" : undefined,

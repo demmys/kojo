@@ -29,7 +29,7 @@
 // (the whole request bills at the long-context tier). kojo prices the short-
 // context tier only, so estimates understate very large turns by up to 2x.
 //
-// Models not in the table (fable-5 bare alias, gpt-*, custom, llama.cpp, "")
+// Models not in the table (fable-5 bare alias, gpt-*, custom-* endpoints, "")
 // return undefined from priceModel → no cost is shown.
 
 export interface ModelPricing {
@@ -95,7 +95,7 @@ const ALIASES: Record<string, string> = {
 
 /**
  * Resolve a kojo agent.model value to its pricing, or undefined when the
- * model is unpriced (gpt/codex, custom, llama.cpp, unknown aliases).
+ * model is unpriced (gpt/codex, custom-* endpoints, unknown aliases).
  */
 export function priceModel(model: string | undefined): ModelPricing | undefined {
   if (!model) return undefined;

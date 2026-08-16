@@ -16,8 +16,10 @@ func TestBackendLoadsClaudeSkills(t *testing.T) {
 	}{
 		// Claude Code itself: native loader.
 		{"claude", true},
-		// "custom" delegates to ClaudeBackend with a relocated config
-		// dir; skill discovery still walks up from cwd.
+		// "custom-claude" delegates to ClaudeBackend with a relocated
+		// config dir; skill discovery still walks up from cwd. The legacy
+		// spelling must resolve the same way for un-migrated rows.
+		{"custom-claude", true},
 		{"custom", true},
 		// Grok Build: `grok inspect` from an agentDir lists kojo-*
 		// skills as `project` scope, confirming the .claude/skills/
@@ -25,6 +27,8 @@ func TestBackendLoadsClaudeSkills(t *testing.T) {
 		{"grok", true},
 		// codex has its own .codex/skills loader, not .claude/skills.
 		{"codex", false},
+		{"custom-codex", false},
+		{"custom-bare", false},
 		{"llama.cpp", false},
 		// Unknown / empty values must fail closed.
 		{"", false},
@@ -40,13 +44,13 @@ func TestBackendLoadsClaudeSkills(t *testing.T) {
 // TestBackendSupportsDeviceSwitch locks the gating contract for the
 // kojo-switch-device SKILL.md install sites. A backend qualifies
 // only when the handoff orchestrator knows how to migrate its
-// session state to the target peer: claude / custom transfer the
+// session state to the target peer: claude / custom-claude transfer the
 // ~/.claude/projects/<...>/<uuid>.jsonl files; grok transfers
 // `<agentDir>/.grok/session_id` plus the
 // $GROK_HOME/sessions/<encoded(absAgentDir)>/<uuid>/ subtree (see
 // grok_session_transfer.go); codex transfers .codex thread refs,
-// rollout JSONLs, and Codex state rows. llama.cpp has no session
-// transfer wired up and must stay false until it does.
+// rollout JSONLs, and Codex state rows. custom-bare has no session
+// state at all and must stay false.
 func TestBackendSupportsDeviceSwitch(t *testing.T) {
 	t.Parallel()
 
@@ -55,9 +59,12 @@ func TestBackendSupportsDeviceSwitch(t *testing.T) {
 		want bool
 	}{
 		{"claude", true},
+		{"custom-claude", true},
 		{"custom", true},
 		{"grok", true},
 		{"codex", true},
+		{"custom-codex", true},
+		{"custom-bare", false},
 		{"llama.cpp", false},
 		{"", false},
 		{"unknown-future-cli", false},
@@ -74,8 +81,9 @@ func TestBackendSupportsDeviceSwitch(t *testing.T) {
 func TestDeviceSwitchHasSkillLoader(t *testing.T) {
 	t.Parallel()
 
-	for _, tool := range []string{"claude", "custom", "grok", "codex", "llama.cpp", ""} {
-		hasSkillLoader := backendLoadsClaudeSkills(tool) || tool == "codex"
+	for _, tool := range []string{"claude", "custom-claude", "grok", "codex", "custom-codex", "custom-bare", ""} {
+		hasSkillLoader := backendLoadsClaudeSkills(tool) ||
+			NormalizeToolName(tool) == ToolCodex || NormalizeToolName(tool) == ToolCustomCodex
 		if backendSupportsDeviceSwitch(tool) && !hasSkillLoader {
 			t.Errorf("backendSupportsDeviceSwitch(%q) is true but no skill loader is wired", tool)
 		}

@@ -1003,7 +1003,7 @@ export function AgentSettings() {
       tool.trim() !== agent.tool ||
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
-      (tool === "llama.cpp" && thinkingMode !== (agent.thinkingMode ?? "")) ||
+      (tool === "custom-bare" && thinkingMode !== (agent.thinkingMode ?? "")) ||
       workDir.trim() !== (agent.workDir ?? "") ||
       cronExpr !== (agent.cronExpr ?? "") ||
       timeoutMinutes !== (agent.timeoutMinutes || 10) ||
@@ -1011,8 +1011,8 @@ export function AgentSettings() {
       silentStart !== (agent.silentStart ?? "") ||
       silentEnd !== (agent.silentEnd ?? "") ||
       notifyDuringSilent !== (agent.notifyDuringSilent ?? true) ||
-      (tool === "custom" && !setEq(allowedTools, agent.allowedTools ?? [])) ||
-      ((tool === "claude" || tool === "custom") &&
+      (tool === "custom-claude" && !setEq(allowedTools, agent.allowedTools ?? [])) ||
+      ((tool === "claude" || tool === "custom-claude") &&
         !setEq(allowProtectedPaths, agent.allowProtectedPaths ?? [])) ||
       !setEq(disabledInjections, agent.disabledInjections ?? []) ||
       ttsEnabled !== (agent.tts?.enabled ?? false) ||
@@ -1316,7 +1316,7 @@ export function AgentSettings() {
             )}
 
             {/* Allowed Tools (custom only) */}
-            {tool === "custom" && (
+            {tool === "custom-claude" && (
               <Field
                 label={
                   <>
@@ -1355,7 +1355,7 @@ export function AgentSettings() {
             )}
 
             {/* Protected Path Allow (claude / custom) */}
-            {(tool === "claude" || tool === "custom") && (
+            {(tool === "claude" || tool === "custom-claude") && (
               <Field
                 label={
                   <>
@@ -1387,8 +1387,8 @@ export function AgentSettings() {
               </Field>
             )}
 
-            {/* Thinking Mode (llama.cpp only) */}
-            {tool === "llama.cpp" && (
+            {/* Thinking Mode (custom-bare only) */}
+            {tool === "custom-bare" && (
               <Field label={t("settings.thinking")}>
                 <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
                   <option value="">{t("settings.thinkingAuto")}</option>

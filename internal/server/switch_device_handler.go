@@ -1665,7 +1665,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
-	if agentRecordTool(rec) == "codex" {
+	if agentRecordUsesCodex(rec) {
 		codexTransfer, codexSkipped, cerr := agent.ReadCodexSessionFiles(agentID)
 		if cerr != nil {
 			return nil, fmt.Errorf("read codex session: %w", cerr)

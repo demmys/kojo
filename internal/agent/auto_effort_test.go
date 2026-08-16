@@ -48,7 +48,7 @@ func TestResolveTurnEffortUnsupportedToolStatic(t *testing.T) {
 		t.Fatal("classifier must not be called for non-claude/grok tools")
 		return "", nil
 	})
-	for _, tool := range []string{"codex", "llama.cpp", "custom"} {
+	for _, tool := range []string{"codex", "custom-bare", "custom-claude", "custom-codex"} {
 		a := &Agent{Tool: tool, Model: "gpt-5.5", Effort: "medium"}
 		eff, src := resolveTurnEffort(context.Background(), a, "hi", false, "", testLogger())
 		if eff != "medium" || src != "static" {
@@ -85,9 +85,9 @@ func TestResolveTurnEffortHappyPath(t *testing.T) {
 		{"low", "high", "low"},
 		{"medium", "high", "medium"},
 		{"high", "high", "high"},
-		{"LOW", "high", "low"},     // case/space tolerant
+		{"LOW", "high", "low"}, // case/space tolerant
 		{" medium\n", "high", "medium"},
-		{"medium", "low", "low"},   // never raise above the static ceiling
+		{"medium", "low", "low"}, // never raise above the static ceiling
 	}
 	for _, c := range cases {
 		withFakeClassifier(t, fakeClassifierReturning(c.classifier))

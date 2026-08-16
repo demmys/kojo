@@ -371,8 +371,16 @@ const steerHandleWait = 30 * time.Second
 
 // backendSupportsSteer reports whether the tool's backend ever registers
 // a steer handle (ChatOptions.OnSteerReady).
+// The custom-* CLI backends delegate to the same claude / codex process
+// and so register the same handle; only the tool-less custom-bare (and
+// grok, which has no stdin channel) never does.
 func backendSupportsSteer(tool string) bool {
-	return tool == "claude" || tool == "codex"
+	switch NormalizeToolName(tool) {
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex:
+		return true
+	default:
+		return false
+	}
 }
 
 // awaitSteerHandle returns the current turn's busy entry once its steer

@@ -14,31 +14,33 @@ import (
 	"strings"
 )
 
-// LlamaCppBackend implements ChatBackend by talking directly to llama-server's
-// OpenAI-compatible /v1/chat/completions endpoint via HTTP SSE streaming.
-// No CLI dependency — just needs HTTP access to the server.
-type LlamaCppBackend struct {
+// CustomBareBackend implements ChatBackend by talking directly to an
+// OpenAI-compatible /v1/chat/completions endpoint (llama-server and friends)
+// via HTTP SSE streaming. "bare" because there is no CLI in between: the
+// model gets a system prompt and one user message and nothing else — no
+// tools, no MCP, no session, no history.
+type CustomBareBackend struct {
 	logger *slog.Logger
 	client *http.Client
 }
 
-func NewLlamaCppBackend(logger *slog.Logger) *LlamaCppBackend {
-	return &LlamaCppBackend{
+func NewCustomBareBackend(logger *slog.Logger) *CustomBareBackend {
+	return &CustomBareBackend{
 		logger: logger,
 		client: &http.Client{Timeout: 0},
 	}
 }
 
-func (b *LlamaCppBackend) Name() string { return "llama.cpp" }
+func (b *CustomBareBackend) Name() string { return ToolCustomBare }
 
-func (b *LlamaCppBackend) Available() bool { return true }
+func (b *CustomBareBackend) Available() bool { return true }
 
-func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+func (b *CustomBareBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
 	if agent.CustomBaseURL == "" {
-		return nil, fmt.Errorf("customBaseURL is required for llama.cpp backend")
+		return nil, fmt.Errorf("customBaseURL is required for the custom-bare backend")
 	}
 	if err := validateLoopbackURL(agent.CustomBaseURL); err != nil {
-		return nil, fmt.Errorf("llama.cpp customBaseURL: %w", err)
+		return nil, fmt.Errorf("custom-bare customBaseURL: %w", err)
 	}
 
 	effectivePrompt := systemPrompt
@@ -127,7 +129,7 @@ func validateLoopbackURL(rawURL string) error {
 	return nil
 }
 
-func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {
+func (b *CustomBareBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
 

@@ -15,14 +15,14 @@ const (
 
 // backendNeedsRecentMessagesFallback reports whether a backend can lose its
 // native session and benefit from a short transcript bootstrap. Claude and
-// custom both run through ClaudeBackend; other backends keep their own resume
+// custom-claude both run through ClaudeBackend; other backends keep their own resume
 // paths and should not receive this Claude-specific fallback.
 func backendNeedsRecentMessagesFallback(b ChatBackend) bool {
 	if b == nil {
 		return false
 	}
 	switch b.Name() {
-	case "claude", "custom":
+	case ToolClaude, ToolCustomClaude:
 		return true
 	default:
 		return false

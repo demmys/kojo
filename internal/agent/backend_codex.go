@@ -43,13 +43,26 @@ func codexReadErrorMessage(err error) string {
 // (JSON-RPC 2.0 over stdio) for real streaming support.
 type CodexBackend struct {
 	logger *slog.Logger
+
+	// extraConfig holds additional `-c key=value` overrides prepended to
+	// every `codex app-server` invocation. Empty for the stock codex
+	// backend; CustomCodexBackend uses it to point the CLI at an
+	// operator-supplied OpenAI-compatible endpoint.
+	extraConfig []string
 }
 
 func NewCodexBackend(logger *slog.Logger) *CodexBackend {
 	return &CodexBackend{logger: logger}
 }
 
-func (b *CodexBackend) Name() string { return "codex" }
+func (b *CodexBackend) Name() string { return ToolCodex }
+
+// SetConfigOverrides replaces the `-c key=value` overrides applied to the
+// app-server invocation. Values must already be TOML-encoded (codex parses
+// the right-hand side as TOML and falls back to a literal string).
+func (b *CodexBackend) SetConfigOverrides(kv []string) {
+	b.extraConfig = append([]string(nil), kv...)
+}
 
 func (b *CodexBackend) Available() bool {
 	_, err := exec.LookPath("codex")
@@ -68,6 +81,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	}
 
 	args := []string{"app-server"}
+	for _, kv := range b.extraConfig {
+		args = append(args, "-c", kv)
+	}
 	for name, srv := range opts.MCPServers {
 		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
 		// Codex's streamable HTTP MCP transport doesn't accept arbitrary request

@@ -72,8 +72,14 @@ func (s *Server) handleCustomModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Operators paste either the server root or the OpenAI API root (the
+	// custom-codex backend wants the "/v1" form), so strip a trailing
+	// "/v1" before appending our own — "…/v1/v1/models" is a 404.
+	probe := strings.TrimRight(baseURL, "/")
+	probe = strings.TrimSuffix(probe, "/v1")
+
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(baseURL + "/v1/models")
+	resp, err := client.Get(probe + "/v1/models")
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "connection_error", fmt.Sprintf("cannot reach %s: %v", baseURL, err))
 		return
@@ -171,7 +177,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		req.WorkDir = home
 	}
 
-	if req.SimpleSystemPrompt && (req.Tool == "claude" || req.Tool == "custom") {
+	if t := session.NormalizeToolName(req.Tool); req.SimpleSystemPrompt && (t == "claude" || t == "custom-claude") {
 		hasSystemPrompt := false
 		for _, a := range req.Args {
 			if a == "--system-prompt" ||

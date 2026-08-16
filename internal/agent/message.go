@@ -159,7 +159,7 @@ func newAssistantMessage() *Message {
 
 // assembleAssistantMessage builds a completed assistant Message from
 // accumulated stream data. Backends pass nil for fields they never
-// populate (grok has no Usage; llama.cpp has no ToolUses).
+// populate (grok has no Usage; custom-bare has no ToolUses).
 func assembleAssistantMessage(content, thinking string, toolUses []ToolUse, usage *Usage) *Message {
 	msg := newAssistantMessage()
 	msg.Content = content

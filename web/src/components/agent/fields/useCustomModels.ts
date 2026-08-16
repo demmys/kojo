@@ -2,6 +2,14 @@ import { useEffect, useState } from "react";
 import { api } from "../../../lib/api";
 import { needsCustomURLFor } from "../agentSettingsPayload";
 
+export type CustomModelsStatus = "idle" | "loading" | "success" | "error";
+export type CustomModelsErrorCode = "no_models" | "";
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  return String(err);
+}
+
 /**
  * For the "custom"/"llama.cpp" backends, debounce-fetch the model list from
  * the operator-supplied base URL. Mirrors the effect that previously lived
@@ -15,14 +23,32 @@ export function useCustomModels(
   tool: string,
   baseURL: string,
   setModel: (updater: (prev: string) => string) => void,
-  options?: { agentId?: string; apiKey?: string; credentialVersion?: number },
+  options?: {
+    agentId?: string;
+    apiKey?: string;
+    credentialVersion?: number;
+    enabled?: boolean;
+  },
 ) {
   const needsCustomURL = needsCustomURLFor(tool);
   const [customModels, setCustomModels] = useState<string[]>([]);
+  const [status, setStatus] = useState<CustomModelsStatus>("idle");
+  const [error, setError] = useState("");
+  const [errorCode, setErrorCode] = useState<CustomModelsErrorCode>("");
 
   useEffect(() => {
-    if (!needsCustomURL) return;
+    if (!needsCustomURL || options?.enabled === false || !baseURL.trim()) {
+      setCustomModels([]);
+      setStatus("idle");
+      setError("");
+      setErrorCode("");
+      return;
+    }
     let cancelled = false;
+    setCustomModels([]);
+    setStatus("loading");
+    setError("");
+    setErrorCode("");
     const timer = setTimeout(() => {
       const requestOptions = options
         ? {
@@ -32,14 +58,32 @@ export function useCustomModels(
         : undefined;
       api.customModels(baseURL, requestOptions).then((models) => {
         if (cancelled) return;
-        setCustomModels(models);
-        if (models.length > 0) {
-          setModel((prev) => (models.includes(prev) ? prev : models[0]));
+        if (models.length === 0) {
+          setCustomModels([]);
+          setStatus("error");
+          setErrorCode("no_models");
+          return;
         }
-      }).catch(() => { if (!cancelled) setCustomModels([]); });
+        setCustomModels(models);
+        setStatus("success");
+        setModel((prev) => (models.includes(prev) ? prev : models[0]));
+      }).catch((err: unknown) => {
+        if (cancelled) return;
+        setCustomModels([]);
+        setStatus("error");
+        setErrorCode("");
+        setError(errorMessage(err));
+      });
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [needsCustomURL, baseURL, options?.agentId, options?.apiKey, options?.credentialVersion]);
+  }, [
+    needsCustomURL,
+    baseURL,
+    options?.agentId,
+    options?.apiKey,
+    options?.credentialVersion,
+    options?.enabled,
+  ]);
 
-  return { needsCustomURL, customModels };
+  return { needsCustomURL, customModels, status, error, errorCode };
 }

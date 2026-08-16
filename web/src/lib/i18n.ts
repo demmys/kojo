@@ -405,17 +405,37 @@ const messages = {
   },
   "settings.customApiKey": { ja: "カスタムAPIキー", en: "Custom API key" },
   "settings.customApiKeyHelp": {
-    ja: "暗号化してエージェントごとに保存。認証不要なAPIでは空欄でよい",
-    en: "Stored encrypted per agent. Leave blank for APIs that do not require authentication",
+    ja: "モデル取得時にこのURLへ送信し、設定保存時にエージェントごとに暗号化保存する",
+    en: "Sent to this URL for model discovery and stored encrypted per agent when settings are saved",
   },
   "settings.customApiKeyConfigured": {
     ja: "設定済み（空欄なら維持）",
     en: "Configured (leave blank to keep)",
   },
   "settings.customApiKeyRemove": { ja: "キーを削除", en: "Remove key" },
-  "settings.customApiKeySaveUrlFirst": {
-    ja: "先に下部の保存ボタンでBase URLを保存してください",
-    en: "Save the Base URL with the settings button below first",
+  "settings.customModelPrerequisites": {
+    ja: "Base URLとAPIキーを入力してください（認証不要なら「APIキーなし」）",
+    en: "Enter the Base URL and API key (or choose no API key for an unauthenticated API)",
+  },
+  "settings.customModelURLPrerequisite": {
+    ja: "Base URLを入力するとモデル一覧を取得します",
+    en: "Enter the Base URL to load available models",
+  },
+  "settings.customModelLoading": {
+    ja: "モデル一覧を取得中…",
+    en: "Loading available models…",
+  },
+  "settings.customModelError": {
+    ja: "モデル一覧を取得できませんでした。モデル名は手動入力できます: {error}",
+    en: "Could not load the model list. You can enter a model name manually: {error}",
+  },
+  "settings.customModelNoModels": {
+    ja: "モデル一覧を取得できませんでした。APIがモデルを返していません。モデル名は手動入力できます",
+    en: "Could not load the model list because the API returned no models. You can enter a model name manually",
+  },
+  "settings.customNoAuth": {
+    ja: "APIキーなしで接続（認証不要のAPI）",
+    en: "Connect without an API key (unauthenticated API)",
   },
   "settings.customApiKeyRemoveConfirm": {
     ja: "カスタムAPIキーを削除しますか？",

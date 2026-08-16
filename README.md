@@ -228,7 +228,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 
 ### AI Agents
 
-- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Grok Build, plus custom Anthropic Messages API endpoints like llama-server)
+- Create persistent AI personas with custom name, personality, avatar, and backend (Claude / Codex / Grok Build, plus three custom-endpoint backends: `custom-claude` for an Anthropic Messages API endpoint driven by the claude CLI, `custom-codex` for an OpenAI Responses API endpoint driven by the codex CLI, and `custom-bare` for a plain OpenAI-compatible chat endpoint with no CLI and no tools)
 - AI-assisted persona generation (via claude/codex/grok CLI) and avatar generation (Gemini Image API)
 - Interactive chat with streaming responses, thinking display, and tool-use cards
 - Markdown rendering in agent messages

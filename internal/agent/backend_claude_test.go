@@ -332,12 +332,20 @@ func TestBackendSupportsSessionKey(t *testing.T) {
 			t.Errorf("claude should support session key")
 		}
 	})
-	t.Run("custom supports", func(t *testing.T) {
-		// custom delegates to ClaudeBackend, so it must mirror claude.
+	t.Run("custom-claude supports", func(t *testing.T) {
+		// custom-claude delegates to ClaudeBackend, so it must mirror claude.
 		// Phase B Part 2 Slack threads must still resume on custom backends.
-		b := &CustomBackend{}
+		b := &CustomClaudeBackend{}
 		if !backendSupportsSessionKey(b) {
-			t.Errorf("custom should support session key")
+			t.Errorf("custom-claude should support session key")
+		}
+	})
+	t.Run("custom-codex supports", func(t *testing.T) {
+		// custom-codex delegates to CodexBackend, which stores a
+		// per-key thread ref, so it must mirror codex.
+		b := &CustomCodexBackend{}
+		if !backendSupportsSessionKey(b) {
+			t.Errorf("custom-codex should support session key")
 		}
 	})
 	t.Run("codex supports", func(t *testing.T) {
@@ -346,10 +354,10 @@ func TestBackendSupportsSessionKey(t *testing.T) {
 			t.Errorf("codex should support session key")
 		}
 	})
-	t.Run("llama does not", func(t *testing.T) {
-		b := &LlamaCppBackend{}
+	t.Run("custom-bare does not", func(t *testing.T) {
+		b := &CustomBareBackend{}
 		if backendSupportsSessionKey(b) {
-			t.Errorf("llama should not support session key")
+			t.Errorf("custom-bare should not support session key")
 		}
 	})
 	t.Run("nil is false", func(t *testing.T) {

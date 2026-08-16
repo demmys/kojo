@@ -684,7 +684,7 @@ func (m *Manager) ActivateAgentRuntime(agentID string) {
 	// dispatches based on Tool: claude/custom install the
 	// Claude-Code-flavored body, grok installs its own body
 	// (no `!`exec`` substitution, `grok --resume` wording), codex
-	// installs a .codex/skills body, and llama.cpp is no-op.
+	// installs a .codex/skills body, and custom-bare is no-op.
 	SyncDeviceSwitchSkillForTool(agentID, a.Tool, a.IsDeviceSwitchEnabled(), m.logger)
 }
 
@@ -2193,14 +2193,11 @@ func (m *Manager) ResetSession(agentID string) error {
 		m.busyMu.Unlock()
 	}()
 
-	switch tool {
-	case "claude":
+	switch NormalizeToolName(tool) {
+	case ToolClaude, ToolCustomClaude:
 		m.closeClaudeSessionSync(agentID)
 		clearClaudeSession(agentID, m.logger)
-	case "custom":
-		m.closeClaudeSessionSync(agentID)
-		clearClaudeSession(agentID, m.logger)
-	case "grok":
+	case ToolGrok:
 		// Use the counted variant so permission / IO failures
 		// surface in the log instead of being silently swallowed.
 		// The handler still returns nil on partial failure
@@ -2217,7 +2214,9 @@ func (m *Manager) ResetSession(agentID string) error {
 				"agent", agentID,
 				"filesRemoved", files, "sessionsRemoved", sessions)
 		}
-	case "codex":
+	// custom-codex drives the same codex CLI, so it leaves the same
+	// thread / rollout state behind and needs the same cleanup.
+	case ToolCodex, ToolCustomCodex:
 		files, threads, cerr := clearCodexSessionCounted(agentID)
 		if cerr != nil {
 			m.logger.Warn("CLI session reset: codex clear partial failure",

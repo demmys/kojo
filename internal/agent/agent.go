@@ -279,7 +279,7 @@ type Agent struct {
 	Persona string `json:"persona"`           // persona description (markdown)
 	Model   string `json:"model"`             // e.g. "sonnet", "opus"
 	Effort  string `json:"effort,omitempty"`  // claude/grok/codex effort level
-	Tool    string `json:"tool"`              // CLI tool: "claude", "codex", "grok"
+	Tool    string `json:"tool"`              // backend id, see tool_names.go
 	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
 	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
@@ -370,7 +370,7 @@ type Agent struct {
 	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
 
 	// CustomBaseURL is the base URL for a custom Anthropic Messages API endpoint
-	// (e.g., llama-server). Only used when Tool is "custom".
+	// (e.g., llama-server). Only used by the custom-* tools.
 	CustomBaseURL string `json:"customBaseURL,omitempty"`
 
 	// AllowedTools is a whitelist of tool names forwarded to a custom endpoint.
@@ -384,7 +384,7 @@ type Agent struct {
 	// explicit permissions.allow rules are the only bypass.
 	AllowProtectedPaths []string `json:"allowProtectedPaths,omitempty"`
 
-	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
+	// ThinkingMode controls reasoning/thinking for the custom-bare backend.
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
 
@@ -843,7 +843,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidModelEffort(cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
-	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {
+	if ToolRequiresCustomBaseURL(cfg.Tool) && cfg.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
 	}
 	if !ValidThinkingMode(cfg.ThinkingMode) {
@@ -891,8 +891,12 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		UpdatedAt:           now,
 	}
 	if a.Tool == "" {
-		a.Tool = "claude"
+		a.Tool = ToolClaude
 	}
+	// Accept the pre-rename identifiers on the API and store the current
+	// name, so callers pinned to an old client keep working while the DB
+	// only ever gains canonical values.
+	a.Tool = NormalizeToolName(a.Tool)
 	if a.Model == "" {
 		a.Model = "sonnet"
 	}

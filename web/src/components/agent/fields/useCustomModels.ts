@@ -3,7 +3,7 @@ import { api } from "../../../lib/api";
 import { needsCustomURLFor } from "../agentSettingsPayload";
 
 /**
- * For the "custom"/"llama.cpp" backends, debounce-fetch the model list from
+ * For the custom-* backends, debounce-fetch the model list from
  * the operator-supplied base URL. Mirrors the effect that previously lived
  * inline in AgentCreate and AgentSettings: on success it publishes the list
  * and, when non-empty, keeps the current model if still valid or falls back

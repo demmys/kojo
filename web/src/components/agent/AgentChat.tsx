@@ -988,7 +988,7 @@ export function AgentChat() {
             )}
           </button>
         )}
-        {agent.tool === "llama.cpp" && (
+        {agent.tool === "custom-bare" && (
           <button
             onClick={async () => {
               const modes = ["", "on", "off"] as const;
@@ -1098,7 +1098,7 @@ export function AgentChat() {
         )}
         {messages.map((msg) => {
           const editable =
-            agent.tool === "llama.cpp" &&
+            agent.tool === "custom-bare" &&
             !streaming &&
             !holderOffline &&
             !msg.id.startsWith("pending_") &&

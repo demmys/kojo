@@ -373,7 +373,7 @@ export function NewSession() {
             </div>
 
             {/* Minimal system prompt (claude / custom only) */}
-            {(tool === "claude" || tool === "custom") && (
+            {(tool === "claude" || tool === "custom-claude") && (
               <div
                 onClick={() => setSimpleSystemPrompt(!simpleSystemPrompt)}
                 className="flex cursor-pointer items-center justify-between gap-3 rounded-[10px] border border-hairline bg-raised px-3 py-2.5"

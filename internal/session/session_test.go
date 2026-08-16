@@ -169,10 +169,10 @@ func TestAppendYoloFlag(t *testing.T) {
 		}
 	})
 
-	t.Run("custom gets no flag", func(t *testing.T) {
-		got := appendYoloFlag("custom", nil, true)
+	t.Run("custom-claude gets no flag", func(t *testing.T) {
+		got := appendYoloFlag("custom-claude", nil, true)
 		if hasArg(got, claudeFlag) || hasArg(got, codexFlag) {
-			t.Fatalf("custom must not get a native yolo flag, got %v", got)
+			t.Fatalf("custom-claude must not get a native yolo flag, got %v", got)
 		}
 	})
 

@@ -27,11 +27,17 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "grok-4.6",
     models: ["grok-4.6", "grok-4.5"],
   },
-  custom: {
+  // The custom-* backends have no fixed model list: the operator supplies
+  // the endpoint and useCustomModels fetches whatever it advertises.
+  "custom-claude": {
     default: "",
     models: [],
   },
-  "llama.cpp": {
+  "custom-codex": {
+    default: "",
+    models: [],
+  },
+  "custom-bare": {
     default: "",
     models: [],
   },

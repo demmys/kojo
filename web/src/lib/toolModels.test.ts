@@ -138,3 +138,19 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
     }
   });
 });
+
+describe("toolModels — custom backends", () => {
+  // The three custom-* backends point at an operator-supplied endpoint, so
+  // kojo cannot know the model list: the UI has to fall back to free text.
+  for (const tool of ["custom-claude", "custom-codex", "custom-bare"]) {
+    it(`${tool} ships no preset models and no default`, () => {
+      expect(modelsForTool(tool)).toEqual([]);
+      expect(defaultModelForTool(tool)).toBe("");
+    });
+  }
+
+  it("the pre-rename ids are gone from the table", () => {
+    expect(modelsForTool("custom")).toEqual([]);
+    expect(modelsForTool("llama.cpp")).toEqual([]);
+  });
+});

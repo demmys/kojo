@@ -25,7 +25,9 @@ export interface ServerInfo {
   version: string;
   hostname: string;
   homeDir: string;
-  tools: Record<string, { available: boolean; path: string }>;
+  // Absent for non-Owner principals: /api/v1/info drops hostname / homeDir /
+  // tools from the response rather than leak the host's deploy details.
+  tools?: Record<string, { available: boolean; path: string }>;
   shellTool: string; // "tmux" on Unix, "shell" on Windows
   agentBackends?: Record<string, boolean>;
 }

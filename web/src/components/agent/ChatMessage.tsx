@@ -336,7 +336,7 @@ export function MessageContent({
         )}
       </button>}
 
-      {/* Edit / Delete (llama.cpp only — parent gates via handler presence) */}
+      {/* Edit / Delete (custom-bare only — parent gates via handler presence) */}
       {onEdit && (
         <button
           onClick={() => {

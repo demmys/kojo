@@ -449,11 +449,12 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	m := &Manager{
 		agents: make(map[string]*Agent),
 		backends: map[string]ChatBackend{
-			"claude":    NewClaudeBackend(logger),
-			"codex":     NewCodexBackend(logger),
-			"grok":      NewGrokBackend(logger),
-			"custom":    NewCustomBackend(logger),
-			"llama.cpp": NewLlamaCppBackend(logger),
+			ToolClaude:       NewClaudeBackend(logger),
+			ToolCodex:        NewCodexBackend(logger),
+			ToolGrok:         NewGrokBackend(logger),
+			ToolCustomClaude: NewCustomClaudeBackend(logger),
+			ToolCustomCodex:  NewCustomCodexBackend(logger),
+			ToolCustomBare:   NewCustomBareBackend(logger),
 		},
 		store:              st,
 		creds:              creds,
@@ -1424,7 +1425,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, err
 	}
-	// Prospective Tool + CustomBaseURL: tool=custom / llama.cpp
+	// Prospective Tool + CustomBaseURL: tool=custom-claude / custom-codex / custom-bare
 	// require a non-empty CustomBaseURL. Both can be patched in
 	// the same PATCH so we have to compute the post-PATCH pair
 	// and validate the combination here, not at the per-field
@@ -1437,7 +1438,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.CustomBaseURL != nil {
 		prospBaseURL = *cfg.CustomBaseURL
 	}
-	if (prospTool == "custom" || prospTool == "llama.cpp") && prospBaseURL == "" {
+	if ToolRequiresCustomBaseURL(prospTool) && prospBaseURL == "" {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", prospTool)
 	}
@@ -1584,7 +1585,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.Effort = *cfg.Effort
 	}
 	if cfg.Tool != nil {
-		a.Tool = *cfg.Tool
+		a.Tool = NormalizeToolName(*cfg.Tool)
 	}
 	if cfg.WorkDir != nil {
 		// Already validated upstream (abs path + IsDir).
@@ -1723,7 +1724,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// Claude-Code body it can't execute, or claude staring at the
 	// grok body with the wrong CLI invocation surfaced to the user.
 	// SyncDeviceSwitchSkillForTool dispatches to the right writer.
-	toolChanged := cfg.Tool != nil && *cfg.Tool != oldTool
+	toolChanged := cfg.Tool != nil && NormalizeToolName(*cfg.Tool) != NormalizeToolName(oldTool)
 	if cfg.DeviceSwitchEnabled != nil || toolChanged {
 		SyncDeviceSwitchSkillForTool(id, cp.Tool, cp.IsDeviceSwitchEnabled(), m.logger)
 	}
@@ -1971,14 +1972,14 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
 	// Claude-Code-specific hooks (PreToolUse / PreCompact) — only
-	// claude / custom understand the settings.local.json schema.
-	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
+	// claude / custom-claude understand the settings.local.json schema.
+	if t := NormalizeToolName(agentCopy.Tool); t == ToolClaude || t == ToolCustomClaude {
 		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
 	}
 	// §3.7 device-switch skill. SyncDeviceSwitchSkillForTool
 	// dispatches based on Tool. Every supported tool (claude,
-	// custom, grok, codex) goes through normal install/remove driven by
-	// the toggle, with the right body/path for that backend; llama.cpp is
+	// custom-claude, grok, codex) goes through normal install/remove driven by
+	// the toggle, with the right body/path for that backend; custom-bare is
 	// no-op (no skill loader). Toggle defaults to
 	// true via IsDeviceSwitchEnabled; the underlying writer
 	// internally gates installation on LookupPeerCount() > 0 so a
@@ -2538,7 +2539,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// invariant across turns within the same session. Doing this at the
 	// manager level (rather than inside each backend) keeps the wire
 	// behaviour identical for every backend including the ones that don't
-	// read ChatOptions.SystemPromptExtra directly (llama.cpp).
+	// read ChatOptions.SystemPromptExtra directly (custom-bare).
 	if opts.SystemPromptExtra != "" {
 		if prep.sysPrompt != "" {
 			prep.sysPrompt += "\n\n"
@@ -2579,9 +2580,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if opts.ForceFreshSession && sessionKey != "" {
 		var resetErr error
 		switch prep.backend.Name() {
-		case "claude", "custom":
+		case ToolClaude, ToolCustomClaude:
 			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
-		case "codex":
+		case ToolCodex, ToolCustomCodex:
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
@@ -4027,7 +4028,7 @@ func (m *Manager) DeleteMirrorForAgent(agentID string) error {
 }
 
 // UpdateMessageContent replaces the content of a single message in the transcript.
-// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// Only supported for the custom-bare backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
 //
 // ifMatchETag is forwarded to the store layer so the optimistic-
@@ -4055,7 +4056,7 @@ func (m *Manager) UpdateMessageContent(agentID, msgID, content, ifMatchETag stri
 }
 
 // DeleteMessage removes a single message from the transcript.
-// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// Only supported for the custom-bare backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
 //
 // ifMatchETag forwards an optimistic-lock precondition to the store.
@@ -4076,7 +4077,7 @@ func (m *Manager) DeleteMessage(agentID, msgID, ifMatchETag string) error {
 }
 
 // Regenerate truncates the transcript at msgID and re-runs the associated
-// user message through the llama.cpp backend. If msgID is an assistant
+// user message through the custom-bare backend. If msgID is an assistant
 // message, msgID and all subsequent messages are removed and the preceding
 // user message is re-sent. If msgID is a user message, all subsequent
 // messages are removed and msgID itself is re-sent.
@@ -4260,7 +4261,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	return nil
 }
 
-// acquireTranscriptEdit verifies the agent exists and uses the llama.cpp
+// acquireTranscriptEdit verifies the agent exists and uses the custom-bare
 // backend, then reserves the agent's busy slot so no Chat can start during
 // the edit. Returns ErrAgentBusy if a chat or reset is already in progress.
 // The returned release func must always be called.
@@ -4271,9 +4272,9 @@ func (m *Manager) acquireTranscriptEdit(agentID string) (func(), error) {
 		m.mu.Unlock()
 		return nil, ErrAgentNotFound
 	}
-	if a.Tool != "llama.cpp" {
+	if NormalizeToolName(a.Tool) != ToolCustomBare {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: only llama.cpp backend supports transcript editing", ErrUnsupportedTool)
+		return nil, fmt.Errorf("%w: only the custom-bare backend supports transcript editing", ErrUnsupportedTool)
 	}
 	// Hold m.mu while taking busyMu to close the TOCTOU window with Update()
 	// (which changes Tool while holding m.mu). Chat acquires busyMu without

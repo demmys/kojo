@@ -137,6 +137,8 @@ export function AgentSettings() {
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [customAPIKey, setCustomAPIKey] = useState("");
   const [customAPIKeyConfigured, setCustomAPIKeyConfigured] = useState(false);
+  const [customAPIKeyStatusKnown, setCustomAPIKeyStatusKnown] = useState(false);
+  const [customNoAuth, setCustomNoAuth] = useState(false);
   const [customAPIKeySaving, setCustomAPIKeySaving] = useState(false);
   const [customAPIKeyVersion, setCustomAPIKeyVersion] = useState(0);
   const [thinkingMode, setThinkingMode] = useState("");
@@ -364,6 +366,8 @@ export function AgentSettings() {
     // replacement requests are still in flight.
     setCustomAPIKey("");
     setCustomAPIKeyConfigured(false);
+    setCustomAPIKeyStatusKnown(false);
+    setCustomNoAuth(false);
     setCustomAPIKeySaving(false);
     // Run agent + workspace-file fetches in parallel via allSettled so a
     // 404 on one endpoint (e.g. /user-context against a server that
@@ -447,8 +451,18 @@ export function AgentSettings() {
         setLoadedAnchor("");
         setAnchorEtag("");
       }
-      setCustomAPIKeyConfigured(
-        customKeyRes.status === "fulfilled" && customKeyRes.value.configured,
+      const customKeyStatusKnown = customKeyRes.status === "fulfilled";
+      const customKeyConfigured =
+        customKeyStatusKnown && customKeyRes.value.configured;
+      setCustomAPIKeyStatusKnown(customKeyStatusKnown);
+      setCustomAPIKeyConfigured(customKeyConfigured);
+      // A persisted custom endpoint with no stored credential is an existing
+      // keyless configuration, not an unfinished form. Reconstruct that
+      // choice on every load so model discovery works immediately and the
+      // operator is not forced to re-confirm "no API key" on every visit.
+      setCustomNoAuth(
+        customKeyStatusKnown && a.tool === "custom" &&
+          !!a.customBaseURL?.trim() && !customKeyConfigured,
       );
       setStatusLoadGen((g) => g + 1);
     });
@@ -533,36 +547,40 @@ export function AgentSettings() {
     };
   }, [id, agent?.nextCronAt]);
 
-  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel, {
-    agentId: id,
-    ...(customAPIKey ? { apiKey: customAPIKey } : {}),
-    credentialVersion: customAPIKeyVersion,
-  });
+  useEffect(() => {
+    if (tool !== "custom") setCustomNoAuth(false);
+  }, [tool]);
+
   const customAPIKeyURLSaved =
     !!agent && customBaseURL.trim() === (agent.customBaseURL ?? "").trim();
-
-  const handleSaveCustomAPIKey = async () => {
-    if (!id || !customAPIKey.trim()) return;
-    const requestID = id;
-    const operation = ++customKeyOperationRef.current;
-    setCustomAPIKeySaving(true);
-    setError("");
-    try {
-      await agentApi.customApiKey.set(id, customBaseURL.trim(), customAPIKey.trim());
-      if (agentIDRef.current !== requestID || customKeyOperationRef.current !== operation) return;
-      setCustomAPIKey("");
-      setCustomAPIKeyConfigured(true);
-      setCustomAPIKeyVersion((v) => v + 1);
-    } catch (err) {
-      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
-        setError(errMsg(err));
-      }
-    } finally {
-      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
-        setCustomAPIKeySaving(false);
-      }
-    }
-  };
+  useEffect(() => {
+    if (customAPIKeyConfigured && customAPIKeyURLSaved) setCustomNoAuth(false);
+  }, [customAPIKeyConfigured, customAPIKeyURLSaved]);
+  const customNoAuthEnabled = tool === "custom" && customNoAuth;
+  const customKeyStatusUnknownForSavedURL =
+    tool === "custom" && !!agent && customAPIKeyURLSaved && !customAPIKeyStatusKnown;
+  const customModelDiscoveryReady =
+    !!customBaseURL.trim() &&
+    (tool === "llama.cpp" || !!customAPIKey.trim() ||
+      (customAPIKeyConfigured && customAPIKeyURLSaved) || customNoAuthEnabled ||
+      customKeyStatusUnknownForSavedURL);
+  const {
+    needsCustomURL,
+    customModels,
+    status: customModelsStatus,
+    error: customModelsError,
+    errorCode: customModelsErrorCode,
+  } = useCustomModels(tool, customBaseURL, setModel, {
+    agentId: id,
+    ...(customAPIKey ? { apiKey: customAPIKey } : customNoAuthEnabled ? { apiKey: "" } : {}),
+    credentialVersion: customAPIKeyVersion,
+    enabled: customModelDiscoveryReady,
+  });
+  const customConnectionNeedsCompletion =
+    needsCustomURL && customModelsStatus === "idle" && !!agent &&
+    (tool !== agent.tool ||
+      customBaseURL.trim() !== (agent.customBaseURL ?? "").trim() ||
+      model.trim() !== agent.model);
 
   const handleDeleteCustomAPIKey = async () => {
     if (!id || !confirm(t("settings.customApiKeyRemoveConfirm"))) return;
@@ -575,6 +593,8 @@ export function AgentSettings() {
       if (agentIDRef.current !== requestID || customKeyOperationRef.current !== operation) return;
       setCustomAPIKey("");
       setCustomAPIKeyConfigured(false);
+      setCustomAPIKeyStatusKnown(true);
+      setCustomNoAuth(tool === "custom");
       setCustomAPIKeyVersion((v) => v + 1);
     } catch (err) {
       if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
@@ -591,7 +611,17 @@ export function AgentSettings() {
     setSaving(true);
     setError("");
     setSuccess(false);
+    const requestID = id!;
+    const saveOperation = ++customKeyOperationRef.current;
+    const saveIsCurrent = () =>
+      agentIDRef.current === requestID &&
+      customKeyOperationRef.current === saveOperation;
     try {
+      // Keep the write-only secret in local state until the ordinary agent
+      // PATCH has persisted its Base URL. The credential endpoint binds the
+      // key to that saved URL, but this sequencing remains one user-visible
+      // Save operation rather than leaking the storage split into the UI.
+      const pendingCustomAPIKey = needsCustomURL ? customAPIKey.trim() : "";
       // cronMessage and userContext live in separate workspace files
       // (checkin.md, user.md) — they're persisted via dedicated
       // endpoints, NOT the agents PATCH. Dirty detection compares the
@@ -616,8 +646,29 @@ export function AgentSettings() {
         needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent?.customBaseURL ?? "").trim();
 
+      // A key replacement against an unchanged endpoint is a credential-only
+      // operation. Do not issue the broad agent PATCH in that case: a stale
+      // settings form must not overwrite a concurrent edit merely because the
+      // operator rotated an API key.
+      if (pendingCustomAPIKey && !nonSecretDirty) {
+        await agentApi.customApiKey.set(
+          requestID,
+          (agent?.customBaseURL ?? customBaseURL).trim(),
+          pendingCustomAPIKey,
+        );
+        if (!saveIsCurrent()) return;
+        setCustomAPIKey("");
+        setCustomAPIKeyConfigured(true);
+        setCustomAPIKeyStatusKnown(true);
+        setCustomNoAuth(false);
+        setCustomAPIKeyVersion((v) => v + 1);
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 2000);
+        return;
+      }
+
       const updated = await agentApi.update(
-        id!,
+        requestID,
         buildAgentSavePayload({
           name,
           persona,
@@ -658,6 +709,7 @@ export function AgentSettings() {
         // "someone else changed this" message below.
         agent?.etag,
       );
+      if (!saveIsCurrent()) return;
 
       // Commit the PATCH result to local state BEFORE the workspace-file
       // PUTs. If a PUT below throws (e.g. status validation 400), the
@@ -672,7 +724,25 @@ export function AgentSettings() {
       // raw local state against the normalized row and stay true forever.
       hydrateFromAgent(updated);
       if (customURLChanged) {
+        // Manager.Update has already invalidated the old URL-bound secret.
+        // Reflect that immediately even if the replacement credential write
+        // below fails, so the UI never claims a deleted key is configured.
         setCustomAPIKeyConfigured(false);
+        setCustomAPIKeyStatusKnown(true);
+      }
+      if (pendingCustomAPIKey) {
+        await agentApi.customApiKey.set(
+          requestID,
+          (updated.customBaseURL ?? customBaseURL).trim(),
+          pendingCustomAPIKey,
+        );
+        if (!saveIsCurrent()) return;
+        setCustomAPIKey("");
+        setCustomAPIKeyConfigured(true);
+        setCustomAPIKeyStatusKnown(true);
+        setCustomNoAuth(false);
+        setCustomAPIKeyVersion((v) => v + 1);
+      } else if (customURLChanged) {
         setCustomAPIKeyVersion((v) => v + 1);
       }
 
@@ -682,10 +752,11 @@ export function AgentSettings() {
         // header. After the write the response carries the freshly
         // computed etag, which we re-pin for the next save.
         const wrapped = await agentApi.putCheckinFile(
-          id!,
+          requestID,
           cronMessage,
           checkinEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setCheckinIsDefault(res.isDefault);
         setCronMessage(res.content);
@@ -698,10 +769,11 @@ export function AgentSettings() {
       }
       if (userDirty) {
         const wrapped = await agentApi.setUserContext(
-          id!,
+          requestID,
           userContext,
           userContextEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setUserContextIsDefault(res.isDefault);
         setUserContext(res.content);
@@ -710,10 +782,11 @@ export function AgentSettings() {
       }
       if (statusDirty) {
         const wrapped = await agentApi.putAgentStatus(
-          id!,
+          requestID,
           statusContent,
           statusEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setStatusIsDefault(res.isDefault);
         setStatusContent(res.content);
@@ -725,10 +798,11 @@ export function AgentSettings() {
       }
       if (anchorDirty) {
         const wrapped = await agentApi.putAgentAnchor(
-          id!,
+          requestID,
           anchorContent,
           anchorEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setAnchorIsDefault(res.isDefault);
         setAnchorContent(res.content);
@@ -739,6 +813,7 @@ export function AgentSettings() {
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
+      if (!saveIsCurrent()) return;
       // PreconditionFailedError is the etag-mismatch 412. Re-fetch the
       // agent so the form rebases onto the server's current row before
       // the user re-applies their edit (otherwise the next Save would
@@ -746,7 +821,8 @@ export function AgentSettings() {
       if (err instanceof Error && err.name === "PreconditionFailedError") {
         setError(t("settings.saveConflict"));
         try {
-          const fresh = await agentApi.get(id!);
+          const fresh = await agentApi.get(requestID);
+          if (!saveIsCurrent()) return;
           setAgent(fresh);
           // Don't blow away the user's in-progress edits — only refresh
           // the etag-bearing record. Form fields stay as-is so the user
@@ -765,11 +841,12 @@ export function AgentSettings() {
         // stay as the user left them.
         try {
           const [ck, uc, st, an] = await Promise.allSettled([
-            agentApi.getCheckinFile(id!),
-            agentApi.getUserContext(id!),
-            agentApi.getAgentStatus(id!),
-            agentApi.getAgentAnchor(id!),
+            agentApi.getCheckinFile(requestID),
+            agentApi.getUserContext(requestID),
+            agentApi.getAgentStatus(requestID),
+            agentApi.getAgentAnchor(requestID),
           ]);
+          if (!saveIsCurrent()) return;
           // For each file: re-pin etag + snapshot, and if the user hadn't
           // edited it (field still equals the old snapshot) fast-forward the
           // field too. Otherwise an untouched textarea would read as dirty
@@ -1101,7 +1178,7 @@ export function AgentSettings() {
   // thinkingMode, allowedTools, allowProtectedPaths, publicProfile body,
   // gemini-only TTS fields) are skipped so hidden inputs can't leave the
   // form un-clearably dirty.
-  const dirty =
+  const nonSecretDirty =
     !!agent &&
     (name.trim() !== agent.name ||
       persona.trim() !== agent.persona ||
@@ -1134,12 +1211,19 @@ export function AgentSettings() {
       userContext !== loadedUser ||
       (statusContent !== loadedStatus && !statusIsDefault) ||
       anchorContent !== loadedAnchor);
+  const dirty =
+    nonSecretDirty || (!!agent && needsCustomURLFor(tool) && !!customAPIKey.trim());
 
   // Rehydrate every form field from the persisted agent row / loaded
   // workspace-file snapshots, dropping unsaved edits.
   const handleDiscard = () => {
     if (!agent) return;
     hydrateFromAgent(agent);
+    setCustomAPIKey("");
+    setCustomNoAuth(
+      customAPIKeyStatusKnown && agent.tool === "custom" &&
+        !!agent.customBaseURL?.trim() && !customAPIKeyConfigured,
+    );
     setCronMessage(loadedCheckin);
     setUserContext(loadedUser);
     setStatusContent(loadedStatus);
@@ -1436,25 +1520,6 @@ export function AgentSettings() {
               setEffort={setEffort}
             />
 
-            <ModelPicker
-              model={model}
-              setModel={setModel}
-              effort={effort}
-              setEffort={setEffort}
-              models={needsCustomURL ? customModels : modelsForTool(tool)}
-            />
-
-            <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
-
-            {(tool === "claude" || tool === "grok") && (
-              <ToggleRow
-                checked={autoEffort}
-                onChange={setAutoEffort}
-                title={t("settings.autoEffort")}
-                desc={t("settings.autoEffortDesc")}
-              />
-            )}
-
             {needsCustomURL && (
               <div className="space-y-4">
                 <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
@@ -1462,7 +1527,7 @@ export function AgentSettings() {
                     mono
                     value={customBaseURL}
                     onChange={(e) => setCustomBaseURL(e.target.value)}
-                    disabled={customAPIKeySaving}
+                    disabled={customAPIKeySaving || saving}
                     placeholder="http://localhost:8080"
                   />
                 </Field>
@@ -1473,40 +1538,83 @@ export function AgentSettings() {
                       type="password"
                       autoComplete="new-password"
                       value={customAPIKey}
-                      onChange={(e) => setCustomAPIKey(e.target.value)}
-                      disabled={customAPIKeySaving}
+                      onChange={(e) => {
+                        setCustomAPIKey(e.target.value);
+                        if (e.target.value) setCustomNoAuth(false);
+                      }}
+                      disabled={customAPIKeySaving || saving || customNoAuthEnabled}
                       placeholder={customAPIKeyConfigured ? t("settings.customApiKeyConfigured") : "sk-unsloth-…"}
                     />
                     <div className="flex items-center gap-2">
-                      <Button
-                        type="button"
-                        disabled={customAPIKeySaving || !customAPIKey.trim() || !customAPIKeyURLSaved}
-                        onClick={handleSaveCustomAPIKey}
-                      >
-                        {customAPIKeyConfigured ? t("gs.update") : t("gs.save")}
-                      </Button>
                       {customAPIKeyConfigured && (
                         <Button
                           type="button"
                           variant="danger"
-                          disabled={customAPIKeySaving}
+                          disabled={customAPIKeySaving || saving}
                           onClick={handleDeleteCustomAPIKey}
                         >
                           {t("settings.customApiKeyRemove")}
                         </Button>
                       )}
-                      {customAPIKeyConfigured && (
+                      {customAPIKeyConfigured && !customAPIKey.trim() && (
                         <span className="text-[12px] text-lamp-run">{t("gs.configured")}</span>
                       )}
                     </div>
-                    {!customAPIKeyURLSaved && (
-                      <p className="text-[12px] text-lamp-warn">
-                        {t("settings.customApiKeySaveUrlFirst")}
-                      </p>
-                    )}
+                    {tool === "custom" &&
+                      (!customAPIKeyConfigured || !customAPIKeyURLSaved) && (
+                        <label className="flex items-center gap-2 text-[12px] text-ink-dim">
+                          <input
+                            type="checkbox"
+                            checked={customNoAuth}
+                            disabled={customAPIKeySaving || saving || !!customAPIKey.trim()}
+                            onChange={(e) => setCustomNoAuth(e.target.checked)}
+                          />
+                          {t("settings.customNoAuth")}
+                        </label>
+                      )}
                   </div>
                 </Field>
               </div>
+            )}
+
+            <ModelPicker
+              model={model}
+              setModel={setModel}
+              effort={effort}
+              setEffort={setEffort}
+              models={needsCustomURL ? customModels : modelsForTool(tool)}
+              disabled={needsCustomURL && customModelsStatus !== "success" && customModelsStatus !== "error"}
+            />
+
+            {needsCustomURL && customModelsStatus === "idle" && (
+              <p className="text-[12px] text-ink-faint">
+                {t(tool === "llama.cpp"
+                  ? "settings.customModelURLPrerequisite"
+                  : "settings.customModelPrerequisites")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "loading" && (
+              <p className="text-[12px] text-ink-faint">
+                {t("settings.customModelLoading")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "error" && (
+              <p className="text-[12px] text-lamp-warn">
+                {customModelsErrorCode === "no_models"
+                  ? t("settings.customModelNoModels")
+                  : t("settings.customModelError", { error: customModelsError })}
+              </p>
+            )}
+
+            <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
+
+            {(tool === "claude" || tool === "grok") && (
+              <ToggleRow
+                checked={autoEffort}
+                onChange={setAutoEffort}
+                title={t("settings.autoEffort")}
+                desc={t("settings.autoEffortDesc")}
+              />
             )}
 
             {/* Allowed Tools (custom only) */}
@@ -1983,10 +2091,18 @@ export function AgentSettings() {
                   <span className="min-w-0 flex-1 truncate text-[12px] text-ink-faint">
                     {t("settings.unsavedChanges")}
                   </span>
-                  <Button onClick={handleDiscard} disabled={saving}>
+                  <Button onClick={handleDiscard} disabled={saving || customAPIKeySaving}>
                     {t("settings.discard")}
                   </Button>
-                  <Button variant="primary" onClick={handleSave} disabled={saving}>
+                  <Button
+                    variant="primary"
+                    onClick={handleSave}
+                    disabled={
+                      saving || customAPIKeySaving ||
+                      (needsCustomURL && customModelsStatus === "loading") ||
+                      customConnectionNeedsCompletion
+                    }
+                  >
                     {saving ? t("settings.saving") : t("settings.saveChanges")}
                   </Button>
                 </div>

@@ -54,6 +54,7 @@ export function AgentCreate() {
   const [tool, setTool] = useState("claude");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [customAPIKey, setCustomAPIKey] = useState("");
+  const [customNoAuth, setCustomNoAuth] = useState(false);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   // cronExpr starts as the default "*/30 * * * *" only for ScheduleEditor's
@@ -97,11 +98,28 @@ export function AgentCreate() {
     listCustomTemplates().then(setCustomTemplates).catch(console.error);
   }, []);
 
-  const { needsCustomURL, customModels } = useCustomModels(
+  useEffect(() => {
+    if (tool !== "custom") setCustomNoAuth(false);
+  }, [tool]);
+
+  const customNoAuthEnabled = tool === "custom" && customNoAuth;
+  const customModelDiscoveryReady =
+    !!customBaseURL.trim() &&
+    (tool === "llama.cpp" || !!customAPIKey.trim() || customNoAuthEnabled);
+  const {
+    needsCustomURL,
+    customModels,
+    status: customModelsStatus,
+    error: customModelsError,
+    errorCode: customModelsErrorCode,
+  } = useCustomModels(
     tool,
     customBaseURL,
     setModel,
-    customAPIKey ? { apiKey: customAPIKey } : undefined,
+    {
+      ...(customAPIKey ? { apiKey: customAPIKey } : customNoAuthEnabled ? { apiKey: "" } : {}),
+      enabled: customModelDiscoveryReady,
+    },
   );
 
   const templates = [...builtinTemplates(), ...customTemplates];
@@ -669,10 +687,25 @@ export function AgentCreate() {
                     type="password"
                     autoComplete="new-password"
                     value={customAPIKey}
-                    onChange={(e) => setCustomAPIKey(e.target.value)}
+                    onChange={(e) => {
+                      setCustomAPIKey(e.target.value);
+                      if (e.target.value) setCustomNoAuth(false);
+                    }}
+                    disabled={customNoAuthEnabled}
                     placeholder="sk-unsloth-…"
                   />
                 </Field>
+                {tool === "custom" && (
+                  <label className="flex items-center gap-2 text-[12px] text-ink-dim">
+                    <input
+                      type="checkbox"
+                      checked={customNoAuth}
+                      disabled={!!customAPIKey.trim()}
+                      onChange={(e) => setCustomNoAuth(e.target.checked)}
+                    />
+                    {t("settings.customNoAuth")}
+                  </label>
+                )}
               </div>
             )}
 
@@ -682,7 +715,28 @@ export function AgentCreate() {
               effort={effort}
               setEffort={setEffort}
               models={needsCustomURL ? customModels : modelsForTool(tool)}
+              disabled={needsCustomURL && customModelsStatus !== "success" && customModelsStatus !== "error"}
             />
+
+            {needsCustomURL && customModelsStatus === "idle" && (
+              <p className="text-[12px] text-ink-faint">
+                {t(tool === "llama.cpp"
+                  ? "settings.customModelURLPrerequisite"
+                  : "settings.customModelPrerequisites")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "loading" && (
+              <p className="text-[12px] text-ink-faint">
+                {t("settings.customModelLoading")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "error" && (
+              <p className="text-[12px] text-lamp-warn">
+                {customModelsErrorCode === "no_models"
+                  ? t("settings.customModelNoModels")
+                  : t("settings.customModelError", { error: customModelsError })}
+              </p>
+            )}
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
@@ -729,7 +783,10 @@ export function AgentCreate() {
           <Button
             variant="primary"
             onClick={handleCreate}
-            disabled={loading || !name.trim()}
+            disabled={
+              loading || !name.trim() ||
+              (needsCustomURL && (customModelsStatus === "idle" || customModelsStatus === "loading"))
+            }
             className="w-full py-3"
           >
             {loading ? t("dash.creating") : t("create.createAgent")}

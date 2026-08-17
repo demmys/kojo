@@ -535,6 +535,19 @@ func truncateRunes(s string, max int) string {
 	return string(r[:max])
 }
 
+func safeAvatarProviderMessage(provider, kind string) string {
+	switch kind {
+	case "avatar_auth_failed":
+		return provider + " authentication failed"
+	case "avatar_rate_limited":
+		return provider + " rate limit exceeded"
+	case "avatar_moderation_blocked":
+		return provider + " rejected the avatar prompt under its content policy"
+	default:
+		return provider + " image generation failed"
+	}
+}
+
 func generateAvatarWithGemini(
 	ctx context.Context,
 	apiKey string,
@@ -594,21 +607,8 @@ func generateAvatarWithGemini(
 		return "", fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		var apiErr struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(body, &apiErr)
-		msg := apiErr.Error.Message
-		if msg == "" {
-			msg = string(body)
-			if len(msg) > 300 {
-				msg = msg[:300]
-			}
-		}
 		if logger != nil {
-			logger.Debug("gemini API error", "status", resp.StatusCode, "body", string(body))
+			logger.Debug("gemini API error", "status", resp.StatusCode, "body_bytes", len(body))
 		}
 		kind := "avatar_provider_error"
 		status := http.StatusBadGateway
@@ -622,7 +622,7 @@ func generateAvatarWithGemini(
 		}
 		return "", &AvatarGenerationError{
 			Code: kind, HTTPStatus: status,
-			Err: fmt.Errorf("Gemini API HTTP %d: %s", resp.StatusCode, msg),
+			Err: fmt.Errorf("Gemini API HTTP %d: %s", resp.StatusCode, safeAvatarProviderMessage("Gemini", kind)),
 		}
 	}
 
@@ -726,15 +726,17 @@ func generateAvatarWithOpenAI(
 			} `json:"error"`
 		}
 		_ = json.Unmarshal(body, &apiErr)
-		msg := strings.TrimSpace(apiErr.Error.Message)
-		if msg == "" {
-			msg = truncateRunes(string(body), 300)
-		}
 		if logger != nil {
-			logger.Debug("OpenAI API error", "status", resp.StatusCode, "code", apiErr.Error.Code, "body", string(body))
+			logger.Debug("OpenAI API error", "status", resp.StatusCode, "body_bytes", len(body))
 		}
 		codeText := strings.ToLower(fmt.Sprint(apiErr.Error.Code))
-		messageText := strings.ToLower(msg)
+		messageText := strings.ToLower(strings.TrimSpace(apiErr.Error.Message))
+		if messageText == "" {
+			// Some gateways return plain text instead of OpenAI's JSON error
+			// envelope. Use only a bounded copy for internal classification;
+			// never include it in logs or client-visible errors.
+			messageText = strings.ToLower(truncateRunes(string(body), 300))
+		}
 		kind := "avatar_provider_error"
 		status := http.StatusBadGateway
 		switch {
@@ -752,7 +754,7 @@ func generateAvatarWithOpenAI(
 		}
 		return "", &AvatarGenerationError{
 			Code: kind, HTTPStatus: status,
-			Err: fmt.Errorf("OpenAI API HTTP %d: %s", resp.StatusCode, msg),
+			Err: fmt.Errorf("OpenAI API HTTP %d: %s", resp.StatusCode, safeAvatarProviderMessage("OpenAI", kind)),
 		}
 	}
 

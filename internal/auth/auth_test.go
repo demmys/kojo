@@ -295,6 +295,14 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/begin", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/complete", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/abort", ag, false},
+		// Bare generation endpoints are Owner-only even though RolePeer may
+		// proxy holder-scoped /agents/{id} routes.
+		{http.MethodPost, "/api/v1/agents/generate-avatar",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/agents/generate-persona",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/messages",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		// §3.7 step 4 target-side pull endpoint. RolePeer is
 		// the production dispatcher (Hub signs as its own peer
 		// identity). RoleAgent / Guest must NOT reach it —

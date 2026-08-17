@@ -1574,11 +1574,11 @@ func (m *GroupDMManager) threadQueuedSnapshot(groupID string) map[string]struct{
 
 func (m *GroupDMManager) runThreadTurnReserved(agentID, groupID, groupName string, msg *GroupMessage, reservation, arrival *fifoReservation) {
 	m.runThreadTurnPayload(agentID, groupID, groupName,
-		m.renderThreadPayload(groupName, msg), msg.ID, msg.Content, false, reservation, arrival)
+		m.renderThreadPayload(groupName, msg), msg.ID, msg.Content, msg.Attachments, false, reservation, arrival)
 }
 
-func (m *GroupDMManager) runThreadTurnPayload(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, forceFresh bool, reservation, arrival *fifoReservation) {
-	m.runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage, forceFresh, "", reservation, arrival, nil)
+func (m *GroupDMManager) runThreadTurnPayload(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, attachments []MessageAttachment, forceFresh bool, reservation, arrival *fifoReservation) {
+	m.runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage, attachments, forceFresh, "", reservation, arrival, nil)
 }
 
 type groupDMHandoffReservation struct {
@@ -1628,7 +1628,7 @@ func (r *groupDMHandoffReservation) Activate(ctx context.Context, prompt, expect
 	}
 	r.activated = true
 	go r.manager.runThreadTurnPayloadLocked(r.agentID, r.groupID, r.groupName,
-		"[system message]\n"+prompt, "", "", true, expectedHolder, r.reservation, nil,
+		"[system message]\n"+prompt, "", "", nil, true, expectedHolder, r.reservation, nil,
 		append([]chathistory.HistoryMessage{}, history...))
 	return nil
 }
@@ -1643,7 +1643,7 @@ func (r *groupDMHandoffReservation) Release() {
 	r.reservation.Release()
 }
 
-func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, forceFresh bool, expectedHolder string, reservation, arrival *fifoReservation, presetHistory []chathistory.HistoryMessage) {
+func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName, payload, historyBeforeID, firstUserMessage string, attachments []MessageAttachment, forceFresh bool, expectedHolder string, reservation, arrival *fifoReservation, presetHistory []chathistory.HistoryMessage) {
 	reservation.Wait()
 	var arrivalReservation *groupDMHandoffReservation
 	if arrival != nil {
@@ -1750,6 +1750,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		HistorySelfUserID:                 agentID,
 		SystemPromptExtra:                 threadSystemPrompt(attachmentStageDir),
 		DisableKojoAttachmentInstructions: true,
+		Attachments:                       append([]MessageAttachment(nil), attachments...),
 		ForceFreshSession:                 forceFresh,
 		ExpectedHolderPeer:                expectedHolder,
 		HandoffArrivalReservation:         arrivalReservation,
@@ -1990,9 +1991,10 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 }
 
 // renderThreadPayload builds the one-shot payload for a thread turn from the
-// posted message: a sanitized sender header, the raw content, and any
-// attachment paths. No curl/CAS reply instructions — the reply is posted for
-// the agent automatically.
+// posted message: a sanitized sender header and the raw content. Attachments
+// are carried separately in OneShotOpts so the external router can replace
+// Hub-local paths with paths materialized on a remote holder. No curl/CAS
+// reply instructions — the reply is posted for the agent automatically.
 func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage) string {
 	var b strings.Builder
 	safeSender := strings.TrimSpace(sanitizeHeaderField(msg.AgentName))
@@ -2001,13 +2003,32 @@ func (m *GroupDMManager) renderThreadPayload(groupName string, msg *GroupMessage
 	}
 	fmt.Fprintf(&b, "[Thread: %s] Message from %s (human operator):\n", sanitizeHeaderField(groupName), safeSender)
 	b.WriteString(msg.Content)
+	return b.String()
+}
+
+// renderThreadHistoryText keeps attachment-only messages in the canonical
+// snapshot and preserves attachment metadata for later fresh-session and
+// handoff-arrival context. The actual file bytes and host-local paths travel
+// only with the live triggering turn; history retains portable name/MIME data.
+func renderThreadHistoryText(msg *GroupMessage) string {
+	if msg == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(msg.Content)
 	for _, a := range msg.Attachments {
-		fmt.Fprintf(&b, "\n📎 %s (%s, %s)",
-			sanitizeHeaderField(a.Path),
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "📎 %s (%s)",
 			sanitizeHeaderField(a.Name),
 			sanitizeHeaderField(a.Mime))
 	}
-	return b.String()
+	text := b.String()
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	return text
 }
 
 // threadConversationSnapshot returns the bounded canonical transcript visible
@@ -2033,7 +2054,8 @@ func (m *GroupDMManager) threadConversationSnapshot(ctx context.Context, groupID
 	}
 	out := make([]chathistory.HistoryMessage, 0, len(msgs))
 	for _, msg := range msgs {
-		if msg == nil || strings.TrimSpace(msg.Content) == "" {
+		text := renderThreadHistoryText(msg)
+		if text == "" {
 			continue
 		}
 		if msg.ID != triggerMessageID {
@@ -2048,7 +2070,7 @@ func (m *GroupDMManager) threadConversationSnapshot(ctx context.Context, groupID
 		out = append(out, chathistory.HistoryMessage{
 			Platform: "kojo-thread", ChannelID: groupID, ThreadID: groupID,
 			MessageID: msg.ID, UserID: uid, UserName: msg.AgentName,
-			Text: msg.Content, Timestamp: msg.Timestamp,
+			Text: text, Timestamp: msg.Timestamp,
 			IsBot: uid != UserSenderID,
 		})
 	}

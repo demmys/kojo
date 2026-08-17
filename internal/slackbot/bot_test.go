@@ -1116,7 +1116,7 @@ func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
 		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
 	}
 	turnCtx, turnCancel := context.WithCancel(context.Background())
-	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
 	defer turnCancel()
 
@@ -1133,6 +1133,87 @@ func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
 	}
 	if postCalls.Load() != 1 || gotThread != "thread.123" || gotMarkdown != stopCommandAck {
 		t.Fatalf("stop ack calls=%d thread=%q markdown=%q", postCalls.Load(), gotThread, gotMarkdown)
+	}
+}
+
+func TestHandleMessageEventStopCommandHonorsThreadGate(t *testing.T) {
+	var postCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	respondThread := false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID: "test-agent", agentDataDir: t.TempDir(),
+		config: agent.SlackBotConfig{Enabled: true, RespondThread: &respondThread},
+		api:    slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), mgr: &mockMgr{}, logger: testLogger,
+		botUserID: "UBOTTEST", ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		threadLocks: make(map[string]*threadLock), activeTurns: make(map[string][]*activeTurn),
+		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.123", TimeStamp: "msg.456", Text: "!stop",
+	})
+	select {
+	case <-turnCtx.Done():
+		t.Fatal("disabled thread surface accepted stop command")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if postCalls.Load() != 0 {
+		t.Fatalf("disabled thread surface posted %d command responses", postCalls.Load())
+	}
+}
+
+func TestHandleMessageEventStopCommandRequiresTurnOwner(t *testing.T) {
+	var postCalls atomic.Int32
+	var gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+			_ = r.ParseForm()
+			gotMarkdown = r.FormValue("markdown_text")
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID: "test-agent", agentDataDir: t.TempDir(), config: agent.SlackBotConfig{Enabled: true},
+		api: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), mgr: &mockMgr{}, logger: testLogger,
+		botUserID: "UBOTTEST", ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		threadLocks: make(map[string]*threadLock), activeTurns: make(map[string][]*activeTurn),
+		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "UOWNER", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "UOTHER", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.123", TimeStamp: "msg.456", Text: "!stop",
+	})
+	select {
+	case <-turnCtx.Done():
+		t.Fatal("unrelated Slack user cancelled the active turn")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if postCalls.Load() != 1 || gotMarkdown != stopCommandNotOwner {
+		t.Fatalf("unauthorized stop response calls=%d markdown=%q", postCalls.Load(), gotMarkdown)
 	}
 }
 

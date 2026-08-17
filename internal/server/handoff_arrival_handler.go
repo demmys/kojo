@@ -451,10 +451,11 @@ func (s *Server) peerDisplayName(ctx context.Context, peerID string) string {
 func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerID string, payload handoffArrivalRequest) (bool, error) {
 	if s.peerID != nil && originPeerID == s.peerID.DeviceID {
 		err := s.activateLocalHandoffCapability(ctx, payload)
-		// A missing in-memory capability after restart is ambiguous: the
-		// adapter may have admitted the arrival immediately before the crash.
-		// Fail closed instead of launching a duplicate legacy fallback.
-		return errors.Is(err, errHandoffCapabilityInvalid), err
+		// A missing in-memory capability is a definite failure for the current
+		// process. If a prior process admitted it before restarting, that
+		// in-process turn died with the process, so the legacy fallback is the
+		// only live continuation and must not be suppressed permanently.
+		return false, err
 	}
 	if s.agents == nil || s.agents.Store() == nil {
 		return false, errors.New("peer registry is unavailable")
@@ -488,17 +489,10 @@ func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerI
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		var errorBody struct {
-			Error struct {
-				Code string `json:"code"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(body, &errorBody)
-		// invalid_capability cannot distinguish "never admitted" from
-		// "admitted, then the origin restarted before finalize committed".
-		// Treat it like a lost response and suppress fallback (at-most-once).
-		uncertain := errorBody.Error.Code == "invalid_capability"
-		return uncertain, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		// invalid_capability is a definite failure on the current origin
+		// process. Any turn admitted by an older process is no longer running,
+		// so suppressing fallback here would persist ArrivalUncertain forever.
+		return false, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return false, nil
 }

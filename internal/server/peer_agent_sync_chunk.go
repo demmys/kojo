@@ -73,7 +73,34 @@ const (
 	// headroom; in practice we run into chunkedSyncMaxAccumulatedBytes
 	// first. Either limit hit returns 413.
 	chunkedSyncMaxChunks = 4096
+
+	// chunkedSyncMaxPendingEntries bounds begin-only reservations globally.
+	// Without this cap, a paired peer can mint op_ids until the 10-minute TTL
+	// expires and retain an unbounded number of request accumulators.
+	chunkedSyncMaxPendingEntries = 16
+
+	// Limit one paired peer to a fraction of the global slots so it cannot
+	// starve every other peer with begin-only reservations.
+	chunkedSyncMaxPendingEntriesPerSource = 4
+
+	// The per-entry cap alone permits every pending entry to approach 2 GiB.
+	// Keep the aggregate retained payload bounded as well. Matching the
+	// existing per-entry ceiling preserves support for one large migration.
+	chunkedSyncMaxTotalPendingBytes = chunkedSyncMaxAccumulatedBytes
 )
+
+func chunkedSyncPendingUsage(entries map[string]*chunkedSyncEntry, sourceDeviceID string) (sourceCount int, totalBytes int64) {
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		totalBytes += entry.accumulatedBytes
+		if entry.sourceDeviceID == sourceDeviceID {
+			sourceCount++
+		}
+	}
+	return sourceCount, totalBytes
+}
 
 // chunkedSyncEntry accumulates one in-flight chunked agent-sync. The
 // orchestrator opens it via /chunked/begin, appends data via
@@ -221,6 +248,20 @@ func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.
 			"op_id is already reserved by another chunked upload; abort first")
 		return
 	}
+	if len(s.chunkedAgentSyncs) >= chunkedSyncMaxPendingEntries {
+		s.chunkedSyncMu.Unlock()
+		writeError(w, http.StatusTooManyRequests, "too_many_pending",
+			fmt.Sprintf("pending chunked upload count reached cap %d; retry after an upload commits, aborts, or expires",
+				chunkedSyncMaxPendingEntries))
+		return
+	}
+	sourceCount, totalPendingBytes := chunkedSyncPendingUsage(s.chunkedAgentSyncs, bReq.SourceDeviceID)
+	if sourceCount >= chunkedSyncMaxPendingEntriesPerSource {
+		s.chunkedSyncMu.Unlock()
+		writeError(w, http.StatusTooManyRequests, "too_many_pending_for_source",
+			fmt.Sprintf("source pending chunked upload count reached cap %d", chunkedSyncMaxPendingEntriesPerSource))
+		return
+	}
 	entry := &chunkedSyncEntry{
 		sourceDeviceID:   bReq.SourceDeviceID,
 		req:              req,
@@ -228,10 +269,10 @@ func (s *Server) handlePeerAgentSyncChunkedBegin(w http.ResponseWriter, r *http.
 		accumulatedBytes: int64(len(body)),
 		lastTouched:      time.Now(),
 	}
-	if entry.accumulatedBytes > chunkedSyncMaxAccumulatedBytes {
+	if entry.accumulatedBytes > chunkedSyncMaxAccumulatedBytes || totalPendingBytes+entry.accumulatedBytes > chunkedSyncMaxTotalPendingBytes {
 		s.chunkedSyncMu.Unlock()
 		writeError(w, http.StatusRequestEntityTooLarge, "too_large",
-			"begin body alone exceeds accumulated cap")
+			"begin body exceeds pending-byte cap")
 		return
 	}
 	s.chunkedAgentSyncs[bReq.OpID] = entry
@@ -424,6 +465,17 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 				newTotal, chunkedSyncMaxAccumulatedBytes))
 		return
 	}
+	_, totalPendingBytes := chunkedSyncPendingUsage(s.chunkedAgentSyncs, "")
+	if totalPendingBytes+int64(len(body)) > chunkedSyncMaxTotalPendingBytes {
+		// Terminal for this upload: retaining it would keep the target above
+		// its global memory budget, and committing a truncated prefix is unsafe.
+		delete(s.chunkedAgentSyncs, opID)
+		s.chunkedSyncMu.Unlock()
+		writeError(w, http.StatusRequestEntityTooLarge, "too_much_pending_data",
+			fmt.Sprintf("total pending bytes would exceed cap %d; entry dropped, restart later",
+				chunkedSyncMaxTotalPendingBytes))
+		return
+	}
 
 	// Append the chunk's arrays to the accumulator. The full
 	// validation (path-safe agent.id, holder check) ran at begin;
@@ -457,14 +509,11 @@ func (s *Server) handlePeerAgentSyncChunkedChunk(w http.ResponseWriter, r *http.
 }
 
 // handlePeerAgentSyncChunkedCommit drains the pending entry and runs
-// applyPeerAgentSync against the accumulated payload. The pending
-// entry is removed from the map BEFORE the apply runs so a retry
-// from the orchestrator (same op_id) is rejected with 404 instead of
-// double-applying; a failed apply leaves the orchestrator with no
-// retry path on target and must restart the switch with a fresh
-// op_id (matching the single-shot handler's idempotency posture —
-// pendingAgentSyncs already keys finalize / drop off (agent_id,
-// op_id)).
+// applyPeerAgentSync against the accumulated payload. The entry stays in the
+// map with committing=true until apply returns: retries cannot double-apply,
+// and its retained bytes/count remain included in admission quotas. A failed
+// apply still drops the entry, so the orchestrator must restart with a fresh
+// op_id (matching the single-shot handler's idempotency posture).
 func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http.Request) {
 	p, ok := requirePeerOrOwner(w, r)
 	if !ok {
@@ -504,14 +553,14 @@ func (s *Server) handlePeerAgentSyncChunkedCommit(w http.ResponseWriter, r *http
 			"commit is already running for this op_id")
 		return
 	}
-	// Pop the entry before releasing the map lock so concurrent
-	// abort can't double-free, but keep a reference to the
-	// in-progress apply via `entry`. A late chunk that races in
-	// between this delete and the response will get 404, which is
-	// the right answer — its data wouldn't have made it into the
-	// apply anyway.
-	delete(s.chunkedAgentSyncs, opID)
 	s.chunkedSyncMu.Unlock()
+	defer func() {
+		s.chunkedSyncMu.Lock()
+		if current, ok := s.chunkedAgentSyncs[opID]; ok && current == entry {
+			delete(s.chunkedAgentSyncs, opID)
+		}
+		s.chunkedSyncMu.Unlock()
+	}()
 
 	s.logger.Info("chunked agent-sync: commit",
 		"agent", entry.req.Agent.ID, "op_id", opID,

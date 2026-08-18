@@ -435,17 +435,21 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 		return
 	}
 
-	// Stop commands bypass attachment downloads, auto-reply checks, the
-	// per-thread FIFO, and the global chat semaphore. Otherwise the command
-	// could sit behind the exact turn it needs to interrupt.
+	// Stop commands bypass attachment downloads, the per-thread FIFO, and the
+	// global chat semaphore. They still honor the configured surface gate and,
+	// in channels, may only stop a turn started by the same Slack user.
+	// Otherwise the command could sit behind the exact turn it needs to
+	// interrupt, while an unrelated channel member could cancel someone else's
+	// work.
 	if ev.ChannelType == "im" {
 		if !b.config.ReactDM() {
 			return
 		}
-		if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text) {
+		if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text) {
 			return
 		}
-	} else if ev.ThreadTimeStamp != "" && b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.Text) {
+	} else if b.config.ReactThread() && ev.ThreadTimeStamp != "" &&
+		b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text) {
 		return
 	}
 
@@ -550,7 +554,7 @@ func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMent
 	}
 	// Strip the bot mention from the message
 	text := StripBotMention(ev.Text, b.botUserID)
-	if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text) {
+	if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, text) {
 		return
 	}
 	replyTS := ev.ThreadTimeStamp
@@ -613,6 +617,7 @@ func contextUntilTurnStop(parent context.Context, active *activeTurn) (context.C
 const (
 	stopCommandAck         = "_Stopping current turn…_"
 	stopCommandNoActive    = "_No active turn in this thread._"
+	stopCommandNotOwner    = "_Only the person who started the current turn can stop it._"
 	stopCommandDone        = "_Stopped current turn._"
 	steerDeliveryUncertain = "_I couldn't confirm whether that interruption was delivered, so I didn't retry it to avoid sending it twice._"
 )
@@ -626,7 +631,7 @@ func isStopCommand(text string) bool {
 	}
 }
 
-func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, text string) bool {
+func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, userID, text string) bool {
 	// Avoid resolving user mentions just to reject an ordinary message. App
 	// mentions have already had the bot mention stripped by their handler.
 	if !isStopCommand(SlackToPlain(text, nil)) {
@@ -637,8 +642,10 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 	if replyTS == "" && b.config.ThreadReplies {
 		replyTS = messageTS
 	}
-	if b.cancelActiveTurn(channel, replyTS) {
+	if cancelled, active := b.cancelActiveTurnForUser(channel, replyTS, userID); cancelled {
 		b.postMessage(ctx, channel, replyTS, stopCommandAck)
+	} else if active {
+		b.postMessage(ctx, channel, replyTS, stopCommandNotOwner)
 	} else {
 		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
 	}
@@ -716,7 +723,7 @@ func (b *Bot) enqueueIncomingTurn(ctx context.Context, channel, origThreadTS, re
 	case b.sem <- struct{}{}:
 		turn, arrival := b.reserveThreadPair(channel, replyTS)
 		turnCtx, turnCancel := context.WithCancel(ctx)
-		active := b.registerActiveTurn(channel, replyTS, turnCancel)
+		active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
 		go func() {
 			defer func() { <-b.sem }()
 			b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID,
@@ -812,7 +819,7 @@ func (b *Bot) enqueueIncomingTurnBefore(ctx context.Context, channel, origThread
 	case b.sem <- struct{}{}:
 		turn, arrival := b.reserveThreadPair(channel, replyTS)
 		turnCtx, turnCancel := context.WithCancel(ctx)
-		active := b.registerActiveTurn(channel, replyTS, turnCancel)
+		active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
 		releaseAdmission()
 		go func() {
 			defer func() { <-b.sem }()
@@ -874,7 +881,7 @@ func (b *Bot) sendToAgentTurn(ctx context.Context, channel, origThreadTS, replyT
 	// each other's updates rather than building prompts from stale history.
 	reservation, arrival := b.reserveThreadPair(channel, replyTS)
 	turnCtx, turnCancel := context.WithCancel(ctx)
-	active := b.registerActiveTurn(channel, replyTS, turnCancel)
+	active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
 	b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, "", attachments, syntheticSystem, messageTS, nil, reservation, arrival, turnCtx, turnCancel, active)
 }
 
@@ -2221,11 +2228,14 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 }
 
 type activeTurn struct {
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	stopUser bool
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	// ownerUserID is the Slack user that started this turn. Channel stop
+	// commands must match it; empty is reserved for synthetic/internal turns.
+	ownerUserID string
+	stopUser    bool
+	stopOnce    sync.Once
+	stopCh      chan struct{}
 
 	// steerTail is a per-turn admission queue. Socket Mode reserves a slot
 	// synchronously in event order, while the peer/backend RPC runs outside the
@@ -2292,16 +2302,20 @@ func (t *activeTurn) stopRequested() bool {
 func activeTurnKey(channel, threadTS string) string { return channel + ":" + threadTS }
 
 func (b *Bot) registerActiveTurn(channel, threadTS string, cancel context.CancelFunc) *activeTurn {
-	return b.registerActiveTurnAfter(channel, threadTS, nil, cancel)
+	return b.registerActiveTurnAfter(channel, threadTS, nil, "", cancel)
+}
+
+func (b *Bot) registerActiveTurnForUser(channel, threadTS, userID string, cancel context.CancelFunc) *activeTurn {
+	return b.registerActiveTurnAfter(channel, threadTS, nil, userID, cancel)
 }
 
 // registerActiveTurnAfter inserts a reserved handoff arrival immediately after
 // its source. Handoff FIFO reserves source→arrival atomically; ordinary Slack
 // events accepted later must not overtake that order in the stop registry.
-func (b *Bot) registerActiveTurnAfter(channel, threadTS string, after *activeTurn, cancel context.CancelFunc) *activeTurn {
+func (b *Bot) registerActiveTurnAfter(channel, threadTS string, after *activeTurn, ownerUserID string, cancel context.CancelFunc) *activeTurn {
 	steerReady := make(chan struct{})
 	close(steerReady)
-	turn := &activeTurn{cancel: cancel, stopCh: make(chan struct{}), steerTail: steerReady}
+	turn := &activeTurn{cancel: cancel, ownerUserID: ownerUserID, stopCh: make(chan struct{}), steerTail: steerReady}
 	key := activeTurnKey(channel, threadTS)
 	b.activeTurnsMu.Lock()
 	if b.activeTurns == nil {
@@ -2416,6 +2430,25 @@ func (b *Bot) cancelActiveTurn(channel, threadTS string) bool {
 	return true
 }
 
+// cancelActiveTurnForUser cancels the FIFO head only when it belongs to the
+// requesting Slack user. The second result reports whether a turn existed, so
+// command handling can distinguish an unauthorized stop from an idle thread.
+func (b *Bot) cancelActiveTurnForUser(channel, threadTS, userID string) (bool, bool) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	defer b.activeTurnsMu.Unlock()
+	turns := b.activeTurns[key]
+	if len(turns) == 0 {
+		return false, false
+	}
+	turn := turns[0]
+	if turn.ownerUserID == "" || userID == "" || turn.ownerUserID != userID {
+		return false, true
+	}
+	turn.requestStop()
+	return true, true
+}
+
 // threadLock is a reference-counted mutex for serializing per-thread processing.
 // The map entry is only removed when the last holder releases it, preventing a
 // race where a new mutex is created while another goroutine is still waiting on
@@ -2497,7 +2530,11 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 	// Once the source reaches its terminal event, !stop can therefore target a
 	// continuation waiting for its semaphore slot instead of seeing a gap.
 	arrivalCtx, arrivalCancel := context.WithCancel(r.bot.ctx)
-	arrivalActive := r.bot.registerActiveTurnAfter(r.channel, r.threadTS, r.source, arrivalCancel)
+	ownerUserID := ""
+	if r.source != nil {
+		ownerUserID = r.source.ownerUserID
+	}
+	arrivalActive := r.bot.registerActiveTurnAfter(r.channel, r.threadTS, r.source, ownerUserID, arrivalCancel)
 	go func() {
 		// Admission is already guaranteed by the FIFO reservation. Wait for
 		// the initiating turn to release it, then take a global execution slot

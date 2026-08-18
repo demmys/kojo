@@ -21,6 +21,7 @@ import (
 type threadStub struct {
 	mu            sync.Mutex
 	calls         []OneShotOpts
+	messages      []string
 	reply         string
 	active        int32
 	maxConcurrent int32
@@ -34,6 +35,11 @@ func (s *threadStub) lastOpts() OneShotOpts {
 	defer s.mu.Unlock()
 	return s.calls[len(s.calls)-1]
 }
+func (s *threadStub) lastMessage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.messages[len(s.messages)-1]
+}
 
 func (s *threadStub) fn(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
 	n := atomic.AddInt32(&s.active, 1)
@@ -45,6 +51,7 @@ func (s *threadStub) fn(ctx context.Context, agentID, userMessage string, opts O
 	}
 	s.mu.Lock()
 	s.calls = append(s.calls, opts)
+	s.messages = append(s.messages, userMessage)
 	reply := s.reply
 	s.mu.Unlock()
 
@@ -115,6 +122,82 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	gdm.notifyMu.Unlock()
 	if exists {
 		t.Errorf("thread post should not create notify state")
+	}
+}
+
+func TestThreadPost_ForwardsInputAttachmentsToOneShot(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	stub := &threadStub{reply: "received"}
+	gdm.oneShot = stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(t.TempDir(), "report.pdf")
+	if err := os.WriteFile(sourcePath, []byte("report contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attachments := []MessageAttachment{{
+		Path: sourcePath, Name: "report.pdf", Mime: "application/pdf", Size: 15, PeerID: "hub",
+	}}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "inspect this", attachments, true); err != nil {
+		t.Fatal(err)
+	}
+	waitForMessage(t, gdm, g.ID, "received")
+
+	got := stub.lastOpts().Attachments
+	if len(got) != 1 || got[0] != attachments[0] {
+		t.Fatalf("one-shot attachments = %+v, want %+v", got, attachments)
+	}
+	if strings.Contains(stub.lastMessage(), sourcePath) {
+		t.Fatalf("live payload leaked Hub-local attachment path: %q", stub.lastMessage())
+	}
+}
+
+func TestThreadConversationHistory_KeepsAttachmentOnlyMessage(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := newGroupMessage(UserSenderID, "User", "", []MessageAttachment{{
+		Path: "kojo://global/groupdms/" + g.ID + "/input/design.png",
+		Name: "design.png", Mime: "image/png", Size: 123,
+	}})
+	if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	gdm.latestMsgID[g.ID] = msg.ID
+
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, msg.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].MessageID != msg.ID ||
+		!strings.Contains(history[0].Text, "design.png") || !strings.Contains(history[0].Text, "image/png") {
+		t.Fatalf("attachment-only history = %+v", history)
+	}
+}
+
+func TestThreadConversationHistory_PreservesContentWhitespace(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "    indented code  \nnext line  "
+	msg := newGroupMessage(UserSenderID, "User", content, nil)
+	if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	gdm.latestMsgID[g.ID] = msg.ID
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, msg.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Text != content {
+		t.Fatalf("history text = %q, want exact %q", history[0].Text, content)
 	}
 }
 

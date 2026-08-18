@@ -185,6 +185,9 @@ func TestGenerateAvatarWithGeminiClassifiesProviderErrors(t *testing.T) {
 	if !errors.As(err, &generationErr) || generationErr.Code != "avatar_rate_limited" || generationErr.HTTPStatus != http.StatusTooManyRequests {
 		t.Fatalf("classified error = %#v (%v)", generationErr, err)
 	}
+	if strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("provider response leaked through client error: %v", err)
+	}
 }
 
 func TestGenerateAvatarWithOpenAIReportsAPIAndDecodeErrors(t *testing.T) {
@@ -208,12 +211,41 @@ func TestGenerateAvatarWithOpenAIReportsAPIAndDecodeErrors(t *testing.T) {
 		}))
 		defer stub.Close()
 		_, err := generateAvatarWithOpenAI(context.Background(), "key", "prompt", stub.Client(), stub.URL, nil)
-		if err == nil || !strings.Contains(err.Error(), "HTTP 429: rate limited") {
+		if err == nil || !strings.Contains(err.Error(), "HTTP 429: OpenAI rate limit exceeded") {
 			t.Fatalf("error = %v", err)
 		}
 		var generationErr *AvatarGenerationError
 		if !errors.As(err, &generationErr) || generationErr.Code != "avatar_rate_limited" || generationErr.HTTPStatus != http.StatusTooManyRequests {
 			t.Fatalf("classified error = %#v", generationErr)
+		}
+	})
+
+	t.Run("unstructured provider body is redacted", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `upstream echoed sk-secret-fragment`)
+		}))
+		defer stub.Close()
+		_, err := generateAvatarWithOpenAI(context.Background(), "key", "prompt", stub.Client(), stub.URL, nil)
+		if err == nil || strings.Contains(err.Error(), "sk-secret-fragment") {
+			t.Fatalf("provider response leaked through client error: %v", err)
+		}
+	})
+
+	t.Run("plain text moderation body is classified but redacted", func(t *testing.T) {
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `content policy rejected secret-fragment`)
+		}))
+		defer stub.Close()
+		_, err := generateAvatarWithOpenAI(context.Background(), "key", "prompt", stub.Client(), stub.URL, nil)
+		var generationErr *AvatarGenerationError
+		if !errors.As(err, &generationErr) || generationErr.Code != "avatar_moderation_blocked" ||
+			generationErr.HTTPStatus != http.StatusUnprocessableEntity {
+			t.Fatalf("classified error = %#v (%v)", generationErr, err)
+		}
+		if strings.Contains(err.Error(), "secret-fragment") {
+			t.Fatalf("plain-text provider response leaked through client error: %v", err)
 		}
 	})
 

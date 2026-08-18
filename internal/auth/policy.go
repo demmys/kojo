@@ -222,6 +222,16 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// trust signal. --unsafe collapses the WhoIs check and
 		// unconditionally stamps RolePeer on every caller (LAN /
 		// docker / CI escape hatch).
+		// Bare generation/preview endpoints are Owner-only. They are not
+		// holder-scoped agent proxy routes, and generate-* can incur provider
+		// charges; do not let the broad per-agent peer proxy prefix admit them.
+		switch path {
+		case "/api/v1/agents/generate-persona",
+			"/api/v1/agents/generate-name",
+			"/api/v1/agents/generate-avatar",
+			"/api/v1/agents/preview-avatar":
+			return false
+		}
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}

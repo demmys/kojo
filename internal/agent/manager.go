@@ -2347,7 +2347,7 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude/codex). For
+	// Honored only by backends in backendSupportsSessionKey (claude/codex/grok). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
@@ -3096,6 +3096,8 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 	switch backend.Name() {
 	case ToolCodex, ToolCustomCodex:
 		return codexCanResumeSession(agentID, sessionKey)
+	case ToolGrok:
+		return grokCanResumeSession(agentID, sessionKey)
 	}
 
 	// Probe the deterministic Claude session file. expectedClaudeSessionID is

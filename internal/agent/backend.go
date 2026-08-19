@@ -132,10 +132,10 @@ var ErrSteerUnsupported = errors.New("steering is not supported for this backend
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (grok, custom-bare) cannot isolate a
-// per-thread session from the agent's main session, so the manager drops
-// SessionKey for them and degrades to OneShot=true — keeping the chat
-// ephemeral rather than silently mixing thread contexts.
+// ignore SessionKey (custom-bare) cannot isolate a per-thread session
+// from the agent's main session, so the manager drops SessionKey for
+// them and degrades to OneShot=true — keeping the chat ephemeral rather
+// than silently mixing thread contexts.
 //
 // Keep this list in sync with the backends that actually read
 // opts.SessionKey when assembling their argv / config.
@@ -144,10 +144,11 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex:
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok:
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
 		// CodexBackend.Chat; codex stores a deterministic per-key thread ref
-		// under agentDir/.codex/threads.
+		// under agentDir/.codex/threads, and grok the equivalent under
+		// agentDir/.grok/threads, resumed by explicit `--resume <id>`.
 		return true
 	default:
 		return false

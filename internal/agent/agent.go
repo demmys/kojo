@@ -474,6 +474,12 @@ type Agent struct {
 	// target's applyPeerAgentSync — cleared on a clean transfer —
 	// so the owner UI can show a "skipped during transfer" notice.
 	LastTransferSkips []SkippedSessionFile `json:"lastTransferSkips,omitempty"`
+	// LastTransferSkipsGeneration identifies the transfer that produced the
+	// visible warning. Derived from the orchestrator op_id (or a stable legacy
+	// hash for rows written before generation tracking) and never persisted as
+	// an Agent field. The dismiss API uses it as a compare-and-set token so an
+	// old dashboard cannot acknowledge a newer transfer's warning.
+	LastTransferSkipsGeneration string `json:"lastTransferSkipsGeneration,omitempty"`
 
 	// HolderPeer is set only for agents that live on a remote peer
 	// (i.e. the agent's agent_locks.holder_peer != local peer). The

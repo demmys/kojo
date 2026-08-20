@@ -4462,6 +4462,35 @@ func (m *Manager) LockPatch(id string) (release func()) {
 	return m.patchMus.Lock(id)
 }
 
+// DismissTransferSkips acknowledges the latest device-transfer loss notice.
+// The acknowledgement is persisted even when the agent is currently held by
+// a remote peer, then the matching warning is hidden from the local cache. A
+// future transfer with new skips creates a new generation.
+func (m *Manager) DismissTransferSkips(id, expectedGeneration string) (bool, error) {
+	if m == nil || m.store == nil || id == "" {
+		return false, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	acknowledged, err := m.store.AcknowledgeTransferSkips(id, expectedGeneration)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// Only hide the generation the caller actually observed. If a new transfer
+	// reloaded the cache while the request was in flight, leave that warning
+	// visible; the store CAS above returns ErrTransferSkipsChanged in the same
+	// situation for the persisted row.
+	m.mu.Lock()
+	if a, ok := m.agents[id]; ok && a.LastTransferSkipsGeneration == expectedGeneration {
+		a.LastTransferSkips = nil
+		a.LastTransferSkipsGeneration = ""
+	}
+	m.mu.Unlock()
+	return acknowledged, nil
+}
+
 // copyAgent returns a deep copy of an Agent, including pointer fields.
 func copyAgent(a *Agent) *Agent {
 	cp := *a

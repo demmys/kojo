@@ -136,6 +136,10 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   // Entries expire after tombstoneTTL (>= proxy timeout) so the
   // map can't grow unbounded.
   const tombstonesRef = useRef<Map<string, number>>(new Map());
+  // Suppress a dismissed transfer-warning generation from an agent-list
+  // request that started before the acknowledgement completed. A different
+  // generation is never masked, so the next lossy transfer still surfaces.
+  const dismissedTransferSkipsRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     // loadSessions concurrently queries every non-self peer in
@@ -288,7 +292,14 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
   }, []);
 
   useEffect(() => {
-    const loadAgents = () => agentApi.list().then(setAgents).catch(console.error);
+    const loadAgents = () => agentApi.list().then((rows) => {
+      setAgents(rows.map((a) =>
+        a.lastTransferSkipsGeneration &&
+        dismissedTransferSkipsRef.current.get(a.id) === a.lastTransferSkipsGeneration
+          ? { ...a, lastTransferSkips: undefined, lastTransferSkipsGeneration: undefined }
+          : a,
+      ));
+    }).catch(console.error);
     loadAgents();
     const interval = setInterval(loadAgents, 5000);
     return () => clearInterval(interval);
@@ -690,73 +701,96 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             : ""
                     }`}
                   >
-                    <button
-                      onClick={() => navigate(`/agents/${agent.id}`)}
-                      className={`flex min-w-0 flex-1 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
-                    >
-                      {open && (
-                        <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
-                      )}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-baseline gap-2">
-                          <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
-                          {agent.busy && !agent.awaitingAnswer && (
-                            <span
-                              className="h-2 w-2 shrink-0 animate-lamp-pulse rounded-full bg-copper"
-                              title={t("dash.processing")}
-                              aria-label={t("dash.processing")}
-                            />
-                          )}
-                          {agent.awaitingAnswer && (
-                            <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-warn/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-warn">
-                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-lamp-warn" />
-                              {t("dash.awaitingAnswer")}
-                            </span>
-                          )}
-                          {agent.attention && !agent.awaitingAnswer && (
-                            <span
-                              className="flex shrink-0 items-center gap-1 rounded-full bg-copper/15 px-1.5 py-0.5 text-[10px] font-semibold text-copper"
-                              title={agent.attentionReason || t("dash.attention")}
-                            >
-                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-copper" />
-                              {t("dash.attention")}
-                            </span>
-                          )}
-                          {errored && (
-                            <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-err/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-err">
-                              <span className="h-1.5 w-1.5 rounded-full bg-lamp-err" />
-                              {t("dash.turnError")}
-                            </span>
-                          )}
-                          {agent.holderPeer && (
-                            <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
-                              {t("dash.transferring", {
-                                peer: agent.holderPeerName || agent.holderPeer.slice(0, 8),
-                              })}
-                            </span>
-                          )}
-                          {open && <RelTime value={ts} className="ml-auto" />}
-                        </div>
+                    <div className="flex min-w-0 flex-1 flex-col">
+                      <button
+                        onClick={() => navigate(`/agents/${agent.id}`)}
+                        className={`flex min-w-0 items-center gap-3 ${open ? "py-3" : "py-2"} pl-3 pr-1 text-left`}
+                      >
                         {open && (
-                          <>
-                            {agent.attention && agent.attentionReason && (
-                              <div className="mt-0.5 truncate text-[13px] text-copper" title={agent.attentionReason}>
-                                {agent.attentionReason}
-                              </div>
-                            )}
-                            <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
-                            <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
-                              <Chip className="shrink-0">{agent.tool}</Chip>
-                              {agent.model && <Chip className="min-w-0 max-w-[45%]">{agent.model}</Chip>}
-                              {agent.workDir && (
-                                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{agent.workDir}</span>
-                              )}
-                            </div>
-                            <TransferSkipsNotice skips={agent.lastTransferSkips} />
-                          </>
+                          <AgentAvatar agentId={agent.id} name={agent.name} size="xs" cacheBust={agent.avatarHash} />
                         )}
-                      </div>
-                    </button>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-baseline gap-2">
+                            <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{agent.name}</span>
+                            {agent.busy && !agent.awaitingAnswer && (
+                              <span
+                                className="h-2 w-2 shrink-0 animate-lamp-pulse rounded-full bg-copper"
+                                title={t("dash.processing")}
+                                aria-label={t("dash.processing")}
+                              />
+                            )}
+                            {agent.awaitingAnswer && (
+                              <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-warn/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-warn">
+                                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-lamp-warn" />
+                                {t("dash.awaitingAnswer")}
+                              </span>
+                            )}
+                            {agent.attention && !agent.awaitingAnswer && (
+                              <span
+                                className="flex shrink-0 items-center gap-1 rounded-full bg-copper/15 px-1.5 py-0.5 text-[10px] font-semibold text-copper"
+                                title={agent.attentionReason || t("dash.attention")}
+                              >
+                                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-copper" />
+                                {t("dash.attention")}
+                              </span>
+                            )}
+                            {errored && (
+                              <span className="flex shrink-0 items-center gap-1 rounded-full bg-lamp-err/15 px-1.5 py-0.5 text-[10px] font-semibold text-lamp-err">
+                                <span className="h-1.5 w-1.5 rounded-full bg-lamp-err" />
+                                {t("dash.turnError")}
+                              </span>
+                            )}
+                            {agent.holderPeer && (
+                              <span className="shrink-0 text-[10px] text-copper" title={agent.holderPeer}>
+                                {t("dash.transferring", {
+                                  peer: agent.holderPeerName || agent.holderPeer.slice(0, 8),
+                                })}
+                              </span>
+                            )}
+                            {open && <RelTime value={ts} className="ml-auto" />}
+                          </div>
+                          {open && (
+                            <>
+                              {agent.attention && agent.attentionReason && (
+                                <div className="mt-0.5 truncate text-[13px] text-copper" title={agent.attentionReason}>
+                                  {agent.attentionReason}
+                                </div>
+                              )}
+                              <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
+                              <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
+                                <Chip className="shrink-0">{agent.tool}</Chip>
+                                {agent.model && <Chip className="min-w-0 max-w-[45%]">{agent.model}</Chip>}
+                                {agent.workDir && (
+                                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{agent.workDir}</span>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </button>
+                      {open && agent.lastTransferSkipsGeneration && (
+                        <div className="px-3 pb-2">
+                          <TransferSkipsNotice
+                            key={agent.lastTransferSkipsGeneration}
+                            skips={agent.lastTransferSkips}
+                            onDismiss={async () => {
+                              const generation = agent.lastTransferSkipsGeneration!;
+                              await agentApi.dismissTransferSkips(agent.id, generation);
+                              dismissedTransferSkipsRef.current.set(agent.id, generation);
+                              setAgents((prev) => prev.map((a) =>
+                                a.id === agent.id && a.lastTransferSkipsGeneration === generation
+                                  ? {
+                                      ...a,
+                                      lastTransferSkips: undefined,
+                                      lastTransferSkipsGeneration: undefined,
+                                    }
+                                  : a,
+                              ));
+                            }}
+                          />
+                        </div>
+                      )}
+                    </div>
 
                     {agent.holderPeer && (
                       <button

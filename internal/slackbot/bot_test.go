@@ -922,6 +922,13 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 
 	source.requestStop()
 	bot.unregisterActiveTurn("C1", "thread.1", source)
+	// Recreate the gap after the source stop transaction has completed but
+	// before the discarded arrival wakes for its reserved FIFO slot.
+	arrivalActive, started := bot.cancelActiveTurnForCommand("C1", "thread.1")
+	if arrivalActive == nil || !started {
+		t.Fatal("handoff arrival was not stoppable while awaiting source release")
+	}
+	arrivalActive.completeStopAck()
 	bot.releaseThreadReservation("C1", "thread.1", sourceReservation)
 
 	deadline := time.Now().Add(time.Second)
@@ -939,6 +946,14 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 	}
 	if got := mgr.oneShots.Load(); got != 0 {
 		t.Fatalf("handoff continuation started %d one-shot turns, want 0", got)
+	}
+	_, nextCancel := context.WithCancel(context.Background())
+	defer nextCancel()
+	next := bot.registerActiveTurn("C1", "thread.1", nextCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.1", next)
+	got, started := bot.cancelActiveTurnForCommand("C1", "thread.1")
+	if got != next || !started {
+		t.Fatal("discarded handoff left a stale stop transaction for the thread")
 	}
 }
 
@@ -1133,6 +1148,185 @@ func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
 	}
 	if postCalls.Load() != 1 || gotThread != "thread.123" || gotMarkdown != stopCommandAck {
 		t.Fatalf("stop ack calls=%d thread=%q markdown=%q", postCalls.Load(), gotThread, gotMarkdown)
+	}
+}
+
+func TestStopCompletionWaitsForCommandAck(t *testing.T) {
+	seen := make(chan string, 2)
+	ackStarted := make(chan struct{})
+	releaseAck := make(chan struct{})
+	doneStarted := make(chan struct{})
+	releaseDone := make(chan struct{})
+	var releaseAckOnce sync.Once
+	var releaseDoneOnce sync.Once
+	release := func() { releaseAckOnce.Do(func() { close(releaseAck) }) }
+	finishDone := func() { releaseDoneOnce.Do(func() { close(releaseDone) }) }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = r.ParseForm()
+		body := r.FormValue("markdown_text")
+		seen <- body
+		if body == stopCommandAck {
+			close(ackStarted)
+			<-releaseAck
+		} else if body == stopCommandDone {
+			close(doneStarted)
+			<-releaseDone
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	t.Cleanup(func() {
+		release()
+		finishDone()
+		srv.Close()
+	})
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api: api, logger: testLogger, ctx: ctx, cancel: cancel,
+		activeTurns: make(map[string][]*activeTurn),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	nextCtx, nextCancel := context.WithCancel(context.Background())
+	defer nextCancel()
+	next := bot.registerActiveTurn("C1", "thread.123", nextCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", next)
+
+	completionAttempted := make(chan struct{})
+	completionDone := make(chan struct{})
+	go func() {
+		<-turnCtx.Done()
+		close(completionAttempted)
+		// sendToAgent removes a terminal turn before Slack finalization. Recreate
+		// that production gap while a queued next turn is already registered.
+		bot.unregisterActiveTurn("C1", "thread.123", turn)
+		bot.postStopNotice("C1", "thread.123", turn)
+		bot.finishStopTransaction("C1", "thread.123", turn)
+		close(completionDone)
+	}()
+	commandDone := make(chan struct{})
+	go func() {
+		bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "!stop")
+		close(commandDone)
+	}()
+
+	select {
+	case <-ackStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stop acknowledgement did not start")
+	}
+	select {
+	case <-completionAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled terminal path did not attempt completion")
+	}
+	select {
+	case body := <-seen:
+		if body != stopCommandAck {
+			t.Fatalf("first stop notice = %q, want acknowledgement", body)
+		}
+	default:
+		t.Fatal("acknowledgement request was not recorded")
+	}
+	select {
+	case body := <-seen:
+		t.Fatalf("completion %q was posted before acknowledgement finished", body)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-commandDone:
+	case <-time.After(time.Second):
+		t.Fatal("stop command did not finish")
+	}
+	select {
+	case <-doneStarted:
+	case <-time.After(time.Second):
+		t.Fatal("stop completion did not start after acknowledgement")
+	}
+	select {
+	case body := <-seen:
+		if body != stopCommandDone {
+			t.Fatalf("second stop notice = %q, want completion", body)
+		}
+	default:
+		t.Fatal("completion request was not recorded")
+	}
+	// The original turn is now absent from activeTurns and the next queued turn
+	// is the FIFO head, but the stop transaction remains until Stopped finishes.
+	if !bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.457", "!stop") {
+		t.Fatal("duplicate stop command was not consumed")
+	}
+	select {
+	case <-nextCtx.Done():
+		t.Fatal("duplicate stop cancelled the next queued turn")
+	default:
+	}
+	select {
+	case body := <-seen:
+		t.Fatalf("duplicate stop emitted an extra notice: %q", body)
+	default:
+	}
+
+	finishDone()
+	select {
+	case <-completionDone:
+	case <-time.After(time.Second):
+		t.Fatal("stop completion did not finish")
+	}
+}
+
+func TestStopCompletionContinuesAfterAckFailure(t *testing.T) {
+	seen := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = r.ParseForm()
+		body := r.FormValue("markdown_text")
+		seen <- body
+		if body == stopCommandAck {
+			fmt.Fprint(w, `{"ok":false,"error":"channel_not_found"}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.2"}`)
+	}))
+	defer srv.Close()
+
+	api := slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		api: api, logger: testLogger, ctx: ctx, cancel: cancel,
+		activeTurns: make(map[string][]*activeTurn),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+
+	completionDone := make(chan struct{})
+	go func() {
+		<-turnCtx.Done()
+		bot.postStopNotice("C1", "thread.123", turn)
+		close(completionDone)
+	}()
+	bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "!stop")
+	select {
+	case <-completionDone:
+	case <-time.After(time.Second):
+		t.Fatal("failed acknowledgement left completion blocked")
+	}
+	for i, want := range []string{stopCommandAck, stopCommandDone} {
+		select {
+		case got := <-seen:
+			if got != want {
+				t.Fatalf("notice %d = %q, want %q", i, got, want)
+			}
+		default:
+			t.Fatalf("notice %d was not posted", i)
+		}
 	}
 }
 

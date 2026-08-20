@@ -58,6 +58,11 @@ type Bot struct {
 	// small window where an immediate !stop could see no work.
 	activeTurnsMu sync.Mutex
 	activeTurns   map[string][]*activeTurn // key: "channel:threadTS"
+	// stoppingTurns keeps a user stop transaction attached to its original
+	// turn through terminal Slack delivery. The active turn is intentionally
+	// unregistered before finalization; without this side registry, a repeated
+	// !stop in that gap could cancel the next queued FIFO turn.
+	stoppingTurns map[string]*activeTurn // key: "channel:threadTS"
 
 	// userCache caches Slack user ID → display name for the Bot's lifetime.
 	// Display names rarely change; the cache is cleared on Bot restart.
@@ -310,21 +315,22 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &Bot{
-		agentID:      agentID,
-		agentDataDir: agentDataDir,
-		config:       cfg,
-		api:          api,
-		sm:           sm,
-		mgr:          mgr,
-		logger:       logger.With("component", "slackbot", "agent", agentID),
-		botToken:     botToken,
-		ctx:          ctx,
-		cancel:       cancel,
-		done:         make(chan struct{}),
-		threadLocks:  make(map[string]*threadLock),
-		activeTurns:  make(map[string][]*activeTurn),
-		userCache:    make(map[string]string),
-		sem:          make(chan struct{}, maxConcurrentChats),
+		agentID:       agentID,
+		agentDataDir:  agentDataDir,
+		config:        cfg,
+		api:           api,
+		sm:            sm,
+		mgr:           mgr,
+		logger:        logger.With("component", "slackbot", "agent", agentID),
+		botToken:      botToken,
+		ctx:           ctx,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		threadLocks:   make(map[string]*threadLock),
+		activeTurns:   make(map[string][]*activeTurn),
+		stoppingTurns: make(map[string]*activeTurn),
+		userCache:     make(map[string]string),
+		sem:           make(chan struct{}, maxConcurrentChats),
 	}
 }
 
@@ -637,11 +643,23 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 	if replyTS == "" && b.config.ThreadReplies {
 		replyTS = messageTS
 	}
-	if b.cancelActiveTurn(channel, replyTS) {
-		b.postMessage(ctx, channel, replyTS, stopCommandAck)
-	} else {
+	active, started := b.cancelActiveTurnForCommand(channel, replyTS)
+	if active != nil && started {
+		// Cancellation is immediate, but its terminal path must not publish the
+		// completion notice before this acknowledgement has finished posting.
+		// Always release the barrier, even when Slack rejects the ack, so final
+		// delivery cannot remain blocked indefinitely.
+		func() {
+			defer active.completeStopAck()
+			ackCtx, ackCancel := context.WithTimeout(ctx, chunkPostTimeout(1))
+			defer ackCancel()
+			b.postMessage(ackCtx, channel, replyTS, stopCommandAck)
+		}()
+	} else if active == nil {
 		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
 	}
+	// A duplicate command against the same already-stopping FIFO head is
+	// coalesced. Its first command owns the sole acknowledgement and barrier.
 	return true
 }
 
@@ -884,6 +902,7 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	defer func() {
 		b.finishActiveTurn(channel, replyTS, active)
 		turnCancel()
+		b.finishStopTransaction(channel, replyTS, active)
 		b.releaseThreadReservation(channel, replyTS, reservation)
 		if arrivalReservation != nil {
 			arrivalReservation.Release()
@@ -1006,7 +1025,7 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
 		if active.stopRequested() && errors.Is(err, context.Canceled) {
-			b.postStopNotice(channel, threadTS)
+			b.postStopNotice(channel, threadTS, active)
 		} else {
 			b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
 		}
@@ -1482,7 +1501,7 @@ streamLoop:
 			// Either way, dead partials are now superseded.
 			finalDelivered = deliveredAll
 		} else if stopped {
-			finalDelivered = b.postStopNotice(channel, threadTS)
+			finalDelivered = b.postStopNotice(channel, threadTS, active)
 			if finalDelivered {
 				// The explicit stop notice replaces the tool/progress-only live
 				// stream; remove that stale artifact during orphan cleanup.
@@ -1518,7 +1537,7 @@ streamLoop:
 		// stream died and we fell back). Dead partials are superseded.
 		finalDelivered = deliveredAll
 	} else if stopped {
-		finalDelivered = b.postStopNotice(channel, threadTS)
+		finalDelivered = b.postStopNotice(channel, threadTS, active)
 	} else if hasError || streamFailed || len(deadStreams) > 0 {
 		// Either an explicit agent error, StartStream failed, or a stream
 		// was opened and then died (every streamTS dropped, so streamTS is
@@ -2091,7 +2110,19 @@ func (b *Bot) postDeliveryFailureNotice(channel, threadTS string) {
 	noticeCancel()
 }
 
-func (b *Bot) postStopNotice(channel, threadTS string) bool {
+func (b *Bot) postStopNotice(channel, threadTS string, active *activeTurn) bool {
+	// cancelActiveTurnForCommand cancels the backend before posting the
+	// acknowledgement so stop latency stays low. The cancelled backend may
+	// reach this terminal path immediately (especially through a peer relay),
+	// therefore order only the user-visible notices here.
+	if active != nil {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1)+time.Second)
+		if !active.waitStopAck(waitCtx) {
+			b.logger.Warn("timed out waiting for slack stop acknowledgement",
+				"channel", channel, "threadTS", threadTS)
+		}
+		waitCancel()
+	}
 	// StopStream/chat.update finalization may consume finCtx. The user-visible
 	// completion notice gets an independent budget that also covers markdown
 	// fallback and rate-limit retries.
@@ -2221,11 +2252,13 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 }
 
 type activeTurn struct {
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	stopUser bool
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	stopUser    bool
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	stopAckDone chan struct{}
+	stopAckOnce sync.Once
 
 	// steerTail is a per-turn admission queue. Socket Mode reserves a slot
 	// synchronously in event order, while the peer/backend RPC runs outside the
@@ -2273,14 +2306,52 @@ func (t *activeTurn) reserveSteer(limited bool) *activeSteerReservation {
 }
 
 func (t *activeTurn) requestStop() {
+	_ = t.requestStopWithAck(false)
+}
+
+// requestStopWithAck returns true only for the first user stop request. This
+// lets repeated !stop events coalesce behind the original acknowledgement.
+func (t *activeTurn) requestStopWithAck(waitForAck bool) bool {
 	t.mu.Lock()
+	if t.stopUser {
+		t.mu.Unlock()
+		return false
+	}
 	t.stopUser = true
+	if waitForAck && t.stopAckDone == nil {
+		t.stopAckDone = make(chan struct{})
+	}
 	cancel := t.cancel
 	t.mu.Unlock()
 	t.stopOnce.Do(func() {
 		close(t.stopCh)
 		cancel()
 	})
+	return true
+}
+
+func (t *activeTurn) completeStopAck() {
+	t.mu.Lock()
+	done := t.stopAckDone
+	t.mu.Unlock()
+	if done != nil {
+		t.stopAckOnce.Do(func() { close(done) })
+	}
+}
+
+func (t *activeTurn) waitStopAck(ctx context.Context) bool {
+	t.mu.Lock()
+	done := t.stopAckDone
+	t.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (t *activeTurn) stopRequested() bool {
@@ -2401,19 +2472,48 @@ func (b *Bot) unregisterActiveTurn(channel, threadTS string, turn *activeTurn) {
 }
 
 func (b *Bot) cancelActiveTurn(channel, threadTS string) bool {
+	active, _ := b.cancelActiveTurnInternal(channel, threadTS, false)
+	return active != nil
+}
+
+func (b *Bot) cancelActiveTurnForCommand(channel, threadTS string) (*activeTurn, bool) {
+	return b.cancelActiveTurnInternal(channel, threadTS, true)
+}
+
+func (b *Bot) cancelActiveTurnInternal(channel, threadTS string, waitForAck bool) (*activeTurn, bool) {
 	key := activeTurnKey(channel, threadTS)
 	b.activeTurnsMu.Lock()
 	defer b.activeTurnsMu.Unlock()
+	if waitForAck {
+		if stopping := b.stoppingTurns[key]; stopping != nil {
+			return stopping, false
+		}
+	}
 	turns := b.activeTurns[key]
 	if len(turns) == 0 {
-		return false
+		return nil, false
 	}
 	turn := turns[0]
 	// Holding activeTurnsMu orders this against unregisterActiveTurn: either
 	// the completed turn unregisters first, or the stop flag is visible before
 	// final Slack delivery begins.
-	turn.requestStop()
-	return true
+	started := turn.requestStopWithAck(waitForAck)
+	if waitForAck && started {
+		if b.stoppingTurns == nil {
+			b.stoppingTurns = make(map[string]*activeTurn)
+		}
+		b.stoppingTurns[key] = turn
+	}
+	return turn, started
+}
+
+func (b *Bot) finishStopTransaction(channel, threadTS string, turn *activeTurn) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	if b.stoppingTurns[key] == turn {
+		delete(b.stoppingTurns, key)
+	}
+	b.activeTurnsMu.Unlock()
 }
 
 // threadLock is a reference-counted mutex for serializing per-thread processing.
@@ -2508,8 +2608,15 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 			case <-r.source.stopCh:
 				// The operator stopped the source turn that created this arrival.
 				// Discard its continuation rather than resuming after cancellation.
+				// A second !stop may have targeted the arrival after the source
+				// transaction completed but before this reservation woke up; finish
+				// that command's notice transaction before releasing the FIFO slot.
 				r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
 				arrivalCancel()
+				if arrivalActive.stopRequested() {
+					r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
+				}
+				r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
 				r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 				return
 			default:
@@ -2523,10 +2630,11 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 			return
 		case <-arrivalCtx.Done():
 			r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
-			r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 			if arrivalActive.stopRequested() {
-				r.bot.postStopNotice(r.channel, r.threadTS)
+				r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
 			}
+			r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
+			r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 			return
 		case r.bot.sem <- struct{}{}:
 			// Cancellation may have become ready in the same select. It wins
@@ -2534,10 +2642,11 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 			if arrivalCtx.Err() != nil {
 				<-r.bot.sem
 				r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
-				r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 				if arrivalActive.stopRequested() {
-					r.bot.postStopNotice(r.channel, r.threadTS)
+					r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
 				}
+				r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
+				r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 				return
 			}
 		}

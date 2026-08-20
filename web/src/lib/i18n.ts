@@ -615,6 +615,10 @@ const messages = {
     ja: "転移時にスキップされたファイル: {count}件",
     en: "Files skipped during transfer: {count}",
   },
+  "skips.dismissFailed": {
+    ja: "警告を閉じられませんでした",
+    en: "Could not dismiss the warning",
+  },
 
   // ── RateLimitBadge ──
   "rate.status": { ja: "レート制限: {status}", en: "Rate limit: {status}" },

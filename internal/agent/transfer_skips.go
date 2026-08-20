@@ -1,5 +1,12 @@
 package agent
 
+import "errors"
+
+// ErrTransferSkipsChanged means the owner tried to acknowledge a warning
+// generation that is no longer current (normally because another transfer
+// completed after the dashboard rendered).
+var ErrTransferSkipsChanged = errors.New("transfer skips changed")
+
 // SkippedSessionFile records one session file the §3.7 device-switch
 // transfer left behind (oversized, unreadable ref, missing rollout,
 // …). Previously a bare filename in a warn log; the structured shape

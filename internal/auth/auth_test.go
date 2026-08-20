@@ -224,6 +224,8 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodDelete, "/api/v1/agents/ag_y/attention", ag, false},
 		{http.MethodGet, "/api/v1/agents/ag_x/attention", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/attention", guest, false},
+		// transfer warning acknowledgement is owner-only.
+		{http.MethodPost, "/api/v1/agents/ag_x/transfer-skips/dismiss", ag, false},
 		// privileged: cross-agent delete/reset
 		{http.MethodDelete, "/api/v1/agents/ag_y", priv, true},
 		{http.MethodPost, "/api/v1/agents/ag_y/reset", priv, true},

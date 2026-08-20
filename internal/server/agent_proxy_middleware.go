@@ -95,6 +95,14 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Transfer-skip acknowledgement clears the warning on the row this
+		// dashboard is rendering. Keep it Hub-local instead of proxying to the
+		// holder, whose row may not be the mirror currently visible to the UI.
+		if sub == "/transfer-skips/dismiss" && r.Method == http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Slack Socket configuration and credentials belong to the
 		// canonical Hub even while the agent runtime is remote.
 		if sub == "/slackbot" || sub == "/slackbot/test" || sub == "/mcp" {

@@ -136,6 +136,9 @@ var reservedAgentKeys = map[string]bool{
 	"attention":       true,
 	"attentionReason": true,
 	"attentionAt":     true,
+	// Derived from lastTransferSkipsOpID (or a legacy content hash) on load.
+	// It is response/runtime state, not a second persisted source of truth.
+	"lastTransferSkipsGeneration": true,
 	// mission is a create-time transient (materialised into MEMORY.md
 	// by ensureAgentDir, then cleared). Strip defensively so no future
 	// Save path can leak a still-set value into settings_json.
@@ -425,6 +428,106 @@ func (st *agentStore) UpdateAgentSetting(id, key string, value any, remove bool)
 	return err
 }
 
+const (
+	transferSkipsKey             = "lastTransferSkips"
+	transferSkipsOpIDKey         = "lastTransferSkipsOpID"
+	transferSkipsDismissedGenKey = "lastTransferSkipsDismissedGeneration"
+)
+
+var transferSkipsMetadataKeys = [...]string{
+	transferSkipsKey,
+	transferSkipsOpIDKey,
+	transferSkipsDismissedGenKey,
+}
+
+// preserveTransferSkipsMetadata makes dst retain the DB's current transfer
+// warning state. Manager snapshots do not own these keys, even when their
+// Agent value was loaded from an older version of the same row.
+func preserveTransferSkipsMetadata(dst, current map[string]any) {
+	for _, key := range transferSkipsMetadataKeys {
+		delete(dst, key)
+		if value, ok := current[key]; ok {
+			dst[key] = value
+		}
+	}
+}
+
+// transferSkipsGeneration returns the compare-and-set token for the warning
+// currently represented by settings. New rows use the switch op_id. Existing
+// rows from before generation tracking get a stable hash of their skip list so
+// they remain dismissible after upgrade.
+func transferSkipsGeneration(settings map[string]any) string {
+	if settings == nil || settings[transferSkipsKey] == nil {
+		return ""
+	}
+	if opID, _ := settings[transferSkipsOpIDKey].(string); opID != "" {
+		return opID
+	}
+	body, err := json.Marshal(settings[transferSkipsKey])
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(body)
+	return "legacy-" + hex.EncodeToString(sum[:])
+}
+
+// AcknowledgeTransferSkips records acknowledgement of exactly one warning
+// generation. The acknowledgement key is intentionally not modeled on Agent:
+// agentToSettings therefore preserves it across an older in-flight m.save()
+// snapshot, preventing a stale full-row save from resurrecting the warning.
+func (st *agentStore) AcknowledgeTransferSkips(id, expectedGeneration string) (bool, error) {
+	if st == nil || st.db == nil {
+		return false, errors.New("agentStore: not initialized")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	errNoChange := errors.New("transfer skips acknowledgement unchanged")
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		acknowledged := false
+		_, err := st.db.UpdateAgent(ctx, id, "", func(rec *store.AgentRecord) error {
+			generation := transferSkipsGeneration(rec.Settings)
+			if generation == "" {
+				return errNoChange
+			}
+			if generation != expectedGeneration {
+				return ErrTransferSkipsChanged
+			}
+			if dismissed, _ := rec.Settings[transferSkipsDismissedGenKey].(string); dismissed == generation {
+				return errNoChange
+			}
+			rec.Settings[transferSkipsDismissedGenKey] = generation
+			acknowledged = true
+			return nil
+		})
+		switch {
+		case err == nil:
+			return acknowledged, nil
+		case errors.Is(err, errNoChange):
+			return false, nil
+		case !errors.Is(err, store.ErrETagMismatch):
+			return false, err
+		}
+		// UpdateAgent detected a concurrent, unrelated row write. Re-read and
+		// retry the generation CAS a bounded number of times rather than
+		// surfacing a transient 500 to the dismiss button.
+	}
+
+	// If the retry budget was exhausted, distinguish a genuinely replaced
+	// warning (409) from continued unrelated write contention (500).
+	rec, err := st.db.GetAgent(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if transferSkipsGeneration(rec.Settings) != expectedGeneration {
+		return false, ErrTransferSkipsChanged
+	}
+	return false, store.ErrETagMismatch
+}
+
 // Upsert writes a single agent through upsertAgent under the store
 // mutex and returns the underlying error rather than logging-and-
 // continuing as Save() does. Used by paths that must observe the
@@ -561,7 +664,15 @@ func (st *agentStore) upsertAgentRow(ctx context.Context, a *Agent, created, upd
 	}
 	if _, err := st.db.UpdateAgent(ctx, a.ID, "", func(r *store.AgentRecord) error {
 		r.Name = a.Name
-		r.Settings = nextSettings
+		// The row may have changed since the GetAgent above because peer sync
+		// writes through the shared store directly. Rebase DB-owned transfer
+		// metadata on the transactional value rather than the earlier snapshot.
+		latestSettings := make(map[string]any, len(nextSettings)+len(transferSkipsMetadataKeys))
+		for key, value := range nextSettings {
+			latestSettings[key] = value
+		}
+		preserveTransferSkipsMetadata(latestSettings, r.Settings)
+		r.Settings = latestSettings
 		return nil
 	}); err != nil {
 		return fmt.Errorf("update: %w", err)
@@ -790,6 +901,12 @@ func agentToSettings(a *Agent, prior map[string]any) (map[string]any, error) {
 	for k := range reservedAgentKeys {
 		delete(m, k)
 	}
+	// Transfer-loss metadata is DB-owned. It is written only by peer sync
+	// and the generation-aware acknowledgement path; ordinary Manager.save
+	// snapshots must never create, clear, or replace it. In particular, a
+	// snapshot captured before a newer transfer must not land afterward and
+	// erase that transfer's warning.
+	preserveTransferSkipsMetadata(m, prior)
 	// Forward-compat: copy keys from prior that this binary doesn't
 	// model on Agent. Known keys are owned by the current Agent type
 	// (m already has them); unknown keys come from prior so they survive
@@ -837,6 +954,8 @@ func agentToSettings(a *Agent, prior map[string]any) (map[string]any, error) {
 // settings JSON copy (if present) is ignored to avoid divergence.
 func settingsToAgent(rec *store.AgentRecord, out *Agent) error {
 	m := make(map[string]any, len(rec.Settings)+4)
+	transferGeneration := transferSkipsGeneration(rec.Settings)
+	dismissedGeneration, _ := rec.Settings[transferSkipsDismissedGenKey].(string)
 	for k, v := range rec.Settings {
 		// loadStripKeys (NOT reservedAgentKeys) — Load must let legacy
 		// keys through so normalizeAgent's transient Legacy* fields can
@@ -854,6 +973,12 @@ func settingsToAgent(rec *store.AgentRecord, out *Agent) error {
 		}
 		m[k] = v
 	}
+	// Keep the underlying loss record for diagnostics, but suppress it from
+	// API/runtime views once this exact transfer generation was acknowledged.
+	// A later sync clears the acknowledgement and stamps a fresh op_id.
+	if transferGeneration != "" && dismissedGeneration == transferGeneration {
+		delete(m, transferSkipsKey)
+	}
 	m["id"] = rec.ID
 	m["name"] = rec.Name
 	if rec.CreatedAt != 0 {
@@ -866,7 +991,13 @@ func settingsToAgent(rec *store.AgentRecord, out *Agent) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(buf, out)
+	if err := json.Unmarshal(buf, out); err != nil {
+		return err
+	}
+	if len(out.LastTransferSkips) > 0 {
+		out.LastTransferSkipsGeneration = transferGeneration
+	}
+	return nil
 }
 
 // normalizeAgent runs the post-load fixups: timestamp normalization,

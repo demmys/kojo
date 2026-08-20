@@ -140,6 +140,9 @@ export interface AgentInfo {
   // agent settings by the sync handler; cleared on a clean transfer.
   // The dashboard shows a "skipped during transfer" notice from it.
   lastTransferSkips?: TransferSkip[];
+  // Compare-and-set token for the visible skip warning. Dismiss calls must
+  // echo this so an old dashboard cannot hide a newer transfer's warning.
+  lastTransferSkipsGeneration?: string;
   // isSwitching is true while a §3.7 device-switch is mid-flight on
   // this peer (between SetSwitching(true) and (false)). Surfaced by
   // the server so the UI can disable mutating controls (credentials
@@ -794,6 +797,15 @@ export const agentApi = {
   clearAttention: (agentId: string) =>
     del<{ attention: boolean; cleared?: boolean }>(
       `/api/v1/agents/${agentId}/attention`,
+    ),
+
+  // Dismisses the latest transfer-loss notice. A later transfer that skips
+  // files writes a fresh notice, so this is an acknowledgement rather than a
+  // permanent suppression preference.
+  dismissTransferSkips: (agentId: string, generation: string) =>
+    post<{ dismissed: boolean }>(
+      `/api/v1/agents/${agentId}/transfer-skips/dismiss?generation=${encodeURIComponent(generation)}`,
+      {},
     ),
 
   getQueuedMessages: (agentId: string) =>

@@ -991,6 +991,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/thumb", s.handleThumbAgentFile)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/transfer-skips/dismiss", s.handleDismissTransferSkips)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 	mux.HandleFunc("POST /api/v1/agents/{id}/memory/truncate", s.handleTruncateAgentMemory)
 	mux.HandleFunc("POST /api/v1/agents/{id}/fork", s.handleForkAgent)

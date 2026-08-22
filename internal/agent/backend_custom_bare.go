@@ -17,8 +17,13 @@ import (
 // CustomBareBackend implements ChatBackend by talking directly to an
 // OpenAI-compatible /v1/chat/completions endpoint (llama-server and friends)
 // via HTTP SSE streaming. "bare" because there is no CLI in between: the
-// model gets a system prompt and one user message and nothing else — no
-// tools, no MCP, no session, no history.
+// model gets a system prompt, a bounded replay of the conversation so far
+// and the current user message, and nothing else — no tools, no MCP, no
+// server-side session.
+//
+// The replay is the only continuity this backend has. /v1/chat/completions
+// is stateless, so kojo rebuilds the transcript from its own store on
+// every turn (ChatOptions.History, capped in bare_history.go).
 type CustomBareBackend struct {
 	logger *slog.Logger
 	client *http.Client
@@ -56,6 +61,23 @@ func (b *CustomBareBackend) Chat(ctx context.Context, agent *Agent, userMessage 
 	messages := []llamaCppMessage{}
 	if effectivePrompt != "" {
 		messages = append(messages, llamaCppMessage{Role: "system", Content: effectivePrompt})
+	}
+	// Prior turns, oldest first, then the current one. History never
+	// carries a system entry and never repeats the current message, so
+	// it splices in verbatim.
+	history := opts.History
+	// A replay ending on a user turn (an unanswered question: the turn
+	// errored, timed out, or was aborted) would sit right next to the
+	// current user message, and chat templates that assume strict
+	// alternation mangle or reject two user turns in a row. Fold it into
+	// the current message instead of dropping it — it is usually still
+	// waiting for an answer.
+	if n := len(history); n > 0 && history[n-1].Role == "user" {
+		userMessage = foldIntoUserMessage(userMessage, history[n-1].Content)
+		history = history[:n-1]
+	}
+	for _, turn := range history {
+		messages = append(messages, llamaCppMessage{Role: turn.Role, Content: turn.Content})
 	}
 	messages = append(messages, llamaCppMessage{Role: "user", Content: userMessage})
 

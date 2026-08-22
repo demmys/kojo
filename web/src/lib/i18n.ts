@@ -298,8 +298,8 @@ const messages = {
   },
   "settings.inj.recent_conversation.label": { ja: "直近の会話", en: "Recent Conversation" },
   "settings.inj.recent_conversation.desc": {
-    ja: "セッション再開時の直近会話フォールバック",
-    en: "Recent conversation fallback on session resume",
+    ja: "セッション再開時の直近会話フォールバック。custom-bare では毎ターンの会話履歴そのもの",
+    en: "Recent conversation fallback on session resume; for custom-bare, the per-turn conversation history itself",
   },
   "settings.inj.persona_anchor.label": { ja: "口調アンカー", en: "Persona Anchor" },
   "settings.inj.persona_anchor.desc": {

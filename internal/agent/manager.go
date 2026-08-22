@@ -1859,6 +1859,7 @@ type chatPrep struct {
 	sysPrompt             string
 	volatileContext       string
 	recentMessagesContext string
+	history               []HistoryTurn
 	mcpServers            map[string]mcpServerEntry
 }
 
@@ -2050,12 +2051,26 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		recentMessagesContext = m.BuildRecentMessagesContext(ctx, agentID)
 	}
 
+	// Session-less backends (custom-bare) get the transcript replayed
+	// in the request itself. Built here, before Chat appends the
+	// incoming message, so the current turn is not sent twice. Skipped
+	// for one-shot chats (indexNewMessages=false — Slack and friends
+	// carry their own context) and for regenerate (skipMemoryContext=
+	// true), where the tail of the transcript contains the very message
+	// being re-run plus everything after it.
+	var history []HistoryTurn
+	if indexNewMessages && !skipMemoryContext && backendReplaysHistory(backend) &&
+		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		history = m.BuildHistoryTurns(ctx, agentID)
+	}
+
 	return &chatPrep{
 		agentCopy:             agentCopy,
 		backend:               backend,
 		sysPrompt:             sysPrompt,
 		volatileContext:       volatileContext,
 		recentMessagesContext: recentMessagesContext,
+		history:               history,
 		mcpServers:            mcpServers,
 	}, nil
 }
@@ -2266,6 +2281,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system",
 		RecentMessagesContext: prep.recentMessagesContext,
+		History:               prep.history,
 		OnSteerReady: func(fn SteerFunc) {
 			m.busyMu.Lock()
 			if entry, ok := m.busy[agentID]; ok {
@@ -2302,7 +2318,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist chat start error", "err", appendErr)
 				} else {
@@ -2763,7 +2779,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 		if receivedDone {
 			if ctx.Err() == context.DeadlineExceeded {
-				errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+				errMsg := newSystemMessage(NoticeTimeoutText)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save timeout message", "err", err)
 				}
@@ -2799,7 +2815,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			m.persistDoneEvent(agentID, msg)
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+			errMsg := newSystemMessage(NoticeTimeoutText)
 			if err := appendMessage(agentID, errMsg); err != nil {
 				m.logger.Warn("failed to save timeout message", "err", err)
 			}
@@ -2949,7 +2965,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+				errMsg := newSystemMessage(NoticeErrorPrefix + event.ErrorMessage)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save error message", "err", err)
 				} else {
@@ -3840,6 +3856,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	}
 	m.refreshLastMessage(agentID)
 
+	var regenHistory []HistoryTurn
+	if backendReplaysHistory(prep.backend) &&
+		!prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		regenHistory = m.BuildHistoryTurnsBefore(ctx, agentID, rt.SourceID)
+	}
+
 	chatCtx, cancel := context.WithCancel(context.Background())
 	outCh := make(chan ChatEvent, 64)
 	bc := newChatBroadcaster(outCh)
@@ -3860,6 +3882,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer cancel()
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			// Session-less backends replay the transcript; here it has
+			// to stop short of the message being re-run, which travels
+			// as effectiveMessage. The truncate above already removed
+			// everything after it, and the cursor excludes the source
+			// row itself.
+			History: regenHistory,
 			// Register the steer handle so a steer sent during a
 			// regenerate turn injects into it instead of stalling in
 			// awaitSteerHandle until the deadline.
@@ -3900,7 +3928,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist regenerate error", "err", appendErr)
 				} else {

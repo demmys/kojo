@@ -103,7 +103,7 @@ export interface AgentInfo {
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
   privileged?: boolean;
-  agentAdmin?: boolean;
+  ownerDeputy?: boolean;
   // Strong HTTP entity tag of the v1 store row for this agent. Carry
   // alongside form state so PATCH /agents/{id} can send it as If-Match;
   // a server-side mismatch surfaces as PreconditionFailedError. Empty
@@ -679,10 +679,10 @@ export const agentApi = {
       { privileged },
     ),
 
-  setAgentAdmin: (id: string, agentAdmin: boolean) =>
-    post<{ id: string; agentAdmin: boolean }>(
-      `/api/v1/agents/${id}/agent-admin`,
-      { agentAdmin },
+  setOwnerDeputy: (id: string, ownerDeputy: boolean) =>
+    post<{ id: string; ownerDeputy: boolean }>(
+      `/api/v1/agents/${id}/owner-deputy`,
+      { ownerDeputy },
     ),
 
   tasks: {

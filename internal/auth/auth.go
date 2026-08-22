@@ -44,14 +44,17 @@ const (
 // Principal identifies the actor behind a request.
 type Principal struct {
 	Role Role
-	// AgentAdmin marks an agent principal the Owner has deputised to
-	// manage OTHER agents (create / PATCH / write their persona and
-	// memory). Kept as a flag rather than a Role because it is
-	// orthogonal to RolePrivAgent: an agent may hold either, both, or
-	// neither. Never set for the Owner (who needs no flag) or a Peer.
-	AgentAdmin bool
-	AgentID    string // populated for RoleAgent / RolePrivAgent
-	PeerID     string // populated for RolePeer (device_id from peer_registry); also stamped on RoleOwner when the Hub-public TailnetIdentityMiddleware's WhoIs lookup matches a paired peer, so events handlers can identify which paired-peer connection they're on without re-querying the registry
+	// OwnerDeputy marks an agent principal the Owner has deputised to
+	// stand in for them over OTHER agents: create, fork, read in full,
+	// PATCH, write their persona and memory, delete and reset. It is
+	// strictly stronger than RolePrivAgent, but kept as a flag rather
+	// than a Role because the two are orthogonal — an agent may hold
+	// either, both, or neither, and only the Role decides
+	// CanRestartServer. Never set for the Owner (who needs no flag) or
+	// a Peer.
+	OwnerDeputy bool
+	AgentID     string // populated for RoleAgent / RolePrivAgent
+	PeerID      string // populated for RolePeer (device_id from peer_registry); also stamped on RoleOwner when the Hub-public TailnetIdentityMiddleware's WhoIs lookup matches a paired peer, so events handlers can identify which paired-peer connection they're on without re-querying the registry
 }
 
 // IsOwner returns true if the principal is the kojo user.
@@ -75,22 +78,22 @@ func (p Principal) IsAgent() bool {
 // request.
 func (p Principal) IsPeer() bool { return p.Role == RolePeer }
 
-// IsAgentAdmin reports whether this principal is an agent the Owner
-// deputised to manage other agents. Owner and Peer are NOT covered:
-// both already pass every gate on their own, and reporting them as
-// agent-admins would make "admin over someone else" checks read
+// IsOwnerDeputy reports whether this principal is an agent the Owner
+// deputised to stand in for them over other agents. Owner and Peer are
+// NOT covered: both already pass every gate on their own, and reporting
+// them as deputies would make "deputy over someone else" checks read
 // wrongly for principals that have no AgentID to compare against.
-func (p Principal) IsAgentAdmin() bool {
-	return p.IsAgent() && p.AgentAdmin
+func (p Principal) IsOwnerDeputy() bool {
+	return p.IsAgent() && p.OwnerDeputy
 }
 
-// IsAgentAdminOver reports whether the principal may act as the Owner's
+// IsOwnerDeputyOver reports whether the principal may act as the Owner's
 // proxy on targetID. The target must be someone ELSE: the grant exists
 // to manage other agents, and letting it apply to the holder would turn
-// it into a self-elevation path (an admin could clear its own
+// it into a self-elevation path (a deputy could clear its own
 // disabledInjections, or PATCH itself in ways a plain agent may not).
-func (p Principal) IsAgentAdminOver(targetID string) bool {
-	return p.IsAgentAdmin() && targetID != "" && p.AgentID != targetID
+func (p Principal) IsOwnerDeputyOver(targetID string) bool {
+	return p.IsOwnerDeputy() && targetID != "" && p.AgentID != targetID
 }
 
 // CanReadFull returns true if the principal can read the full record
@@ -99,7 +102,7 @@ func (p Principal) IsAgentAdminOver(targetID string) bool {
 // admitted because the Hub's proxy already validated the original
 // caller's identity before forwarding.
 func (p Principal) CanReadFull(targetID string) bool {
-	if p.IsOwner() || p.IsPeer() || p.IsAgentAdminOver(targetID) {
+	if p.IsOwner() || p.IsPeer() || p.IsOwnerDeputyOver(targetID) {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
@@ -110,7 +113,7 @@ func (p Principal) CanReadFull(targetID string) bool {
 // because the Hub's Enforce layer already authorised the original
 // request before the proxy signed and forwarded it.
 func (p Principal) CanMutateSelf(targetID string) bool {
-	if p.IsOwner() || p.IsPeer() || p.IsAgentAdminOver(targetID) {
+	if p.IsOwner() || p.IsPeer() || p.IsOwnerDeputyOver(targetID) {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
@@ -120,33 +123,41 @@ func (p Principal) CanMutateSelf(targetID string) bool {
 // reset-session ops. Owner: any. PrivAgent: any. Agent: self only.
 // Peer: admitted — Hub proxy validated the original caller.
 func (p Principal) CanDeleteOrReset(targetID string) bool {
-	if p.IsOwner() || p.Role == RolePrivAgent || p.IsPeer() || p.IsAgentAdminOver(targetID) {
+	if p.IsOwner() || p.Role == RolePrivAgent || p.IsPeer() || p.IsOwnerDeputyOver(targetID) {
 		return true
 	}
 	return p.IsAgent() && p.AgentID == targetID
 }
 
-// CanForkOrCreate returns true only for the Owner. Forking copies
-// persona/memory and would leak the source agent's full state, so it is
-// kept Owner-only even for privileged agents. It doubles as the
+// CanForkOrCreate returns true only for the Owner. It doubles as the
 // owner-only gate for a few unrelated global routes (TTS/STT), so it
-// deliberately did NOT grow an agent-admin case — see CanCreateAgent.
+// deliberately did NOT grow a deputy case — the agent-scoped decisions
+// live in CanCreateAgent / CanFork.
 func (p Principal) CanForkOrCreate() bool {
 	return p.IsOwner()
 }
 
-// CanCreateAgent gates POST /api/v1/agents. The Owner, and agents the
-// Owner deputised via AgentAdmin, may create new agents. Fork stays on
-// CanForkOrCreate: it clones an existing agent's persona and memory,
-// which is a copy of someone else's data rather than a fresh one.
+// CanCreateAgent gates POST /api/v1/agents: the Owner, and the agents
+// the Owner deputised, may make new ones.
 func (p Principal) CanCreateAgent() bool {
-	return p.IsOwner() || p.IsAgentAdmin()
+	return p.IsOwner() || p.IsOwnerDeputy()
 }
 
-// CanSetAgentAdmin returns true only for the Owner. An agent-admin
-// must never be able to mint another agent-admin, or promote itself —
-// that would make the grant self-propagating.
-func (p Principal) CanSetAgentAdmin() bool {
+// CanFork gates POST /api/v1/agents/{id}/fork. Forking copies the
+// source's persona and memory, so it stays denied for a privileged
+// agent — but a deputy already reads those in full and may create
+// agents, so withholding fork would buy nothing. Self-fork is NOT
+// covered (IsOwnerDeputyOver excludes self): a deputy cloning itself
+// would hand its own memory to a second agent that the Owner never
+// deputised.
+func (p Principal) CanFork(targetID string) bool {
+	return p.IsOwner() || p.IsOwnerDeputyOver(targetID)
+}
+
+// CanSetOwnerDeputy returns true only for the Owner. A deputy must
+// never be able to mint another deputy, or promote itself — that would
+// make the grant self-propagating.
+func (p Principal) CanSetOwnerDeputy() bool {
 	return p.IsOwner()
 }
 
@@ -166,22 +177,22 @@ func (p Principal) CanRestartServer() bool {
 
 // Resolver maps a Bearer token to a Principal.
 type Resolver struct {
-	tokens       *TokenStore
-	isPrivileged func(agentID string) bool
-	isAgentAdmin func(agentID string) bool
+	tokens        *TokenStore
+	isPrivileged  func(agentID string) bool
+	isOwnerDeputy func(agentID string) bool
 }
 
 // NewResolver builds a Resolver from a TokenStore and the two per-agent
-// grant predicates (agent.Manager.IsPrivileged / IsAgentAdmin). A nil
+// grant predicates (agent.Manager.IsPrivileged / IsOwnerDeputy). A nil
 // predicate reads as "nobody holds this grant".
-func NewResolver(tokens *TokenStore, isPrivileged, isAgentAdmin func(string) bool) *Resolver {
+func NewResolver(tokens *TokenStore, isPrivileged, isOwnerDeputy func(string) bool) *Resolver {
 	if isPrivileged == nil {
 		isPrivileged = func(string) bool { return false }
 	}
-	if isAgentAdmin == nil {
-		isAgentAdmin = func(string) bool { return false }
+	if isOwnerDeputy == nil {
+		isOwnerDeputy = func(string) bool { return false }
 	}
-	return &Resolver{tokens: tokens, isPrivileged: isPrivileged, isAgentAdmin: isAgentAdmin}
+	return &Resolver{tokens: tokens, isPrivileged: isPrivileged, isOwnerDeputy: isOwnerDeputy}
 }
 
 // Resolve maps a Bearer token to a Principal. Empty/unknown tokens
@@ -196,11 +207,11 @@ func (r *Resolver) Resolve(token string) Principal {
 		return Principal{Role: RoleOwner}
 	}
 	if id, ok := r.tokens.LookupAgent(token); ok {
-		admin := r.isAgentAdmin(id)
+		deputy := r.isOwnerDeputy(id)
 		if r.isPrivileged(id) {
-			return Principal{Role: RolePrivAgent, AgentID: id, AgentAdmin: admin}
+			return Principal{Role: RolePrivAgent, AgentID: id, OwnerDeputy: deputy}
 		}
-		return Principal{Role: RoleAgent, AgentID: id, AgentAdmin: admin}
+		return Principal{Role: RoleAgent, AgentID: id, OwnerDeputy: deputy}
 	}
 	return Principal{Role: RoleGuest}
 }

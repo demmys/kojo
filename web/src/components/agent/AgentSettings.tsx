@@ -296,8 +296,8 @@ export function AgentSettings() {
   );
   const [privileged, setPrivileged] = useState(false);
   const [privilegeSaving, setPrivilegeSaving] = useState(false);
-  const [agentAdmin, setAgentAdmin] = useState(false);
-  const [agentAdminSaving, setAgentAdminSaving] = useState(false);
+  const [ownerDeputy, setOwnerDeputy] = useState(false);
+  const [ownerDeputySaving, setOwnerDeputySaving] = useState(false);
   const [showForkDialog, setShowForkDialog] = useState(false);
   const [forkName, setForkName] = useState("");
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
@@ -332,7 +332,7 @@ export function AgentSettings() {
     setDisabledInjections(a.disabledInjections ?? []);
     setAllowProtectedPaths(a.allowProtectedPaths ?? []);
     setPrivileged(a.privileged ?? false);
-    setAgentAdmin(a.agentAdmin ?? false);
+    setOwnerDeputy(a.ownerDeputy ?? false);
     setTTSEnabled(a.tts?.enabled ?? false);
     setTTSProvider(a.tts?.provider === "grok" ? "grok" : "gemini");
     setTTSModel(a.tts?.model ?? "");
@@ -802,19 +802,19 @@ export function AgentSettings() {
     }
   };
 
-  const handleToggleAgentAdmin = async (next: boolean) => {
+  const handleToggleOwnerDeputy = async (next: boolean) => {
     // Same shape as privilege: its own Owner-only endpoint, so it saves
     // immediately instead of riding along with Save Changes.
-    setAgentAdminSaving(true);
+    setOwnerDeputySaving(true);
     setError("");
     try {
-      await agentApi.setAgentAdmin(id!, next);
-      setAgentAdmin(next);
-      setAgent((a) => (a ? { ...a, agentAdmin: next } : a));
+      await agentApi.setOwnerDeputy(id!, next);
+      setOwnerDeputy(next);
+      setAgent((a) => (a ? { ...a, ownerDeputy: next } : a));
     } catch (err) {
       setError(errMsg(err));
     } finally {
-      setAgentAdminSaving(false);
+      setOwnerDeputySaving(false);
     }
   };
 
@@ -1438,11 +1438,11 @@ export function AgentSettings() {
               desc={t("settings.privilegedDesc")}
             />
             <ToggleRow
-              checked={agentAdmin}
-              disabled={agentAdminSaving}
-              onChange={handleToggleAgentAdmin}
-              title={t("settings.agentAdmin")}
-              desc={t("settings.agentAdminDesc")}
+              checked={ownerDeputy}
+              disabled={ownerDeputySaving}
+              onChange={handleToggleOwnerDeputy}
+              title={t("settings.ownerDeputy")}
+              desc={t("settings.ownerDeputyDesc")}
             />
           </div>
         </SectionCard>

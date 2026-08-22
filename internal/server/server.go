@@ -949,7 +949,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/memory/truncate", s.handleTruncateAgentMemory)
 	mux.HandleFunc("POST /api/v1/agents/{id}/fork", s.handleForkAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/privilege", s.handlePrivilegeAgent)
-	mux.HandleFunc("POST /api/v1/agents/{id}/agent-admin", s.handleAgentAdminAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/owner-deputy", s.handleOwnerDeputyAgent)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDeleteAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/unarchive", s.handleUnarchiveAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}/avatar", s.handleGetAvatar)

@@ -407,10 +407,10 @@ const messages = {
     en: "Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record.",
   },
 
-  "settings.agentAdmin": { ja: "エージェント管理権限", en: "Agent Admin" },
-  "settings.agentAdminDesc": {
-    ja: "このエージェントにユーザーの代わりの他エージェント管理を許可する。作成、設定の変更、persona / user.md / status / MEMORY.md の編集、チャットへの発言ができる。権限の付与とフォークはオーナー専用のまま。自分自身に対しては何も増えない。",
-    en: "Let this agent manage other agents for you: create them, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Granting privileges and forking stay Owner-only, and the grant adds nothing over the agent itself.",
+  "settings.ownerDeputy": { ja: "オーナー代理 (特権より強い)", en: "Owner Deputy (stronger than Privileged)" },
+  "settings.ownerDeputyDesc": {
+    ja: "このエージェントをオーナーの代理にする。特権エージェントの権限に加えて、他エージェントの作成 / フォーク / 完全な記録の読み取り / 設定の変更 / persona・user.md・status・MEMORY.md の編集 / チャットへの発言ができる。権限の付与だけはオーナー専用のまま。自分自身に対しては何も増えない。",
+    en: "Make this agent your deputy. On top of everything a privileged agent can do, it may create and fork agents, read their full record, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Only granting privileges stays Owner-only, and the grant adds nothing over the agent itself.",
   },
 
   // ── AgentSettings: Schedule ──

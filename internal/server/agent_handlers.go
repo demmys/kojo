@@ -424,10 +424,10 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	// An agent-admin manages the fleet on the Owner's behalf, so it
+	// An owner-deputy manages the fleet on the Owner's behalf, so it
 	// gets the Owner's view — including the archived rows it needs in
 	// order to unarchive them.
-	if p.IsOwner() || p.IsAgentAdmin() {
+	if p.IsOwner() || p.IsOwnerDeputy() {
 		out := make([]*agent.Agent, 0, len(all))
 		for _, a := range all {
 			switch {
@@ -496,7 +496,7 @@ func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	if p := auth.FromContext(r.Context()); !p.CanCreateAgent() {
 		writeError(w, http.StatusForbidden, "forbidden",
-			"agent creation requires the Owner or an agent-admin")
+			"agent creation requires the Owner or an owner-deputy")
 		return
 	}
 	var cfg agent.AgentConfig
@@ -504,7 +504,7 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
-	// AgentConfig carries no privileged / agentAdmin field, so a
+	// AgentConfig carries no privileged / ownerDeputy field, so a
 	// creation request cannot mint a grant however it is crafted: the
 	// owner-only toggle endpoints are the only way in.
 	a, err := s.agents.Create(cfg)
@@ -646,13 +646,13 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 					"privileged is owner-only; use POST /api/v1/agents/{id}/privilege")
 				return
 			}
-			// Same reasoning for the agent-admin grant: it has its own
+			// Same reasoning for the owner-deputy grant: it has its own
 			// owner-only endpoint, and letting it through PATCH would
-			// make the grant self-propagating (an admin may PATCH any
+			// make the grant self-propagating (a deputy may PATCH any
 			// other agent).
-			if strings.EqualFold(k, "agentAdmin") {
+			if strings.EqualFold(k, "ownerDeputy") {
 				writeError(w, http.StatusForbidden, "forbidden",
-					"agentAdmin is owner-only; use POST /api/v1/agents/{id}/agent-admin")
+					"ownerDeputy is owner-only; use POST /api/v1/agents/{id}/owner-deputy")
 				return
 			}
 			// disabledInjections changes the agent's capability /
@@ -665,7 +665,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			// Case-insensitive match for the same casing-trick reason
 			// as privileged.
 			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() &&
-				!p.IsAgentAdminOver(id) {
+				!p.IsOwnerDeputyOver(id) {
 				writeError(w, http.StatusForbidden, "forbidden",
 					"disabledInjections is owner-only")
 				return
@@ -872,8 +872,9 @@ func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
-		writeError(w, http.StatusForbidden, "forbidden", "fork is owner-only")
+	if p := auth.FromContext(r.Context()); !p.CanFork(id) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"fork requires the Owner or an owner-deputy acting on another agent")
 		return
 	}
 	var body struct {
@@ -2608,25 +2609,25 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "privileged": body.Privileged})
 }
 
-// handleAgentAdminAgent toggles the AgentAdmin flag on an agent.
+// handleOwnerDeputyAgent toggles the OwnerDeputy flag on an agent.
 // Owner-only, and reasserted here for the same reason as
 // handlePrivilegeAgent: this flag is what lets an agent act for the
 // Owner on every other agent, so it must never be settable by one.
-func (s *Server) handleAgentAdminAgent(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOwnerDeputyAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if p := auth.FromContext(r.Context()); !p.CanSetAgentAdmin() {
-		writeError(w, http.StatusForbidden, "forbidden", "agentAdmin is owner-only")
+	if p := auth.FromContext(r.Context()); !p.CanSetOwnerDeputy() {
+		writeError(w, http.StatusForbidden, "forbidden", "ownerDeputy is owner-only")
 		return
 	}
 
 	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
-		"If-Match: * is not supported on POST /agents/{id}/agent-admin; send a specific etag or omit the header")
+		"If-Match: * is not supported on POST /agents/{id}/owner-deputy; send a specific etag or omit the header")
 	if !ok {
 		return
 	}
 
 	var body struct {
-		AgentAdmin bool `json:"agentAdmin"`
+		OwnerDeputy bool `json:"ownerDeputy"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
@@ -2640,7 +2641,7 @@ func (s *Server) handleAgentAdminAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.agents.SetAgentAdmin(id, body.AgentAdmin); err != nil {
+	if err := s.agents.SetOwnerDeputy(id, body.OwnerDeputy); err != nil {
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -2654,7 +2655,7 @@ func (s *Server) handleAgentAdminAgent(w http.ResponseWriter, r *http.Request) {
 	if newETag := s.readAgentETag(r, id); newETag != "" {
 		w.Header().Set("ETag", quoteETag(newETag))
 	}
-	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "agentAdmin": body.AgentAdmin})
+	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "ownerDeputy": body.OwnerDeputy})
 }
 
 func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {

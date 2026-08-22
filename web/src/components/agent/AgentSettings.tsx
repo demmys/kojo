@@ -3,6 +3,7 @@ import { useParams, useNavigate, useLocation } from "react-router";
 import {
   agentApi,
   CONTEXT_INJECTION_KEYS,
+  injectionSupportedByTool,
   type AgentInfo,
   type ContextInjectionKey,
   type TruncateMemoryResult,
@@ -97,7 +98,7 @@ function ToggleRow({
   desc: React.ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3">
+    <div className={`flex items-start justify-between gap-3${disabled ? " opacity-50" : ""}`}>
       <div className="min-w-0">
         <div className="text-[13px] text-ink">{title}</div>
         <p className="mt-0.5 text-[12px] text-ink-faint">{desc}</p>
@@ -1276,13 +1277,25 @@ export function AgentSettings() {
           <div className="space-y-3">
             {CONTEXT_INJECTION_KEYS.map((key) => {
               const enabled = !disabledInjections.includes(key);
+              // A tool-less backend never receives these sections, so a
+              // live toggle would be a lie. Dim the row in place (rather
+              // than hiding it) and show it off: that is the effective
+              // state. Display only — disabledInjections is left alone, so
+              // the stored value reappears the moment the backend is
+              // switched away from custom-bare.
+              const supported = injectionSupportedByTool(key, tool);
               return (
                 <ToggleRow
                   key={key}
-                  checked={enabled}
+                  checked={supported && enabled}
                   onChange={(v) => toggleInjection(key, v)}
+                  disabled={!supported}
                   title={t(`settings.inj.${key}.label`)}
-                  desc={t(`settings.inj.${key}.desc`)}
+                  desc={
+                    supported
+                      ? t(`settings.inj.${key}.desc`)
+                      : t("settings.inj.unsupportedByTool")
+                  }
                 />
               );
             })}

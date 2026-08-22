@@ -208,6 +208,35 @@ export const CONTEXT_INJECTION_KEYS = [
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
 
+// Injection sections that only exist for agents with agentic tools.
+// buildSystemPrompt gates each of these on hasTools (= the backend is
+// not custom-bare): they hand the agent a shell recipe — stage a file
+// under the attach directory, curl the attention endpoint, read the
+// credentials guide, curl the group-DM API — none of which a single
+// stateless chat completion can act on. The toggle is therefore inert
+// for custom-bare and the UI disables it rather than implying an effect.
+// Keep in sync with the hasTools gates in internal/agent/memory.go.
+export const TOOL_ONLY_INJECTION_KEYS: readonly ContextInjectionKey[] = [
+  "credentials",
+  "groupdm",
+  "attachments",
+  "call_user",
+];
+
+// toolHasAgenticTools mirrors internal/agent.toolHasAgenticTools, legacy
+// name included: rows written before the rename still carry "llama.cpp",
+// and the server normalizes them to custom-bare (see legacyToolNames), so
+// a settings screen loaded against an un-migrated row must too.
+export function toolHasAgenticTools(tool: string): boolean {
+  return tool !== "custom-bare" && tool !== "llama.cpp";
+}
+
+// injectionSupportedByTool reports whether toggling the section has any
+// effect on the prompt built for this backend.
+export function injectionSupportedByTool(key: ContextInjectionKey, tool: string): boolean {
+  return toolHasAgenticTools(tool) || !TOOL_ONLY_INJECTION_KEYS.includes(key);
+}
+
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
 // Empty model/voice/stylePrompt are interpreted as "use default" at
 // synthesize time.

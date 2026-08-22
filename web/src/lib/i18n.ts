@@ -296,6 +296,10 @@ const messages = {
     ja: "メモリ検索結果 (毎ターン)",
     en: "Memory search results (per turn)",
   },
+  "settings.inj.unsupportedByTool": {
+    ja: "custom-bare では注入されない (ツールを使う手順なので届いても実行できない)",
+    en: "Not injected for custom-bare: the section is a tool recipe a single stateless completion cannot act on",
+  },
   "settings.inj.recent_conversation.label": { ja: "直近の会話", en: "Recent Conversation" },
   "settings.inj.recent_conversation.desc": {
     ja: "セッション再開時の直近会話フォールバック。custom-bare では毎ターンの会話履歴そのもの",

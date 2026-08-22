@@ -427,6 +427,20 @@ type Agent struct {
 	// POST /api/v1/agents/{id}/privilege handler instead.
 	Privileged bool `json:"privileged,omitempty"`
 
+	// AgentAdmin lets the agent act for the Owner on OTHER agents:
+	// create them, PATCH their settings, and write their persona /
+	// user.md / status / anchor / MEMORY.md / memory entries. It is
+	// deliberately separate from Privileged so the destructive
+	// delete/reset power and the operator-proxy power can be handed out
+	// independently.
+	//
+	// The grant never widens what the holder may do to ITSELF — an
+	// admin still cannot flip its own privileged / agentAdmin bits or
+	// disabledInjections, so the flag is not a self-elevation path.
+	// Owner-only mutation via POST /api/v1/agents/{id}/agent-admin;
+	// the API strips the field from PATCH bodies.
+	AgentAdmin bool `json:"agentAdmin,omitempty"`
+
 	// DeviceSwitchEnabled gates whether the §3.7 device-switch skill
 	// (kojo-switch-device) gets installed into the agent's .claude/skills
 	// directory. Nil = use the default (true) — agents created before

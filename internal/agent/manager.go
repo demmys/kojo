@@ -398,6 +398,40 @@ func (m *Manager) IsPrivileged(id string) bool {
 	return ok && a.Privileged
 }
 
+// IsAgentAdmin returns whether the agent has the AgentAdmin flag set.
+// Used by auth.Resolver to stamp Principal.AgentAdmin.
+func (m *Manager) IsAgentAdmin(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[id]
+	return ok && a.AgentAdmin
+}
+
+// SetAgentAdmin toggles the AgentAdmin flag on the named agent and
+// persists the change. Owner-only mutation enforced at the API layer.
+func (m *Manager) SetAgentAdmin(id string, admin bool) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if a.AgentAdmin == admin {
+		m.mu.Unlock()
+		return nil
+	}
+	a.AgentAdmin = admin
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
+	return nil
+}
+
 // SetPrivileged toggles the Privileged flag on the named agent and
 // persists the change. Owner-only mutation enforced at the API layer.
 func (m *Manager) SetPrivileged(id string, privileged bool) error {

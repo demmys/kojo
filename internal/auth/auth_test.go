@@ -140,7 +140,7 @@ func TestResolver_Roles(t *testing.T) {
 	aliceTok, _ := st.AgentToken("ag_alice")
 	bobTok, _ := st.AgentToken("ag_bob")
 
-	r := NewResolver(st, func(id string) bool { return id == "ag_bob" })
+	r := NewResolver(st, func(id string) bool { return id == "ag_bob" }, nil)
 
 	cases := []struct {
 		name string
@@ -375,7 +375,7 @@ func TestAuthMiddleware_PrincipalInContext(t *testing.T) {
 	dir := t.TempDir()
 	st, _ := NewTokenStore(dir, nil, "owner-x")
 	tok, _ := st.AgentToken("ag_alice")
-	r := NewResolver(st, func(string) bool { return false })
+	r := NewResolver(st, func(string) bool { return false }, nil)
 
 	var got Principal
 	h := AuthMiddleware(r)(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

@@ -92,6 +92,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	// Privilege is NEVER inherited. Forks start as regular agents; the
 	// owner must explicitly grant privilege via the dedicated endpoint.
 	fork.Privileged = false
+	fork.AgentAdmin = false
 	// Clear WorkDir so the fork does not share an external file storage
 	// directory with the source (would cross-contaminate generated files).
 	fork.WorkDir = ""

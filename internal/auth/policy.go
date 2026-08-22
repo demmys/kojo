@@ -112,6 +112,12 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
 //     reset-session. Permitted for self by Agent, or for any target by
 //     PrivAgent.
+//  4. Agent-admin-cross-agent — an agent the Owner deputised
+//     (Principal.AgentAdmin) gets bucket 2's surface on OTHER agents
+//     plus agent creation and chat injection, so it can manage them on
+//     the Owner's behalf. The grant-management routes (/privilege,
+//     /agent-admin, /fork, /handoff/switch) stay Owner-only so it can
+//     neither propagate itself nor move someone else's runtime.
 //
 // Owner-only routes (sessions, git, files browser, embedding,
 // push, custom-models, group DM mutate-as-owner, fork, /privilege,
@@ -263,6 +269,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/agents" {
 		return true
 	}
+	// Agent creation on the Owner's behalf. Fork stays Owner-only: it
+	// copies an existing agent's persona and memory rather than making
+	// a new one.
+	if method == http.MethodPost && path == "/api/v1/agents" {
+		return p.IsAgentAdmin()
+	}
 	if method == http.MethodGet && matchAgentSubpath(path) {
 		return true
 	}
@@ -311,6 +323,33 @@ func AllowNonOwner(p Principal, method, path string) bool {
 				return p.IsAgent() && p.AgentID == id
 			}
 		}
+		// Agent-admin acting on someone ELSE: the same surface a
+		// regular agent has over itself, minus the routes that would
+		// let the grant spread or move another agent's runtime, plus
+		// chat injection (the Owner's way of talking to an agent
+		// without a DM).
+		if p.IsAgentAdminOver(id) {
+			switch sub {
+			case "/privilege", "/agent-admin", "/fork", "/handoff/switch":
+				return false
+			case "/messages":
+				if method == http.MethodPost {
+					return true
+				}
+			case "/persona", "/memory", "/memory-entries":
+				// Owner-only for a plain agent (an agent edits its own
+				// persona.md / MEMORY.md on disk, not through the API),
+				// so they are listed here rather than in
+				// isSelfScopedRoute — an admin has no disk-level
+				// equivalent for someone else's workspace.
+				return true
+			}
+			if strings.HasPrefix(sub, "/memory-entries/") {
+				return true
+			}
+			return isSelfScopedRoute(method, sub)
+		}
+
 		// Everything else is self-scoped read/write. The handler still
 		// applies its own access checks; this layer just refuses
 		// requests that target a different agent.

@@ -424,7 +424,10 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if p.IsOwner() {
+	// An agent-admin manages the fleet on the Owner's behalf, so it
+	// gets the Owner's view — including the archived rows it needs in
+	// order to unarchive them.
+	if p.IsOwner() || p.IsAgentAdmin() {
 		out := make([]*agent.Agent, 0, len(all))
 		for _, a := range all {
 			switch {
@@ -491,8 +494,9 @@ func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
-	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
-		writeError(w, http.StatusForbidden, "forbidden", "agent creation is owner-only")
+	if p := auth.FromContext(r.Context()); !p.CanCreateAgent() {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"agent creation requires the Owner or an agent-admin")
 		return
 	}
 	var cfg agent.AgentConfig
@@ -500,6 +504,9 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// AgentConfig carries no privileged / agentAdmin field, so a
+	// creation request cannot mint a grant however it is crafted: the
+	// owner-only toggle endpoints are the only way in.
 	a, err := s.agents.Create(cfg)
 	if err != nil {
 		// ErrAgentBusy here means the restart drain's quiesce refused
@@ -639,6 +646,15 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 					"privileged is owner-only; use POST /api/v1/agents/{id}/privilege")
 				return
 			}
+			// Same reasoning for the agent-admin grant: it has its own
+			// owner-only endpoint, and letting it through PATCH would
+			// make the grant self-propagating (an admin may PATCH any
+			// other agent).
+			if strings.EqualFold(k, "agentAdmin") {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"agentAdmin is owner-only; use POST /api/v1/agents/{id}/agent-admin")
+				return
+			}
 			// disabledInjections changes the agent's capability /
 			// context surface, so unlike persona / effort it is NOT
 			// self-PATCHable — Owner only. Peers pass for the same
@@ -648,7 +664,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			// to their local daemon and may only PATCH themselves).
 			// Case-insensitive match for the same casing-trick reason
 			// as privileged.
-			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() {
+			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() &&
+				!p.IsAgentAdminOver(id) {
 				writeError(w, http.StatusForbidden, "forbidden",
 					"disabledInjections is owner-only")
 				return
@@ -2589,6 +2606,55 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quoteETag(newETag))
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "privileged": body.Privileged})
+}
+
+// handleAgentAdminAgent toggles the AgentAdmin flag on an agent.
+// Owner-only, and reasserted here for the same reason as
+// handlePrivilegeAgent: this flag is what lets an agent act for the
+// Owner on every other agent, so it must never be settable by one.
+func (s *Server) handleAgentAdminAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanSetAgentAdmin() {
+		writeError(w, http.StatusForbidden, "forbidden", "agentAdmin is owner-only")
+		return
+	}
+
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
+		"If-Match: * is not supported on POST /agents/{id}/agent-admin; send a specific etag or omit the header")
+	if !ok {
+		return
+	}
+
+	var body struct {
+		AgentAdmin bool `json:"agentAdmin"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	release := s.agents.LockPatch(id)
+	defer release()
+
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
+	if err := s.agents.SetAgentAdmin(id, body.AgentAdmin); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	if newETag := s.readAgentETag(r, id); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "agentAdmin": body.AgentAdmin})
 }
 
 func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {

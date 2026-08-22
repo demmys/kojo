@@ -99,7 +99,7 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		// 403 anyway (CanForkOrCreate / CanSetPrivileged don't
 		// admit RolePeer). Short-circuit here to avoid a wasted
 		// round-trip.
-		if sub == "/fork" || sub == "/privilege" {
+		if sub == "/fork" || sub == "/privilege" || sub == "/agent-admin" {
 			next.ServeHTTP(w, r)
 			return
 		}

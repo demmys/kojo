@@ -407,6 +407,12 @@ const messages = {
     en: "Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record.",
   },
 
+  "settings.agentAdmin": { ja: "エージェント管理権限", en: "Agent Admin" },
+  "settings.agentAdminDesc": {
+    ja: "このエージェントにユーザーの代わりの他エージェント管理を許可する。作成、設定の変更、persona / user.md / status / MEMORY.md の編集、チャットへの発言ができる。権限の付与とフォークはオーナー専用のまま。自分自身に対しては何も増えない。",
+    en: "Let this agent manage other agents for you: create them, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Granting privileges and forking stay Owner-only, and the grant adds nothing over the agent itself.",
+  },
+
   // ── AgentSettings: Schedule ──
   "settings.notifyDuringSilent": { ja: "静音時間中も DM を受信", en: "Receive DM During Silent Hours" },
   "settings.notifyDuringSilentDesc": {

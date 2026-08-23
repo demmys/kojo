@@ -257,10 +257,21 @@ func customCodexOverrides(base string) []string {
 	// rust-v0.95.0 and now hard-errors on it, so the endpoint has to speak
 	// /v1/responses (llama-server does since its partial implementation
 	// landed; older builds need a bridge in front).
+	//
+	// features.view_image=false disables codex's view_image tool. It returns
+	// its result as a function_call_output whose output is an array holding
+	// an {"type":"input_image"} part, and llama-server's /v1/responses parser
+	// accepts only input_text parts there — anything else fails the whole
+	// request with 400 "Output of tool call should be 'Input text'", killing
+	// the turn. Dropping the tool costs image viewing and keeps the backend
+	// usable; revisit once the endpoint accepts image parts.
+	// The features.* table landed in codex rust-v0.147.0; older CLIs ignore
+	// the unknown key silently, which just leaves the 400 in place.
 	return []string{
 		fmt.Sprintf("model_providers.%s.name=%q", customCodexProviderID, "kojo custom endpoint"),
 		fmt.Sprintf("model_providers.%s.base_url=%q", customCodexProviderID, base),
 		fmt.Sprintf("model_providers.%s.wire_api=%q", customCodexProviderID, "responses"),
 		fmt.Sprintf("model_provider=%q", customCodexProviderID),
+		"features.view_image=false",
 	}
 }

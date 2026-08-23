@@ -98,6 +98,17 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Attachment-cache purge acts on THIS device's blob store.
+		// Attachments replicate to every peer that has seen them, so the
+		// disk pressure the operator is trying to relieve is local by
+		// definition; proxying to the holder would free the holder's disk
+		// and leave this one untouched — the opposite of what the button
+		// on this screen promises.
+		if sub == "/attach-cache" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Hub-only management ops: the target peer's handler would
 		// 403 anyway (CanFork / CanSetPrivileged / CanSetOwnerDeputy
 		// don't admit RolePeer). Short-circuit here to avoid a

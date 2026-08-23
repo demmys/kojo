@@ -5,12 +5,13 @@ import {
   CONTEXT_INJECTION_KEYS,
   injectionSupportedByTool,
   type AgentInfo,
+  type AttachCacheResult,
   type ContextInjectionKey,
   type TruncateMemoryResult,
 } from "../../lib/agentApi";
 import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
-import { errMsg } from "../../lib/utils";
+import { errMsg, formatBytes } from "../../lib/utils";
 import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
@@ -186,6 +187,11 @@ export function AgentSettings() {
   const [archiving, setArchiving] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
+  // Attachment blob cache. `attachCache` is the size probe shown next to the
+  // button; null means "not loaded / unknown" so the label degrades to the
+  // plain verb instead of claiming 0 bytes.
+  const [attachCache, setAttachCache] = useState<AttachCacheResult | null>(null);
+  const [clearingAttach, setClearingAttach] = useState(false);
   // Memory truncation. The datetime-local input emits a naive
   // "YYYY-MM-DDTHH:mm" string; we attach the browser's current UTC offset
   // when calling the API so the server interprets it in local time. The
@@ -889,6 +895,59 @@ export function AgentSettings() {
       setError(errMsg(err));
     } finally {
       setResetting(false);
+    }
+  };
+
+  // Probe the cache size on mount so the button can say what it would free.
+  // Failure is silent: the size is a nicety, and a settings screen that
+  // refuses to render because a cache probe 503'd would be worse than a
+  // button with no number on it.
+  useEffect(() => {
+    if (!id) return;
+    // Drop the previous agent's figure first: navigating between two
+    // settings screens reuses this component, and showing agent A's cache
+    // size under agent B's button until the probe lands is worse than
+    // showing no number at all.
+    setAttachCache(null);
+    let cancelled = false;
+    agentApi
+      .getAttachCache(id)
+      .then((r) => {
+        if (!cancelled) setAttachCache(r);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  const handleClearAttachCache = async () => {
+    if (!confirm(t("settings.attachCacheConfirm"))) return;
+    setClearingAttach(true);
+    setError("");
+    try {
+      const r = await agentApi.clearAttachCache(id!);
+      if (r.failed) {
+        // A partial purge leaves blobs behind, so the button must not claim
+        // 0/0. Re-probe for the real remainder; if even that fails, fall
+        // back to "unknown" rather than a figure we cannot stand behind.
+        setError(t("settings.attachCacheFailed", { failed: r.failed }));
+        try {
+          setAttachCache(await agentApi.getAttachCache(id!));
+        } catch {
+          setAttachCache(null);
+        }
+      } else {
+        // Show the post-purge state rather than what was removed: the label
+        // says what this button would free next time.
+        setAttachCache({ deleted: 0, bytes: 0 });
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 2000);
+      }
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setClearingAttach(false);
     }
   };
 
@@ -1764,6 +1823,26 @@ export function AgentSettings() {
                 </div>
               </div>
             )}
+            <div>
+              <Button
+                variant="danger"
+                onClick={handleClearAttachCache}
+                disabled={clearingAttach}
+                className="w-full"
+              >
+                {clearingAttach
+                  ? t("settings.attachCacheClearing")
+                  : attachCache
+                    ? t("settings.attachCacheButtonSized", {
+                        size: formatBytes(attachCache.bytes),
+                        count: attachCache.deleted,
+                      })
+                    : t("settings.attachCacheButton")}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                {t("settings.attachCacheHelp")}
+              </p>
+            </div>
             <div>
               <Button
                 variant="danger"

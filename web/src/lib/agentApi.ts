@@ -191,6 +191,16 @@ export function isTurnErrorPreview(m?: { role: string; content: string }): boole
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
 // disabledInjections. Unknown keys are rejected by the server with 400,
 // so this list must stay in sync with the backend's validation.
+// AttachCacheResult is returned by both getAttachCache and clearAttachCache.
+// On GET, `deleted` is the number of blobs currently held (nothing has been
+// deleted yet) and `bytes` their total size; on DELETE both describe what the
+// call actually removed. `failed` counts blobs the server could not delete.
+export interface AttachCacheResult {
+  deleted: number;
+  bytes: number;
+  failed?: number;
+}
+
 export const CONTEXT_INJECTION_KEYS = [
   "user_context",
   "memory_md",
@@ -616,6 +626,19 @@ export const agentApi = {
     id: string,
     params: { since: string } | { fromMessageId: string },
   ) => post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, params),
+
+  // Ingested-attachment blob cache (global scope, agents/{id}/attach/...).
+  // GET reports what is currently held so the settings screen can show the
+  // size before the operator commits; DELETE removes every blob under the
+  // prefix and reports what it actually freed.
+  //
+  // This is a cache purge, not a transcript edit: past messages keep their
+  // attachment references and render as broken links afterwards.
+  getAttachCache: (id: string) =>
+    get<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
+
+  clearAttachCache: (id: string) =>
+    del<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
 
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 

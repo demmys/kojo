@@ -968,6 +968,8 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Agent-raised, non-blocking "look at me" page. POST raises (with an
 	// optional one-line reason), DELETE clears — the web UI clears
 	// whenever the operator has the agent's chat open.
+	mux.HandleFunc("GET /api/v1/agents/{id}/attach-cache", s.handleGetAgentAttachCache)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/attach-cache", s.handleDeleteAgentAttachCache)
 	mux.HandleFunc("POST /api/v1/agents/{id}/attention", s.handleRaiseAgentAttention)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/attention", s.handleClearAgentAttention)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/messages/{msgId}", s.handleUpdateMessage)

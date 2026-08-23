@@ -347,6 +347,14 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodGet, "/api/v1/system/restart", priv, true},
 		{http.MethodGet, "/api/v1/system/restart", ag, false},
 		{http.MethodGet, "/api/v1/system/restart", guest, false},
+		// attachment-cache purge — Owner-only (and RolePeer, which is
+		// admitted to the whole /api/v1/agents/ surface by design). An
+		// agent must not be able to wipe its own attachment history, so
+		// the route is deliberately absent from isSelfScopedRoute.
+		{http.MethodDelete, "/api/v1/agents/ag_x/attach-cache", ag, false},
+		{http.MethodDelete, "/api/v1/agents/ag_x/attach-cache", priv, false},
+		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", ag, false},
+		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", guest, false},
 	}
 	for _, c := range cases {
 		t.Run(c.method+" "+c.path+"/"+roleName(c.p.Role), func(t *testing.T) {

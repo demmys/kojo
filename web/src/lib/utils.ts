@@ -125,3 +125,14 @@ export function formatTime(timestamp: string): string {
     return "";
   }
 }
+
+// formatBytes renders a byte count in binary units. Sizes here are disk
+// figures (blob caches, skipped transfers), which every OS tool reports in
+// KiB/MiB/GiB, so binary is the unit that matches what the operator sees
+// when they go check the directory themselves.
+export function formatBytes(n: number): string {
+  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GiB`;
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
+  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KiB`;
+  return `${n} B`;
+}

@@ -482,6 +482,32 @@ const messages = {
     en: "Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.",
   },
 
+  // ── AgentSettings: attachment blob cache ──
+  "settings.attachCacheButton": {
+    ja: "添付ファイルのキャッシュを削除",
+    en: "Clear attachment cache",
+  },
+  "settings.attachCacheButtonSized": {
+    ja: "添付ファイルのキャッシュを削除 ({count} 件 / {size})",
+    en: "Clear attachment cache ({count} files / {size})",
+  },
+  "settings.attachCacheClearing": {
+    ja: "削除中…",
+    en: "Clearing…",
+  },
+  "settings.attachCacheHelp": {
+    ja: "このエージェントが送受信した添付ファイルの実体を消してディスクを空ける。過去のチャットに残る添付は表示できなくなる。",
+    en: "Frees disk by deleting the stored files this agent sent or received. Attachments in past chats stop rendering.",
+  },
+  "settings.attachCacheConfirm": {
+    ja: "添付ファイルのキャッシュを削除する。過去のチャットの添付は表示できなくなる。続行する?",
+    en: "Delete the attachment cache? Attachments in past chats will stop rendering.",
+  },
+  "settings.attachCacheFailed": {
+    ja: "{failed} 件を削除できなかった。",
+    en: "Failed to delete {failed} file(s).",
+  },
+
   // ── AgentSettings: banners / save ──
   "settings.saveConflict": {
     ja: "他の誰かがこのエージェントを更新した。再読み込み中…",

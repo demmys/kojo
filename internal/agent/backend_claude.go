@@ -649,7 +649,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		var processError string
 		if err := cmd.Wait(); err != nil {
 			b.logger.Warn("claude process exited with error", "err", err, "stderr", stderrBuf.String())
-			processError = strings.TrimSpace(stderrBuf.String())
+			processError = filterClaudeStderrNoise(stderrBuf.String())
 			if processError == "" {
 				processError = err.Error()
 			}
@@ -2477,4 +2477,54 @@ func isRealUserEntry(msgRaw json.RawMessage) bool {
 		}
 	}
 	return true
+}
+
+// claudeStderrNoisePrefixes matches startup advisories the Claude CLI writes
+// to stderr on every run. They are not failures, but they are often the ONLY
+// thing on stderr when the CLI dies, so promoting raw stderr shows the
+// operator a warning about MCP connectors while the real cause (a 400, a
+// context overflow, a crashed model endpoint) is nowhere in the message.
+//
+// The connectors line in particular fires for every custom-claude agent by
+// construction: kojo itself injects ANTHROPIC_API_KEY=dummy alongside
+// ANTHROPIC_BASE_URL, which is exactly the condition the warning reports.
+//
+// Matching is prefix-anchored, not substring: a diagnostic that merely
+// mentions the advisory (an echoed command line, a wrapped log record) must
+// survive, and only a line the CLI itself emitted as the advisory is dropped.
+var claudeStderrNoisePrefixes = []string{
+	"⚠ claude.ai connectors are disabled because",
+	"claude.ai connectors are disabled because",
+}
+
+// filterClaudeStderrNoise drops known-benign advisory lines and returns the
+// remaining stderr. Returns "" when nothing but noise was written, letting
+// the caller fall back to the wait error (which at least carries the exit
+// code) instead of reporting a warning as the failure.
+//
+// Surviving lines keep their original text: leading indentation carries
+// structure in multi-line diagnostics (stack traces, JSON dumps), so only
+// the noise test trims, never the output.
+func filterClaudeStderrNoise(stderr string) string {
+	var kept []string
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimRight(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		noise := false
+		for _, pat := range claudeStderrNoisePrefixes {
+			if strings.HasPrefix(trimmed, pat) {
+				noise = true
+				break
+			}
+		}
+		if !noise {
+			kept = append(kept, line)
+		}
+	}
+	// No final TrimSpace: blank lines are already dropped above, so the only
+	// thing it could strip is a surviving line's own indentation.
+	return strings.Join(kept, "\n")
 }

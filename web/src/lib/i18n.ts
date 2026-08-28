@@ -300,10 +300,14 @@ const messages = {
     ja: "メモリ検索結果 (毎ターン)",
     en: "Memory search results (per turn)",
   },
+  "settings.inj.unsupportedByTool": {
+    ja: "custom-bare では注入されない (ツールを使う手順なので届いても実行できない)",
+    en: "Not injected for custom-bare: the section is a tool recipe a single stateless completion cannot act on",
+  },
   "settings.inj.recent_conversation.label": { ja: "直近の会話", en: "Recent Conversation" },
   "settings.inj.recent_conversation.desc": {
-    ja: "セッション再開時の直近会話フォールバック",
-    en: "Recent conversation fallback on session resume",
+    ja: "セッション再開時の直近会話フォールバック。custom-bare では毎ターンの会話履歴そのもの",
+    en: "Recent conversation fallback on session resume; for custom-bare, the per-turn conversation history itself",
   },
   "settings.inj.persona_anchor.label": { ja: "口調アンカー", en: "Persona Anchor" },
   "settings.inj.persona_anchor.desc": {
@@ -419,6 +423,12 @@ const messages = {
     en: "Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record.",
   },
 
+  "settings.ownerDeputy": { ja: "オーナー代理 (特権より強い)", en: "Owner Deputy (stronger than Privileged)" },
+  "settings.ownerDeputyDesc": {
+    ja: "このエージェントをオーナーの代理にする。特権エージェントの権限に加えて、他エージェントの作成 / フォーク / 完全な記録の読み取り / 設定の変更 / persona・user.md・status・MEMORY.md の編集 / チャットへの発言ができる。権限の付与だけはオーナー専用のまま。自分自身に対しては何も増えない。",
+    en: "Make this agent your deputy. On top of everything a privileged agent can do, it may create and fork agents, read their full record, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Only granting privileges stays Owner-only, and the grant adds nothing over the agent itself.",
+  },
+
   // ── AgentSettings: Schedule ──
   "settings.notifyDuringSilent": { ja: "静音時間中も DM を受信", en: "Receive DM During Silent Hours" },
   "settings.notifyDuringSilentDesc": {
@@ -482,6 +492,32 @@ const messages = {
   "settings.resetDataHelp": {
     ja: "会話ログとメモリを消す。設定・人格・アバター・認証情報は保持される。",
     en: "Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.",
+  },
+
+  // ── AgentSettings: attachment blob cache ──
+  "settings.attachCacheButton": {
+    ja: "添付ファイルのキャッシュを削除",
+    en: "Clear attachment cache",
+  },
+  "settings.attachCacheButtonSized": {
+    ja: "添付ファイルのキャッシュを削除 ({count} 件 / {size})",
+    en: "Clear attachment cache ({count} files / {size})",
+  },
+  "settings.attachCacheClearing": {
+    ja: "削除中…",
+    en: "Clearing…",
+  },
+  "settings.attachCacheHelp": {
+    ja: "このエージェントが送受信した添付ファイルの実体を消してディスクを空ける。過去のチャットに残る添付は表示できなくなる。",
+    en: "Frees disk by deleting the stored files this agent sent or received. Attachments in past chats stop rendering.",
+  },
+  "settings.attachCacheConfirm": {
+    ja: "添付ファイルのキャッシュを削除する。過去のチャットの添付は表示できなくなる。続行する?",
+    en: "Delete the attachment cache? Attachments in past chats will stop rendering.",
+  },
+  "settings.attachCacheFailed": {
+    ja: "{failed} 件を削除できなかった。",
+    en: "Failed to delete {failed} file(s).",
   },
 
   // ── AgentSettings: banners / save ──

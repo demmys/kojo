@@ -7,33 +7,26 @@ import (
 	"os"
 )
 
-// errNonRegular is returned by openNoFollow when the path is a
-// symlink, FIFO, socket, device, or directory.
+// errNonRegular is returned by openStagedAttachment when the path
+// resolves to a directory, device, or other non-regular file.
 var errNonRegular = errors.New("attach: not a regular file")
 
-// openNoFollow on Windows: O_NOFOLLOW + reparse-point handling
-// is not exposed by syscall in a portable way, so we approximate
-// it with a pre-flight Lstat (rejects symlinks / reparse points
-// by mode) and a post-open re-Stat (catches non-regular targets
-// the open survived). The window between Lstat and Open is a
-// TOCTOU race a local attacker could exploit by swapping a
-// reparse point in place — kojo-attach runs inside the agent's
-// own data directory where the agent already has write access,
-// so the attack surface is "agent reads a file the agent could
-// already read", which we accept. Operators concerned about a
-// hardened multi-tenant Windows deployment should disable the
-// attach skill until proper ReOpenFile + FILE_FLAG_OPEN_REPARSE_POINT
-// support is wired through.
-func openNoFollow(path string) (*os.File, os.FileInfo, error) {
-	li, err := os.Lstat(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !li.Mode().IsRegular() {
-		return nil, nil, errNonRegular
-	}
+// errDanglingSymlink is returned when a staged symlink's target is
+// missing.
+var errDanglingSymlink = errors.New("attach: symlink target missing")
+
+// openStagedAttachment on Windows: os.Open follows reparse points,
+// which is what we now want (see the unix build's doc comment for
+// why following is safe here), and the post-open Stat rejects
+// anything that did not resolve to a regular file.
+func openStagedAttachment(path string) (*os.File, os.FileInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if li, lerr := os.Lstat(path); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
+				return nil, nil, errDanglingSymlink
+			}
+		}
 		return nil, nil, err
 	}
 	info, err := f.Stat()

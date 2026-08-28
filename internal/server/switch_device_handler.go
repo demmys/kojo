@@ -1530,7 +1530,7 @@ func (s *Server) noteSwitchFailure(agentID, reason string) {
 	if s.agents == nil {
 		return
 	}
-	if err := s.agents.AppendSystemNote(agentID, "⚠️ デバイス移行を中断した: "+reason); err != nil {
+	if err := s.agents.AppendSystemNote(agentID, agent.NoticeSwitchAbortedPrefix+reason); err != nil {
 		s.logger.Warn("switch-device: failed to append failure note to transcript",
 			"agent", agentID, "err", err)
 	}

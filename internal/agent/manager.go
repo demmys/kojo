@@ -402,6 +402,40 @@ func (m *Manager) IsPrivileged(id string) bool {
 	return ok && a.Privileged
 }
 
+// IsOwnerDeputy returns whether the agent has the OwnerDeputy flag set.
+// Used by auth.Resolver to stamp Principal.OwnerDeputy.
+func (m *Manager) IsOwnerDeputy(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[id]
+	return ok && a.OwnerDeputy
+}
+
+// SetOwnerDeputy toggles the OwnerDeputy flag on the named agent and
+// persists the change. Owner-only mutation enforced at the API layer.
+func (m *Manager) SetOwnerDeputy(id string, deputy bool) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if a.OwnerDeputy == deputy {
+		m.mu.Unlock()
+		return nil
+	}
+	a.OwnerDeputy = deputy
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
+	return nil
+}
+
 // SetPrivileged toggles the Privileged flag on the named agent and
 // persists the change. Owner-only mutation enforced at the API layer.
 func (m *Manager) SetPrivileged(id string, privileged bool) error {
@@ -1855,6 +1889,7 @@ type chatPrep struct {
 	sysPrompt           string
 	volatileContext     string
 	freshSessionContext string
+	history             []HistoryTurn
 	mcpServers          map[string]mcpServerEntry
 }
 
@@ -2041,9 +2076,22 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
 	freshSessionContext := ""
-	if indexNewMessages &&
+	if indexNewMessages && !backendReplaysHistory(backend) &&
 		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
 		freshSessionContext = m.BuildSessionHistoryContext(ctx, agentID)
+	}
+
+	// Session-less backends (custom-bare) get the transcript replayed
+	// in the request itself. Built here, before Chat appends the
+	// incoming message, so the current turn is not sent twice. Skipped
+	// for one-shot chats (indexNewMessages=false — Slack and friends
+	// carry their own context) and for regenerate (skipMemoryContext=
+	// true), where the tail of the transcript contains the very message
+	// being re-run plus everything after it.
+	var history []HistoryTurn
+	if indexNewMessages && !skipMemoryContext && backendReplaysHistory(backend) &&
+		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		history = m.BuildHistoryTurns(ctx, agentID)
 	}
 
 	return &chatPrep{
@@ -2052,6 +2100,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		sysPrompt:           sysPrompt,
 		volatileContext:     volatileContext,
 		freshSessionContext: freshSessionContext,
+		history:             history,
 		mcpServers:          mcpServers,
 	}, nil
 }
@@ -2263,6 +2312,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		MCPServers:          prep.mcpServers,
 		AutomatedTrigger:    role == "system",
 		FreshSessionContext: prep.freshSessionContext,
+		History:             prep.history,
 		OnSteerReady: func(fn SteerFunc) {
 			m.busyMu.Lock()
 			if entry, ok := m.busy[agentID]; ok {
@@ -2299,7 +2349,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist chat start error", "err", appendErr)
 				} else {
@@ -2385,7 +2435,8 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude/custom/codex). For
+	// Honored only by backends in backendSupportsSessionKey
+	// (claude/custom-claude/codex/custom-codex/grok). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
@@ -2584,6 +2635,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
 		case ToolCodex, ToolCustomCodex:
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
+		case ToolGrok:
+			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
 			if responseAttachments != nil {
@@ -3051,7 +3104,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 		if receivedDone {
 			if ctx.Err() == context.DeadlineExceeded {
-				errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+				errMsg := newSystemMessage(NoticeTimeoutText)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save timeout message", "err", err)
 				}
@@ -3087,7 +3140,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			m.persistDoneEvent(agentID, msg)
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+			errMsg := newSystemMessage(NoticeTimeoutText)
 			if err := appendMessage(agentID, errMsg); err != nil {
 				m.logger.Warn("failed to save timeout message", "err", err)
 			}
@@ -3237,7 +3290,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+				errMsg := newSystemMessage(NoticeErrorPrefix + event.ErrorMessage)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save error message", "err", err)
 				} else {
@@ -4176,8 +4229,15 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	// prepareChat ran before truncation so setup failures could not mutate the
 	// transcript. Rebuild the fresh-session fallback now from the committed
 	// prefix; otherwise regenerate could inject the answer it just removed.
-	if !prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+	if !backendReplaysHistory(prep.backend) &&
+		!prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
 		prep.freshSessionContext = m.buildSessionHistoryContext(context.Background(), agentID, rt.SourceID)
+	}
+
+	var regenHistory []HistoryTurn
+	if backendReplaysHistory(prep.backend) &&
+		!prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		regenHistory = m.BuildHistoryTurnsBefore(ctx, agentID, rt.SourceID)
 	}
 
 	chatCtx, cancel := context.WithCancel(context.Background())
@@ -4201,6 +4261,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
 			FreshSessionContext: prep.freshSessionContext,
+			// Session-less backends replay the transcript; here it has
+			// to stop short of the message being re-run, which travels
+			// as effectiveMessage. The truncate above already removed
+			// everything after it, and the cursor excludes the source
+			// row itself.
+			History: regenHistory,
 			// Register the steer handle so a steer sent during a
 			// regenerate turn injects into it instead of stalling in
 			// awaitSteerHandle until the deadline.
@@ -4241,7 +4307,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist regenerate error", "err", appendErr)
 				} else {

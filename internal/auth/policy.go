@@ -112,10 +112,17 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
 //     reset-session. Permitted for self by Agent, or for any target by
 //     PrivAgent.
+//  4. Owner-deputy-cross-agent — an agent the Owner deputised
+//     (Principal.OwnerDeputy) gets buckets 2 and 3's surface on OTHER
+//     agents, plus agent creation, fork and chat injection, so it can
+//     stand in for the Owner over the fleet. The grant-management
+//     routes (/privilege, /owner-deputy) and /handoff/switch stay
+//     Owner-only so it can neither propagate itself nor move someone
+//     else's runtime.
 //
 // Owner-only routes (sessions, git, files browser, embedding,
-// push, custom-models, group DM mutate-as-owner, fork, /privilege,
-// generate-*) fall through and 403. Note: POST /api/v1/groupdms
+// push, custom-models, group DM mutate-as-owner, /privilege,
+// /owner-deputy, generate-*) fall through and 403. Note: POST /api/v1/groupdms
 // (group creation) is exposed to Agent / PrivAgent below — the handler
 // then enforces the caller-in-memberIds invariant.
 func AllowNonOwner(p Principal, method, path string) bool {
@@ -291,6 +298,11 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/agents" {
 		return true
 	}
+	// Agent creation on the Owner's behalf (forking someone else is
+	// allowed too — see the per-agent /fork case below).
+	if method == http.MethodPost && path == "/api/v1/agents" {
+		return p.IsOwnerDeputy()
+	}
 	if method == http.MethodGet && matchAgentSubpath(path) {
 		return true
 	}
@@ -326,7 +338,11 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			switch sub {
 			case "/reset", "/unarchive", "/checkin", "/reset-session", "/memory/truncate":
 				return p.CanDeleteOrReset(id)
-			case "/fork", "/privilege":
+			case "/fork":
+				// Owner is short-circuited above; a deputy may
+				// fork someone else (CanFork excludes self).
+				return p.CanFork(id)
+			case "/privilege", "/owner-deputy":
 				// Owner-only — already filtered out above.
 				return false
 			case "/handoff/switch":
@@ -339,6 +355,33 @@ func AllowNonOwner(p Principal, method, path string) bool {
 				return p.IsAgent() && p.AgentID == id
 			}
 		}
+		// Deputy acting on someone ELSE: the surface a regular agent
+		// has over itself, plus fork, chat injection (the Owner's way
+		// of talking to an agent without a DM) and the persona/memory
+		// writes — minus the routes that would let the grant spread or
+		// move another agent's runtime.
+		if p.IsOwnerDeputyOver(id) {
+			switch sub {
+			case "/privilege", "/owner-deputy", "/handoff/switch":
+				return false
+			case "/messages":
+				if method == http.MethodPost {
+					return true
+				}
+			case "/persona", "/memory", "/memory-entries":
+				// Owner-only for a plain agent (an agent edits its own
+				// persona.md / MEMORY.md on disk, not through the API),
+				// so they are listed here rather than in
+				// isSelfScopedRoute — a deputy has no disk-level
+				// equivalent for someone else's workspace.
+				return true
+			}
+			if strings.HasPrefix(sub, "/memory-entries/") {
+				return true
+			}
+			return isSelfScopedRoute(method, sub)
+		}
+
 		// Everything else is self-scoped read/write. The handler still
 		// applies its own access checks; this layer just refuses
 		// requests that target a different agent.

@@ -82,6 +82,19 @@ type ChatOptions struct {
 	// native session and canonical transcript advance together.
 	ResumeSessionContext string
 
+	// History is a bounded replay of the prior conversation, oldest
+	// first, for backends that keep no session of their own. Only
+	// custom-bare receives it (see backendReplaysHistory): it POSTs a
+	// plain /v1/chat/completions request, so the transcript has to
+	// travel in the messages array or the model sees nothing but the
+	// current turn.
+	//
+	// It never contains the current user message — that arrives as the
+	// userMessage argument — and never a "system" entry, so a backend
+	// can splice it straight between its system prompt and the current
+	// turn.
+	History []HistoryTurn
+
 	// SystemPromptExtra is appended verbatim to the systemPrompt argument
 	// AFTER the backend's normal prompt assembly. Use it to inject
 	// per-conversation context (e.g. Slack channel/thread info) without
@@ -146,10 +159,10 @@ var ErrSteerUnsupported = errors.New("steering is not supported for this backend
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (grok, custom-bare) cannot isolate a
-// per-thread session from the agent's main session, so the manager drops
-// SessionKey for them and degrades to OneShot=true — keeping the chat
-// ephemeral rather than silently mixing thread contexts.
+// ignore SessionKey (custom-bare) cannot isolate a per-thread session
+// from the agent's main session, so the manager drops SessionKey for
+// them and degrades to OneShot=true — keeping the chat ephemeral rather
+// than silently mixing thread contexts.
 //
 // Keep this list in sync with the backends that actually read
 // opts.SessionKey when assembling their argv / config.
@@ -158,10 +171,11 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex:
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok:
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
 		// CodexBackend.Chat; codex stores a deterministic per-key thread ref
-		// under agentDir/.codex/threads.
+		// under agentDir/.codex/threads, and grok the equivalent under
+		// agentDir/.grok/threads, resumed by explicit `--resume <id>`.
 		return true
 	default:
 		return false
@@ -219,8 +233,10 @@ func backendLoadsClaudeSkills(tool string) bool {
 //     sqlite rows via CodexSession; backend_codex.go resumes with
 //     app-server `thread/resume`.
 //
-// custom-bare has no session state at all (every turn is a fresh
-// stateless request), so there is nothing to transfer; it stays off.
+// custom-bare has no session state to transfer: every turn is a fresh
+// stateless request, and its continuity comes from kojo replaying the
+// transcript it already stores (ChatOptions.History), which the target
+// peer reads from the synced store anyway. It stays off.
 //
 // Gating the SKILL.md install (instead of, say, a runtime 4xx) keeps
 // the failure mode obvious for unsupported tools: the skill simply

@@ -122,6 +122,10 @@ func TestCustomCodexOverrides(t *testing.T) {
 		`model_providers.kojo_custom.base_url="http://127.0.0.1:8080/v1"`,
 		`model_providers.kojo_custom.wire_api="responses"`,
 		`model_provider="kojo_custom"`,
+		// view_image returns an input_image part inside function_call_output,
+		// which llama-server's /v1/responses parser rejects with a 400 that
+		// kills the whole turn. See customCodexOverrides.
+		`features.view_image=false`,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d overrides, want %d: %q", len(got), len(want), got)

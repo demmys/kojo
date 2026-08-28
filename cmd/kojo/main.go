@@ -402,7 +402,7 @@ func main() {
 		}
 		return t, true
 	})
-	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged)
+	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged, agentMgr.IsOwnerDeputy)
 
 	// Phase G: peer identity. Load (or generate on first run) this
 	// binary's stable {device_id, Ed25519 keypair, name} from kv. The

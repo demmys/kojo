@@ -1,4 +1,5 @@
-// Lightweight, dependency-free UI internationalization (Japanese / English).
+// Lightweight UI internationalization (Japanese / English built in, plus any
+// language an installed extension contributes).
 //
 // Design:
 //   - Locale is a global module-level value with a subscriber set, exposed to
@@ -8,6 +9,11 @@
 //   - Detection order: localStorage "kojo.locale" override → navigator.language
 //     ("ja*" → ja) → "en".
 //   - Dictionaries are keyed by stable English-ish keys; each entry has ja+en.
+//   - Extension locales are overlays: a flat key→string map fetched from
+//     /api/v1/locales/{tag} and registered at boot. Keys an overlay omits fall
+//     back to English, so a half-finished translation is still usable. The
+//     bundle is built ahead of time, so this is the only way a package can add
+//     a language — it ships data, never code.
 //   - t(key, params?) interpolates {name}-style placeholders. A missing key
 //     returns the key itself (fail-soft) and console.warns in dev.
 //
@@ -15,15 +21,35 @@
 // model/tool names, file paths, and anything sent to the server stay literal.
 
 import { useSyncExternalStore } from "react";
+import { authHeaders } from "./auth";
 
-export type Locale = "ja" | "en";
+/** The languages compiled into the bundle. Every message has these two. */
+export type BuiltinLocale = "ja" | "en";
+
+/**
+ * A language tag. Either a builtin or an extension-contributed BCP 47 tag;
+ * `string` rather than a union because the set is only known at runtime.
+ */
+export type Locale = string;
 
 const STORAGE_KEY = "kojo.locale";
+
+/** Mirrors the server's localeTagRe so a junk localStorage value is ignored. */
+const TAG_RE = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/;
+
+function isBuiltin(loc: Locale): loc is BuiltinLocale {
+  return loc === "ja" || loc === "en";
+}
 
 function detect(): Locale {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === "ja" || saved === "en") return saved;
+    // Any well-formed tag is accepted, not just the ones currently
+    // installed: extension locales load asynchronously, so a saved tag
+    // is generally still unknown at this point. Until its catalogue
+    // arrives the UI reads English, which is also what happens if the
+    // extension providing it was uninstalled.
+    if (saved && TAG_RE.test(saved)) return saved;
   } catch {
     /* localStorage unavailable (private mode / SSR) — fall through */
   }
@@ -39,6 +65,25 @@ function detect(): Locale {
 let current: Locale = detect();
 const listeners = new Set<() => void>();
 
+// useSyncExternalStore re-renders only when getSnapshot returns a value
+// Object.is says is different. The locale alone is not enough: a
+// catalogue arriving or the contributed-language list changing must
+// re-render too, and neither of those changes `current`. So the
+// snapshot is the locale plus a revision counter that every mutation
+// bumps.
+let revision = 0;
+let snapshot = `${revision}:${current}`;
+
+function notify(): void {
+  revision++;
+  snapshot = `${revision}:${current}`;
+  for (const l of listeners) l();
+}
+
+function getSnapshot(): string {
+  return snapshot;
+}
+
 export function getLocale(): Locale {
   return current;
 }
@@ -46,12 +91,17 @@ export function getLocale(): Locale {
 export function setLocale(loc: Locale): void {
   if (loc === current) return;
   current = loc;
+  if (!isBuiltin(loc) && !overlays.has(loc)) {
+    // Picked before its catalogue was fetched — load it now. The UI
+    // renders English in the meantime and re-renders when it lands.
+    void loadLocaleMessages(loc);
+  }
   try {
     localStorage.setItem(STORAGE_KEY, loc);
   } catch {
     /* ignore persistence failure */
   }
-  for (const l of listeners) l();
+  notify();
 }
 
 function subscribe(cb: () => void): () => void {
@@ -61,7 +111,8 @@ function subscribe(cb: () => void): () => void {
 
 /** Subscribe a component to locale changes; returns the current locale. */
 export function useLocale(): Locale {
-  return useSyncExternalStore(subscribe, getLocale, getLocale);
+  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return current;
 }
 
 /**
@@ -76,6 +127,106 @@ export function useT(): typeof t {
 interface Entry {
   ja: string;
   en: string;
+}
+
+// ── Extension-contributed locales ──
+
+/** Fetched catalogues, keyed by tag. */
+const overlays = new Map<string, Record<string, string>>();
+/** Endonyms for the language picker, keyed by tag. */
+const localeNames = new Map<string, string>();
+// Serialises overlapping bootstrapLocales calls. ExtensionsSection
+// calls it after every registry mutation, so two can easily be in
+// flight at once; without this the slower one — carrying the older
+// list — lands last and resurrects languages the operator just removed.
+let listGeneration = 0;
+// Generation of the list that is actually in localeNames. Only a
+// successful bootstrap moves it, so a refresh that fails (offline, server
+// error) neither discards a good response still in flight nor invalidates
+// a catalogue fetch that has nothing left to re-request it.
+let appliedGeneration = 0;
+
+/** One language offered by an installed extension. */
+export interface ExtensionLocale {
+  tag: string;
+  name: string;
+}
+
+/**
+ * Every language the picker should offer: the two builtins first, then
+ * extension-contributed tags in the order the server listed them.
+ */
+export function availableLocales(): { tag: Locale; name: string }[] {
+  const out: { tag: Locale; name: string }[] = [
+    { tag: "ja", name: "日本語" },
+    { tag: "en", name: "English" },
+  ];
+  for (const [tag, name] of localeNames) out.push({ tag, name });
+  return out;
+}
+
+/** Make a catalogue available under `tag` and re-render subscribers. */
+export function registerLocale(
+  tag: string,
+  messages: Record<string, string>,
+): void {
+  overlays.set(tag, messages);
+  if (tag === current) notify();
+}
+
+async function loadLocaleMessages(tag: string): Promise<void> {
+  // A catalogue fetch outlives the list it was started from: by the time
+  // it lands the operator may have removed the package. Re-check both the
+  // generation and the current list before registering, or a slow response
+  // resurrects a language bootstrapLocales just pruned.
+  const generation = appliedGeneration;
+  try {
+    const res = await fetch(`/api/v1/locales/${encodeURIComponent(tag)}`, {
+      headers: authHeaders(),
+    });
+    if (!res.ok) return;
+    const messages = (await res.json()) as Record<string, string>;
+    if (generation !== appliedGeneration || !localeNames.has(tag)) return;
+    registerLocale(tag, messages);
+  } catch {
+    /* offline or the extension went away — English is the fallback */
+  }
+}
+
+/**
+ * Fetch the list of extension-contributed languages and, if one of them is
+ * the active locale, its catalogue. Called once at startup; failure is
+ * silent because the builtin languages work regardless.
+ */
+export async function bootstrapLocales(): Promise<void> {
+  const generation = ++listGeneration;
+  let list: ExtensionLocale[];
+  try {
+    const res = await fetch("/api/v1/locales", { headers: authHeaders() });
+    if (!res.ok) return;
+    list = (await res.json()) as ExtensionLocale[];
+  } catch {
+    return;
+  }
+  // Older than what is already applied — a newer call won the race. A
+  // newer generation that failed is not in the way, because failure never
+  // moves appliedGeneration.
+  if (generation <= appliedGeneration) return;
+  appliedGeneration = generation;
+  localeNames.clear();
+  for (const loc of list) localeNames.set(loc.tag, loc.name);
+  // Drop catalogues whose package was disabled or uninstalled, so the
+  // UI stops rendering a language the instance no longer offers instead
+  // of keeping it alive until the next reload.
+  for (const tag of overlays.keys()) {
+    if (!localeNames.has(tag)) overlays.delete(tag);
+  }
+  // Notify regardless of whether the active locale changed: the picker
+  // itself has to re-render to show the new entries.
+  notify();
+  if (!isBuiltin(current) && localeNames.has(current)) {
+    await loadLocaleMessages(current);
+  }
 }
 
 const messages = {
@@ -1696,7 +1847,9 @@ export function t(
     }
     return key;
   }
-  const out = entry[current];
+  const out = isBuiltin(current)
+    ? entry[current]
+    : (overlays.get(current)?.[key] ?? entry.en);
   if (!params) return out;
   // Single pass with a function replacer so param values containing `$`
   // sequences ($&, $1, …) are inserted verbatim rather than interpreted as

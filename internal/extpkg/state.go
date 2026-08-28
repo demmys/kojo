@@ -113,6 +113,9 @@ func (m Manifest) clone() Manifest {
 		cp := *st
 		out.Contributes.Settings = &cp
 	}
+	// LocaleFile is all strings, so copying the slice is the whole
+	// deep copy.
+	out.Contributes.Locales = append([]LocaleFile(nil), m.Contributes.Locales...)
 	return out
 }
 

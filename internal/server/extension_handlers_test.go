@@ -29,10 +29,21 @@ const extTestManifest = `{
 func newExtTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for rel, body := range map[string]string{
+	writeExtTestFiles(t, dir, map[string]string{
 		extpkg.ManifestFilename: extTestManifest,
 		"skills/demo/SKILL.md":  "# demo\n",
-	} {
+	})
+	runExtTestGit(t, dir, "init", "-q", "-b", "main")
+	commitExtTestRepo(t, dir)
+	return dir
+}
+
+// writeExtTestFiles drops repository-relative files into dir, creating
+// parent directories. Overwrites, so a caller can replace the manifest
+// a previous helper wrote.
+func writeExtTestFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for rel, body := range files {
 		p := filepath.Join(dir, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
@@ -41,19 +52,26 @@ func newExtTestRepo(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"add", "-A"}, {"commit", "-q", "-m", "init"}} {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com",
-			"GIT_CONFIG_NOSYSTEM=1",
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
+}
+
+func commitExtTestRepo(t *testing.T, dir string) {
+	t.Helper()
+	runExtTestGit(t, dir, "add", "-A")
+	runExtTestGit(t, dir, "commit", "-q", "-m", "change")
+}
+
+func runExtTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com",
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
-	return dir
 }
 
 // newExtTestServer builds a Server carrying only an extension registry.
@@ -340,4 +358,71 @@ func jsonString(s string) string {
 		panic(err)
 	}
 	return string(b)
+}
+
+// The locale list is the one extension route the frontend calls on
+// every page load, including on builds with no registry at all, so it
+// answers with an empty list instead of the 503 the others return.
+func TestLocaleListEmptyWithoutRegistry(t *testing.T) {
+	srv := &Server{logger: slog.Default()}
+	rr := extCall(t, srv.handleListLocales, http.MethodGet, "/api/v1/locales", "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rr.Code, rr.Body)
+	}
+	if strings.TrimSpace(rr.Body.String()) != "[]" {
+		t.Fatalf("body = %s, want []", rr.Body)
+	}
+}
+
+func TestLocaleRoutesServeContributedCatalogue(t *testing.T) {
+	srv := newExtTestServer(t)
+	repo := newExtTestLocaleRepo(t)
+	commit := extPreviewCommit(t, srv, repo)
+	rr := extCall(t, srv.handleInstallExtension, http.MethodPost, "/api/v1/extensions",
+		`{"url":`+jsonString(repo)+`,"commit":`+jsonString(commit)+`}`, nil)
+	if rr.Code != http.StatusCreated && rr.Code != http.StatusOK {
+		t.Fatalf("install status = %d: %s", rr.Code, rr.Body)
+	}
+
+	rr = extCall(t, srv.handleListLocales, http.MethodGet, "/api/v1/locales", "", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("list status = %d: %s", rr.Code, rr.Body)
+	}
+	var list []map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0]["tag"] != "zh-Hans" || list[0]["name"] != "简体中文" {
+		t.Fatalf("locales = %v", list)
+	}
+
+	rr = extCall(t, srv.handleGetLocaleMessages, http.MethodGet, "/api/v1/locales/zh-Hans", "",
+		map[string]string{"tag": "zh-Hans"})
+	if rr.Code != http.StatusOK {
+		t.Fatalf("messages status = %d: %s", rr.Code, rr.Body)
+	}
+	if got := decodeExt(t, rr)["common.cancel"]; got != "取消" {
+		t.Fatalf("common.cancel = %v", got)
+	}
+
+	rr = extCall(t, srv.handleGetLocaleMessages, http.MethodGet, "/api/v1/locales/ko", "",
+		map[string]string{"tag": "ko"})
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status for an uncontributed tag = %d, want 404", rr.Code)
+	}
+}
+
+// newExtTestLocaleRepo builds a package whose only contribution is a
+// single translation catalogue.
+func newExtTestLocaleRepo(t *testing.T) string {
+	t.Helper()
+	dir := newExtTestRepo(t)
+	manifest := `{"id":"lang","name":"Lang","version":"1.0.0",
+	  "contributes":{"locales":[{"tag":"zh-Hans","name":"简体中文","file":"locales/zh-Hans.json"}]}}`
+	writeExtTestFiles(t, dir, map[string]string{
+		extpkg.ManifestFilename: manifest,
+		"locales/zh-Hans.json":  `{"common.cancel":"取消"}`,
+	})
+	commitExtTestRepo(t, dir)
+	return dir
 }

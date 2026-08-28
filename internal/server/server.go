@@ -779,6 +779,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("POST /api/v1/extensions/{id}/token", s.handleRotateExtensionToken)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/config", s.handlePutExtensionConfig)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/agents/{agentId}", s.handlePutExtensionAgentBinding)
+	// UI languages contributed by extensions. Separate from
+	// /api/v1/extensions because they are a property of the browser
+	// rather than of any one package: the frontend asks "what
+	// languages exist" without caring which package supplied them.
+	mux.HandleFunc("GET /api/v1/locales", s.handleListLocales)
+	mux.HandleFunc("GET /api/v1/locales/{tag}", s.handleGetLocaleMessages)
 
 	// Op-log replay endpoint (§3.13.1). Owner-only. Wired only when
 	// the agent store is available — the fencing gate + every

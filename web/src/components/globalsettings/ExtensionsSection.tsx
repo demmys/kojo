@@ -18,7 +18,7 @@ import {
 } from "../../lib/extensionsApi";
 import { agentApi, type AgentInfo } from "../../lib/agentApi";
 import { errMsg } from "../../lib/utils";
-import { useT } from "../../lib/i18n";
+import { useT, bootstrapLocales } from "../../lib/i18n";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
@@ -64,6 +64,10 @@ export function ExtensionsSection({
         setServices(res.services);
       })
       .catch((err) => setError(errMsg(err)));
+    // Installing, enabling or removing a package can change which UI
+    // languages exist. Re-read them here so the language picker one
+    // section up is right without a page reload.
+    void bootstrapLocales();
   }, [setError]);
 
   useEffect(() => {
@@ -309,6 +313,14 @@ function ConsentPanel({
           )}
           {m.contributes.service && (
             <li>service ({m.contributes.service.scope})</li>
+          )}
+          {(m.contributes.locales ?? []).length > 0 && (
+            <li>
+              locales:{" "}
+              {(m.contributes.locales ?? [])
+                .map((l) => `${l.name} (${l.tag})`)
+                .join(", ")}
+            </li>
           )}
           {m.contributes.settings && (
             <li>settings ({m.contributes.settings.scope})</li>

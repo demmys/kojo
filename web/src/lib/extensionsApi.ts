@@ -34,10 +34,18 @@ export interface ExtensionSettings {
   schema: string;
 }
 
+/** A UI language a package adds to the language picker. */
+export interface ExtensionLocaleFile {
+  tag: string;
+  name: string;
+  file: string;
+}
+
 export interface ExtensionContributes {
   skills?: string[];
   mcpServers?: ExtensionMCPServer[];
   service?: ExtensionService;
+  locales?: ExtensionLocaleFile[];
   settings?: ExtensionSettings;
 }
 

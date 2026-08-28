@@ -59,6 +59,27 @@ func validateAgentID(id string) error {
 	return nil
 }
 
+// localeTagRe is a deliberately narrow BCP 47 subset: a 2-3 letter
+// primary language followed by alphanumeric subtags. The tag becomes a
+// URL path segment and a localStorage value, so anything with a slash,
+// dot or space is refused rather than escaped at every use site.
+var localeTagRe = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$`)
+
+// builtinLocales are the languages compiled into the web bundle. A
+// package may not claim one: the bundle's own catalogue would win for
+// every key it defines, so the package's file would apply only to the
+// keys the bundle forgot — a confusing half-override rather than a
+// translation.
+var builtinLocales = map[string]bool{"ja": true, "en": true}
+
+// Bounds on the locale list. A package translating the UI into more
+// than a handful of languages is conceivable; one translating it into
+// dozens is a mistake worth catching at install time.
+const (
+	maxLocales       = 32
+	maxLocaleNameLen = 64
+)
+
 // execKeyRe matches the GOOS/GOARCH keys of Service.Exec.
 var execKeyRe = regexp.MustCompile(`^[a-z0-9]+/[a-z0-9]+$`)
 
@@ -112,6 +133,26 @@ type Contributes struct {
 	MCPServers []MCPServer `json:"mcpServers,omitempty"`
 	Service    *Service    `json:"service,omitempty"`
 	Settings   *Settings   `json:"settings,omitempty"`
+	// Locales are UI translation catalogues. The web bundle ships
+	// ja and en compiled in; a package adds further languages as
+	// data, which is the only form a prebuilt bundle can accept.
+	Locales []LocaleFile `json:"locales,omitempty"`
+}
+
+// LocaleFile is one UI language contributed by a package.
+type LocaleFile struct {
+	// Tag is the BCP 47 language tag the locale registers under,
+	// e.g. "zh-Hans". It is what gets persisted as the operator's
+	// language choice, so it must stay stable across updates.
+	Tag string `json:"tag"`
+	// Name is the endonym shown in the language picker ("简体中文").
+	// Written in its own language on purpose: someone who needs the
+	// entry cannot necessarily read the current UI language.
+	Name string `json:"name"`
+	// File is a repository-relative JSON file mapping message keys
+	// to translated strings. Keys the file omits fall back to
+	// English, so a partial translation is useful immediately.
+	File string `json:"file"`
 }
 
 // MCPServer is an stdio MCP server definition contributed to agents.
@@ -253,6 +294,36 @@ func (m *Manifest) Validate() error {
 		}
 		if err := validateEnv(svc.Env, "contributes.service.env"); err != nil {
 			return err
+		}
+	}
+	// Caps on the locale list. Every entry ends up in the /locales
+	// response the frontend fetches on each page load, and the name is
+	// rendered directly into the language picker; a package with
+	// thousands of entries or a kilobyte-long endonym is a broken
+	// package, not a use case.
+	if n := len(m.Contributes.Locales); n > maxLocales {
+		return fmt.Errorf("contributes.locales: %d languages, at most %d are allowed", n, maxLocales)
+	}
+	tags := map[string]bool{}
+	for i, loc := range m.Contributes.Locales {
+		if !localeTagRe.MatchString(loc.Tag) {
+			return fmt.Errorf("contributes.locales[%d]: invalid tag %q, want a BCP 47 tag like \"zh-Hans\"", i, loc.Tag)
+		}
+		if builtinLocales[loc.Tag] {
+			return fmt.Errorf("contributes.locales[%d]: %q is built into kojo and cannot be replaced", i, loc.Tag)
+		}
+		if tags[loc.Tag] {
+			return fmt.Errorf("contributes.locales: duplicate tag %q", loc.Tag)
+		}
+		tags[loc.Tag] = true
+		if strings.TrimSpace(loc.Name) == "" {
+			return fmt.Errorf("contributes.locales[%d]: name is required", i)
+		}
+		if len(loc.Name) > maxLocaleNameLen {
+			return fmt.Errorf("contributes.locales[%d]: name is longer than %d bytes", i, maxLocaleNameLen)
+		}
+		if err := checkRelPath(loc.File); err != nil {
+			return fmt.Errorf("contributes.locales[%d].file: %w", i, err)
 		}
 	}
 	if st := m.Contributes.Settings; st != nil {

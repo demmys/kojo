@@ -630,6 +630,19 @@ func verifyContributions(dir string, m *Manifest) error {
 			return fmt.Errorf("contributes.settings.schema: %s is not a JSON object", st.Schema)
 		}
 	}
+	// Locale files are parsed, not just stat'd: a catalogue that is
+	// not a flat JSON object would leave the language installed and
+	// permanently empty, and the operator would see a picker entry
+	// that does nothing.
+	for i, loc := range m.Contributes.Locales {
+		file, err := containedPath(dir, loc.File)
+		if err != nil {
+			return fmt.Errorf("contributes.locales[%d].file: %s is missing from the package: %w", i, loc.File, err)
+		}
+		if _, err := readLocaleFile(file); err != nil {
+			return fmt.Errorf("contributes.locales[%d].file: %s is not a usable message catalogue: %w", i, loc.File, err)
+		}
+	}
 	// A relative MCP command is part of the package, so it has to be
 	// there and be runnable now — the alternative is a server that
 	// fails to spawn on the agent's next turn, where the operator

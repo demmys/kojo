@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -125,6 +126,12 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 // /owner-deputy, generate-*) fall through and 403. Note: POST /api/v1/groupdms
 // (group creation) is exposed to Agent / PrivAgent below — the handler
 // then enforces the caller-in-memberIds invariant.
+// localeTagRe mirrors extpkg's tag validation so only an actual language
+// tag is public. A future GET /api/v1/locales/<something-else> is not a
+// tag, so it keeps the owner-only default instead of inheriting this
+// exemption from a loose path match.
+var localeTagRe = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$`)
+
 func AllowNonOwner(p Principal, method, path string) bool {
 	if p.IsOwner() {
 		return true
@@ -260,6 +267,20 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	// Bare /api/v1/info — reduced view (version only) returned by the handler.
 	if method == http.MethodGet && path == "/api/v1/info" {
 		return true
+	}
+	// UI languages contributed by extensions. Every dashboard client
+	// fetches these at boot regardless of who is looking, and a list of
+	// language tags plus their endonyms — and the translated strings
+	// themselves — carry no identity or instance data. Owner-gating them
+	// would silently leave non-owner dashboards stuck in English.
+	// Only the list and one tag below it: an exact match plus a single
+	// non-empty segment, so a route added under this prefix later is not
+	// published to the world by accident.
+	if method == http.MethodGet && path == "/api/v1/locales" {
+		return true
+	}
+	if method == http.MethodGet && strings.HasPrefix(path, "/api/v1/locales/") {
+		return localeTagRe.MatchString(strings.TrimPrefix(path, "/api/v1/locales/"))
 	}
 	// Peer list: agents need this to discover handoff targets
 	// by Tailscale machine name. The wire shape carries no

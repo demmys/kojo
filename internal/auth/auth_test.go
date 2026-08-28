@@ -355,6 +355,22 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodDelete, "/api/v1/agents/ag_x/attach-cache", priv, false},
 		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", ag, false},
 		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", guest, false},
+		// UI languages are public reads: a tag list and translated
+		// strings say nothing about the instance, and the dashboard
+		// fetches them at boot for every role.
+		{http.MethodGet, "/api/v1/locales", guest, true},
+		{http.MethodGet, "/api/v1/locales/zh-Hans", guest, true},
+		{http.MethodGet, "/api/v1/locales/zh-Hans", ag, true},
+		// Nothing else on that prefix: there are no mutating locale
+		// routes, so a POST must not slip through the prefix match.
+		{http.MethodPost, "/api/v1/locales", guest, false},
+		{http.MethodPost, "/api/v1/locales/zh-Hans", guest, false},
+		// Not a bare tag: anything deeper under the prefix stays owner-only.
+		{http.MethodGet, "/api/v1/locales/zh-Hans/raw", guest, false},
+		{http.MethodGet, "/api/v1/locales/", guest, false},
+		// Not a language tag: a future admin route under the prefix keeps
+		// the owner-only default.
+		{http.MethodGet, "/api/v1/locales/config", guest, false},
 	}
 	for _, c := range cases {
 		t.Run(c.method+" "+c.path+"/"+roleName(c.p.Role), func(t *testing.T) {

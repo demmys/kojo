@@ -383,3 +383,31 @@ func (s *Server) handleRotateExtensionToken(w http.ResponseWriter, r *http.Reque
 	s.publishExtensionsChanged()
 	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "token": token})
 }
+
+// handleListLocales lists the UI languages contributed by installed
+// extensions. It answers with an empty array rather than 503 when the
+// registry is unavailable: the frontend calls this during boot on every
+// page load, and a build with extensions disabled simply has no extra
+// languages — that is not an error worth showing the operator.
+func (s *Server) handleListLocales(w http.ResponseWriter, r *http.Request) {
+	out := []extpkg.LocaleContribution{}
+	if s.extensions != nil {
+		out = append(out, s.extensions.Locales()...)
+	}
+	writeJSONResponse(w, http.StatusOK, out)
+}
+
+// handleGetLocaleMessages serves one language's message catalogue,
+// merged across every enabled package contributing that tag.
+func (s *Server) handleGetLocaleMessages(w http.ResponseWriter, r *http.Request) {
+	mgr, ok := s.requireExtensions(w)
+	if !ok {
+		return
+	}
+	msgs, err := mgr.LocaleMessages(r.PathValue("tag"))
+	if err != nil {
+		writeExtensionError(w, err)
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, msgs)
+}

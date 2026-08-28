@@ -11,7 +11,7 @@ import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useXAIApiKey } from "./globalsettings/useXAIApiKey";
 import { useEnterSends } from "../lib/preferences";
-import { useLocale, setLocale, useT, type Locale } from "../lib/i18n";
+import { useLocale, setLocale, useT, availableLocales } from "../lib/i18n";
 import { PageHeader } from "./ui/PageHeader";
 import { SectionCard } from "./ui/SectionCard";
 import { Field } from "./ui/Field";
@@ -54,12 +54,12 @@ export function GlobalSettings() {
       <main className="mx-auto max-w-[560px] space-y-6 px-4 py-6">
         <SectionCard title={t("gs.language")}>
           <Field help={t("gs.languageHelp")}>
-            <Select
-              value={locale}
-              onChange={(e) => setLocale(e.target.value as Locale)}
-            >
-              <option value="ja">日本語</option>
-              <option value="en">English</option>
+            <Select value={locale} onChange={(e) => setLocale(e.target.value)}>
+              {availableLocales().map((l) => (
+                <option key={l.tag} value={l.tag}>
+                  {l.name}
+                </option>
+              ))}
             </Select>
           </Field>
         </SectionCard>

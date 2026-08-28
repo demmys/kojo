@@ -42,19 +42,28 @@ type TruncateMemoryResult struct {
 	// would have been left empty).
 	ClaudeSessionFilesRemoved int `json:"claudeSessionFilesRemoved"`
 
+	// GrokSessionEntriesRemoved counts chat_history.jsonl records dropped
+	// while trimming grok sessions back to a turn boundary. Grok records
+	// carry no timestamp of their own, but events.jsonl's `turn_started`
+	// maps an RFC3339 ts to the exact chat_history line count at that
+	// turn's start, so the conversation prefix (and the agent's context)
+	// survives the cut instead of being thrown away.
+	GrokSessionEntriesRemoved int `json:"grokSessionEntriesRemoved"`
+
 	// GrokSessionsRemoved counts UUID-named grok session subdirectories
-	// dropped from $GROK_HOME/sessions/<encoded(agentDir)>/. Grok's
-	// events.jsonl / chat_history.jsonl have no kojo-compatible per-record
-	// timestamp scheme, so any truncate that lands inside a session
-	// drops the entire session rather than risk replaying a torn turn
-	// log on the next `grok --resume <id>`. The session_id pointer file
-	// (<agentDir>/.grok/session_id) is removed alongside so the next
-	// non-OneShot turn opens a fresh session.
+	// dropped outright from $GROK_HOME/sessions/<encoded(agentDir)>/.
+	// Only sessions whose very FIRST turn is at-or-after the threshold
+	// land here — nothing conversational would survive the trim and the
+	// leftover bootstrap records are not a usable `grok --resume` target.
+	// The resume pointers (<agentDir>/.grok/session_id and the keyed
+	// refs under .grok/threads) are cleared only for those sessions.
 	GrokSessionsRemoved int `json:"grokSessionsRemoved"`
 
-	// GrokSessionFilesRemoved counts every regular file deleted from
-	// the dropped grok session subtrees (events.jsonl, chat_history.jsonl,
-	// summary.json, system_prompt.txt, terminal/*.log, …).
+	// GrokSessionFilesRemoved counts every regular file deleted from the
+	// grok session subtrees dropped outright (events.jsonl,
+	// chat_history.jsonl, summary.json, system_prompt.txt,
+	// terminal/*.log, …). Trimmed-in-place sessions contribute nothing
+	// here — their files are rewritten, not removed.
 	GrokSessionFilesRemoved int `json:"grokSessionFilesRemoved"`
 
 	// CodexThreadsRemoved counts Codex app-server threads whose Kojo
@@ -127,7 +136,7 @@ func (m *Manager) TruncateMemoryFromMessage(agentID, msgID string) (*TruncateMem
 	if strings.TrimSpace(msgID) == "" {
 		return nil, fmt.Errorf("messageID is required")
 	}
-	return m.truncateMemory(agentID, time.Time{}, msgID)
+	return m.truncateMemory(agentID, time.Time{}, msgID, truncateOptions{})
 }
 
 // TruncateMemoryAt removes everything in the agent's memory recorded at or
@@ -157,7 +166,35 @@ func (m *Manager) TruncateMemoryFromMessage(agentID, msgID string) (*TruncateMem
 // pollers see ErrAgentResetting in the meantime instead of racing the
 // rewrites against memory writes.
 func (m *Manager) TruncateMemoryAt(agentID string, since time.Time) (*TruncateMemoryResult, error) {
-	return m.truncateMemory(agentID, since, "")
+	return m.truncateMemory(agentID, since, "", truncateOptions{})
+}
+
+// RewindToMessage rolls the agent back to just before msgID: the message
+// and everything after it leave the kojo transcript, and each backend's
+// native session state (Claude session JSONL, grok session dirs, Codex
+// threads) is trimmed to the same boundary so the CLI-side context matches
+// what the UI now shows.
+//
+// Unlike TruncateMemoryFromMessage this does NOT touch the daily diary or
+// the derived recent.md summary. Rewinding a conversation is not the same
+// as erasing what the agent wrote down about that day, and silently
+// deleting diary entries is the kind of collateral damage nobody clicking
+// "rewind" is asking for. Use TruncateMemoryFromMessage when the intent
+// really is "forget everything from here".
+//
+// There is no redo: the removed turns are gone.
+func (m *Manager) RewindToMessage(agentID, msgID string) (*TruncateMemoryResult, error) {
+	if strings.TrimSpace(msgID) == "" {
+		return nil, fmt.Errorf("messageID is required")
+	}
+	return m.truncateMemory(agentID, time.Time{}, msgID, truncateOptions{keepDiary: true})
+}
+
+// truncateOptions tunes how far a truncate reaches beyond the transcript.
+type truncateOptions struct {
+	// keepDiary leaves memory/YYYY-MM-DD.md (and the derived recent.md)
+	// alone. Set by RewindToMessage.
+	keepDiary bool
 }
 
 // truncateMemory is the shared implementation behind TruncateMemoryAt and
@@ -166,7 +203,7 @@ func (m *Manager) TruncateMemoryAt(agentID string, since time.Time) (*TruncateMe
 // fromMessageId distinguish between messages that share an RFC3339-second
 // timestamp. Claude session JSONL and the daily diary still use the
 // derived `since` because they don't carry kojo's per-message ID.
-func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID string) (*TruncateMemoryResult, error) {
+func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID string, opts truncateOptions) (*TruncateMemoryResult, error) {
 	m.mu.Lock()
 	_, ok := m.agents[agentID]
 	m.mu.Unlock()
@@ -221,6 +258,13 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	}
 	dir := agentDir(agentID)
 
+	// 1b. Kill any live persistent claude process first. It holds the
+	//     conversation in memory and rewrites its JSONL on exit, so
+	//     trimming the file underneath a running process would either be
+	//     clobbered or leave the removed tail in the model's context —
+	//     exactly what a rewind is supposed to undo.
+	m.closeClaudeSessionSync(agentID)
+
 	// 2. Claude session JSONL files. Best-effort: a per-file failure is
 	//    logged but does not abort the whole truncation, since the DB
 	//    truncate has already committed and bailing now would leave the
@@ -232,21 +276,21 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.ClaudeSessionEntriesRemoved = entriesRm
 	res.ClaudeSessionFilesRemoved = filesRm
 
-	// 2b. Grok session subtree. Grok's events.jsonl / chat_history.jsonl
-	//     records do not carry the RFC3339 `timestamp` field we trim
-	//     claude JSONL on, so a per-record cut would either be
-	//     unreliable (timestamp guessed from a non-canonical field)
-	//     or destructively wrong (resume after a torn turn breaks the
-	//     UI replay). Drop the session wholesale and let the next
-	//     non-OneShot turn open a fresh one with the post-truncate
-	//     transcript still injected via the system prompt. Best-effort
-	//     across files; called unconditionally because a non-grok agent
+	// 2b. Grok session subtree. Trimmed at a turn boundary rather than
+	//     dropped: grok's chat_history.jsonl records carry no timestamp,
+	//     but events.jsonl's `turn_started` records carry both an
+	//     RFC3339 ts and the chat_history line count at that instant, so
+	//     the cut lands exactly between turns and the conversation
+	//     prefix survives. Sessions whose first turn is already past the
+	//     threshold have no usable remainder and are removed whole.
+	//     Best-effort; called unconditionally because a non-grok agent
 	//     simply has no $GROK_HOME/sessions/<encoded(agentDir)>/ entry
 	//     and the helper no-ops.
-	grokFilesRm, grokSessRm, gerr := clearGrokSessionCounted(agentID)
+	grokEntriesRm, grokSessRm, grokFilesRm, gerr := truncateGrokSessions(agentID, since, m.logger)
 	if gerr != nil {
 		m.logger.Warn("truncate: grok session partial failure", "agent", agentID, "err", gerr)
 	}
+	res.GrokSessionEntriesRemoved = grokEntriesRm
 	res.GrokSessionFilesRemoved = grokFilesRm
 	res.GrokSessionsRemoved = grokSessRm
 
@@ -261,10 +305,14 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race
 	//    our file rewrite against the DB body it just observed.
+	//    Skipped entirely under opts.keepDiary (rewind).
 	releaseSync := lockMemorySync(agentID)
-	dEntries, dFiles, err := m.truncateDiary(ctx, agentID, since)
-	if err != nil {
-		m.logger.Warn("truncate: diary partial failure", "agent", agentID, "err", err)
+	var dEntries, dFiles int
+	if !opts.keepDiary {
+		dEntries, dFiles, err = m.truncateDiary(ctx, agentID, since)
+		if err != nil {
+			m.logger.Warn("truncate: diary partial failure", "agent", agentID, "err", err)
+		}
 	}
 	res.DiaryEntriesRemoved = dEntries
 	res.DiaryFilesRemoved = dFiles

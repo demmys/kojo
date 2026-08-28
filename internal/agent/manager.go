@@ -1998,6 +1998,11 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// prompt is now the single source of the attachment contract and can be
 	// filtered per turn; remove any legacy skill copies during migration.
 	RemoveLegacyAttachSkills(agentID, m.logger)
+	// Extension-contributed skills, materialised into the same
+	// project-config skills/ tree. Runs every turn so enabling,
+	// disabling or updating a package takes effect on the agent's
+	// next message without a restart.
+	SyncExtensionSkillsForTool(agentID, agentCopy.Tool, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""

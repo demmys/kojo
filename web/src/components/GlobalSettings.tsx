@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
 import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
+import { ExtensionsSection } from "./globalsettings/ExtensionsSection";
 import { PeersSection } from "./globalsettings/PeersSection";
 import { PersonaTemplatesSection } from "./globalsettings/PersonaTemplatesSection";
 import { SystemSection } from "./globalsettings/SystemSection";
@@ -65,6 +66,8 @@ export function GlobalSettings() {
         <ApiKeysSection gemini={gemini} embedding={embedding} xai={xai} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />
+
+        <ExtensionsSection setError={setError} flashSuccess={flashSuccess} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
         <SystemSection setError={setError} />

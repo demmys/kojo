@@ -281,25 +281,6 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	// Materialise the user message via --prompt-file. Passing the
-	// prompt through argv works for short inputs but risks ARG_MAX
-	// truncation and removes ambiguity around messages that start
-	// with "-" (which grok's clap parser would treat as flags).
-	promptFile, err := os.CreateTemp(dir, "grok-prompt-*.txt")
-	if err != nil {
-		return nil, fmt.Errorf("create prompt file: %w", err)
-	}
-	promptPath := promptFile.Name()
-	if _, err := promptFile.WriteString(userMessage); err != nil {
-		promptFile.Close()
-		os.Remove(promptPath)
-		return nil, fmt.Errorf("write prompt file: %w", err)
-	}
-	if err := promptFile.Close(); err != nil {
-		os.Remove(promptPath)
-		return nil, fmt.Errorf("close prompt file: %w", err)
-	}
-
 	// Resume strategy, per (OneShot, SessionKey):
 	//   !OneShot            → resume the ID stored for opts.SessionKey
 	//                         ("" = the agent's own session), or start
@@ -324,6 +305,36 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 				"agent", agent.ID, "staleId", resumeID)
 			resumeID = ""
 		}
+	}
+
+	// A fresh session has no history of its own, so bootstrap it with a
+	// bounded transcript excerpt (including the recent tool calls) the
+	// same way ClaudeBackend does. Without this, a session that was
+	// reset / GC'd / lost to a stale ref leaves the agent blind to what
+	// it just did — re-running commands it already ran. Resumed sessions
+	// skip it: their context is already on disk. OneShot turns skip it
+	// too — Slack / Discord / Group DM carry their own context.
+	if !opts.OneShot && resumeID == "" && opts.RecentMessagesContext != "" {
+		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
+	}
+
+	// Materialise the user message via --prompt-file. Passing the
+	// prompt through argv works for short inputs but risks ARG_MAX
+	// truncation and removes ambiguity around messages that start
+	// with "-" (which grok's clap parser would treat as flags).
+	promptFile, err := os.CreateTemp(dir, "grok-prompt-*.txt")
+	if err != nil {
+		return nil, fmt.Errorf("create prompt file: %w", err)
+	}
+	promptPath := promptFile.Name()
+	if _, err := promptFile.WriteString(userMessage); err != nil {
+		promptFile.Close()
+		os.Remove(promptPath)
+		return nil, fmt.Errorf("write prompt file: %w", err)
+	}
+	if err := promptFile.Close(); err != nil {
+		os.Remove(promptPath)
+		return nil, fmt.Errorf("close prompt file: %w", err)
 	}
 
 	args := buildGrokArgs(promptPath, dir, resumeID, agent, systemPrompt)

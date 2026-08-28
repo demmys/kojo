@@ -94,17 +94,34 @@ func toKVResponse(rec *store.KVRecord) kvResponse {
 	return out
 }
 
-// handleListKV lists all rows in a namespace. Owner-only — kv can
-// hold arbitrary data including non-VAPID secrets.
+// kvNamespaceAllowed reports whether the principal may touch this
+// namespace. Owner reaches all of them. An extension holding kv:own
+// reaches exactly one — its own — which is what turns the scope the
+// operator acknowledged at install time into something the package can
+// actually use; without this every kv call from a package 403s and the
+// scope is decoration. auth.allowExtension already confines the path,
+// so this is the second of the two checks, not the only one.
+func kvNamespaceAllowed(p auth.Principal, ns string) bool {
+	if p.IsOwner() {
+		return true
+	}
+	if p.IsExtension() && p.HasScope("kv:own") {
+		own := auth.ExtensionKVNamespace(p.ExtensionID)
+		return own != "" && ns == own
+	}
+	return false
+}
+
+// handleListKV lists all rows in a namespace.
 func (s *Server) handleListKV(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden", "kv API is owner-only")
-		return
-	}
 	ns := r.PathValue("namespace")
 	if err := validateKVPathSegment(ns, "namespace"); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if !kvNamespaceAllowed(p, ns) {
+		writeError(w, http.StatusForbidden, "forbidden", "kv namespace is not yours")
 		return
 	}
 	st := s.agents.Store()
@@ -129,10 +146,6 @@ func (s *Server) handleListKV(w http.ResponseWriter, r *http.Request) {
 // (the encrypted blob is never serialized over HTTP).
 func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden", "kv API is owner-only")
-		return
-	}
 	ns := r.PathValue("namespace")
 	key := r.PathValue("key")
 	if err := validateKVPathSegment(ns, "namespace"); err != nil {
@@ -141,6 +154,10 @@ func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateKVPathSegment(key, "key"); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if !kvNamespaceAllowed(p, ns) {
+		writeError(w, http.StatusForbidden, "forbidden", "kv namespace is not yours")
 		return
 	}
 	st := s.agents.Store()
@@ -181,10 +198,6 @@ func (s *Server) handleGetKV(w http.ResponseWriter, r *http.Request) {
 //   - no precondition   → unconditional upsert (last-writer-wins)
 func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden", "kv API is owner-only")
-		return
-	}
 	ns := r.PathValue("namespace")
 	key := r.PathValue("key")
 	if err := validateKVPathSegment(ns, "namespace"); err != nil {
@@ -193,6 +206,10 @@ func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateKVPathSegment(key, "key"); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if !kvNamespaceAllowed(p, ns) {
+		writeError(w, http.StatusForbidden, "forbidden", "kv namespace is not yours")
 		return
 	}
 	// Precondition handling for PUT:
@@ -309,10 +326,6 @@ func (s *Server) handlePutKV(w http.ResponseWriter, r *http.Request) {
 // outright since the store doesn't support wildcard deletes).
 func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
-		writeError(w, http.StatusForbidden, "forbidden", "kv API is owner-only")
-		return
-	}
 	ns := r.PathValue("namespace")
 	key := r.PathValue("key")
 	if err := validateKVPathSegment(ns, "namespace"); err != nil {
@@ -321,6 +334,10 @@ func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateKVPathSegment(key, "key"); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	if !kvNamespaceAllowed(p, ns) {
+		writeError(w, http.StatusForbidden, "forbidden", "kv namespace is not yours")
 		return
 	}
 	ifMatch, ifMatchPresent, err := extractDomainIfMatch(r)

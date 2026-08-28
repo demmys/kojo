@@ -806,6 +806,42 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 // Same auth gate as reset/delete (CanDeleteOrReset), same busy / reset
 // guard semantics. Returns 404 when the agent or fromMessageId can't be
 // found, 409 if a chat is in flight or another reset is racing.
+// handleRewindToMessage rolls the agent's conversation back to just before
+// msgId — the message and everything after it leave the transcript, and the
+// backend's native session state (Claude session JSONL, grok session dirs,
+// Codex threads) is trimmed to the same boundary so the CLI-side context
+// matches the UI. The daily diary is left alone; see Manager.RewindToMessage.
+//
+// Same auth gate and busy/reset semantics as memory/truncate. There is no
+// redo — the removed turns are gone.
+func (s *Server) handleRewindToMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgID := r.PathValue("msgId")
+	p := auth.FromContext(r.Context())
+	if !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to rewind others' conversation")
+		return
+	}
+
+	res, err := s.agents.RewindToMessage(id, msgID)
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound), errors.Is(err, agent.ErrMessageNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrMessageETagMismatch):
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		case errors.Is(err, agent.ErrAgentArchived):
+			writeError(w, http.StatusConflict, "archived", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, res)
+}
+
 func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
@@ -968,6 +1004,19 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
+	if s.extensions != nil {
+		// Drop the deleted agent's extension bindings. Archive keeps
+		// them: the row comes back on unarchive, and so should its
+		// per-agent extension config.
+		if !archive {
+			if err := s.extensions.ForgetAgent(id); err != nil {
+				s.logger.Warn("drop extension bindings failed", "agent", id, "err", err)
+			}
+		}
+		// Either way the agent is gone from service: reconcile stops
+		// any per-agent extension process that was running for it.
+		s.reconcileExtensionServices()
+	}
 	// Echo the new ETag for archive=true (the row still exists with
 	// a bumped etag). For full delete the row is gone — no useful
 	// etag to return. readAgentETag returns "" when the row is
@@ -1046,6 +1095,9 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 				"agent", id, "reason", mutErr.Error())
 		}
 	}
+	// Per-agent extension services are gated on the agent being
+	// active, so the restored agent's processes come back here.
+	s.reconcileExtensionServices()
 	if a, ok := s.agents.Get(id); ok {
 		if newETag := s.readAgentETag(r, id); newETag != "" {
 			w.Header().Set("ETag", quoteETag(newETag))

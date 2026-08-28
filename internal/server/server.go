@@ -16,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +25,9 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/eventbus"
+	"github.com/loppo-llc/kojo/internal/extpkg"
 	"github.com/loppo-llc/kojo/internal/filebrowser"
 	gitpkg "github.com/loppo-llc/kojo/internal/git"
 	"github.com/loppo-llc/kojo/internal/notify"
@@ -88,10 +91,18 @@ func httpServerErrorLog(logger *slog.Logger) *log.Logger {
 var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
 
 type Server struct {
-	sessions        *session.Manager
-	agents          *agent.Manager
-	groupdms        *agent.GroupDMManager
-	slackHub        *slackbot.Hub
+	sessions *session.Manager
+	agents   *agent.Manager
+	groupdms *agent.GroupDMManager
+	slackHub *slackbot.Hub
+	// extensions is the kojo extension-package registry (packages
+	// installed from a git URL). Nil on PeerOnly daemons and when
+	// the registry directory could not be opened; every handler
+	// degrades to 503 rather than panicking.
+	extensions *extpkg.Manager
+	// extSupervisor owns the extension service processes. Nil until
+	// StartExtensions runs (i.e. until the API listener is bound).
+	extSupervisor   *extpkg.Supervisor
 	files           *filebrowser.Browser
 	git             *gitpkg.Manager
 	notify          *notify.Manager
@@ -529,6 +540,21 @@ func New(cfg Config) *Server {
 		}
 	}
 
+	// Extension-package registry. PeerOnly skips it for the same
+	// reason it skips the Slack hub: a daemon-only peer hosts no
+	// agents, so it must not run a second copy of an extension that
+	// the Hub already runs. A failure here is logged and leaves the
+	// registry nil — the rest of the daemon must still start.
+	if !cfg.PeerOnly {
+		extRoot := filepath.Join(configdir.Path(), "extensions")
+		extMgr, err := extpkg.NewManager(extRoot, cfg.Version, logger)
+		if err != nil {
+			logger.Error("extension registry unavailable", "root", extRoot, "error", err)
+		} else {
+			s.extensions = extMgr
+		}
+	}
+
 	// send push notification when an agent finishes its response.
 	// PeerOnly skips this wiring: the peer doesn't host agents, so
 	// OnChatDone would never fire — but more importantly, even if
@@ -735,6 +761,24 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("PUT /api/v1/kv/{namespace}/{key...}", s.handlePutKV)
 		mux.HandleFunc("DELETE /api/v1/kv/{namespace}/{key...}", s.handleDeleteKV)
 	}
+
+	// Extension packages. Owner-only by default-deny in
+	// auth.AllowNonOwner — installing code from a git URL is the
+	// most privileged operation kojo exposes, so no agent or peer
+	// token may reach it. Registered unconditionally; the handlers
+	// answer 503 when the registry is nil.
+	mux.HandleFunc("GET /api/v1/extensions", s.handleListExtensions)
+	mux.HandleFunc("POST /api/v1/extensions", s.handleInstallExtension)
+	mux.HandleFunc("POST /api/v1/extensions/preview", s.handlePreviewExtension)
+	mux.HandleFunc("GET /api/v1/extensions/{id}", s.handleGetExtension)
+	mux.HandleFunc("PATCH /api/v1/extensions/{id}", s.handlePatchExtension)
+	mux.HandleFunc("DELETE /api/v1/extensions/{id}", s.handleDeleteExtension)
+	mux.HandleFunc("POST /api/v1/extensions/{id}/update", s.handleUpdateExtension)
+	mux.HandleFunc("GET /api/v1/extensions/{id}/schema", s.handleExtensionSchema)
+	mux.HandleFunc("GET /api/v1/extensions/{id}/token", s.handleGetExtensionToken)
+	mux.HandleFunc("POST /api/v1/extensions/{id}/token", s.handleRotateExtensionToken)
+	mux.HandleFunc("PUT /api/v1/extensions/{id}/config", s.handlePutExtensionConfig)
+	mux.HandleFunc("PUT /api/v1/extensions/{id}/agents/{agentId}", s.handlePutExtensionAgentBinding)
 
 	// Op-log replay endpoint (§3.13.1). Owner-only. Wired only when
 	// the agent store is available — the fencing gate + every
@@ -947,6 +991,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 	mux.HandleFunc("POST /api/v1/agents/{id}/memory/truncate", s.handleTruncateAgentMemory)
+	mux.HandleFunc("POST /api/v1/agents/{id}/messages/{msgId}/rewind", s.handleRewindToMessage)
 	mux.HandleFunc("POST /api/v1/agents/{id}/fork", s.handleForkAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/privilege", s.handlePrivilegeAgent)
 	mux.HandleFunc("POST /api/v1/agents/{id}/owner-deputy", s.handleOwnerDeputyAgent)
@@ -1679,7 +1724,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.logger.Warn("public listener shutdown error", "err", err)
 	}
 
-	// Now stop background producers / hubs.
+	// Now stop background producers / hubs. Extension services go
+	// first: they are ordinary API clients, and letting them keep
+	// calling a half-torn-down daemon only produces noise in the log.
+	s.stopExtensionServices()
+
 	// Stop the mirror refresher BEFORE agents.Shutdown() so an in-flight
 	// sweep isn't writing to the store while the DB closes. Closing
 	// mirrorRefreshDone also cancels the sweep's fetch context, so this

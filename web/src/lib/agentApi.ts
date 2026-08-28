@@ -442,14 +442,16 @@ export interface TruncateMemoryResult {
   messagesRemoved: number;
   claudeSessionEntriesRemoved: number;
   claudeSessionFilesRemoved: number;
-  // Grok session subtrees dropped wholesale ($GROK_HOME/sessions/<encoded(agentDir)>/<uuid>/).
-  // Grok's events.jsonl has no kojo-compatible per-record timestamp so any
-  // truncate that lands inside a session drops the whole session — the next
-  // non-OneShot turn opens a fresh one.
+  // Grok sessions are trimmed at a turn boundary, not dropped: events.jsonl's
+  // `turn_started` records map an RFC3339 ts to the chat_history.jsonl line
+  // count at that instant, so the conversation prefix survives.
+  // grokSessionsRemoved counts only the sessions whose FIRST turn was already
+  // past the threshold — those have no usable remainder and go away whole.
   //
   // Optional because the fields were added after v0.19 — an older server
   // peer (mid-rollout) returns the response without them, and the UI
   // should render "0" instead of "undefined".
+  grokSessionEntriesRemoved?: number;
   grokSessionsRemoved?: number;
   grokSessionFilesRemoved?: number;
   diaryFilesRemoved: number;
@@ -909,6 +911,14 @@ export const agentApi = {
           expectedEtag,
         ).then((r) => r.value)
       : post<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}/regenerate`),
+
+  // rewindToMessage rolls the conversation back to just before msgId: the
+  // message and everything after it leave the transcript, and the backend's
+  // native session state (Claude session JSONL, grok session dirs, Codex
+  // threads) is trimmed to the same boundary so the model's context matches
+  // what the UI shows. The daily diary is NOT touched. No redo.
+  rewindToMessage: (agentId: string, msgId: string) =>
+    post<TruncateMemoryResult>(`/api/v1/agents/${agentId}/messages/${msgId}/rewind`),
 
   generatePersona: (currentPersona: string, prompt: string) =>
     post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),

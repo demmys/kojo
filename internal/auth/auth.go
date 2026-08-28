@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // Role identifies the actor behind an HTTP request after middleware
@@ -39,6 +40,15 @@ const (
 	RolePeer
 	// RoleOwner is the kojo user. It has full access to everything.
 	RoleOwner
+	// RoleExtension authenticates an installed extension package's
+	// out-of-process service (internal/extpkg). It is the only role
+	// whose surface is data-driven: the manifest's scope list, which
+	// the Owner acknowledged at install time, is carried on the
+	// Principal and consumed by allowExtension. An extension holds
+	// strictly less than RoleAgent — it has no self-scoped agent, so
+	// every agent-addressed route is gated on the operator having
+	// bound the package to that agent.
+	RoleExtension
 )
 
 // Principal identifies the actor behind a request.
@@ -55,6 +65,17 @@ type Principal struct {
 	OwnerDeputy bool
 	AgentID     string // populated for RoleAgent / RolePrivAgent
 	PeerID      string // populated for RolePeer (device_id from peer_registry); also stamped on RoleOwner when the Hub-public TailnetIdentityMiddleware's WhoIs lookup matches a paired peer, so events handlers can identify which paired-peer connection they're on without re-querying the registry
+	// ExtensionID names the installed package behind a RoleExtension
+	// request. It doubles as the KV namespace suffix the extension may
+	// read and write.
+	ExtensionID string
+	// Scopes is the manifest scope list the Owner granted at install
+	// time. Only meaningful for RoleExtension.
+	Scopes []string
+	// AgentScope lists the agent IDs the extension is currently bound
+	// to AND enabled for. Resolved per request, so revoking a binding
+	// takes effect on the next call rather than at the next restart.
+	AgentScope []string
 }
 
 // IsOwner returns true if the principal is the kojo user.
@@ -77,6 +98,41 @@ func (p Principal) IsAgent() bool {
 // proxying — re-blocking at the handler would 403 every proxied
 // request.
 func (p Principal) IsPeer() bool { return p.Role == RolePeer }
+
+// IsExtension reports whether the principal is an installed extension
+// package's service process.
+func (p Principal) IsExtension() bool { return p.Role == RoleExtension }
+
+// HasScope reports whether the extension was granted scope at install
+// time. Non-extension principals never hold scopes: the Owner does not
+// need them and an agent's surface is decided by AgentID, not a grant
+// list, so answering true here would silently widen those roles.
+func (p Principal) HasScope(scope string) bool {
+	if p.Role != RoleExtension {
+		return false
+	}
+	for _, s := range p.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// BoundTo reports whether the extension is enabled for agentID. An
+// extension may only address agents the operator explicitly bound it
+// to — installing a package is not consent to touch every agent.
+func (p Principal) BoundTo(agentID string) bool {
+	if p.Role != RoleExtension || agentID == "" {
+		return false
+	}
+	for _, id := range p.AgentScope {
+		if id == agentID {
+			return true
+		}
+	}
+	return false
+}
 
 // IsOwnerDeputy reports whether this principal is an agent the Owner
 // deputised to stand in for them over other agents. Owner and Peer are
@@ -180,6 +236,22 @@ type Resolver struct {
 	tokens        *TokenStore
 	isPrivileged  func(agentID string) bool
 	isOwnerDeputy func(agentID string) bool
+
+	mu           sync.RWMutex
+	extResolveFn ExtensionResolveFunc
+}
+
+// ExtensionResolveFunc maps a raw token to the installed extension that
+// owns it. extpkg.Manager implements it; the server wires it in after
+// both packages are constructed, which is why it is a setter rather
+// than a NewResolver argument.
+type ExtensionResolveFunc func(token string) (ExtensionIdentity, bool)
+
+// ExtensionIdentity is what an extension token resolves to.
+type ExtensionIdentity struct {
+	ID         string
+	Scopes     []string
+	AgentScope []string
 }
 
 // NewResolver builds a Resolver from a TokenStore and the two per-agent
@@ -213,7 +285,34 @@ func (r *Resolver) Resolve(token string) Principal {
 		}
 		return Principal{Role: RoleAgent, AgentID: id, OwnerDeputy: deputy}
 	}
+	// Extension tokens are checked last: they are the weakest role, so
+	// an ID collision with an agent token must never downgrade the
+	// agent (and cannot upgrade the extension).
+	r.mu.RLock()
+	fn := r.extResolveFn
+	r.mu.RUnlock()
+	if fn != nil {
+		if ident, ok := fn(token); ok && ident.ID != "" {
+			return Principal{
+				Role:        RoleExtension,
+				ExtensionID: ident.ID,
+				Scopes:      ident.Scopes,
+				AgentScope:  ident.AgentScope,
+			}
+		}
+	}
 	return Principal{Role: RoleGuest}
+}
+
+// SetExtensionResolver installs (or clears, with nil) the lookup used
+// to resolve extension tokens.
+func (r *Resolver) SetExtensionResolver(fn ExtensionResolveFunc) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.extResolveFn = fn
+	r.mu.Unlock()
 }
 
 // --- context plumbing ------------------------------------------------

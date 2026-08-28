@@ -85,6 +85,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		args = append(args, "-c", kv)
 	}
 	for name, srv := range opts.MCPServers {
+		if srv.isStdio() {
+			// Extension-contributed stdio server. Codex spawns it
+			// itself, so it needs the command, its argv and the
+			// KOJO_EXT_* environment as TOML config overrides.
+			args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.command=%s", name, tomlString(srv.Command)))
+			if len(srv.Args) > 0 {
+				args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.args=%s", name, tomlStringArray(srv.Args)))
+			}
+			if len(srv.Env) > 0 {
+				args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.env=%s", name, tomlStringTable(srv.Env)))
+			}
+			continue
+		}
 		args = append(args, "-c", fmt.Sprintf("mcp_servers.%s.url=%q", name, srv.URL))
 		// Codex's streamable HTTP MCP transport doesn't accept arbitrary request
 		// headers (`mcp_servers.<name>.http_headers` is rejected as an invalid

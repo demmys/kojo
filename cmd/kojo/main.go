@@ -1707,6 +1707,13 @@ func main() {
 		defer tsShutdown()
 	}
 
+	// Extension packages. Deferred to here for the same reason as the
+	// restart-wake consumer: every listener branch has already run, so
+	// agent.KojoAPIBase() is the address extension processes will be
+	// handed as KOJO_API_BASE. A PeerOnly daemon has no registry and
+	// this is a no-op.
+	srv.StartExtensions(agent.KojoAPIBase(), resolver)
+
 	// Consume a restart-wake marker if the previous process armed one
 	// (POST /api/v1/system/restart {"wake":true}) — fires ONE chat turn
 	// for the marked agent so it can verify its own deploy. Placed after

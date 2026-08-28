@@ -260,6 +260,12 @@ var kojoAPIBase string
 // API calls. Idempotent; safe to call repeatedly during boot.
 func SetKojoAPIBase(base string) { kojoAPIBase = base }
 
+// KojoAPIBase returns the auth-listener URL recorded by
+// SetKojoAPIBase, or "" before any listener is bound. Callers that
+// need the same value for non-agent subprocesses (extension services)
+// read it here instead of re-deriving it per listener branch.
+func KojoAPIBase() string { return kojoAPIBase }
+
 // agentTokenLookup, when set, returns the per-agent auth token kojo
 // should expose via $KOJO_AGENT_TOKEN to the PTY. Wired up by the
 // server using the auth.TokenStore.

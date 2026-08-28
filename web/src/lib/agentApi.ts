@@ -112,6 +112,7 @@ export interface AgentInfo {
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
   privileged?: boolean;
+  ownerDeputy?: boolean;
   // Strong HTTP entity tag of the v1 store row for this agent. Carry
   // alongside form state so PATCH /agents/{id} can send it as If-Match;
   // a server-side mismatch surfaces as PreconditionFailedError. Empty
@@ -199,6 +200,16 @@ export function isTurnErrorPreview(m?: { role: string; content: string }): boole
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
 // disabledInjections. Unknown keys are rejected by the server with 400,
 // so this list must stay in sync with the backend's validation.
+// AttachCacheResult is returned by both getAttachCache and clearAttachCache.
+// On GET, `deleted` is the number of blobs currently held (nothing has been
+// deleted yet) and `bytes` their total size; on DELETE both describe what the
+// call actually removed. `failed` counts blobs the server could not delete.
+export interface AttachCacheResult {
+  deleted: number;
+  bytes: number;
+  failed?: number;
+}
+
 export const CONTEXT_INJECTION_KEYS = [
   "user_context",
   "memory_md",
@@ -215,6 +226,35 @@ export const CONTEXT_INJECTION_KEYS = [
 ] as const;
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
+
+// Injection sections that only exist for agents with agentic tools.
+// buildSystemPrompt gates each of these on hasTools (= the backend is
+// not custom-bare): they hand the agent a shell recipe — stage a file
+// under the attach directory, curl the attention endpoint, read the
+// credentials guide, curl the group-DM API — none of which a single
+// stateless chat completion can act on. The toggle is therefore inert
+// for custom-bare and the UI disables it rather than implying an effect.
+// Keep in sync with the hasTools gates in internal/agent/memory.go.
+export const TOOL_ONLY_INJECTION_KEYS: readonly ContextInjectionKey[] = [
+  "credentials",
+  "groupdm",
+  "attachments",
+  "call_user",
+];
+
+// toolHasAgenticTools mirrors internal/agent.toolHasAgenticTools, legacy
+// name included: rows written before the rename still carry "llama.cpp",
+// and the server normalizes them to custom-bare (see legacyToolNames), so
+// a settings screen loaded against an un-migrated row must too.
+export function toolHasAgenticTools(tool: string): boolean {
+  return tool !== "custom-bare" && tool !== "llama.cpp";
+}
+
+// injectionSupportedByTool reports whether toggling the section has any
+// effect on the prompt built for this backend.
+export function injectionSupportedByTool(key: ContextInjectionKey, tool: string): boolean {
+  return toolHasAgenticTools(tool) || !TOOL_ONLY_INJECTION_KEYS.includes(key);
+}
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
 // Empty model/voice/stylePrompt are interpreted as "use default" at
@@ -597,6 +637,19 @@ export const agentApi = {
     params: { since: string } | { fromMessageId: string },
   ) => post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, params),
 
+  // Ingested-attachment blob cache (global scope, agents/{id}/attach/...).
+  // GET reports what is currently held so the settings screen can show the
+  // size before the operator commits; DELETE removes every blob under the
+  // prefix and reports what it actually freed.
+  //
+  // This is a cache purge, not a transcript edit: past messages keep their
+  // attachment references and render as broken links afterwards.
+  getAttachCache: (id: string) =>
+    get<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
+
+  clearAttachCache: (id: string) =>
+    del<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
+
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
   // user.md workspace file (per-agent notes about the people the agent works
@@ -686,6 +739,12 @@ export const agentApi = {
     post<{ id: string; privileged: boolean }>(
       `/api/v1/agents/${id}/privilege`,
       { privileged },
+    ),
+
+  setOwnerDeputy: (id: string, ownerDeputy: boolean) =>
+    post<{ id: string; ownerDeputy: boolean }>(
+      `/api/v1/agents/${id}/owner-deputy`,
+      { ownerDeputy },
     ),
 
   tasks: {

@@ -12,7 +12,11 @@ const mocks = vi.hoisted(() => ({
   clearAttention: vi.fn(),
 }));
 
-vi.mock("../lib/groupdmApi", () => ({
+vi.mock("../lib/groupdmApi", async (importOriginal) => ({
+  // The real classifier, not a copy of it — the Threads / Group DMs split is
+  // what this suite asserts on, and a stub would keep passing after the real
+  // rule regressed.
+  isThreadRoom: (await importOriginal<typeof import("../lib/groupdmApi")>()).isThreadRoom,
   groupdmApi: {
     list: mocks.groupList,
     unread: mocks.unread,
@@ -129,6 +133,32 @@ describe("Dashboard room list", () => {
     renderDashboard();
     expect(await screen.findByText("Threads · 1")).toBeInTheDocument();
     expect(screen.getByText("Group DMs · 1")).toBeInTheDocument();
+  });
+
+  // Regression: an agent↔agent 1:1 DM is kind "dm" with TWO members, and
+  // splitting on kind alone filed it under Threads.
+  it("keeps a two-member dm room under Group DMs, not Threads", async () => {
+    mocks.groupList.mockResolvedValue([
+      room({ id: "g1", name: "Team" }),
+      room({
+        id: "t1",
+        name: "Alice",
+        kind: "thread",
+        members: [{ agentId: "ag_a", agentName: "Alice" }],
+      }),
+      room({
+        id: "d2",
+        name: "Alice, Bob",
+        kind: "dm",
+        members: [
+          { agentId: "ag_a", agentName: "Alice" },
+          { agentId: "ag_b", agentName: "Bob" },
+        ],
+      }),
+    ]);
+    renderDashboard();
+    expect(await screen.findByText("Threads · 1")).toBeInTheDocument();
+    expect(screen.getByText("Group DMs · 2")).toBeInTheDocument();
   });
 
   it("renders unread and mention badges from the unread endpoint", async () => {

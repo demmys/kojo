@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { TransferSkip } from "../../lib/agentApi";
 import { useT } from "../../lib/i18n";
+import { formatBytes } from "../../lib/utils";
 
 // TransferSkipsNotice renders the owner-facing "skipped during
 // transfer" warning for an agent whose most recent §3.7 device-switch
@@ -45,11 +46,4 @@ export function TransferSkipsNotice({ skips }: { skips?: TransferSkip[] }) {
       )}
     </div>
   );
-}
-
-function formatBytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GiB`;
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
-  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KiB`;
-  return `${n} B`;
 }

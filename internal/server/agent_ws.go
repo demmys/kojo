@@ -483,8 +483,8 @@ func (s *Server) synthesizeTerminal(agentID string) agent.ChatEvent {
 	}
 	// No assistant message found — look for a persisted system error
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "system" && strings.HasPrefix(msgs[i].Content, "⚠️ Error: ") {
-			errText := strings.TrimPrefix(msgs[i].Content, "⚠️ Error: ")
+		if msgs[i].Role == "system" && strings.HasPrefix(msgs[i].Content, agent.NoticeErrorPrefix) {
+			errText := strings.TrimPrefix(msgs[i].Content, agent.NoticeErrorPrefix)
 			return agent.ChatEvent{Type: "error", ErrorMessage: errText}
 		}
 	}

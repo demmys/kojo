@@ -493,6 +493,16 @@ type codexStreamResult struct {
 	turnStatus    string // status reported by the newest turn/completed
 	turnCompleted bool   // true if turn/completed was received
 	cancelled     bool   // true if send returned false (context cancelled)
+
+	// streamedReasoning records the reasoning item ids that already arrived
+	// as item/reasoning/*Delta notifications, so the completed item for the
+	// same id is not appended a second time. See handleReasoningCompleted.
+	streamedReasoning map[string]bool
+
+	// anyStreamedReasoning is true once any reasoning delta arrived, with or
+	// without an item id. It is the fallback guard for a provider that streams
+	// deltas but leaves itemId empty, where the per-id set cannot match.
+	anyStreamedReasoning bool
 }
 
 // codexTurnStarter writes turn/start and returns its JSON-RPC request id.
@@ -718,10 +728,18 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 			return false
 		}
 		var params struct {
-			Delta string `json:"delta"`
+			ItemID string `json:"itemId"`
+			Delta  string `json:"delta"`
 		}
 		json.Unmarshal(*msg.Params, &params)
 		if params.Delta != "" {
+			res.anyStreamedReasoning = true
+			if params.ItemID != "" {
+				if res.streamedReasoning == nil {
+					res.streamedReasoning = map[string]bool{}
+				}
+				res.streamedReasoning[params.ItemID] = true
+			}
 			res.thinking.WriteString(params.Delta)
 			if !send(ChatEvent{Type: "thinking", Delta: params.Delta}) {
 				res.cancelled = true
@@ -859,6 +877,34 @@ func (res *codexStreamResult) handleAgentMessageDelta(msg *rpcMessage, itemPhase
 	return false
 }
 
+// codexReasoningItemText joins the entries of a completed reasoning item's
+// `summary` / `content` array. app-server writes plain strings there for a
+// custom provider and objects carrying a text field for OpenAI models, so
+// accept both and ignore anything else rather than rendering raw JSON.
+func codexReasoningItemText(entries []json.RawMessage) string {
+	parts := make([]string, 0, len(entries))
+	for _, raw := range entries {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil {
+			// Keep the entry verbatim; only skip it when it carries no text at
+			// all, so a model's own indentation and blank lines survive.
+			if strings.TrimSpace(s) != "" {
+				parts = append(parts, s)
+			}
+			continue
+		}
+		var obj struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &obj); err == nil {
+			if strings.TrimSpace(obj.Text) != "" {
+				parts = append(parts, obj.Text)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases map[string]string, send func(ChatEvent) bool) bool {
 	if msg.Params == nil {
 		return false
@@ -878,13 +924,44 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 			Error            *struct {
 				Message string `json:"message"`
 			} `json:"error"`
-			ContentItems json.RawMessage `json:"contentItems"`
-			Success      *bool           `json:"success"`
+			ContentItems json.RawMessage   `json:"contentItems"`
+			Success      *bool             `json:"success"`
+			Summary      []json.RawMessage `json:"summary"`
+			Content      []json.RawMessage `json:"content"`
 		} `json:"item"`
 	}
 	json.Unmarshal(*msg.Params, &params)
 
 	switch params.Item.Type {
+	case "reasoning":
+		// Reasoning does not always arrive as item/reasoning/*Delta. Against a
+		// custom model provider (custom-codex) app-server emits no reasoning
+		// deltas at all and only publishes the finished item, so without this
+		// branch the model's thinking never reaches the UI. Skip ids that did
+		// stream so the OpenAI provider does not duplicate its own summary.
+		if res.streamedReasoning[params.Item.ID] {
+			return false
+		}
+		if res.anyStreamedReasoning && params.Item.ID == "" {
+			// A provider that streams deltas without an item id cannot be
+			// matched per id, so fall back to suppressing the whole item.
+			return false
+		}
+		text := codexReasoningItemText(params.Item.Summary)
+		if text == "" {
+			text = codexReasoningItemText(params.Item.Content)
+		}
+		if text == "" {
+			return false
+		}
+		if prev := res.thinking.String(); prev != "" && !strings.HasSuffix(prev, "\n") {
+			text = "\n" + text
+		}
+		res.thinking.WriteString(text)
+		if !send(ChatEvent{Type: "thinking", Delta: text}) {
+			res.cancelled = true
+			return true
+		}
 	case "agentMessage":
 		// app-server normally streams agentMessage deltas, but the completed
 		// item is the authoritative snapshot. If no delta arrived at all, use

@@ -22,7 +22,11 @@ vi.mock("../../lib/agentApi", () => ({
   agentApi: { get: mocks.agentGet },
 }));
 
-vi.mock("../../lib/groupdmApi", () => ({
+vi.mock("../../lib/groupdmApi", async (importOriginal) => ({
+  // The real classifier, not a copy: the thread-vs-room split is what the
+  // component branches on, so a stub would make every affordance assertion
+  // vacuous the moment the real rule changed.
+  isThreadRoom: (await importOriginal<typeof import("../../lib/groupdmApi")>()).isThreadRoom,
   DEFAULT_GROUPDM_VENUE: "chatroom",
   USER_SENDER_ID: "user",
   DEFAULT_MAX_HOPS: 4,

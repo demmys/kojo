@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { api, type SessionInfo } from "../lib/api";
 import { agentApi, isTurnErrorPreview, type AgentInfo } from "../lib/agentApi";
-import { groupdmApi, getLastRead, type GroupDMInfo, type UnreadInfo } from "../lib/groupdmApi";
+import { groupdmApi, getLastRead, isThreadRoom, type GroupDMInfo, type UnreadInfo } from "../lib/groupdmApi";
 import { peersApi, type PeerInfo } from "../lib/peerApi";
 import { AgentAvatar } from "./agent/AgentAvatar";
 import { TransferSkipsNotice } from "./agent/TransferSkipsNotice";
@@ -382,10 +382,12 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     if (diff !== 0 && !Number.isNaN(diff)) return diff;
     return a.id.localeCompare(b.id);
   });
-  // First-class 1:1 rooms get their own "DMs" section; everything else
-  // (including legacy rooms without a kind) stays under "Group DMs".
-  const dmRooms = sortedRooms.filter((g) => g.kind === "dm" || g.kind === "thread");
-  const groupRooms = sortedRooms.filter((g) => g.kind !== "dm" && g.kind !== "thread");
+  // Threads (human↔agent side conversations) get their own section;
+  // everything else — multi-agent rooms, legacy rooms without a kind, and
+  // agent↔agent 1:1 DMs, which are kind "dm" with TWO members — stays under
+  // "Group DMs". Splitting on kind alone filed those DMs under Threads.
+  const dmRooms = sortedRooms.filter((g) => isThreadRoom(g));
+  const groupRooms = sortedRooms.filter((g) => !isThreadRoom(g));
 
   const unreadBadge = (roomId: string) => {
     const u = unreadByRoom.get(roomId);

@@ -422,10 +422,27 @@ type Agent struct {
 	ArchivedAt string `json:"archivedAt,omitempty"`
 
 	// Privileged grants the agent the ability to delete/reset other agents
-	// (but NOT to fork or read their full record). Owner-only mutation —
+	// (but NOT to fork or read their full record — those need the
+	// stronger OwnerDeputy grant below). Owner-only mutation —
 	// the API strips this field from PATCH bodies and exposes a dedicated
 	// POST /api/v1/agents/{id}/privilege handler instead.
 	Privileged bool `json:"privileged,omitempty"`
+
+	// OwnerDeputy makes the agent the Owner's stand-in over OTHER
+	// agents: everything Privileged grants, plus create, fork, full
+	// record reads, PATCH, and writes to their persona / user.md /
+	// status / anchor / MEMORY.md / memory entries. It is strictly
+	// stronger than Privileged but kept as its own flag: the two are
+	// granted independently, and only Privileged carries the
+	// restart-the-server power (auth.Principal.CanRestartServer).
+	//
+	// The grant never widens what the holder may do to ITSELF — a
+	// deputy still cannot flip its own privileged / ownerDeputy bits or
+	// disabledInjections, and cannot fork itself, so the flag is not a
+	// self-elevation path.
+	// Owner-only mutation via POST /api/v1/agents/{id}/owner-deputy;
+	// the API strips the field from PATCH bodies.
+	OwnerDeputy bool `json:"ownerDeputy,omitempty"`
 
 	// DeviceSwitchEnabled gates whether the §3.7 device-switch skill
 	// (kojo-switch-device) gets installed into the agent's .claude/skills
@@ -674,8 +691,10 @@ type AgentUpdateConfig struct {
 	// installs or removes the SKILL.md accordingly.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
 	// DisabledInjections replaces the whole set when non-nil; pass an
-	// empty array to re-enable everything. Owner-only (enforced at the
-	// HTTP handler). Keys validated via ValidateDisabledInjections.
+	// empty array to re-enable everything. Settable by the Owner, or by
+	// an owner-deputy acting on ANOTHER agent — never self-PATCHable
+	// (enforced at the HTTP handler). Keys validated via
+	// ValidateDisabledInjections.
 	DisabledInjections *[]string `json:"disabledInjections"`
 	// AutoEffort toggles the per-turn dynamic effort classifier. nil =
 	// "not provided; leave as-is"; explicit true/false overwrites.

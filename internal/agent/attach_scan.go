@@ -83,7 +83,9 @@ func (m *Manager) attachmentForwarder() AttachmentForwarder {
 const attachMaxBytes int64 = 10 << 30
 
 // scanAndIngestAttachments walks <agentDir>/.kojo/attach/ once,
-// moves every regular file from there into the blob store under
+// moves every regular file (and every symlink to one — the target's
+// bytes are copied, the target itself is left where it is) from
+// there into the blob store under
 //
 //	scope=global, path=agents/{agentID}/attach/{messageID}/{filename}
 //
@@ -171,7 +173,9 @@ func (m *Manager) scanAndIngestAttachmentsFromDirReserved(ctx context.Context, a
 	// rejected, dotfiles, and any subdirectories the agent
 	// accidentally created). RemoveAll on a real directory is
 	// scoped — Lstat above proved stageDir is not a symlink, so
-	// this only walks inside the validated staging directory. Ignore
+	// this only walks inside the validated staging directory, and
+	// a staged symlink is unlinked rather than followed, so the
+	// file the agent linked to survives the purge. Ignore
 	// errors; leaving residue is harmless and only makes the next
 	// scan a no-op.
 	if err := os.RemoveAll(stageDir); err != nil {
@@ -226,20 +230,24 @@ func (m *Manager) ingestOneAttachment(
 		return MessageAttachment{}, false
 	}
 
-	// Open with O_NOFOLLOW so a symlink the agent dropped between
-	// our directory scan and this open can't redirect us to an
-	// arbitrary host file. After open we fstat the same fd (NOT a
-	// fresh os.Lstat on the path) so the size / regular-file check
-	// is bound to the bytes we will actually read — no TOCTOU
-	// window. fstatNoFollow falls back on Windows where the flag
-	// is unavailable; the path is already inside agentDir which
-	// the kojo-attach contract treats as agent-owned territory.
-	f, info, err := openNoFollow(full)
+	// Open the staged entry, following a final-segment symlink so
+	// `ln -s big.mp4 .kojo/attach/big.mp4` attaches the target's
+	// bytes instead of being skipped. After open we fstat the same
+	// fd (NOT a fresh os.Stat on the path) so the size /
+	// regular-file check is bound to the bytes we will actually
+	// read — no TOCTOU window.
+	f, info, err := openStagedAttachment(full)
 	if err != nil {
-		if errors.Is(err, errNonRegular) {
-			logger.Debug("attach scan: skip non-regular / symlink",
+		switch {
+		case errors.Is(err, errNonRegular):
+			logger.Debug("attach scan: skip non-regular entry",
 				"path", full)
-		} else {
+		case errors.Is(err, errDanglingSymlink):
+			// Louder than a FIFO: the agent meant to attach
+			// something and the link points nowhere, which is
+			// almost always a bug in what it staged.
+			logger.Warn("attach scan: symlink target missing", "path", full)
+		default:
 			logger.Warn("attach scan: open", "path", full, "err", err)
 		}
 		return MessageAttachment{}, false
@@ -305,15 +313,17 @@ func (m *Manager) ingestOneAttachment(
 	}
 
 	if forwarder != nil {
-		// Re-open the staged file for the hub stream. The
-		// scanAndIngestAttachments cleanup (RemoveAll on stageDir)
-		// fires AFTER this loop returns, so the path is still
-		// valid here. openNoFollow again so a between-Put-and-
-		// forward symlink swap can't redirect us.
-		fwdFile, _, openErr := openNoFollow(full)
+		// Forward the copy we just committed, NOT the staged path.
+		// The hub verifies the body against obj.SHA256, and a
+		// staged entry can still change under us between Put and
+		// forward — a symlink whose target is rewritten, or a
+		// plain file the agent overwrites. Re-reading it would
+		// stream bytes that no longer match the digest and the
+		// hub would reject the whole push.
+		fwdFile, _, openErr := m.blobStore.Get(scope, blobPath)
 		if openErr != nil {
-			logger.Warn("attach scan: re-open for forward",
-				"path", full, "err", openErr)
+			logger.Warn("attach scan: re-open blob for forward",
+				"uri", uri, "err", openErr)
 			// Keep the attachment — the local blob exists on
 			// this peer, and a future device-switch back to here
 			// (or a manual blob pull) will surface the bytes.

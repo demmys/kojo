@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -136,6 +137,9 @@ func TestMkdirAllReplacingDanglingSymlink_Dangling(t *testing.T) {
 	if !fi.IsDir() {
 		t.Fatalf("want real dir, got mode %v", fi.Mode())
 	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Fatalf("replacement mode = %o, want 755", got)
+	}
 }
 
 // A VALID symlink to an existing dir is the migration-era
@@ -172,5 +176,71 @@ func TestMkdirAllReplacingDanglingSymlink_PlainPaths(t *testing.T) {
 	}
 	if err := mkdirAllReplacingDanglingSymlink(fresh); err != nil {
 		t.Fatalf("existing dir: %v", err)
+	}
+}
+
+func TestEnsureClaudeProjectDir_RepairsProjectPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, ".claude"))
+	agentDir := filepath.Join(root, "agent")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectDir, err := claudeProjectPath(agentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(projectDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "gone"), projectDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureClaudeProjectDir(agentDir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(projectDir)
+	if err != nil {
+		t.Fatalf("project dir %s stat: %v", projectDir, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("project dir %s was not repaired: mode=%v", projectDir, info.Mode())
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("project dir %s mode = %o, want 700", projectDir, got)
+	}
+}
+
+func TestMkdirAllReplacingDanglingSymlink_Concurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "project")
+	if err := os.Symlink(filepath.Join(dir, "gone"), path); err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 16
+	errCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- mkdirAllReplacingDanglingSymlink(path)
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent repair: %v", err)
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("repaired path stat: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("repaired path mode=%v, want dir", info.Mode())
 	}
 }

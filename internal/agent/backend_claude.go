@@ -551,6 +551,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
+	if err := ensureClaudeProjectDir(dir); err != nil {
+		return nil, fmt.Errorf("prepare claude project dir: %w", err)
+	}
 
 	// SystemPromptExtra is appended by the manager before reaching us — see
 	// Manager.ChatOneShot. The backend treats systemPrompt as the final
@@ -692,6 +695,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				return
 			}
 		}
+		if processError == "" && result.resultError != "" && ctx.Err() == nil {
+			processError = result.resultError
+		}
 
 		// Determine final text. mergeStreamTexts prepends text from
 		// earlier assistant turns (lastAssistantText) that was captured
@@ -700,7 +706,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// retries a malformed tool call: the first turn's text lands in
 		// lastAssistantText, and the retry's error message lands in
 		// fullText. Without merging, the original text is silently lost.
-		finalText := mergeStreamTexts(result)
+		finalText := finalStreamText(result, processError != "")
 
 		// Last resort: recover from Claude session JSONL when the stream
 		// produced no usable text. Only used as fallback, never overrides
@@ -889,12 +895,17 @@ type streamParseResult struct {
 	fullText          string
 	thinking          string
 	lastAssistantText string
-	streamSessionID   string
-	toolUses          []ToolUse
-	usage             *Usage
-	cancelled         bool   // true if send returned false (context cancelled)
-	origin            string // "result" event origin.kind, e.g. "task-notification"
-	usageCumulative   bool   // usage came from result.modelUsage (cumulative per process)
+	// lastAssistantIsLatestText is true when the most recent textual event
+	// was a complete assistant event and text deltas already preceded it.
+	// A subsequent text delta clears it, preserving newer retry output.
+	lastAssistantIsLatestText bool
+	streamSessionID           string
+	resultError               string // non-empty when result subtype starts with "error"
+	toolUses                  []ToolUse
+	usage                     *Usage
+	cancelled                 bool   // true if send returned false (context cancelled)
+	origin                    string // "result" event origin.kind, e.g. "task-notification"
+	usageCumulative           bool   // usage came from result.modelUsage (cumulative per process)
 }
 
 // applyUsage merges non-zero token metrics into res.usage, allocating it
@@ -948,6 +959,19 @@ func mergeStreamTexts(r *streamParseResult) string {
 		return r.fullText
 	}
 	return r.lastAssistantText + "\n\n" + r.fullText
+}
+
+// finalStreamText selects the terminal assistant content. A failed Claude
+// process can emit a complete final assistant event containing an error such
+// as "Prompt is too long" after it already streamed an unrelated partial
+// response. In that case lastAssistantText is the authoritative terminal
+// message; merging it with fullText produces a fabricated hybrid response.
+// Successful turns retain mergeStreamTexts' malformed-tool retry recovery.
+func finalStreamText(r *streamParseResult, turnFailed bool) string {
+	if turnFailed && r.lastAssistantIsLatestText && r.lastAssistantText != "" {
+		return r.lastAssistantText
+	}
+	return mergeStreamTexts(r)
 }
 
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
@@ -1182,6 +1206,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		}
 		if atext.Len() > 0 {
 			res.lastAssistantText = atext.String()
+			res.lastAssistantIsLatestText = fullText.Len() > 0
 		}
 
 		// Record usage whenever the assistant turn reports any metric.
@@ -1247,6 +1272,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		case "text_delta":
 			if event.Delta.Text != "" {
 				fullText.WriteString(event.Delta.Text)
+				res.lastAssistantIsLatestText = false
 				if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
 					res.cancelled = true
 					return false
@@ -1332,6 +1358,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 
 	case "result":
 		isResult = true
+		if strings.HasPrefix(event.Subtype, "error") {
+			res.resultError = "claude turn failed: " + event.Subtype
+		}
 		if event.SessionID != "" {
 			res.streamSessionID = event.SessionID
 		}
@@ -1365,6 +1394,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		if event.Result != "" {
 			if fullText.Len() == 0 {
 				fullText.WriteString(event.Result)
+				res.lastAssistantIsLatestText = false
 				if !send(ChatEvent{Type: "text", Delta: event.Result}) {
 					// Record the cancelled send but still report the result
 					// boundary: returning early here would leave the caller

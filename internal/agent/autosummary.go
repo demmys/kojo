@@ -174,6 +174,14 @@ func validateTranscriptPath(agentID, raw string) (string, error) {
 		return "", fmt.Errorf("not a .jsonl path: %s", raw)
 	}
 
+	absDir, err := filepath.Abs(agentDir(agentID))
+	if err != nil {
+		return "", fmt.Errorf("agent dir abs: %w", err)
+	}
+	if err := ensureClaudeProjectDir(absDir); err != nil {
+		return "", fmt.Errorf("prepare project dir: %w", err)
+	}
+
 	// Resolve symlinks so an attacker can't aim a project-dir symlink
 	// at /etc/passwd. EvalSymlinks fails on missing files, which is
 	// also what we want — no point summarising a path that doesn't
@@ -189,10 +197,6 @@ func validateTranscriptPath(agentID, raw string) (string, error) {
 		return "", fmt.Errorf("symlink target is not .jsonl: %s", resolved)
 	}
 
-	absDir, err := filepath.Abs(agentDir(agentID))
-	if err != nil {
-		return "", fmt.Errorf("agent dir abs: %w", err)
-	}
 	projectDir, err := filepath.EvalSymlinks(claudeProjectDir(absDir))
 	if err != nil {
 		return "", fmt.Errorf("project dir resolve: %w", err)
@@ -1146,6 +1150,10 @@ func TurnSummarize(agentID string, tool string, logger *slog.Logger) error {
 	if err != nil {
 		return nil
 	}
+	if err := ensureClaudeProjectDir(absDir); err != nil {
+		logger.Warn("autosummary: prepare claude project dir failed", "agent", agentID, "err", err)
+		return nil
+	}
 	sessionPath := filepath.Join(claudeProjectDir(absDir), agentIDToUUID(agentID)+".jsonl")
 	if _, err := os.Stat(sessionPath); err != nil {
 		// No main session yet (fresh agent, or reset just cleared it).
@@ -1296,6 +1304,10 @@ func loadSessionMessages(agentID, tool string, transcriptPath string, limit int,
 		dir := agentDir(agentID)
 		absDir, err := filepath.Abs(dir)
 		if err != nil {
+			return nil
+		}
+		if err := ensureClaudeProjectDir(absDir); err != nil {
+			logger.Warn("autosummary: prepare claude project dir failed", "agent", agentID, "err", err)
 			return nil
 		}
 

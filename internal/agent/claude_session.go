@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -80,6 +81,7 @@ type claudeSession struct {
 	unsolicited   bool            // true when the active turn is a background notification
 	turnCanAnswer bool            // true when a user can answer AskUserQuestion this turn
 	turnAutomated bool            // true when the active turn is automated (question held with a timeout)
+	turnAborted   bool            // true when Kojo intentionally interrupted this turn
 	turnDone      chan struct{}   // closed when the active turn's result is delivered
 	// turnSteer gates steer writes to the current turn. Overwritten each
 	// startTurn and marked over at the turn's result boundary so a steer that
@@ -156,6 +158,9 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 	dir := agentDir(agent.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+	if err := ensureClaudeProjectDir(dir); err != nil {
+		return nil, fmt.Errorf("prepare claude project dir: %w", err)
 	}
 	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 	args := inv.args
@@ -479,6 +484,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	s.unsolicited = false
 	s.turnCanAnswer = canAnswer
 	s.turnAutomated = automated
+	s.turnAborted = false
 	s.turnSink = sink
 	s.turnCtx = ctx
 	s.turnDone = done
@@ -800,6 +806,7 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	// turn handler below, and turnCanAnswer lets handleControlRequest surface the
 	// card (held with a timeout since unsolicited turns count as automated).
 	s.turnCanAnswer = true
+	s.turnAborted = false
 	s.turnSink = sink
 	s.turnCtx = context.Background()
 	s.turnDone = make(chan struct{})
@@ -810,7 +817,7 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	// turnDone identity pins it to THIS turn: a late abort (user mashing stop
 	// around the turn boundary) must never interrupt a successor turn.
 	abortTurn := s.turnDone
-	abort := func() {
+	abortWorker := func() {
 		// Fully async: callers include Manager.Abort (WS main loop) — a
 		// deny/interrupt write to a wedged stdin, or the 10s escalation
 		// wait, must never block them.
@@ -848,6 +855,20 @@ func (s *claudeSession) openUnsolicitedLocked() {
 			}
 		}()
 	}
+	abort := func() {
+		// Record intent synchronously. The result/EOF can already be buffered,
+		// so deferring this bit to the worker would let completion win the race
+		// and surface an intentional interrupt as a real error.
+		s.mu.Lock()
+		stale := s.turnDone != abortTurn || s.state != sessInTurn
+		if !stale {
+			s.turnAborted = true
+		}
+		s.mu.Unlock()
+		if !stale {
+			abortWorker()
+		}
+	}
 	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer, abort)
 	// Queued-steer reaper: this unsolicited turn is (within the deadline)
 	// the CLI auto-consuming a steer line queued behind an aborted turn.
@@ -857,11 +878,12 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	if s.killQueuedSteerTurns > 0 {
 		if time.Now().Before(s.killQueuedSteerUntil) {
 			s.killQueuedSteerTurns--
+			s.turnAborted = true // caller holds s.mu
 			s.logger.Info("interrupting queued-steer auto-turn after abort", "agent", s.agentID, "remaining", s.killQueuedSteerTurns)
-			// abort is identity-pinned to THIS turn and runs async
+			// abortWorker is identity-pinned to THIS turn and runs async
 			// itself, so it can neither block the readLoop (our caller)
 			// nor interrupt a successor turn.
-			abort()
+			abortWorker()
 		} else {
 			s.killQueuedSteerTurns = 0
 		}
@@ -887,8 +909,11 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	acc.feed(event, rawParent)
 	res := acc.finalize()
 	turnUsage := s.turnUsageDelta(res)
-	finalText := mergeStreamTexts(res)
+	finalText := finalStreamText(res, res.resultError != "")
 	if finalText == "" {
+		if res.resultError != "" {
+			sessionSend(context.Background(), sink, ChatEvent{Type: "error", ErrorMessage: res.resultError})
+		}
 		close(sink)
 		return
 	}
@@ -896,7 +921,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 		sessionSend(context.Background(), sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage})
+	sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: res.resultError})
 	close(sink)
 }
 
@@ -909,11 +934,13 @@ func (s *claudeSession) completeTurn() {
 	unsolicited := s.unsolicited
 	done := s.turnDone
 	turnCtx := s.turnCtx
+	turnAborted := s.turnAborted
 	s.acc = nil
 	s.turnSink = nil
 	s.turnCtx = nil
 	s.state = sessIdle
 	s.unsolicited = false
+	s.turnAborted = false
 	s.turnDone = nil
 	s.armReapLocked()
 	s.mu.Unlock()
@@ -944,6 +971,9 @@ func (s *claudeSession) completeTurn() {
 	// not persist an empty message: close the sink without a done event so
 	// the background handler drops it.
 	if unsolicited && res.fullText == "" && res.lastAssistantText == "" && len(res.toolUses) == 0 {
+		if res.resultError != "" && !turnAborted {
+			sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: res.resultError})
+		}
 		close(sink)
 		if done != nil {
 			close(done)
@@ -951,7 +981,11 @@ func (s *claudeSession) completeTurn() {
 		return
 	}
 
-	finalText := mergeStreamTexts(res)
+	turnError := ""
+	if !turnAborted && (turnCtx == nil || turnCtx.Err() == nil) {
+		turnError = res.resultError
+	}
+	finalText := finalStreamText(res, turnError != "")
 	if finalText == "" {
 		recoverID := res.streamSessionID
 		if recoverID == "" {
@@ -967,7 +1001,7 @@ func (s *claudeSession) completeTurn() {
 		sessionSend(turnCtx, sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage})
+	sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError})
 	close(sink)
 	if done != nil {
 		close(done)
@@ -1004,8 +1038,9 @@ func (s *claudeSession) turnUsageDelta(res *streamParseResult) *Usage {
 // onEOF handles process exit: any in-flight turn gets an error/done so its
 // consumer unblocks, and the session is marked dead so the next turn respawns.
 func (s *claudeSession) onEOF() {
+	var waitErr error
 	if s.cmd != nil {
-		_ = s.cmd.Wait()
+		waitErr = s.cmd.Wait()
 		// Reap any orphaned background-subagent children still in the process
 		// group. If the parent was kill -9'd externally, its children survive
 		// and keep the deterministic session id open — a group SIGKILL here
@@ -1026,6 +1061,13 @@ func (s *claudeSession) onEOF() {
 	if s.stderr != nil {
 		stderr = strings.TrimSpace(s.stderr.String())
 	}
+	processError := stderr
+	if processError == "" && waitErr != nil {
+		processError = waitErr.Error()
+	}
+	if processError == "" {
+		processError = "claude process exited"
+	}
 	s.logger.Info("claude persistent session exited",
 		"agent", s.agentID,
 		"stderr", headRunes(stderr, 300))
@@ -1035,10 +1077,12 @@ func (s *claudeSession) onEOF() {
 	sink := s.turnSink
 	done := s.turnDone
 	turnCtx := s.turnCtx
+	turnAborted := s.turnAborted
 	s.acc = nil
 	s.turnSink = nil
 	s.turnCtx = nil
 	s.turnDone = nil
+	s.turnAborted = false
 	s.state = sessDead
 	if s.reapTimer != nil {
 		s.reapTimer.Stop()
@@ -1055,17 +1099,17 @@ func (s *claudeSession) onEOF() {
 	if sink != nil {
 		if acc != nil {
 			res := acc.finalize()
-			finalText := mergeStreamTexts(res)
+			finalText := finalStreamText(res, !turnAborted)
 			if finalText != "" {
-				sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: assembleAssistantMessage(finalText, res.thinking, res.toolUses, res.usage), Usage: res.usage})
-			} else {
-				msg := stderr
-				if msg == "" {
-					msg = "claude process exited"
+				errorMessage := processError
+				if turnAborted {
+					errorMessage = ""
 				}
-				sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: msg})
+				sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: assembleAssistantMessage(finalText, res.thinking, res.toolUses, res.usage), Usage: res.usage, ErrorMessage: errorMessage})
+			} else if !turnAborted {
+				sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: processError})
 			}
-		} else {
+		} else if !turnAborted {
 			sessionSend(turnCtx, sink, ChatEvent{Type: "error", ErrorMessage: "claude process exited"})
 		}
 		close(sink)

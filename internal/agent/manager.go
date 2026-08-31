@@ -502,6 +502,17 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		logger.Warn("failed to load agents", "err", err)
 	}
 	for _, a := range agents {
+		// v0→v1 external-CLI migration linked the new encoded Claude
+		// project path to the old one. If --clean v0 later removed that
+		// target, repair the surviving dangling link at daemon startup so
+		// autosummary and the first post-restart chat can persist sessions.
+		// Best-effort: one broken filesystem entry must not prevent every
+		// other agent from loading.
+		if repaired, repairErr := repairDanglingClaudeProjectDir(agentDir(a.ID)); repairErr != nil {
+			logger.Warn("claude project directory repair failed", "agent", a.ID, "err", repairErr)
+		} else if repaired {
+			logger.Info("repaired dangling claude project directory symlink", "agent", a.ID)
+		}
 		has, hash := m.avatarMeta(a.ID)
 		applyAvatarMeta(a, has, hash)
 		// Load last message preview

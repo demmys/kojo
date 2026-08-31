@@ -1269,3 +1269,54 @@ func TestMergeStreamTexts(t *testing.T) {
 		})
 	}
 }
+
+func TestFinalStreamText(t *testing.T) {
+	tests := []struct {
+		name          string
+		processFailed bool
+		fullText      string
+		lastAssistant string
+		assistantLast bool
+		want          string
+	}{
+		{
+			name:          "successful retry keeps both turns",
+			fullText:      "retry output",
+			lastAssistant: "original response",
+			want:          "original response\n\nretry output",
+		},
+		{
+			name:          "failed process keeps terminal assistant only",
+			processFailed: true,
+			fullText:      "partial response that streamed before failure",
+			lastAssistant: "Prompt is too long",
+			assistantLast: true,
+			want:          "Prompt is too long",
+		},
+		{
+			name:          "failed process preserves newer retry output",
+			processFailed: true,
+			fullText:      "retry output before process exit",
+			lastAssistant: "earlier complete assistant",
+			want:          "earlier complete assistant\n\nretry output before process exit",
+		},
+		{
+			name:          "failed process falls back to streamed text",
+			processFailed: true,
+			fullText:      "partial response",
+			want:          "partial response",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &streamParseResult{
+				fullText:                  tt.fullText,
+				lastAssistantText:         tt.lastAssistant,
+				lastAssistantIsLatestText: tt.assistantLast,
+			}
+			if got := finalStreamText(r, tt.processFailed); got != tt.want {
+				t.Fatalf("finalStreamText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

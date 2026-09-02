@@ -158,7 +158,7 @@ func NormalizeThinkingMode(mode string) string {
 
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
-	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok CLI 1.0.3's models_cache.json advertises xhigh for grok-4.6
 	// but only low/medium/high for grok-4.5; neither offers max. Keep
 	// this in sync with web/src/lib/toolModels.ts xhighModels /

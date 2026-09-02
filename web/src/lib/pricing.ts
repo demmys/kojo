@@ -7,6 +7,7 @@
 //   - cache write 5m  = 1.25x the base input rate
 //
 // Anthropic base input/output rates (USD / 1M tokens):
+//   claude-fable-5-1 : 10 / 50   (cache read 0.025x, not 0.1x — see below)
 //   claude-fable-5   : 10 / 50
 //   claude-opus-5    :  5 / 25
 //   claude-opus-4-8  :  5 / 25
@@ -29,6 +30,15 @@
 // (the whole request bills at the long-context tier). kojo prices the short-
 // context tier only, so estimates understate very large turns by up to 2x.
 //
+// claude-fable-5-1 is the one id in this table that departs from the 0.1x
+// cache-read rule: https://platform.claude.com/docs/en/about-claude/pricing
+// (fetched 2026-09-02) prices its cache hits and refreshes at 0.025x the base
+// input rate, i.e. $0.25/1M against Fable 5's $1/1M. Everything else about the
+// two Fable models — input, output, both cache-write TTLs — is identical.
+// (Mythos 5.1 carries the same exception, but kojo does not offer it: the
+// model is gated behind Anthropic's trusted access, so it never reaches
+// toolModels.ts and has no row here.)
+//
 // Models not in the table (fable-5 bare alias, gpt-*, custom-* endpoints, "")
 // return undefined from priceModel → no cost is shown.
 
@@ -43,12 +53,24 @@ export interface ModelPricing {
   cacheWrite: number;
 }
 
-/** Anthropic: cache read 0.1x, cache write 5m 1.25x base input. */
-function pricedAnthropic(input: number, output: number): ModelPricing {
+/**
+ * Anthropic: cache read 0.1x, cache write 5m 1.25x base input.
+ *
+ * The cache-read multiplier is an option rather than a constant because Fable
+ * 5.1 reads cache at 0.025x. It is named at the call site on purpose: the
+ * third positional argument of pricedXai below is a dollar rate, and two
+ * neighbouring helpers whose third argument means different things is exactly
+ * the mix-up that would misprice a model by 10x.
+ */
+function pricedAnthropic(
+  input: number,
+  output: number,
+  opts: { cacheReadRate?: number } = {},
+): ModelPricing {
   return {
     input,
     output,
-    cacheRead: input * 0.1,
+    cacheRead: input * (opts.cacheReadRate ?? 0.1),
     cacheWrite: input * 1.25,
   };
 }
@@ -72,6 +94,7 @@ function pricedXai(
 
 // Keyed by the canonical (full) model id.
 const CANONICAL_PRICING: Record<string, ModelPricing> = {
+  "claude-fable-5-1": pricedAnthropic(10, 50, { cacheReadRate: 0.025 }),
   "claude-fable-5": pricedAnthropic(10, 50),
   "claude-opus-5": pricedAnthropic(5, 25),
   "claude-opus-4-8": pricedAnthropic(5, 25),

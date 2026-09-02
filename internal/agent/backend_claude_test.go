@@ -949,7 +949,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 
 		var calledAgent, calledTool string
 		orig := preResetSummarize
-		preResetSummarize = func(agentID, tool string, _ *slog.Logger) error {
+		preResetSummarize = func(agentID, tool, _ string, _ *slog.Logger) error {
 			calledAgent = agentID
 			calledTool = tool
 			return nil
@@ -981,7 +981,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		os.Chtimes(sessionFile, old, old)
 
 		orig := preResetSummarize
-		preResetSummarize = func(_, _ string, _ *slog.Logger) error {
+		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error {
 			return fmt.Errorf("simulated summary failure")
 		}
 		t.Cleanup(func() { preResetSummarize = orig })
@@ -1027,7 +1027,7 @@ func TestSessionFileUsable_ResetOverThreshold(t *testing.T) {
 		// Stub the summary hook so the reset path can complete without
 		// spawning a real claude subprocess.
 		orig := preResetSummarize
-		preResetSummarize = func(_, _ string, _ *slog.Logger) error { return nil }
+		preResetSummarize = func(_, _, _ string, _ *slog.Logger) error { return nil }
 		t.Cleanup(func() { preResetSummarize = orig })
 
 		if sessionFileUsable(aDir, sessionID, false, "ag_per_agent_idle", 1*time.Minute, nil) {
@@ -1263,4 +1263,192 @@ func TestMergeStreamTexts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSessionFileUsable_ColdCacheFloor covers the lower token threshold
+// that applies once the session has idled past the prompt-cache TTL.
+// A mid-sized transcript (over the cold floor, under the normal 150k
+// threshold) is resumed while the cache can still be warm and reset once
+// it can't be; a transcript under the floor is resumed either way; and a
+// per-agent idle guard longer than the cache TTL still wins for
+// interactive turns.
+func TestSessionFileUsable_ColdCacheFloor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_cold_cache_test")
+	os.MkdirAll(aDir, 0o755)
+
+	absDir, _ := filepath.Abs(aDir)
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	os.MkdirAll(projectDir, 0o755)
+
+	sessionID := "deadbeef-1234-3abc-8def-00000000c01d"
+	sessionFile := filepath.Join(projectDir, sessionID+".jsonl")
+
+	// 50k context: above sessionColdResetFloorTokens, well below
+	// sessionResetThresholdTokens.
+	mid := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":49000,"cache_creation_input_tokens":1000}}}`
+	// 20k context: below the cold floor.
+	small := `{"type":"assistant","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":19000,"cache_creation_input_tokens":1000}}}`
+
+	write := func(t *testing.T, entry string, age time.Duration) {
+		t.Helper()
+		if err := os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if age > 0 {
+			ts := time.Now().Add(-age)
+			if err := os.Chtimes(sessionFile, ts, ts); err != nil {
+				t.Fatalf("chtimes: %v", err)
+			}
+		}
+	}
+
+	t.Run("mid context resumed while cache may be warm", func(t *testing.T) {
+		// 45 minutes idle: past the interactive idle guard, but the
+		// 1-hour cache TTL can still be live, so the normal threshold
+		// applies and 50k is nowhere near it.
+		write(t, mid, 45*time.Minute)
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
+			t.Error("expected mid-sized session to resume before the cache goes cold")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected file to still exist")
+		}
+	})
+
+	t.Run("mid context reset once cache is cold", func(t *testing.T) {
+		write(t, mid, 2*time.Hour)
+		if sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
+			t.Error("expected cold mid-sized session to reset")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected file to be removed on cold reset")
+		}
+	})
+
+	t.Run("cold reset fires for automated triggers too", func(t *testing.T) {
+		write(t, mid, 2*time.Hour)
+		if sessionFileUsable(aDir, sessionID, true, "", sessionResetMinIdleDuration, nil) {
+			t.Error("expected cold mid-sized session to reset on an automated trigger")
+		}
+		if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
+			t.Error("expected file to be removed on cold reset")
+		}
+	})
+
+	t.Run("small context resumed even when cold", func(t *testing.T) {
+		write(t, small, 2*time.Hour)
+		if !sessionFileUsable(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil) {
+			t.Error("expected sub-floor session to resume regardless of cache state")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected file to still exist")
+		}
+	})
+
+	t.Run("per-agent idle guard longer than the TTL still protects interactive turns", func(t *testing.T) {
+		write(t, mid, 2*time.Hour)
+		if !sessionFileUsable(aDir, sessionID, false, "", 3*time.Hour, nil) {
+			t.Error("expected per-agent idle window to keep the session")
+		}
+		if _, err := os.Stat(sessionFile); err != nil {
+			t.Error("expected file to still exist under the idle guard")
+		}
+	})
+}
+
+// TestSessionFileUsable_ColdCacheBoundaries pins the exact edges of the
+// cold-cache rule: the token floor is inclusive-keep (== floor resumes,
+// floor+1 resets), the normal threshold likewise, and the idle boundary
+// flips around sessionCacheColdIdle (probed a minute either side; the
+// wall clock is not injected, so the exact instant is not asserted). It also checks the reset flag
+// that the persistent-session pool keys on, and that the pre-reset
+// summary receives the path of the file being deleted rather than
+// relying on discovery.
+func TestSessionFileUsable_ColdCacheBoundaries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	aDir := filepath.Join(home, ".config", "kojo-v1", "agents", "ag_cold_edge_test")
+	os.MkdirAll(aDir, 0o755)
+	absDir, _ := filepath.Abs(aDir)
+	encoded := strings.NewReplacer(
+		string(filepath.Separator), "-",
+		".", "-",
+		"_", "-",
+	).Replace(absDir)
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	os.MkdirAll(projectDir, 0o755)
+	sessionID := "deadbeef-1234-3abc-8def-00000000ed6e"
+	sessionFile := filepath.Join(projectDir, sessionID+".jsonl")
+
+	write := func(t *testing.T, tokens int, age time.Duration) {
+		t.Helper()
+		entry := fmt.Sprintf(`{"type":"assistant","message":{"usage":{"input_tokens":%d,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}`, tokens)
+		if err := os.WriteFile(sessionFile, []byte(entry+"\n"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		ts := time.Now().Add(-age)
+		if err := os.Chtimes(sessionFile, ts, ts); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+	cases := []struct {
+		name       string
+		tokens     int
+		age        time.Duration
+		wantUsable bool
+	}{
+		{"cold, exactly at floor keeps", sessionColdResetFloorTokens, 2 * time.Hour, true},
+		{"cold, one over floor resets", sessionColdResetFloorTokens + 1, 2 * time.Hour, false},
+		{"warm, exactly at threshold keeps", sessionResetThresholdTokens, 45 * time.Minute, true},
+		{"warm, one over threshold resets", sessionResetThresholdTokens + 1, 45 * time.Minute, false},
+		// mtime one minute short of the TTL: cache may be warm, floor off.
+		{"just under TTL keeps mid context", sessionColdResetFloorTokens + 1, sessionCacheColdIdle - time.Minute, true},
+		// mtime a minute past the TTL: cold, floor on.
+		{"just past TTL resets mid context", sessionColdResetFloorTokens + 1, sessionCacheColdIdle + time.Minute, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			write(t, tc.tokens, tc.age)
+			usable, reset := sessionFileUsableReset(aDir, sessionID, false, "", sessionResetMinIdleDuration, nil)
+			if usable != tc.wantUsable {
+				t.Errorf("usable = %v, want %v", usable, tc.wantUsable)
+			}
+			if reset != !tc.wantUsable {
+				t.Errorf("reset = %v, want %v", reset, !tc.wantUsable)
+			}
+			_, err := os.Stat(sessionFile)
+			if tc.wantUsable && err != nil {
+				t.Errorf("expected file kept, stat err = %v", err)
+			}
+			if !tc.wantUsable && !os.IsNotExist(err) {
+				t.Errorf("expected file removed, stat err = %v", err)
+			}
+		})
+	}
+
+	t.Run("pre-reset summary gets the doomed file's path", func(t *testing.T) {
+		write(t, sessionColdResetFloorTokens+1, 2*time.Hour)
+		var got string
+		orig := preResetSummarize
+		preResetSummarize = func(_, _, transcriptPath string, _ *slog.Logger) error {
+			got = transcriptPath
+			return nil
+		}
+		t.Cleanup(func() { preResetSummarize = orig })
+		if usable, reset := sessionFileUsableReset(aDir, sessionID, false, "ag_cold_edge_test", sessionResetMinIdleDuration, nil); usable || !reset {
+			t.Errorf("usable,reset = %v,%v; want false,true", usable, reset)
+		}
+		if got != sessionFile {
+			t.Errorf("summary path = %q, want %q", got, sessionFile)
+		}
+	})
 }

@@ -1642,6 +1642,46 @@ func hasSessionFile(agentDir string, sessionID string) bool {
 // interval-driven agents. Resetting is cheaper and keeps context tight.
 const sessionResetThresholdTokens = 150_000
 
+// sessionCacheColdIdle is the idle gap after which the prompt cache behind
+// a --resume is assumed dead. Claude Code picks its cache TTL automatically:
+// 1 hour on a Claude subscription within its usage limits, 5 minutes on an
+// API key / Bedrock / Vertex / Foundry (CLI 2.1.258 settings reference for
+// promptCacheTtl). kojo sets no CLAUDE_CODE_PROMPT_CACHE_TTL, so 1 hour is
+// the longest window that can apply; past it the cache is cold on every
+// platform, and a --resume re-writes the whole transcript at cache-write
+// price (2x base input on the 1-hour TTL) for no cache benefit.
+//
+// This is deliberately the ceiling, not the effective TTL: on a 5-minute
+// setup the cache is already cold for up to 55 minutes before the floor
+// kicks in and the normal threshold governs. Detecting the platform to
+// tighten the window would need the account type, which kojo cannot see;
+// the ceiling never resets a session whose cache could still be warm,
+// which is the property that matters.
+//
+// Measured against the session JSONL's mtime, i.e. roughly the end of the
+// last turn, while the TTL clock runs from the start of the request that
+// last touched the entry — so the cache is always at least as cold as this
+// measurement says.
+const sessionCacheColdIdle = 60 * time.Minute
+
+// sessionColdResetFloorTokens replaces sessionResetThresholdTokens once the
+// idle gap exceeds sessionCacheColdIdle. With the cache cold there is no
+// resume-side saving to protect, so the trade is purely "re-write the
+// transcript" vs "start fresh + incremental diary summary". Below this
+// floor the transcript is small enough that the summary call and the lost
+// in-context continuity outweigh the write; above it, resetting is cheaper.
+//
+// Arithmetic behind the floor: a cold --resume writes the full transcript
+// at 2x base input (1-hour TTL) — on a $10/MTok model, 30k tokens is
+// $0.60 every time the agent wakes cold. A fresh session writes only the
+// system prompt and tool definitions, and the pre-reset summary is
+// incremental since the autosummary marker, so it reads a few thousand
+// new tokens at base input plus a short diary entry at output price —
+// tens of cents at most, and it has to be paid eventually anyway. Under
+// ~30k the two are close enough that keeping the conversation intact
+// wins; the number is a judgement, not a measurement.
+const sessionColdResetFloorTokens = 30_000
+
 // sessionTailReadBytes caps how much of the session JSONL is read when
 // measuring the last recorded context size. Chosen to fit at least one full
 // assistant turn (tool_result payloads can reach several hundred KiB) so the
@@ -1656,12 +1696,15 @@ const sessionTailReadBytes = 1 * 1024 * 1024
 // which writes a diary entry from the live session JSONL. Exposed as a
 // package variable so tests can substitute a deterministic fake instead of
 // spawning a real claude CLI process.
-var preResetSummarize = func(agentID, tool string, logger *slog.Logger) error {
+var preResetSummarize = func(agentID, tool, transcriptPath string, logger *slog.Logger) error {
 	// Reset path doesn't have the PreCompact-hook stdin payload (claude
 	// isn't telling us about a compaction here — kojo is initiating a
-	// session wipe), so transcriptPath is left empty and the function
-	// falls back to discovery.
-	return PreCompactSummarize(agentID, tool, "", logger)
+	// session wipe), but it does know exactly which JSONL it is about to
+	// delete, so that path is passed through rather than left to
+	// discovery — which picks the most recently modified file in the
+	// project dir and, with several keyed sessions live, can be a
+	// different conversation.
+	return PreCompactSummarize(agentID, tool, transcriptPath, logger)
 }
 
 // sessionResetMinIdleDuration is the package-default idle window used when
@@ -1682,9 +1725,10 @@ const sessionResetMinIdleDuration = defaultResumeIdleDuration
 
 // sessionFileUsable checks whether the deterministic session file exists and
 // is minimally valid. Returns false (and removes the file) when the file is
-// empty or the last recorded usage exceeds sessionResetThresholdTokens —
-// forcing the caller to start a fresh session with --session-id instead of
-// --resume.
+// empty or the last recorded usage exceeds sessionResetThresholdTokens
+// (sessionColdResetFloorTokens once the session has idled past
+// sessionCacheColdIdle) — forcing the caller to start a fresh session with
+// --session-id instead of --resume.
 //
 // When the usage cannot be read reliably (e.g. the claude process is mid-write
 // or the scanner tripped on an oversized line), we conservatively return true
@@ -1754,7 +1798,18 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 		// re-evaluate on the next chat.
 		return true, false
 	}
-	if ctx <= sessionResetThresholdTokens {
+	// Once the prompt cache behind the session has gone cold, resuming
+	// buys nothing but a full-price re-write of the transcript, so the
+	// token threshold drops to the cold floor. Everything else — the
+	// interactive idle guard, the pre-reset diary summary — applies
+	// unchanged.
+	idle := time.Since(info.ModTime())
+	tokenThreshold := sessionResetThresholdTokens
+	cacheCold := idle >= sessionCacheColdIdle
+	if cacheCold {
+		tokenThreshold = sessionColdResetFloorTokens
+	}
+	if ctx <= tokenThreshold {
 		return true, false
 	}
 	if !automatedTrigger {
@@ -1762,7 +1817,7 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 		if threshold <= 0 {
 			threshold = sessionResetMinIdleDuration
 		}
-		if idle := time.Since(info.ModTime()); idle < threshold {
+		if idle < threshold {
 			logger.Debug("claude session over threshold but recently active, keeping",
 				"path", path, "contextTokens", ctx,
 				"idle", idle, "idleThreshold", threshold)
@@ -1776,7 +1831,7 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 	// abort the reset — losing context silently would be worse than
 	// carrying a slightly-over-threshold session for one more turn.
 	if agentID != "" {
-		if err := preResetSummarize(agentID, "claude", logger); err != nil {
+		if err := preResetSummarize(agentID, "claude", path, logger); err != nil {
 			logger.Warn("pre-reset summary failed, keeping session to avoid context loss",
 				"path", path, "agent", agentID, "err", err)
 			return true, false
@@ -1785,8 +1840,8 @@ func sessionFileUsableReset(agentDir string, sessionID string, automatedTrigger 
 
 	logger.Info("claude session context over threshold, resetting",
 		"path", path, "contextTokens", ctx,
-		"threshold", sessionResetThresholdTokens,
-		"automatedTrigger", automatedTrigger)
+		"threshold", tokenThreshold, "cacheCold", cacheCold,
+		"idle", idle, "automatedTrigger", automatedTrigger)
 	if err := os.Remove(path); err != nil {
 		// Couldn't delete the session file — don't lie to the caller by
 		// returning false. With our deterministic session ID, a subsequent

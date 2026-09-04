@@ -14,33 +14,44 @@ import (
 	"github.com/loppo-llc/kojo/internal/customapi"
 )
 
-// LlamaCppBackend implements ChatBackend by talking directly to llama-server's
-// OpenAI-compatible /v1/chat/completions endpoint via HTTP SSE streaming.
-// No CLI dependency — just needs HTTP access to the server.
-type LlamaCppBackend struct {
+// CustomBareBackend implements ChatBackend by talking directly to an
+// OpenAI-compatible /v1/chat/completions endpoint (llama-server and friends)
+// via HTTP SSE streaming. "bare" because there is no CLI in between: the
+// model gets a system prompt, a bounded replay of the conversation so far
+// and the current user message, and nothing else — no tools, no MCP, no
+// server-side session.
+//
+// The replay is the only continuity this backend has. /v1/chat/completions
+// is stateless, so kojo rebuilds the transcript from its own store on
+// every turn (ChatOptions.History, capped in bare_history.go).
+type CustomBareBackend struct {
 	logger *slog.Logger
 	creds  *CredentialStore
 }
 
-func NewLlamaCppBackend(logger *slog.Logger, creds *CredentialStore) *LlamaCppBackend {
-	return &LlamaCppBackend{
-		logger: logger,
-		creds:  creds,
-	}
+func NewCustomBareBackend(logger *slog.Logger, creds *CredentialStore) *CustomBareBackend {
+	return &CustomBareBackend{logger: logger, creds: creds}
 }
 
-func (b *LlamaCppBackend) Name() string { return "llama.cpp" }
+func (b *CustomBareBackend) Name() string { return ToolCustomBare }
 
-func (b *LlamaCppBackend) Available() bool { return true }
+func (b *CustomBareBackend) Available() bool { return true }
 
-func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
-	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, false)
+func (b *CustomBareBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	// Local callers provide the canonical transcript as structured History,
+	// which is replayed below. Remote peer dispatch deliberately sends only the
+	// bounded preformatted context instead, so use that fallback only when the
+	// structured replay is absent. Applying both would duplicate every prior
+	// turn in the request.
+	if len(opts.History) == 0 {
+		userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, false)
+	}
 	if agent.CustomBaseURL == "" {
-		return nil, fmt.Errorf("customBaseURL is required for llama.cpp backend")
+		return nil, fmt.Errorf("customBaseURL is required for the custom-bare backend")
 	}
 	client, err := customapi.NewLocalOrTailnetClient(ctx, agent.CustomBaseURL, 0)
 	if err != nil {
-		return nil, fmt.Errorf("llama.cpp customBaseURL: %w", err)
+		return nil, fmt.Errorf("custom-bare customBaseURL: %w", err)
 	}
 	apiKey, err := LoadCustomAPIKey(b.creds, agent.ID, agent.CustomBaseURL)
 	if err != nil {
@@ -61,6 +72,23 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 	messages := []llamaCppMessage{}
 	if effectivePrompt != "" {
 		messages = append(messages, llamaCppMessage{Role: "system", Content: effectivePrompt})
+	}
+	// Prior turns, oldest first, then the current one. History never
+	// carries a system entry and never repeats the current message, so
+	// it splices in verbatim.
+	history := opts.History
+	// A replay ending on a user turn (an unanswered question: the turn
+	// errored, timed out, or was aborted) would sit right next to the
+	// current user message, and chat templates that assume strict
+	// alternation mangle or reject two user turns in a row. Fold it into
+	// the current message instead of dropping it — it is usually still
+	// waiting for an answer.
+	if n := len(history); n > 0 && history[n-1].Role == "user" {
+		userMessage = foldIntoUserMessage(userMessage, history[n-1].Content)
+		history = history[:n-1]
+	}
+	for _, turn := range history {
+		messages = append(messages, llamaCppMessage{Role: turn.Role, Content: turn.Content})
 	}
 	messages = append(messages, llamaCppMessage{Role: "user", Content: userMessage})
 
@@ -125,7 +153,7 @@ func (b *LlamaCppBackend) Chat(ctx context.Context, agent *Agent, userMessage st
 	return ch, nil
 }
 
-func (b *LlamaCppBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {
+func (b *CustomBareBackend) streamSSE(ctx context.Context, ch chan<- ChatEvent, body io.Reader, thinkOff bool) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 256*1024)
 

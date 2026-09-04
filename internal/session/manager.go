@@ -54,11 +54,30 @@ const (
 	maxWriteRetries = 5
 )
 
+// toolCustomClaude is the PTY tool that runs the claude CLI against a
+// user-supplied Anthropic Messages API endpoint. It was called "custom"
+// before the agent backends were split into custom-claude / custom-codex /
+// custom-bare; the old name is still accepted on input and normalized here
+// so sessions persisted by an older build keep launching.
+const toolCustomClaude = "custom-claude"
+
 var userTools = map[string]bool{
-	"claude": true,
-	"codex":  true,
-	"grok":   true,
-	"custom": true,
+	"claude":         true,
+	"codex":          true,
+	"grok":           true,
+	toolCustomClaude: true,
+}
+
+// legacySessionTools maps pre-rename PTY tool identifiers to current ones.
+var legacySessionTools = map[string]string{"custom": toolCustomClaude}
+
+// NormalizeToolName rewrites a legacy PTY tool identifier to its current
+// name. Unknown values pass through so isAllowedTool still rejects them.
+func NormalizeToolName(name string) string {
+	if cur, ok := legacySessionTools[name]; ok {
+		return cur
+	}
+	return name
 }
 
 // internalTools is populated by platform-specific init() functions.
@@ -122,6 +141,7 @@ func NewManager(logger *slog.Logger, db *store.Store, opts ManagerOptions) *Mana
 }
 
 func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, parentID string) (*Session, error) {
+	tool = NormalizeToolName(tool)
 	if !isAllowedTool(tool) {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, tool)
 	}
@@ -134,7 +154,7 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	// Yolo mode via native CLI flags at creation time. claude / codex bake a
 	// tool-native permission-bypass flag into the persisted args (s.Args), so
 	// launch AND a later RESTART (buildRestartArgs copies s.Args for claude)
-	// relaunch with it. Keyed on the ORIGINAL tool, so "custom" (→ claude) and
+	// relaunch with it. Keyed on the ORIGINAL tool, so "custom-claude" (→ claude) and
 	// other tools get no flag and keep the PTY auto-approve machinery instead.
 	args = appendYoloFlag(tool, args, yoloMode)
 
@@ -232,7 +252,10 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		return nil, fmt.Errorf("%w: %s", ErrSessionRunning, id)
 	}
 	s.restarting = true
-	tool := s.Tool
+	// Sessions persisted before the custom → custom-claude rename still carry
+	// the old identifier in s.Tool, so normalize before every allowlist /
+	// dispatch check on the restart path.
+	tool := NormalizeToolName(s.Tool)
 	workDir := s.WorkDir
 	args := s.Args
 	toolSessionID := s.ToolSessionID
@@ -613,15 +636,15 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 
 // customAPIResult holds the result of resolving custom API configuration.
 type customAPIResult struct {
-	actualTool string   // the actual tool to execute ("claude" if custom)
+	actualTool string   // the actual tool to execute ("claude" if custom-claude)
 	args       []string // args (unchanged for non-custom)
 	baseURL    string   // custom API base URL
 }
 
-// resolveCustomAPI resolves custom → claude with ANTHROPIC_BASE_URL.
+// resolveCustomAPI resolves custom-claude → claude with ANTHROPIC_BASE_URL.
 func (m *Manager) resolveCustomAPI(tool string, args []string) customAPIResult {
 	result := customAPIResult{actualTool: tool, args: args}
-	if tool != "custom" {
+	if NormalizeToolName(tool) != toolCustomClaude {
 		return result
 	}
 
@@ -835,8 +858,9 @@ func generateID() string {
 func ToolAvailability() map[string]ToolInfo {
 	result := make(map[string]ToolInfo)
 	for tool := range userTools {
-		if tool == "custom" {
-			// custom requires claude CLI (used as client with ANTHROPIC_BASE_URL).
+		if tool == toolCustomClaude {
+			// custom-claude requires the claude CLI (used as the client with
+			// ANTHROPIC_BASE_URL).
 			claudePath, err := exec.LookPath("claude")
 			result[tool] = ToolInfo{Available: err == nil, Path: claudePath}
 			continue

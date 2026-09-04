@@ -140,7 +140,7 @@ func TestResolver_Roles(t *testing.T) {
 	aliceTok, _ := st.AgentToken("ag_alice")
 	bobTok, _ := st.AgentToken("ag_bob")
 
-	r := NewResolver(st, func(id string) bool { return id == "ag_bob" })
+	r := NewResolver(st, func(id string) bool { return id == "ag_bob" }, nil)
 
 	cases := []struct {
 		name string
@@ -376,6 +376,30 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodGet, "/api/v1/system/restart", priv, true},
 		{http.MethodGet, "/api/v1/system/restart", ag, false},
 		{http.MethodGet, "/api/v1/system/restart", guest, false},
+		// attachment-cache purge — Owner-only (and RolePeer, which is
+		// admitted to the whole /api/v1/agents/ surface by design). An
+		// agent must not be able to wipe its own attachment history, so
+		// the route is deliberately absent from isSelfScopedRoute.
+		{http.MethodDelete, "/api/v1/agents/ag_x/attach-cache", ag, false},
+		{http.MethodDelete, "/api/v1/agents/ag_x/attach-cache", priv, false},
+		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", ag, false},
+		{http.MethodGet, "/api/v1/agents/ag_x/attach-cache", guest, false},
+		// UI languages are public reads: a tag list and translated
+		// strings say nothing about the instance, and the dashboard
+		// fetches them at boot for every role.
+		{http.MethodGet, "/api/v1/locales", guest, true},
+		{http.MethodGet, "/api/v1/locales/zh-Hans", guest, true},
+		{http.MethodGet, "/api/v1/locales/zh-Hans", ag, true},
+		// Nothing else on that prefix: there are no mutating locale
+		// routes, so a POST must not slip through the prefix match.
+		{http.MethodPost, "/api/v1/locales", guest, false},
+		{http.MethodPost, "/api/v1/locales/zh-Hans", guest, false},
+		// Not a bare tag: anything deeper under the prefix stays owner-only.
+		{http.MethodGet, "/api/v1/locales/zh-Hans/raw", guest, false},
+		{http.MethodGet, "/api/v1/locales/", guest, false},
+		// Not a language tag: a future admin route under the prefix keeps
+		// the owner-only default.
+		{http.MethodGet, "/api/v1/locales/config", guest, false},
 	}
 	for _, c := range cases {
 		t.Run(c.method+" "+c.path+"/"+roleName(c.p.Role), func(t *testing.T) {
@@ -404,7 +428,7 @@ func TestAuthMiddleware_PrincipalInContext(t *testing.T) {
 	dir := t.TempDir()
 	st, _ := NewTokenStore(dir, nil, "owner-x")
 	tok, _ := st.AgentToken("ag_alice")
-	r := NewResolver(st, func(string) bool { return false })
+	r := NewResolver(st, func(string) bool { return false }, nil)
 
 	var got Principal
 	h := AuthMiddleware(r)(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

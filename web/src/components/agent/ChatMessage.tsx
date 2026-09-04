@@ -31,6 +31,7 @@ interface ChatMessageProps {
   onEdit?: (msgId: string, content: string) => Promise<void>;
   onDelete?: (msgId: string) => Promise<void>;
   onRegenerate?: (msgId: string) => Promise<void>;
+  onRewind?: (msgId: string) => Promise<void>;
   // TTS controls — when ttsEnabled is true a small play/stop button is
   // rendered next to assistant messages. The parent owns the audio
   // element so navigating between messages cancels the previous one.
@@ -48,6 +49,7 @@ export const ChatMessage = memo(function ChatMessage({
   onEdit,
   onDelete,
   onRegenerate,
+  onRewind,
   ttsEnabled,
   ttsPlayState,
   onTTSPlay,
@@ -75,6 +77,7 @@ export const ChatMessage = memo(function ChatMessage({
             onEdit={onEdit}
             onDelete={onDelete}
             onRegenerate={onRegenerate}
+            onRewind={onRewind}
           />
         </div>
       </div>
@@ -109,6 +112,7 @@ export const ChatMessage = memo(function ChatMessage({
             onEdit={onEdit}
             onDelete={onDelete}
             onRegenerate={onRegenerate}
+            onRewind={onRewind}
           />
         </div>
 
@@ -228,6 +232,7 @@ export function MessageContent({
   onEdit,
   onDelete,
   onRegenerate,
+  onRewind,
 }: {
   messageId: string;
   content: string;
@@ -238,6 +243,7 @@ export function MessageContent({
   onEdit?: (msgId: string, content: string) => Promise<void>;
   onDelete?: (msgId: string) => Promise<void>;
   onRegenerate?: (msgId: string) => Promise<void>;
+  onRewind?: (msgId: string) => Promise<void>;
 }) {
   const t = useT();
   const [preview, setPreview] = useState<{ path: string; type: "image" | "video" } | null>(null);
@@ -336,7 +342,7 @@ export function MessageContent({
         )}
       </button>}
 
-      {/* Edit / Delete (llama.cpp only — parent gates via handler presence) */}
+      {/* Edit / Delete (custom-bare only — parent gates via handler presence) */}
       {onEdit && (
         <button
           onClick={() => {
@@ -385,6 +391,30 @@ export function MessageContent({
             <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
           </svg>
           {t("msg.regenerate")}
+        </button>
+      )}
+      {onRewind && (
+        <button
+          onClick={async () => {
+            // Destructive and one-way: this drops the message, every
+            // later message, AND the matching slice of the backend's
+            // native session so the CLI-side context matches the UI.
+            // There is no redo, hence the confirm.
+            if (!window.confirm(t("msg.rewindConfirm"))) return;
+            try {
+              await onRewind(messageId);
+            } catch (e) {
+              console.error(e);
+              alert(t("msg.rewindFailed"));
+            }
+          }}
+          className={btnCls}
+          title={t("msg.rewindTitle")}
+        >
+          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 15L3 9m0 0l6-6M3 9h12a6 6 0 010 12h-3" />
+          </svg>
+          {t("msg.rewind")}
         </button>
       )}
     </div>

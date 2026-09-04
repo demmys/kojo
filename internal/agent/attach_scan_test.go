@@ -262,7 +262,7 @@ func TestScanAndIngestAttachments_RejectsBadEntries(t *testing.T) {
 	if err := os.MkdirAll(stageDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// 1 good + 3 bad: dotfile, empty, symlink-to-outside.
+	// 1 good + 3 bad: dotfile, empty, dangling symlink.
 	if err := os.WriteFile(filepath.Join(stageDir, "good.txt"), []byte("ok"), 0o644); err != nil {
 		t.Fatalf("write good: %v", err)
 	}
@@ -272,14 +272,14 @@ func TestScanAndIngestAttachments_RejectsBadEntries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(stageDir, "empty.bin"), nil, 0o644); err != nil {
 		t.Fatalf("write empty: %v", err)
 	}
-	outside := filepath.Join(t.TempDir(), "outside.txt")
-	if err := os.WriteFile(outside, []byte("steal me"), 0o644); err != nil {
-		t.Fatalf("write outside: %v", err)
-	}
-	if err := os.Symlink(outside, filepath.Join(stageDir, "smuggle.txt")); err != nil {
+	// A symlink to a file that exists is now INGESTED (see
+	// TestScanAndIngestAttachments_FollowsSymlink); what stays
+	// rejected is a link pointing at nothing.
+	if err := os.Symlink(filepath.Join(t.TempDir(), "gone.txt"),
+		filepath.Join(stageDir, "dangling.txt")); err != nil {
 		// On Windows test runs without admin, symlink may fail. Skip
 		// that one rejection rather than fail the whole test.
-		t.Logf("symlink not supported; skipping symlink rejection check: %v", err)
+		t.Logf("symlink not supported; skipping dangling-link check: %v", err)
 	}
 
 	m := &Manager{blobStore: bs}
@@ -456,5 +456,92 @@ func TestScanAndIngestAttachments_ForwarderErrorKeepsAttachment(t *testing.T) {
 	if _, err := bs.Head(blob.ScopeGlobal,
 		"agents/"+agentID+"/attach/m_fwderr/y.bin"); err != nil {
 		t.Errorf("local blob lost after forward failure: %v", err)
+	}
+}
+
+// TestScanAndIngestAttachments_FollowsSymlink is the point of the
+// feature: an agent that stages a link instead of a copy still gets
+// the real bytes attached, and the file it linked to is left on disk
+// (the staging purge must unlink the link, never chase it).
+func TestScanAndIngestAttachments_FollowsSymlink(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", "")
+
+	bs := newWiredBlob(t)
+	agentID := "ag_attach_symlink"
+	stageDir := filepath.Join(agentDir(agentID), attachStagingSubpath)
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "report.txt")
+	body := "the real bytes"
+	if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(stageDir, "report.txt")); err != nil {
+		t.Skipf("symlink not supported on this fs: %v", err)
+	}
+
+	m := &Manager{blobStore: bs}
+	out := m.scanAndIngestAttachments(context.Background(), agentID, "m_sym")
+
+	if len(out) != 1 || out[0].Name != "report.txt" {
+		t.Fatalf("got %+v; want one report.txt attachment", out)
+	}
+	if out[0].Size != int64(len(body)) {
+		t.Errorf("size = %d; want %d (the target's length, not the link's)",
+			out[0].Size, len(body))
+	}
+	scope, path, err := blob.ParseURI(out[0].Path)
+	if err != nil {
+		t.Fatalf("parse uri %q: %v", out[0].Path, err)
+	}
+	rc, _, err := bs.Get(scope, path)
+	if err != nil {
+		t.Fatalf("get blob: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read blob: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("blob body = %q; want %q", got, body)
+	}
+
+	// The link is consumed; the file it pointed at is not.
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("symlink target was destroyed by the staging purge: %v", err)
+	}
+}
+
+// TestScanAndIngestAttachments_RejectsSymlinkToDir keeps the
+// follow from turning a directory link into an ingest attempt.
+func TestScanAndIngestAttachments_RejectsSymlinkToDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("APPDATA", "")
+
+	bs := newWiredBlob(t)
+	agentID := "ag_attach_symdir_entry"
+	stageDir := filepath.Join(agentDir(agentID), attachStagingSubpath)
+	if err := os.MkdirAll(stageDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	victim := t.TempDir()
+	if err := os.WriteFile(filepath.Join(victim, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	if err := os.Symlink(victim, filepath.Join(stageDir, "adir")); err != nil {
+		t.Skipf("symlink not supported on this fs: %v", err)
+	}
+
+	m := &Manager{blobStore: bs}
+	if out := m.scanAndIngestAttachments(context.Background(), agentID, "m_symdir"); len(out) != 0 {
+		t.Fatalf("got %+v; want no attachments", out)
+	}
+	if _, err := os.Stat(filepath.Join(victim, "keep.txt")); err != nil {
+		t.Errorf("linked directory's contents were removed: %v", err)
 	}
 }

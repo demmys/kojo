@@ -98,14 +98,16 @@ export function AgentCreate() {
     listCustomTemplates().then(setCustomTemplates).catch(console.error);
   }, []);
 
+  const isCustomClaude = tool === "custom-claude" || tool === "custom";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
   useEffect(() => {
-    if (tool !== "custom") setCustomNoAuth(false);
-  }, [tool]);
+    if (!isCustomClaude) setCustomNoAuth(false);
+  }, [isCustomClaude]);
 
-  const customNoAuthEnabled = tool === "custom" && customNoAuth;
+  const customNoAuthEnabled = isCustomClaude && customNoAuth;
   const customModelDiscoveryReady =
     !!customBaseURL.trim() &&
-    (tool === "llama.cpp" || !!customAPIKey.trim() || customNoAuthEnabled);
+    (isKeyOptionalCustom || !!customAPIKey.trim() || customNoAuthEnabled);
   const {
     needsCustomURL,
     customModels,
@@ -360,7 +362,7 @@ export function AgentCreate() {
         tool,
         customBaseURL: needsCustomURL ? customBaseURL : undefined,
         customApiKey: needsCustomURL && customAPIKey.trim() ? customAPIKey.trim() : undefined,
-        thinkingMode: tool === "llama.cpp" && thinkingMode ? thinkingMode : undefined,
+        thinkingMode: tool === "custom-bare" && thinkingMode ? thinkingMode : undefined,
         workDir: workDir.trim() || undefined,
         cronExpr: cronExprDirty ? cronExpr : undefined,
         timeoutMinutes,
@@ -668,7 +670,12 @@ export function AgentCreate() {
               setModel={setModel}
               effort={effort}
               setEffort={setEffort}
-              isDisabled={(toolName) => (info ? !(info.tools[toolName]?.available || info.agentBackends?.[toolName]) : false)}
+              // `tools` is optional: /api/v1/info serves a version-only view to
+              // non-Owner principals, so indexing it unguarded crashes the
+              // whole picker instead of just leaving the buttons enabled.
+              isDisabled={(toolName) =>
+                info?.tools ? !(info.tools[toolName]?.available || info.agentBackends?.[toolName]) : false
+              }
             />
 
             {needsCustomURL && (
@@ -695,7 +702,7 @@ export function AgentCreate() {
                     placeholder="sk-unsloth-…"
                   />
                 </Field>
-                {tool === "custom" && (
+                {isCustomClaude && (
                   <label className="flex items-center gap-2 text-[12px] text-ink-dim">
                     <input
                       type="checkbox"
@@ -720,7 +727,7 @@ export function AgentCreate() {
 
             {needsCustomURL && customModelsStatus === "idle" && (
               <p className="text-[12px] text-ink-faint">
-                {t(tool === "llama.cpp"
+                {t(isKeyOptionalCustom
                   ? "settings.customModelURLPrerequisite"
                   : "settings.customModelPrerequisites")}
               </p>
@@ -740,7 +747,7 @@ export function AgentCreate() {
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
-            {tool === "llama.cpp" && (
+            {tool === "custom-bare" && (
               <Field label={t("settings.thinking")}>
                 <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
                   <option value="">{t("settings.thinkingAuto")}</option>

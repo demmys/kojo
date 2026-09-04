@@ -5,12 +5,13 @@ import {
 } from "../../../lib/toolModels";
 import { Field } from "../../ui/Field";
 import { useT } from "../../../lib/i18n";
+import { needsCustomURLFor } from "../agentSettingsPayload";
 
-const TOOLS = ["claude", "codex", "grok", "custom", "llama.cpp"];
+const TOOLS = ["claude", "codex", "grok", "custom-claude", "custom-codex", "custom-bare"];
 
 /**
  * The "Tool" (backend) selector. Switching tools resets the model to the
- * backend default (or clears it for custom/llama.cpp) and drops an effort
+ * backend default (or clears it for the custom-* backends) and drops an effort
  * level the new default model can't support.
  *
  * `isDisabled` is optional: when provided (AgentCreate gates on server
@@ -45,7 +46,7 @@ export function ToolPicker({
               onClick={() => {
                 if (name !== tool) {
                   setTool(name);
-                  if (name === "custom" || name === "llama.cpp") {
+                  if (needsCustomURLFor(name)) {
                     setModel("");
                   } else {
                     const m = defaultModelForTool(name);

@@ -227,7 +227,7 @@ $ kojo
 
 ### AI エージェント
 
-- カスタム名・性格・アバター・バックエンド（Claude / Codex / Grok Build、加えてカスタム Anthropic Messages API エンドポイント対応）を持つ永続 AI ペルソナの作成
+- カスタム名・性格・アバター・バックエンド（Claude / Codex / Grok Build、加えてカスタムエンドポイント3種: claude CLI 経由で Anthropic Messages API を叩く `custom-claude`、codex CLI 経由で OpenAI Responses API を叩く `custom-codex`、CLI もツールも使わず OpenAI 互換 chat エンドポイントを直接叩く `custom-bare`）を持つ永続 AI ペルソナの作成
 - AI によるペルソナ自動生成（claude/codex/grok CLI 経由）とアバター生成（Gemini Image API）
 - ストリーミング応答・思考表示・ツール使用カード付きのインタラクティブチャット
 - エージェントメッセージの Markdown レンダリング

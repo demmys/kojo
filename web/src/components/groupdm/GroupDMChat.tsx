@@ -13,6 +13,7 @@ import {
   clearLastRead,
   type GroupMessage,
   type ThreadLive,
+  isThreadRoom,
 } from "../../lib/groupdmApi";
 import { useEnterSends } from "../../lib/preferences";
 import { formatTime } from "../../lib/utils";
@@ -238,8 +239,7 @@ export function GroupDMChat() {
   // (single agent member) carry per-reply usage, so skip group rooms.
   useEffect(() => {
     if (!group) return;
-    const threadLike =
-      group.kind === "thread" || (group.kind === "dm" && group.members.length === 1);
+    const threadLike = isThreadRoom(group);
     if (!threadLike || group.members.length === 0) return;
     let cancelled = false;
     agentApi
@@ -326,9 +326,7 @@ export function GroupDMChat() {
   // A "thread" room is a human↔agent DM with a single agent member: a
   // temporary Slack-thread-like side conversation. Group-only affordances
   // (cooldown / hops settings) are hidden and Delete becomes Archive.
-  const isThread =
-    !!group &&
-    (group.kind === "thread" || (group.kind === "dm" && group.members.length === 1));
+  const isThread = isThreadRoom(group);
 
   // In a thread, the newest message being the user's own post means the
   // agent's turn is still running (polling will append the reply and flip

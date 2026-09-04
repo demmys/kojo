@@ -1018,6 +1018,15 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 	a.CreatedAt = normalizeTimestamp(a.CreatedAt)
 	a.UpdatedAt = normalizeTimestamp(a.UpdatedAt)
 
+	// Migrate the pre-rename backend identifiers ("custom" → "custom-claude",
+	// "llama.cpp" → "custom-bare"). Read-path only, like the grok model
+	// rewrite above it: the row keeps the old string until its next save, so
+	// a peer still running an older kojo build can continue to read it.
+	if migrated := NormalizeToolName(a.Tool); migrated != a.Tool {
+		st.logger.Debug("migrated legacy tool name", "agent", a.ID, "from", a.Tool, "to", migrated)
+		a.Tool = migrated
+	}
+
 	// Migrate retired grok model ids to the current default. grok CLI
 	// 0.2.91 dropped "grok-build" and 1.0.3 dropped
 	// "grok-composer-2.5-fast" (its models endpoint now lists only

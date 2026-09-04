@@ -3,13 +3,15 @@ import { useParams, useNavigate, useLocation } from "react-router";
 import {
   agentApi,
   CONTEXT_INJECTION_KEYS,
+  injectionSupportedByTool,
   type AgentInfo,
+  type AttachCacheResult,
   type ContextInjectionKey,
   type TruncateMemoryResult,
 } from "../../lib/agentApi";
 import { useTTSCapability } from "../../hooks/useTTS";
 import { ttsApi, pickBestFormat } from "../../lib/ttsApi";
-import { errMsg } from "../../lib/utils";
+import { errMsg, formatBytes } from "../../lib/utils";
 import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
@@ -98,7 +100,7 @@ function ToggleRow({
   desc: React.ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3">
+    <div className={`flex items-start justify-between gap-3${disabled ? " opacity-50" : ""}`}>
       <div className="min-w-0">
         <div className="text-[13px] text-ink">{title}</div>
         <p className="mt-0.5 text-[12px] text-ink-faint">{desc}</p>
@@ -200,6 +202,11 @@ export function AgentSettings() {
   const [archiving, setArchiving] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
+  // Attachment blob cache. `attachCache` is the size probe shown next to the
+  // button; null means "not loaded / unknown" so the label degrades to the
+  // plain verb instead of claiming 0 bytes.
+  const [attachCache, setAttachCache] = useState<AttachCacheResult | null>(null);
+  const [clearingAttach, setClearingAttach] = useState(false);
   // Memory truncation. The datetime-local input emits a naive
   // "YYYY-MM-DDTHH:mm" string; we attach the browser's current UTC offset
   // when calling the API so the server interprets it in local time. The
@@ -314,6 +321,8 @@ export function AgentSettings() {
   );
   const [privileged, setPrivileged] = useState(false);
   const [privilegeSaving, setPrivilegeSaving] = useState(false);
+  const [ownerDeputy, setOwnerDeputy] = useState(false);
+  const [ownerDeputySaving, setOwnerDeputySaving] = useState(false);
   const [showForkDialog, setShowForkDialog] = useState(false);
   const [forkName, setForkName] = useState("");
   const [forkIncludeTranscript, setForkIncludeTranscript] = useState(false);
@@ -348,6 +357,7 @@ export function AgentSettings() {
     setDisabledInjections(a.disabledInjections ?? []);
     setAllowProtectedPaths(a.allowProtectedPaths ?? []);
     setPrivileged(a.privileged ?? false);
+    setOwnerDeputy(a.ownerDeputy ?? false);
     setTTSEnabled(a.tts?.enabled ?? false);
     setTTSProvider(a.tts?.provider === "grok" ? "grok" : "gemini");
     setTTSModel(a.tts?.model ?? "");
@@ -461,7 +471,7 @@ export function AgentSettings() {
       // choice on every load so model discovery works immediately and the
       // operator is not forced to re-confirm "no API key" on every visit.
       setCustomNoAuth(
-        customKeyStatusKnown && a.tool === "custom" &&
+        customKeyStatusKnown && (a.tool === "custom-claude" || a.tool === "custom") &&
           !!a.customBaseURL?.trim() && !customKeyConfigured,
       );
       setStatusLoadGen((g) => g + 1);
@@ -547,21 +557,23 @@ export function AgentSettings() {
     };
   }, [id, agent?.nextCronAt]);
 
+  const isCustomClaude = tool === "custom-claude" || tool === "custom";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
   useEffect(() => {
-    if (tool !== "custom") setCustomNoAuth(false);
-  }, [tool]);
+    if (!isCustomClaude) setCustomNoAuth(false);
+  }, [isCustomClaude]);
 
   const customAPIKeyURLSaved =
     !!agent && customBaseURL.trim() === (agent.customBaseURL ?? "").trim();
   useEffect(() => {
     if (customAPIKeyConfigured && customAPIKeyURLSaved) setCustomNoAuth(false);
   }, [customAPIKeyConfigured, customAPIKeyURLSaved]);
-  const customNoAuthEnabled = tool === "custom" && customNoAuth;
+  const customNoAuthEnabled = isCustomClaude && customNoAuth;
   const customKeyStatusUnknownForSavedURL =
-    tool === "custom" && !!agent && customAPIKeyURLSaved && !customAPIKeyStatusKnown;
+    isCustomClaude && !!agent && customAPIKeyURLSaved && !customAPIKeyStatusKnown;
   const customModelDiscoveryReady =
     !!customBaseURL.trim() &&
-    (tool === "llama.cpp" || !!customAPIKey.trim() ||
+    (isKeyOptionalCustom || !!customAPIKey.trim() ||
       (customAPIKeyConfigured && customAPIKeyURLSaved) || customNoAuthEnabled ||
       customKeyStatusUnknownForSavedURL);
   const {
@@ -594,7 +606,7 @@ export function AgentSettings() {
       setCustomAPIKey("");
       setCustomAPIKeyConfigured(false);
       setCustomAPIKeyStatusKnown(true);
-      setCustomNoAuth(tool === "custom");
+      setCustomNoAuth(isCustomClaude);
       setCustomAPIKeyVersion((v) => v + 1);
     } catch (err) {
       if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
@@ -963,6 +975,22 @@ export function AgentSettings() {
     }
   };
 
+  const handleToggleOwnerDeputy = async (next: boolean) => {
+    // Same shape as privilege: its own Owner-only endpoint, so it saves
+    // immediately instead of riding along with Save Changes.
+    setOwnerDeputySaving(true);
+    setError("");
+    try {
+      await agentApi.setOwnerDeputy(id!, next);
+      setOwnerDeputy(next);
+      setAgent((a) => (a ? { ...a, ownerDeputy: next } : a));
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setOwnerDeputySaving(false);
+    }
+  };
+
   const handleResetSession = async () => {
     if (!confirm(t("settings.resetSessionConfirm"))) return;
     setResettingSession(true);
@@ -1033,6 +1061,59 @@ export function AgentSettings() {
       setError(errMsg(err));
     } finally {
       setResetting(false);
+    }
+  };
+
+  // Probe the cache size on mount so the button can say what it would free.
+  // Failure is silent: the size is a nicety, and a settings screen that
+  // refuses to render because a cache probe 503'd would be worse than a
+  // button with no number on it.
+  useEffect(() => {
+    if (!id) return;
+    // Drop the previous agent's figure first: navigating between two
+    // settings screens reuses this component, and showing agent A's cache
+    // size under agent B's button until the probe lands is worse than
+    // showing no number at all.
+    setAttachCache(null);
+    let cancelled = false;
+    agentApi
+      .getAttachCache(id)
+      .then((r) => {
+        if (!cancelled) setAttachCache(r);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  const handleClearAttachCache = async () => {
+    if (!confirm(t("settings.attachCacheConfirm"))) return;
+    setClearingAttach(true);
+    setError("");
+    try {
+      const r = await agentApi.clearAttachCache(id!);
+      if (r.failed) {
+        // A partial purge leaves blobs behind, so the button must not claim
+        // 0/0. Re-probe for the real remainder; if even that fails, fall
+        // back to "unknown" rather than a figure we cannot stand behind.
+        setError(t("settings.attachCacheFailed", { failed: r.failed }));
+        try {
+          setAttachCache(await agentApi.getAttachCache(id!));
+        } catch {
+          setAttachCache(null);
+        }
+      } else {
+        // Show the post-purge state rather than what was removed: the label
+        // says what this button would free next time.
+        setAttachCache({ deleted: 0, bytes: 0 });
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 2000);
+      }
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setClearingAttach(false);
     }
   };
 
@@ -1190,7 +1271,7 @@ export function AgentSettings() {
       tool.trim() !== agent.tool ||
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
-      (tool === "llama.cpp" && thinkingMode !== (agent.thinkingMode ?? "")) ||
+      (tool === "custom-bare" && thinkingMode !== (agent.thinkingMode ?? "")) ||
       workDir.trim() !== (agent.workDir ?? "") ||
       cronExpr !== (agent.cronExpr ?? "") ||
       timeoutMinutes !== (agent.timeoutMinutes || 10) ||
@@ -1198,8 +1279,8 @@ export function AgentSettings() {
       silentStart !== (agent.silentStart ?? "") ||
       silentEnd !== (agent.silentEnd ?? "") ||
       notifyDuringSilent !== (agent.notifyDuringSilent ?? true) ||
-      (tool === "custom" && !setEq(allowedTools, agent.allowedTools ?? [])) ||
-      ((tool === "claude" || tool === "custom") &&
+      (tool === "custom-claude" && !setEq(allowedTools, agent.allowedTools ?? [])) ||
+      ((tool === "claude" || tool === "custom-claude") &&
         !setEq(allowProtectedPaths, agent.allowProtectedPaths ?? [])) ||
       !setEq(disabledInjections, agent.disabledInjections ?? []) ||
       ttsEnabled !== (agent.tts?.enabled ?? false) ||
@@ -1221,7 +1302,7 @@ export function AgentSettings() {
     hydrateFromAgent(agent);
     setCustomAPIKey("");
     setCustomNoAuth(
-      customAPIKeyStatusKnown && agent.tool === "custom" &&
+      customAPIKeyStatusKnown && (agent.tool === "custom-claude" || agent.tool === "custom") &&
         !!agent.customBaseURL?.trim() && !customAPIKeyConfigured,
     );
     setCronMessage(loadedCheckin);
@@ -1492,13 +1573,25 @@ export function AgentSettings() {
           <div className="space-y-3">
             {CONTEXT_INJECTION_KEYS.map((key) => {
               const enabled = !disabledInjections.includes(key);
+              // A tool-less backend never receives these sections, so a
+              // live toggle would be a lie. Dim the row in place (rather
+              // than hiding it) and show it off: that is the effective
+              // state. Display only — disabledInjections is left alone, so
+              // the stored value reappears the moment the backend is
+              // switched away from custom-bare.
+              const supported = injectionSupportedByTool(key, tool);
               return (
                 <ToggleRow
                   key={key}
-                  checked={enabled}
+                  checked={supported && enabled}
                   onChange={(v) => toggleInjection(key, v)}
+                  disabled={!supported}
                   title={t(`settings.inj.${key}.label`)}
-                  desc={t(`settings.inj.${key}.desc`)}
+                  desc={
+                    supported
+                      ? t(`settings.inj.${key}.desc`)
+                      : t("settings.inj.unsupportedByTool")
+                  }
                 />
               );
             })}
@@ -1560,7 +1653,7 @@ export function AgentSettings() {
                         <span className="text-[12px] text-lamp-run">{t("gs.configured")}</span>
                       )}
                     </div>
-                    {tool === "custom" &&
+                    {isCustomClaude &&
                       (!customAPIKeyConfigured || !customAPIKeyURLSaved) && (
                         <label className="flex items-center gap-2 text-[12px] text-ink-dim">
                           <input
@@ -1588,7 +1681,7 @@ export function AgentSettings() {
 
             {needsCustomURL && customModelsStatus === "idle" && (
               <p className="text-[12px] text-ink-faint">
-                {t(tool === "llama.cpp"
+                {t(isKeyOptionalCustom
                   ? "settings.customModelURLPrerequisite"
                   : "settings.customModelPrerequisites")}
               </p>
@@ -1618,7 +1711,7 @@ export function AgentSettings() {
             )}
 
             {/* Allowed Tools (custom only) */}
-            {tool === "custom" && (
+            {tool === "custom-claude" && (
               <Field
                 label={
                   <>
@@ -1657,7 +1750,7 @@ export function AgentSettings() {
             )}
 
             {/* Protected Path Allow (claude / custom) */}
-            {(tool === "claude" || tool === "custom") && (
+            {(tool === "claude" || tool === "custom-claude") && (
               <Field
                 label={
                   <>
@@ -1689,8 +1782,8 @@ export function AgentSettings() {
               </Field>
             )}
 
-            {/* Thinking Mode (llama.cpp only) */}
-            {tool === "llama.cpp" && (
+            {/* Thinking Mode (custom-bare only) */}
+            {tool === "custom-bare" && (
               <Field label={t("settings.thinking")}>
                 <Select value={thinkingMode} onChange={(e) => setThinkingMode(e.target.value)}>
                   <option value="">{t("settings.thinkingAuto")}</option>
@@ -1719,6 +1812,13 @@ export function AgentSettings() {
               onChange={handleTogglePrivileged}
               title={t("settings.privileged")}
               desc={t("settings.privilegedDesc")}
+            />
+            <ToggleRow
+              checked={ownerDeputy}
+              disabled={ownerDeputySaving}
+              onChange={handleToggleOwnerDeputy}
+              title={t("settings.ownerDeputy")}
+              desc={t("settings.ownerDeputyDesc")}
             />
           </div>
         </SectionCard>
@@ -2027,6 +2127,26 @@ export function AgentSettings() {
                 </div>
               </div>
             )}
+            <div>
+              <Button
+                variant="danger"
+                onClick={handleClearAttachCache}
+                disabled={clearingAttach}
+                className="w-full"
+              >
+                {clearingAttach
+                  ? t("settings.attachCacheClearing")
+                  : attachCache
+                    ? t("settings.attachCacheButtonSized", {
+                        size: formatBytes(attachCache.bytes),
+                        count: attachCache.deleted,
+                      })
+                    : t("settings.attachCacheButton")}
+              </Button>
+              <p className="mt-1.5 text-[12px] text-ink-faint">
+                {t("settings.attachCacheHelp")}
+              </p>
+            </div>
             <div>
               <Button
                 variant="danger"

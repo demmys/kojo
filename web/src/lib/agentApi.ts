@@ -112,6 +112,7 @@ export interface AgentInfo {
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
   privileged?: boolean;
+  ownerDeputy?: boolean;
   // Strong HTTP entity tag of the v1 store row for this agent. Carry
   // alongside form state so PATCH /agents/{id} can send it as If-Match;
   // a server-side mismatch surfaces as PreconditionFailedError. Empty
@@ -202,6 +203,16 @@ export function isTurnErrorPreview(m?: { role: string; content: string }): boole
 // CONTEXT_INJECTION_KEYS mirrors the server-side allowlist for
 // disabledInjections. Unknown keys are rejected by the server with 400,
 // so this list must stay in sync with the backend's validation.
+// AttachCacheResult is returned by both getAttachCache and clearAttachCache.
+// On GET, `deleted` is the number of blobs currently held (nothing has been
+// deleted yet) and `bytes` their total size; on DELETE both describe what the
+// call actually removed. `failed` counts blobs the server could not delete.
+export interface AttachCacheResult {
+  deleted: number;
+  bytes: number;
+  failed?: number;
+}
+
 export const CONTEXT_INJECTION_KEYS = [
   "user_context",
   "memory_md",
@@ -218,6 +229,35 @@ export const CONTEXT_INJECTION_KEYS = [
 ] as const;
 
 export type ContextInjectionKey = (typeof CONTEXT_INJECTION_KEYS)[number];
+
+// Injection sections that only exist for agents with agentic tools.
+// buildSystemPrompt gates each of these on hasTools (= the backend is
+// not custom-bare): they hand the agent a shell recipe — stage a file
+// under the attach directory, curl the attention endpoint, read the
+// credentials guide, curl the group-DM API — none of which a single
+// stateless chat completion can act on. The toggle is therefore inert
+// for custom-bare and the UI disables it rather than implying an effect.
+// Keep in sync with the hasTools gates in internal/agent/memory.go.
+export const TOOL_ONLY_INJECTION_KEYS: readonly ContextInjectionKey[] = [
+  "credentials",
+  "groupdm",
+  "attachments",
+  "call_user",
+];
+
+// toolHasAgenticTools mirrors internal/agent.toolHasAgenticTools, legacy
+// name included: rows written before the rename still carry "llama.cpp",
+// and the server normalizes them to custom-bare (see legacyToolNames), so
+// a settings screen loaded against an un-migrated row must too.
+export function toolHasAgenticTools(tool: string): boolean {
+  return tool !== "custom-bare" && tool !== "llama.cpp";
+}
+
+// injectionSupportedByTool reports whether toggling the section has any
+// effect on the prompt built for this backend.
+export function injectionSupportedByTool(key: ContextInjectionKey, tool: string): boolean {
+  return toolHasAgenticTools(tool) || !TOOL_ONLY_INJECTION_KEYS.includes(key);
+}
 
 // TTSConfig mirrors internal/agent.TTSConfig in the Go backend.
 // Empty model/voice/stylePrompt are interpreted as "use default" at
@@ -416,14 +456,16 @@ export interface TruncateMemoryResult {
   messagesRemoved: number;
   claudeSessionEntriesRemoved: number;
   claudeSessionFilesRemoved: number;
-  // Grok session subtrees dropped wholesale ($GROK_HOME/sessions/<encoded(agentDir)>/<uuid>/).
-  // Grok's events.jsonl has no kojo-compatible per-record timestamp so any
-  // truncate that lands inside a session drops the whole session — the next
-  // non-OneShot turn opens a fresh one.
+  // Grok sessions are trimmed at a turn boundary, not dropped: events.jsonl's
+  // `turn_started` records map an RFC3339 ts to the chat_history.jsonl line
+  // count at that instant, so the conversation prefix survives.
+  // grokSessionsRemoved counts only the sessions whose FIRST turn was already
+  // past the threshold — those have no usable remainder and go away whole.
   //
   // Optional because the fields were added after v0.19 — an older server
   // peer (mid-rollout) returns the response without them, and the UI
   // should render "0" instead of "undefined".
+  grokSessionEntriesRemoved?: number;
   grokSessionsRemoved?: number;
   grokSessionFilesRemoved?: number;
   diaryFilesRemoved: number;
@@ -610,6 +652,19 @@ export const agentApi = {
     params: { since: string } | { fromMessageId: string },
   ) => post<TruncateMemoryResult>(`/api/v1/agents/${id}/memory/truncate`, params),
 
+  // Ingested-attachment blob cache (global scope, agents/{id}/attach/...).
+  // GET reports what is currently held so the settings screen can show the
+  // size before the operator commits; DELETE removes every blob under the
+  // prefix and reports what it actually freed.
+  //
+  // This is a cache purge, not a transcript edit: past messages keep their
+  // attachment references and render as broken links afterwards.
+  getAttachCache: (id: string) =>
+    get<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
+
+  clearAttachCache: (id: string) =>
+    del<AttachCacheResult>(`/api/v1/agents/${id}/attach-cache`),
+
   checkin: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/checkin`),
 
   // user.md workspace file (per-agent notes about the people the agent works
@@ -699,6 +754,12 @@ export const agentApi = {
     post<{ id: string; privileged: boolean }>(
       `/api/v1/agents/${id}/privilege`,
       { privileged },
+    ),
+
+  setOwnerDeputy: (id: string, ownerDeputy: boolean) =>
+    post<{ id: string; ownerDeputy: boolean }>(
+      `/api/v1/agents/${id}/owner-deputy`,
+      { ownerDeputy },
     ),
 
   tasks: {
@@ -882,6 +943,14 @@ export const agentApi = {
           expectedEtag,
         ).then((r) => r.value)
       : post<{ ok: boolean }>(`/api/v1/agents/${agentId}/messages/${msgId}/regenerate`),
+
+  // rewindToMessage rolls the conversation back to just before msgId: the
+  // message and everything after it leave the transcript, and the backend's
+  // native session state (Claude session JSONL, grok session dirs, Codex
+  // threads) is trimmed to the same boundary so the model's context matches
+  // what the UI shows. The daily diary is NOT touched. No redo.
+  rewindToMessage: (agentId: string, msgId: string) =>
+    post<TruncateMemoryResult>(`/api/v1/agents/${agentId}/messages/${msgId}/rewind`),
 
   generatePersona: (currentPersona: string, prompt: string) =>
     post<{ persona: string }>("/api/v1/agents/generate-persona", { currentPersona, prompt }),

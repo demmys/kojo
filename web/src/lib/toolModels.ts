@@ -8,7 +8,7 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-5.6-sol",
@@ -27,11 +27,17 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "grok-4.6",
     models: ["grok-4.6", "grok-4.5"],
   },
-  custom: {
+  // The custom-* backends have no fixed model list: the operator supplies
+  // the endpoint and useCustomModels fetches whatever it advertises.
+  "custom-claude": {
     default: "",
     models: [],
   },
-  "llama.cpp": {
+  "custom-codex": {
+    default: "",
+    models: [],
+  },
+  "custom-bare": {
     default: "",
     models: [],
   },
@@ -52,7 +58,7 @@ export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
 /** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
+const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
 // codex CLI 0.144.1 models_cache.json: the gpt-5.6 family advertises
 // low/medium/high/xhigh/max (sol and terra also list "ultra", which kojo's
@@ -71,9 +77,9 @@ const grokXhighModels = new Set(["grok-4.6"]);
 
 /**
  * Models whose default effort is xhigh (rather than high).
- * Opus 5 / 4.8 support xhigh and max but default to high; only Opus 4.7
- * defaults to xhigh. The "opus" alias is treated as Opus 5, so it defaults
- * to high. grok-4.6 advertises low/medium/high/xhigh and grok-4.5
+ * Opus 5 / 4.8 and both Fable models support xhigh and max but default to
+ * high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated as
+ * Opus 5, so it defaults to high. grok-4.6 advertises low/medium/high/xhigh and grok-4.5
  * low/medium/high; both carry reasoning_effort "high" as the CLI default,
  * so neither is listed here.
  */

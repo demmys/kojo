@@ -158,7 +158,7 @@ func NormalizeThinkingMode(mode string) string {
 
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
-	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok CLI 1.0.3's models_cache.json advertises xhigh for grok-4.6
 	// but only low/medium/high for grok-4.5; neither offers max. Keep
 	// this in sync with web/src/lib/toolModels.ts xhighModels /
@@ -242,7 +242,8 @@ func ValidModelEffort(model, effort string) bool {
 // a name that happens to match a Grok or Codex model must not inherit kojo's
 // assumptions about that built-in model's effort ladder.
 func ValidToolModelEffort(tool, model, effort string) bool {
-	if tool == "custom" || tool == "llama.cpp" {
+	switch NormalizeToolName(tool) {
+	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
 		if !ValidEffort(effort) {
 			return false
 		}
@@ -310,7 +311,7 @@ type Agent struct {
 	Persona string `json:"persona"`           // persona description (markdown)
 	Model   string `json:"model"`             // e.g. "sonnet", "opus"
 	Effort  string `json:"effort,omitempty"`  // claude/grok/codex effort level
-	Tool    string `json:"tool"`              // CLI tool: "claude", "codex", "grok"
+	Tool    string `json:"tool"`              // backend id, see tool_names.go
 	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
 	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
 	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
@@ -401,7 +402,7 @@ type Agent struct {
 	PublicProfileOverride bool   `json:"publicProfileOverride,omitempty"`
 
 	// CustomBaseURL is the base URL for a custom Anthropic Messages API endpoint
-	// (e.g., llama-server). Only used when Tool is "custom".
+	// (e.g., llama-server). Only used by the custom-* tools.
 	CustomBaseURL string `json:"customBaseURL,omitempty"`
 
 	// AllowedTools is a whitelist of tool names forwarded to a custom endpoint.
@@ -415,7 +416,7 @@ type Agent struct {
 	// explicit permissions.allow rules are the only bypass.
 	AllowProtectedPaths []string `json:"allowProtectedPaths,omitempty"`
 
-	// ThinkingMode controls reasoning/thinking for llama.cpp backend.
+	// ThinkingMode controls reasoning/thinking for the custom-bare backend.
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
 
@@ -453,10 +454,27 @@ type Agent struct {
 	ArchivedAt string `json:"archivedAt,omitempty"`
 
 	// Privileged grants the agent the ability to delete/reset other agents
-	// (but NOT to fork or read their full record). Owner-only mutation —
+	// (but NOT to fork or read their full record — those need the
+	// stronger OwnerDeputy grant below). Owner-only mutation —
 	// the API strips this field from PATCH bodies and exposes a dedicated
 	// POST /api/v1/agents/{id}/privilege handler instead.
 	Privileged bool `json:"privileged,omitempty"`
+
+	// OwnerDeputy makes the agent the Owner's stand-in over OTHER
+	// agents: everything Privileged grants, plus create, fork, full
+	// record reads, PATCH, and writes to their persona / user.md /
+	// status / anchor / MEMORY.md / memory entries. It is strictly
+	// stronger than Privileged but kept as its own flag: the two are
+	// granted independently, and only Privileged carries the
+	// restart-the-server power (auth.Principal.CanRestartServer).
+	//
+	// The grant never widens what the holder may do to ITSELF — a
+	// deputy still cannot flip its own privileged / ownerDeputy bits or
+	// disabledInjections, and cannot fork itself, so the flag is not a
+	// self-elevation path.
+	// Owner-only mutation via POST /api/v1/agents/{id}/owner-deputy;
+	// the API strips the field from PATCH bodies.
+	OwnerDeputy bool `json:"ownerDeputy,omitempty"`
 
 	// DeviceSwitchEnabled gates whether the §3.7 device-switch skill
 	// (kojo-switch-device) gets installed into the agent's .claude/skills
@@ -714,8 +732,10 @@ type AgentUpdateConfig struct {
 	// installs or removes the SKILL.md accordingly.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
 	// DisabledInjections replaces the whole set when non-nil; pass an
-	// empty array to re-enable everything. Owner-only (enforced at the
-	// HTTP handler). Keys validated via ValidateDisabledInjections.
+	// empty array to re-enable everything. Settable by the Owner, or by
+	// an owner-deputy acting on ANOTHER agent — never self-PATCHable
+	// (enforced at the HTTP handler). Keys validated via
+	// ValidateDisabledInjections.
 	DisabledInjections *[]string `json:"disabledInjections"`
 	// AutoEffort toggles the per-turn dynamic effort classifier. nil =
 	// "not provided; leave as-is"; explicit true/false overwrites.
@@ -884,7 +904,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidToolModelEffort(cfg.Tool, cfg.Model, cfg.Effort) {
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", cfg.Effort, cfg.Model)
 	}
-	if (cfg.Tool == "custom" || cfg.Tool == "llama.cpp") && cfg.CustomBaseURL == "" {
+	if ToolRequiresCustomBaseURL(cfg.Tool) && cfg.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
 	}
 	if !ValidThinkingMode(cfg.ThinkingMode) {
@@ -932,8 +952,12 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		UpdatedAt:           now,
 	}
 	if a.Tool == "" {
-		a.Tool = "claude"
+		a.Tool = ToolClaude
 	}
+	// Accept the pre-rename identifiers on the API and store the current
+	// name, so callers pinned to an old client keep working while the DB
+	// only ever gains canonical values.
+	a.Tool = NormalizeToolName(a.Tool)
 	if a.Model == "" {
 		a.Model = "sonnet"
 	}

@@ -21,8 +21,23 @@ describe("priceModel", () => {
       cacheRead: 0.5,
       cacheWrite: 6.25,
     });
-    expect(priceModel("claude-fable-5")?.input).toBe(10);
+    expect(priceModel("claude-fable-5")).toEqual({
+      input: 10,
+      output: 50,
+      cacheRead: 1,
+      cacheWrite: 12.5,
+    });
     expect(priceModel("claude-sonnet-4-6")?.output).toBe(15);
+  });
+
+  it("reads cache at 0.025x for Fable 5.1, 0.1x for Fable 5", () => {
+    // Same base rates; only the cache-read multiplier differs.
+    expect(priceModel("claude-fable-5-1")).toEqual({
+      input: 10,
+      output: 50,
+      cacheRead: 0.25,
+      cacheWrite: 12.5,
+    });
   });
 
   it("prices xAI grok models with their explicit cache-read rates", () => {

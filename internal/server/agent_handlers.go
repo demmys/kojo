@@ -425,7 +425,10 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if p.IsOwner() {
+	// An owner-deputy manages the fleet on the Owner's behalf, so it
+	// gets the Owner's view — including the archived rows it needs in
+	// order to unarchive them.
+	if p.IsOwner() || p.IsOwnerDeputy() {
 		out := make([]*agent.Agent, 0, len(all))
 		for _, a := range all {
 			switch {
@@ -492,8 +495,9 @@ func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
-	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
-		writeError(w, http.StatusForbidden, "forbidden", "agent creation is owner-only")
+	if p := auth.FromContext(r.Context()); !p.CanCreateAgent() {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"agent creation requires the Owner or an owner-deputy")
 		return
 	}
 	var cfg agent.AgentConfig
@@ -501,6 +505,9 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 		return
 	}
+	// AgentConfig carries no privileged / ownerDeputy field, so a
+	// creation request cannot mint a grant however it is crafted: the
+	// owner-only toggle endpoints are the only way in.
 	a, err := s.agents.Create(cfg)
 	if err != nil {
 		// ErrAgentBusy here means the restart drain's quiesce refused
@@ -660,6 +667,15 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 					"privileged is owner-only; use POST /api/v1/agents/{id}/privilege")
 				return
 			}
+			// Same reasoning for the owner-deputy grant: it has its own
+			// owner-only endpoint, and letting it through PATCH would
+			// make the grant self-propagating (a deputy may PATCH any
+			// other agent).
+			if strings.EqualFold(k, "ownerDeputy") {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"ownerDeputy is owner-only; use POST /api/v1/agents/{id}/owner-deputy")
+				return
+			}
 			// disabledInjections changes the agent's capability /
 			// context surface, so unlike persona / effort it is NOT
 			// self-PATCHable — Owner only. Peers pass for the same
@@ -669,7 +685,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			// to their local daemon and may only PATCH themselves).
 			// Case-insensitive match for the same casing-trick reason
 			// as privileged.
-			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() {
+			if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsPeer() &&
+				!p.IsOwnerDeputyOver(id) {
 				writeError(w, http.StatusForbidden, "forbidden",
 					"disabledInjections is owner-only")
 				return
@@ -810,6 +827,42 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 // Same auth gate as reset/delete (CanDeleteOrReset), same busy / reset
 // guard semantics. Returns 404 when the agent or fromMessageId can't be
 // found, 409 if a chat is in flight or another reset is racing.
+// handleRewindToMessage rolls the agent's conversation back to just before
+// msgId — the message and everything after it leave the transcript, and the
+// backend's native session state (Claude session JSONL, grok session dirs,
+// Codex threads) is trimmed to the same boundary so the CLI-side context
+// matches the UI. The daily diary is left alone; see Manager.RewindToMessage.
+//
+// Same auth gate and busy/reset semantics as memory/truncate. There is no
+// redo — the removed turns are gone.
+func (s *Server) handleRewindToMessage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	msgID := r.PathValue("msgId")
+	p := auth.FromContext(r.Context())
+	if !p.CanDeleteOrReset(id) {
+		writeError(w, http.StatusForbidden, "forbidden", "agent is not allowed to rewind others' conversation")
+		return
+	}
+
+	res, err := s.agents.RewindToMessage(id, msgID)
+	if err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound), errors.Is(err, agent.ErrMessageNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrMessageETagMismatch):
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy), errors.Is(err, agent.ErrAgentResetting):
+			writeError(w, http.StatusConflict, "busy", err.Error())
+		case errors.Is(err, agent.ErrAgentArchived):
+			writeError(w, http.StatusConflict, "archived", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, res)
+}
+
 func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
@@ -876,8 +929,9 @@ func (s *Server) handleTruncateAgentMemory(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if p := auth.FromContext(r.Context()); !p.CanForkOrCreate() {
-		writeError(w, http.StatusForbidden, "forbidden", "fork is owner-only")
+	if p := auth.FromContext(r.Context()); !p.CanFork(id) {
+		writeError(w, http.StatusForbidden, "forbidden",
+			"fork requires the Owner or an owner-deputy acting on another agent")
 		return
 	}
 	var body struct {
@@ -973,6 +1027,19 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		s.slackHub.StopBot(id)
 	}
 	s.reconcileLocalAgentLifecycle(r.Context(), id)
+	if s.extensions != nil {
+		// Drop the deleted agent's extension bindings. Archive keeps
+		// them: the row comes back on unarchive, and so should its
+		// per-agent extension config.
+		if !archive {
+			if err := s.extensions.ForgetAgent(id); err != nil {
+				s.logger.Warn("drop extension bindings failed", "agent", id, "err", err)
+			}
+		}
+		// Either way the agent is gone from service: reconcile stops
+		// any per-agent extension process that was running for it.
+		s.reconcileExtensionServices()
+	}
 	// Echo the new ETag for archive=true (the row still exists with
 	// a bumped etag). For full delete the row is gone — no useful
 	// etag to return. readAgentETag returns "" when the row is
@@ -1052,6 +1119,9 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 				"agent", id, "reason", mutErr.Error())
 		}
 	}
+	// Per-agent extension services are gated on the agent being
+	// active, so the restored agent's processes come back here.
+	s.reconcileExtensionServices()
 	if a, ok := s.agents.Get(id); ok {
 		if newETag := s.readAgentETag(r, id); newETag != "" {
 			w.Header().Set("ETag", quoteETag(newETag))
@@ -2701,6 +2771,55 @@ func (s *Server) handlePrivilegeAgent(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quoteETag(newETag))
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "privileged": body.Privileged})
+}
+
+// handleOwnerDeputyAgent toggles the OwnerDeputy flag on an agent.
+// Owner-only, and reasserted here for the same reason as
+// handlePrivilegeAgent: this flag is what lets an agent act for the
+// Owner on every other agent, so it must never be settable by one.
+func (s *Server) handleOwnerDeputyAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if p := auth.FromContext(r.Context()); !p.CanSetOwnerDeputy() {
+		writeError(w, http.StatusForbidden, "forbidden", "ownerDeputy is owner-only")
+		return
+	}
+
+	ifMatch, ifMatchPresent, ok := s.parseIfMatchStrict(w, r,
+		"If-Match: * is not supported on POST /agents/{id}/owner-deputy; send a specific etag or omit the header")
+	if !ok {
+		return
+	}
+
+	var body struct {
+		OwnerDeputy bool `json:"ownerDeputy"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	release := s.agents.LockPatch(id)
+	defer release()
+
+	if !s.agentIfMatchPrecheck(w, r, id, ifMatch, ifMatchPresent) {
+		return
+	}
+
+	if err := s.agents.SetOwnerDeputy(id, body.OwnerDeputy); err != nil {
+		switch {
+		case errors.Is(err, agent.ErrAgentNotFound):
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+		case errors.Is(err, agent.ErrAgentBusy):
+			writeError(w, http.StatusConflict, "agent_busy", err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+	if newETag := s.readAgentETag(r, id); newETag != "" {
+		w.Header().Set("ETag", quoteETag(newETag))
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"id": id, "ownerDeputy": body.OwnerDeputy})
 }
 
 func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {

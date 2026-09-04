@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestLlamaCppBackendUsesStoredBearerKey(t *testing.T) {
+func TestCustomBareBackendUsesStoredBearerKey(t *testing.T) {
 	const wantKey = "sk-unsloth-chat"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -27,7 +27,7 @@ func TestLlamaCppBackendUsesStoredBearerKey(t *testing.T) {
 	if err := StoreCustomAPIKey(creds, "ag_unsloth", upstream.URL, wantKey); err != nil {
 		t.Fatal(err)
 	}
-	backend := NewLlamaCppBackend(slog.New(slog.NewTextHandler(io.Discard, nil)), creds)
+	backend := NewCustomBareBackend(slog.New(slog.NewTextHandler(io.Discard, nil)), creds)
 	ch, err := backend.Chat(context.Background(), &Agent{
 		ID: "ag_unsloth", Model: "test-model", CustomBaseURL: upstream.URL,
 	}, "hello", "", ChatOptions{})

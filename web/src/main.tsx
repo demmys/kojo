@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { bootstrapTokenFromURL } from "./lib/auth";
+import { bootstrapLocales } from "./lib/i18n";
 import { AppLayout, EmptyPane } from "./components/AppLayout";
 import { SessionPage } from "./components/SessionPage";
 import { NewSession } from "./components/NewSession";
@@ -24,6 +25,11 @@ import "./index.css";
 // Pull the Owner token out of `?token=…` and stash it before any
 // component mounts and starts hitting /api/v1/*.
 bootstrapTokenFromURL();
+
+// Pull in extension-contributed UI languages. Not awaited: the builtin
+// languages render immediately and the overlay re-renders subscribers
+// when it arrives.
+void bootstrapLocales();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

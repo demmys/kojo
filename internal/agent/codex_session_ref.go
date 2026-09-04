@@ -167,3 +167,25 @@ func codexEffortForProtocol(model, effort string) string {
 		return ""
 	}
 }
+
+func codexCanResumeSession(agentID, sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	ref, err := readCodexThreadRef(agentID, sessionKey)
+	if err != nil || ref == nil || ref.ThreadID == "" {
+		return false
+	}
+	path := ref.RolloutPath
+	if path == "" {
+		path = lookupCodexRolloutPath(ref.ThreadID)
+	}
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Size() > 0
+}

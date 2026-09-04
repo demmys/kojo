@@ -247,7 +247,7 @@ func (m *Manager) DeleteAgentMemory(ctx context.Context, agentID, ifMatchETag st
 // fast (acquireResetGuard refuses when m.editing[agentID] is set).
 // The returned release MUST always be called.
 //
-// Mirrors acquireTranscriptEdit but without the llama.cpp constraint
+// Mirrors acquireTranscriptEdit but without the custom-bare constraint
 // — MEMORY.md edits are CLI-agnostic. Returns ErrAgentNotFound,
 // ErrAgentArchived, ErrAgentResetting, or ErrAgentBusy depending on
 // which guard tripped; the HTTP handler maps these to 404 / 409.

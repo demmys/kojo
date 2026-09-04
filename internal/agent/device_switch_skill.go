@@ -30,14 +30,14 @@ import (
 //
 //   - Manager.prepareChat calls SyncDeviceSwitchSkillForTool right
 //     after PrepareClaudeSettings. That dispatcher routes by
-//     agent.Tool: claude/custom write the Claude-Code-flavored
+//     agent.Tool: claude/custom-claude write the Claude-Code-flavored
 //     body (deviceSwitchSkillBody / deviceSwitchSkillBodyWindows),
 //     grok writes the grok-flavored body
 //     (deviceSwitchSkillBodyGrokPOSIX / deviceSwitchSkillBodyGrokWindows
 //     — no Claude-Code-only `!`exec`` substitution, mentions
 //     `grok --resume` instead of `claude --continue`), codex writes
 //     a `.codex/skills` body that mentions Codex thread resume, and
-//     llama.cpp is no-op. The Update path additionally
+//     custom-bare is no-op. The Update path additionally
 //     re-fires the dispatcher whenever Tool changes so a tool
 //     switch overwrites the on-disk body with the variant the
 //     new backend can actually execute.
@@ -653,7 +653,7 @@ func syncDeviceSwitchSkillBodyAt(agentID, root, body string, enabled bool, logge
 // the lower-level Sync*DeviceSwitchSkill variants. Dispatches on
 // the agent's current Tool value:
 //
-//   - "claude" / "custom": install the Claude-Code body when
+//   - "claude" / "custom-claude": install the Claude-Code body when
 //     enabled, remove otherwise (SyncDeviceSwitchSkill).
 //
 //   - "grok": install the grok-flavored body when enabled, remove
@@ -664,17 +664,18 @@ func syncDeviceSwitchSkillBodyAt(agentID, root, body string, enabled bool, logge
 //     a tool change must yield a body the new backend can
 //     execute.
 //
-//   - "codex": install the codex-flavored body under `.codex/skills`
-//     when enabled, remove otherwise (SyncCodexDeviceSwitchSkill).
+//   - "codex" / "custom-codex": install the codex-flavored body under
+//     `.codex/skills` when enabled, remove otherwise
+//     (SyncCodexDeviceSwitchSkill).
 //
-//   - any other tool (llama.cpp): no-op.
+//   - any other tool (custom-bare): no-op.
 func SyncDeviceSwitchSkillForTool(agentID, tool string, enabled bool, logger *slog.Logger) {
-	switch tool {
-	case "claude", "custom":
+	switch NormalizeToolName(tool) {
+	case ToolClaude, ToolCustomClaude:
 		SyncDeviceSwitchSkill(agentID, enabled, logger)
-	case "grok":
+	case ToolGrok:
 		SyncGrokDeviceSwitchSkill(agentID, enabled, logger)
-	case "codex":
+	case ToolCodex, ToolCustomCodex:
 		SyncCodexDeviceSwitchSkill(agentID, enabled, logger)
 	}
 }

@@ -1,6 +1,9 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -110,11 +113,22 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Attachment-cache purge acts on THIS device's blob store.
+		// Attachments replicate to every peer that has seen them, so the
+		// disk pressure the operator is trying to relieve is local by
+		// definition; proxying to the holder would free the holder's disk
+		// and leave this one untouched — the opposite of what the button
+		// on this screen promises.
+		if sub == "/attach-cache" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Hub-only management ops: the target peer's handler would
-		// 403 anyway (CanForkOrCreate / CanSetPrivileged don't
-		// admit RolePeer). Short-circuit here to avoid a wasted
-		// round-trip.
-		if sub == "/fork" || sub == "/privilege" {
+		// 403 anyway (CanFork / CanSetPrivileged / CanSetOwnerDeputy
+		// don't admit RolePeer). Short-circuit here to avoid a
+		// wasted round-trip.
+		if sub == "/fork" || sub == "/privilege" || sub == "/owner-deputy" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -144,6 +158,47 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		// syncs home at the next device switch. Only when that proxy
 		// is guaranteed to fail (holder offline or unknown) does a
 		// hub-safe-only payload get applied to the hub's own row.
+
+		// disabledInjections is a capability-surface field, so the
+		// same Owner-or-deputy rule handleUpdateAgent applies must
+		// hold for a REMOTE target too. Enforce it here, on the
+		// original principal: once the request is proxied the holder
+		// stamps RolePeer, which passes that guard by design, so a
+		// self-PATCH would otherwise slip through unchecked. Peer
+		// callers already returned above (loop prevention), so every
+		// principal reaching here is an Owner, agent or guest.
+		if r.Method == http.MethodPatch && sub == "" {
+			p := auth.FromContext(r.Context())
+			// Read one byte past the cap so an oversized body is
+			// detected rather than silently truncated: parsing a
+			// clipped prefix would miss the very key this guard
+			// looks for, and forwarding it would corrupt the PATCH.
+			// The local handler caps at the same 1 MiB, so refusing
+			// here matches what a hub-local PATCH would do anyway.
+			body, rerr := io.ReadAll(io.LimitReader(r.Body, (1<<20)+1))
+			if rerr != nil {
+				writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+				return
+			}
+			if len(body) > 1<<20 {
+				writeError(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+					"request body too large")
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var raw map[string]json.RawMessage
+			if json.Unmarshal(body, &raw) == nil {
+				for k := range raw {
+					if strings.EqualFold(k, "disabledInjections") &&
+						!p.IsOwner() && !p.IsOwnerDeputyOver(id) {
+						writeError(w, http.StatusForbidden, "forbidden",
+							"disabledInjections is owner-only")
+						return
+					}
+				}
+			}
+		}
+
 		if r.Method == http.MethodPatch && sub == "" && !s.holderPeerOnline(r.Context(), remote.HolderPeer) {
 			if s.tryPatchRemoteAgentHubLocal(w, r, id) {
 				return

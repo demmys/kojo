@@ -988,7 +988,7 @@ export function AgentChat() {
             )}
           </button>
         )}
-        {agent.tool === "llama.cpp" && (
+        {agent.tool === "custom-bare" && (
           <button
             onClick={async () => {
               const modes = ["", "on", "off"] as const;
@@ -1098,7 +1098,7 @@ export function AgentChat() {
         )}
         {messages.map((msg) => {
           const editable =
-            agent.tool === "llama.cpp" &&
+            agent.tool === "custom-bare" &&
             !streaming &&
             !holderOffline &&
             !msg.id.startsWith("pending_") &&
@@ -1106,6 +1106,22 @@ export function AgentChat() {
             !msg.id.startsWith("aborted_");
           const regeneratable =
             editable && (msg.role === "user" || msg.role === "assistant");
+          // Rewind is not backend-specific the way edit/regenerate are: the
+          // server trims the native session state (Claude session JSONL,
+          // grok session dirs, Codex threads) alongside the transcript, so
+          // every backend can be rolled back consistently.
+          // User messages only. Rewind means "un-send this prompt": the
+          // text goes back into the composer and the conversation returns
+          // to the state it was in just before it was sent. Offering it on
+          // an assistant reply read as "delete from here", which is a
+          // different (and misleading) operation.
+          const rewindable =
+            !streaming &&
+            !holderOffline &&
+            msg.role === "user" &&
+            !msg.id.startsWith("pending_") &&
+            !msg.id.startsWith("error_") &&
+            !msg.id.startsWith("aborted_");
           return (
             <ChatMessage
               key={msg.id}
@@ -1250,6 +1266,65 @@ export function AgentChat() {
                           resetStream();
                         }
                       }
+                    }
+                  : undefined
+              }
+              onRewind={
+                rewindable
+                  ? async (msgId) => {
+                      // Optimistic truncation: the server tombstones this
+                      // row and everything after it, so slice locally
+                      // rather than waiting a full round-trip.
+                      const snapshot = messages;
+                      const idx = snapshot.findIndex((m) => m.id === msgId);
+                      if (idx < 0) return;
+                      // Put the prompt back in the composer so the user can
+                      // edit and re-send it — that is the whole point of
+                      // rewinding to your own message. Never clobber a
+                      // draft they have already started typing.
+                      const restored = snapshot[idx].content ?? "";
+                      const didRestore = !!restored && !inputRef.current.trim();
+                      if (didRestore) {
+                        inputRef.current = restored;
+                        setInput(restored);
+                      }
+                      setMessages(snapshot.slice(0, idx));
+                      let failure: unknown;
+                      try {
+                        await agentApi.rewindToMessage(agent.id, msgId);
+                      } catch (e) {
+                        failure = e;
+                      }
+                      // Always resync from the server, success or not.
+                      // Restoring the snapshot on failure would resurrect
+                      // rows the server may well have tombstoned already
+                      // (a timeout says nothing about whether the write
+                      // landed), so the transcript is the only truth.
+                      try {
+                        const fresh = await agentApi.messages(agent.id, 30);
+                        setMessages(fresh.messages);
+                        // Rewind failed and the prompt is still in the
+                        // transcript: undo the composer restore so the
+                        // text isn't sitting there twice. Only when the
+                        // user hasn't since edited what we put there.
+                        if (
+                          didRestore &&
+                          fresh.messages.some((m) => m.id === msgId) &&
+                          inputRef.current === restored
+                        ) {
+                          inputRef.current = "";
+                          setInput("");
+                        }
+                        // The refetch replaced the whole list with the
+                        // newest page, so any older pages that were paged
+                        // in are gone — mirror hasMore exactly instead of
+                        // the usual never-shrink rule.
+                        setHasMore(fresh.hasMore);
+                      } catch (e) {
+                        if (!failure) failure = e;
+                        else console.error(e);
+                      }
+                      if (failure) throw failure;
                     }
                   : undefined
               }

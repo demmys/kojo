@@ -93,11 +93,32 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("gpt-5.5")).toBe("medium");
   });
 
-  it("lists the gpt-5.6 family and defaults codex to gpt-5.6-sol", () => {
+  it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {
+    // codex CLI 0.153.3 models_cache.json, visibility "list" only —
+    // gpt-reserve and codex-auto-review are hidden and stay out.
+    expect(modelsForTool("codex")).toEqual([
+      "gpt-6-astra",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex",
+      "gpt-5.2",
+    ]);
+    expect(defaultModelForTool("codex")).toBe("gpt-6-astra");
+  });
+
+  it("gpt-6-astra supports xhigh and max, and defaults to low", () => {
+    expect(effortLevelsForModel("gpt-6-astra")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(defaultEffortForModel("gpt-6-astra")).toBe("low");
+  });
+
+  it("still lists the gpt-5.6 family", () => {
     expect(modelsForTool("codex")).toContain("gpt-5.6-sol");
     expect(modelsForTool("codex")).toContain("gpt-5.6-terra");
     expect(modelsForTool("codex")).toContain("gpt-5.6-luna");
-    expect(defaultModelForTool("codex")).toBe("gpt-5.6-sol");
   });
 
   it("gpt-5.6 family supports xhigh and max", () => {
@@ -131,7 +152,9 @@ describe("toolModels — Opus 5 / effort defaults", () => {
 });
 
 describe("sessionEffortLevelsForModel — ultra is session-only", () => {
-  it("adds ultra for gpt-5.6-sol and gpt-5.6-terra", () => {
+  it("adds ultra for gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra", () => {
+    expect(sessionEffortLevelsForModel("gpt-6-astra")).toContain("ultra");
+    expect(sessionEffortLevelsForModel("gpt-6-astra").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-5.6-sol")).toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.6-terra")).toContain("ultra");
   });

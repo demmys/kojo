@@ -164,24 +164,27 @@ var xhighModels = map[string]bool{
 	// this in sync with web/src/lib/toolModels.ts xhighModels /
 	// grokXhighModels.
 	"grok-4.6":    true,
+	"gpt-6-astra": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 var codexEffortModels = map[string]bool{
+	"gpt-6-astra": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 // codexMaxEffortModels lists codex models that support the "max" effort
-// level. codex CLI 0.144.1 models_cache.json advertises
-// low/medium/high/xhigh/max for the gpt-5.6 family (sol and terra also
-// list "ultra", which kojo's effort scale doesn't model). Older gpt-5.x
-// models stop at xhigh. Keep in sync with web/src/lib/toolModels.ts
-// codexMaxModels.
+// level. codex CLI 0.153.3 models_cache.json advertises
+// low/medium/high/xhigh/max for gpt-6-astra and the gpt-5.6 family
+// (astra, sol and terra also list "ultra", which kojo's effort scale
+// doesn't model). Older gpt-5.x models stop at xhigh. Keep in sync with
+// web/src/lib/toolModels.ts codexMaxModels.
 var codexMaxEffortModels = map[string]bool{
+	"gpt-6-astra": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
@@ -916,7 +919,12 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	// name, so callers pinned to an old client keep working while the DB
 	// only ever gains canonical values.
 	a.Tool = NormalizeToolName(a.Tool)
-	if a.Model == "" {
+	// Only the claude backend gets a hard-coded model fallback. For every
+	// other tool an empty model means "backend CLI default" (the option
+	// ModelPicker always renders), and stamping "sonnet" onto a
+	// codex/grok/custom-* agent would hand that CLI a model id it does
+	// not serve.
+	if a.Model == "" && a.Tool == ToolClaude {
 		a.Model = "sonnet"
 	}
 	return a, nil

@@ -145,7 +145,8 @@ func codexEffortForProtocol(model, effort string) string {
 	case "none", "minimal", "low", "medium", "high", "xhigh":
 		return effort
 	case "max":
-		// codex CLI 0.144.1 accepts "max" only for the gpt-5.6 family.
+		// Of the codex models kojo whitelists, only gpt-6-astra and the
+		// gpt-5.6 family advertise "max" (codex CLI 0.153.3).
 		// ValidModelEffort rejects codex-model+max combos elsewhere, but
 		// an agent with an EMPTY model (CLI-default) can hold effort=max
 		// — dropping it here keeps the pre-gpt-5.6 behavior (CLI default

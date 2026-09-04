@@ -402,6 +402,40 @@ func (m *Manager) IsPrivileged(id string) bool {
 	return ok && a.Privileged
 }
 
+// IsOwnerDeputy returns whether the agent has the OwnerDeputy flag set.
+// Used by auth.Resolver to stamp Principal.OwnerDeputy.
+func (m *Manager) IsOwnerDeputy(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.agents[id]
+	return ok && a.OwnerDeputy
+}
+
+// SetOwnerDeputy toggles the OwnerDeputy flag on the named agent and
+// persists the change. Owner-only mutation enforced at the API layer.
+func (m *Manager) SetOwnerDeputy(id string, deputy bool) error {
+	releaseMut, err := m.AcquireMutation(id)
+	if err != nil {
+		return err
+	}
+	defer releaseMut()
+	m.mu.Lock()
+	a, ok := m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if a.OwnerDeputy == deputy {
+		m.mu.Unlock()
+		return nil
+	}
+	a.OwnerDeputy = deputy
+	a.UpdatedAt = time.Now().Format(time.RFC3339)
+	m.mu.Unlock()
+	m.save()
+	return nil
+}
+
 // SetPrivileged toggles the Privileged flag on the named agent and
 // persists the change. Owner-only mutation enforced at the API layer.
 func (m *Manager) SetPrivileged(id string, privileged bool) error {
@@ -449,11 +483,12 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	m := &Manager{
 		agents: make(map[string]*Agent),
 		backends: map[string]ChatBackend{
-			"claude":    NewClaudeBackend(logger),
-			"codex":     NewCodexBackend(logger),
-			"grok":      NewGrokBackend(logger),
-			"custom":    NewCustomBackend(logger, creds),
-			"llama.cpp": NewLlamaCppBackend(logger, creds),
+			ToolClaude:       NewClaudeBackend(logger),
+			ToolCodex:        NewCodexBackend(logger),
+			ToolGrok:         NewGrokBackend(logger),
+			ToolCustomClaude: NewCustomClaudeBackend(logger, creds),
+			ToolCustomCodex:  NewCustomCodexBackend(logger, creds),
+			ToolCustomBare:   NewCustomBareBackend(logger, creds),
 		},
 		store:              st,
 		creds:              creds,
@@ -1467,7 +1502,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		m.mu.Unlock()
 		return nil, err
 	}
-	// Prospective Tool + CustomBaseURL: tool=custom / llama.cpp
+	// Prospective Tool + CustomBaseURL: tool=custom-claude / custom-codex / custom-bare
 	// require a non-empty CustomBaseURL. Both can be patched in
 	// the same PATCH so we have to compute the post-PATCH pair
 	// and validate the combination here, not at the per-field
@@ -1476,7 +1511,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.CustomBaseURL != nil {
 		prospBaseURL = *cfg.CustomBaseURL
 	}
-	if (prospTool == "custom" || prospTool == "llama.cpp") && prospBaseURL == "" {
+	if ToolRequiresCustomBaseURL(prospTool) && prospBaseURL == "" {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", prospTool)
 	}
@@ -1624,7 +1659,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		a.Effort = *cfg.Effort
 	}
 	if cfg.Tool != nil {
-		a.Tool = *cfg.Tool
+		a.Tool = NormalizeToolName(*cfg.Tool)
 	}
 	if cfg.WorkDir != nil {
 		// Already validated upstream (abs path + IsDir).
@@ -1773,7 +1808,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// Claude-Code body it can't execute, or claude staring at the
 	// grok body with the wrong CLI invocation surfaced to the user.
 	// SyncDeviceSwitchSkillForTool dispatches to the right writer.
-	toolChanged := cfg.Tool != nil && *cfg.Tool != oldTool
+	toolChanged := cfg.Tool != nil && NormalizeToolName(*cfg.Tool) != NormalizeToolName(oldTool)
 	if cfg.DeviceSwitchEnabled != nil || toolChanged {
 		SyncDeviceSwitchSkillForTool(id, cp.Tool, cp.IsDeviceSwitchEnabled(), m.logger)
 	}
@@ -1899,12 +1934,14 @@ func (m *Manager) HasCredentials() bool {
 // keys on the system prompt prefix, and any per-turn change there
 // invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy           Agent
-	backend             ChatBackend
-	sysPrompt           string
-	volatileContext     string
-	freshSessionContext string
-	mcpServers          map[string]mcpServerEntry
+	agentCopy             Agent
+	backend               ChatBackend
+	sysPrompt             string
+	volatileContext       string
+	freshSessionContext   string
+	recentMessagesContext string
+	history               []HistoryTurn
+	mcpServers            map[string]mcpServerEntry
 }
 
 // prepareChatOptions describes response-surface capabilities that can differ
@@ -2021,14 +2058,14 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
 	// Claude-Code-specific hooks (PreToolUse / PreCompact) — only
-	// claude / custom understand the settings.local.json schema.
-	if agentCopy.Tool == "claude" || agentCopy.Tool == "custom" {
+	// claude / custom-claude understand the settings.local.json schema.
+	if t := NormalizeToolName(agentCopy.Tool); t == ToolClaude || t == ToolCustomClaude {
 		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
 	}
 	// §3.7 device-switch skill. SyncDeviceSwitchSkillForTool
 	// dispatches based on Tool. Every supported tool (claude,
-	// custom, grok, codex) goes through normal install/remove driven by
-	// the toggle, with the right body/path for that backend; llama.cpp is
+	// custom-claude, grok, codex) goes through normal install/remove driven by
+	// the toggle, with the right body/path for that backend; custom-bare is
 	// no-op (no skill loader). Toggle defaults to
 	// true via IsDeviceSwitchEnabled; the underlying writer
 	// internally gates installation on LookupPeerCount() > 0 so a
@@ -2042,6 +2079,11 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// prompt is now the single source of the attachment contract and can be
 	// filtered per turn; remove any legacy skill copies during migration.
 	RemoveLegacyAttachSkills(agentID, m.logger)
+	// Extension-contributed skills, materialised into the same
+	// project-config skills/ tree. Runs every turn so enabling,
+	// disabling or updating a package takes effect on the agent's
+	// next message without a restart.
+	SyncExtensionSkillsForTool(agentID, agentCopy.Tool, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
 	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
@@ -2090,18 +2132,34 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
 	freshSessionContext := ""
-	if indexNewMessages &&
+	recentMessagesContext := ""
+	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
 		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
-		freshSessionContext = m.BuildSessionHistoryContext(ctx, agentID)
+		recentMessagesContext = m.BuildRecentMessagesContext(ctx, agentID)
+	}
+
+	// Session-less backends (custom-bare) get the transcript replayed
+	// in the request itself. Built here, before Chat appends the
+	// incoming message, so the current turn is not sent twice. Skipped
+	// for one-shot chats (indexNewMessages=false — Slack and friends
+	// carry their own context) and for regenerate (skipMemoryContext=
+	// true), where the tail of the transcript contains the very message
+	// being re-run plus everything after it.
+	var history []HistoryTurn
+	if indexNewMessages && !skipMemoryContext && backendReplaysHistory(backend) &&
+		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		history = m.BuildHistoryTurns(ctx, agentID)
 	}
 
 	return &chatPrep{
-		agentCopy:           agentCopy,
-		backend:             backend,
-		sysPrompt:           sysPrompt,
-		volatileContext:     volatileContext,
-		freshSessionContext: freshSessionContext,
-		mcpServers:          mcpServers,
+		agentCopy:             agentCopy,
+		backend:               backend,
+		sysPrompt:             sysPrompt,
+		volatileContext:       volatileContext,
+		freshSessionContext:   freshSessionContext,
+		recentMessagesContext: recentMessagesContext,
+		history:               history,
+		mcpServers:            mcpServers,
 	}, nil
 }
 
@@ -2309,9 +2367,11 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
-		MCPServers:          prep.mcpServers,
-		AutomatedTrigger:    role == "system",
-		FreshSessionContext: prep.freshSessionContext,
+		MCPServers:            prep.mcpServers,
+		AutomatedTrigger:      role == "system",
+		FreshSessionContext:   prep.freshSessionContext,
+		RecentMessagesContext: prep.recentMessagesContext,
+		History:               prep.history,
 		OnSteerReady: func(fn SteerFunc) {
 			m.busyMu.Lock()
 			if entry, ok := m.busy[agentID]; ok {
@@ -2348,7 +2408,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist chat start error", "err", appendErr)
 				} else {
@@ -2434,7 +2494,8 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude/custom/codex). For
+	// Honored only by backends in backendSupportsSessionKey
+	// (claude/custom-claude/codex/custom-codex/grok). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
@@ -2588,7 +2649,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// invariant across turns within the same session. Doing this at the
 	// manager level (rather than inside each backend) keeps the wire
 	// behaviour identical for every backend including the ones that don't
-	// read ChatOptions.SystemPromptExtra directly (llama.cpp).
+	// read ChatOptions.SystemPromptExtra directly (custom-bare).
 	if opts.SystemPromptExtra != "" {
 		if prep.sysPrompt != "" {
 			prep.sysPrompt += "\n\n"
@@ -2629,10 +2690,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if opts.ForceFreshSession && sessionKey != "" {
 		var resetErr error
 		switch prep.backend.Name() {
-		case "claude", "custom":
+		case ToolClaude, ToolCustomClaude:
 			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
-		case "codex":
+		case ToolCodex, ToolCustomCodex:
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
+		case ToolGrok:
+			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
 			if responseAttachments != nil {
@@ -3100,7 +3163,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 		}
 		if receivedDone {
 			if ctx.Err() == context.DeadlineExceeded {
-				errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+				errMsg := newSystemMessage(NoticeTimeoutText)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save timeout message", "err", err)
 				}
@@ -3136,7 +3199,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			m.persistDoneEvent(agentID, msg)
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			errMsg := newSystemMessage("⚠️ この応答は制限時間超過により中断されました。")
+			errMsg := newSystemMessage(NoticeTimeoutText)
 			if err := appendMessage(agentID, errMsg); err != nil {
 				m.logger.Warn("failed to save timeout message", "err", err)
 			}
@@ -3286,7 +3349,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + event.ErrorMessage)
+				errMsg := newSystemMessage(NoticeErrorPrefix + event.ErrorMessage)
 				if err := appendMessage(agentID, errMsg); err != nil {
 					m.logger.Warn("failed to save error message", "err", err)
 				} else {
@@ -3413,6 +3476,82 @@ func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedTool, agentCopy.Tool)
 	}
 	return backend, nil
+}
+
+// CanResumeSession reports whether the next ChatOneShot for this
+// (agentID, sessionKey) pair will actually resume an existing backend
+// session. Three conditions must hold: the configured backend honors
+// ChatOptions.SessionKey for resumption, the on-disk session artifact
+// exists, AND the artifact is non-empty (a zero-byte JSONL is treated
+// as "no session" because sessionFileUsable would delete it and start
+// fresh on the next invocation anyway).
+//
+// Used by the Slack bot to gate the "head+tail safety net" injection
+// mode: on the first message in a thread we replay the full history,
+// on subsequent messages we send only a small head+tail recap because
+// the resumed session already carries the bulk of the conversation
+// (see slackbot.Bot.sendToAgent and chathistory.FormatForInjectionHeadTail).
+//
+// Claude caveat: this does NOT check sessionResetThresholdTokens. If a
+// long-running thread's JSONL eventually exceeds the reset threshold,
+// sessionFileUsable will summarise + delete it on the next chat and
+// Claude starts a new session with --session-id. CanResumeSession would
+// keep returning true (the file existed at probe time) so the resumed
+// session loses prior Slack context. The head+tail safety net is the
+// primary mitigation: even when this caveat fires, the next turn still
+// re-injects the opening and most-recent slices of the thread, which
+// re-seeds the new session with enough framing to continue. Replicating
+// sessionFileUsable's token check here would either duplicate its
+// destructive side effects (preReset summary, file removal) or require
+// splitting it into a read-only probe; we accept that instead.
+func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	m.mu.Lock()
+	a, ok := m.agents[agentID]
+	if !ok {
+		m.mu.Unlock()
+		return false
+	}
+	tool := a.Tool
+	m.mu.Unlock()
+
+	backend, ok := m.backends[tool]
+	if !ok {
+		return false
+	}
+	if !backendSupportsSessionKey(backend) {
+		return false
+	}
+
+	// custom-codex delegates to the codex CLI, so its resumable state is a
+	// codex thread, not a Claude JSONL transcript.
+	switch backend.Name() {
+	case ToolCodex, ToolCustomCodex:
+		return codexCanResumeSession(agentID, sessionKey)
+	case ToolGrok:
+		return grokCanResumeSession(agentID, sessionKey)
+	}
+
+	// Probe the deterministic Claude session file. expectedClaudeSessionID is
+	// called with oneShot=false because CanResumeSession asks whether a
+	// resumable session EXISTS; the ChatOneShot call site decides the
+	// actual oneShot/sessionKey combination.
+	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
+	if sessionID == "" {
+		return false
+	}
+	dir := agentDir(agentID)
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
+	if err != nil {
+		return false
+	}
+	return info.Size() > 0
 }
 
 // updatePostChatIndex updates the memory index after a chat completes.
@@ -4077,7 +4216,7 @@ func (m *Manager) DeleteMirrorForAgent(agentID string) error {
 }
 
 // UpdateMessageContent replaces the content of a single message in the transcript.
-// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// Only supported for the custom-bare backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
 //
 // ifMatchETag is forwarded to the store layer so the optimistic-
@@ -4105,7 +4244,7 @@ func (m *Manager) UpdateMessageContent(agentID, msgID, content, ifMatchETag stri
 }
 
 // DeleteMessage removes a single message from the transcript.
-// Only supported for the llama.cpp backend. Rejected with ErrAgentBusy while the
+// Only supported for the custom-bare backend. Rejected with ErrAgentBusy while the
 // agent has an active chat.
 //
 // ifMatchETag forwards an optimistic-lock precondition to the store.
@@ -4126,7 +4265,7 @@ func (m *Manager) DeleteMessage(agentID, msgID, ifMatchETag string) error {
 }
 
 // Regenerate truncates the transcript at msgID and re-runs the associated
-// user message through the llama.cpp backend. If msgID is an assistant
+// user message through the custom-bare backend. If msgID is an assistant
 // message, msgID and all subsequent messages are removed and the preceding
 // user message is re-sent. If msgID is a user message, all subsequent
 // messages are removed and msgID itself is re-sent.
@@ -4229,6 +4368,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		prep.freshSessionContext = m.buildSessionHistoryContext(context.Background(), agentID, rt.SourceID)
 	}
 
+	var regenHistory []HistoryTurn
+	if backendReplaysHistory(prep.backend) &&
+		!prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		regenHistory = m.BuildHistoryTurnsBefore(ctx, agentID, rt.SourceID)
+	}
+
 	chatCtx, cancel := context.WithCancel(context.Background())
 	outCh := make(chan ChatEvent, 64)
 	bc := newChatBroadcaster(outCh)
@@ -4250,6 +4395,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
 			FreshSessionContext: prep.freshSessionContext,
+			// Session-less backends replay the transcript; here it has
+			// to stop short of the message being re-run, which travels
+			// as effectiveMessage. The truncate above already removed
+			// everything after it, and the cursor excludes the source
+			// row itself.
+			History: regenHistory,
 			// Register the steer handle so a steer sent during a
 			// regenerate turn injects into it instead of stalling in
 			// awaitSteerHandle until the deadline.
@@ -4290,7 +4441,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			_, stillHere := m.agents[agentID]
 			m.mu.Unlock()
 			if stillHere {
-				errMsg := newSystemMessage("⚠️ Error: " + err.Error())
+				errMsg := newSystemMessage(NoticeErrorPrefix + err.Error())
 				if appendErr := appendMessage(agentID, errMsg); appendErr != nil {
 					m.logger.Warn("failed to persist regenerate error", "err", appendErr)
 				} else {
@@ -4310,7 +4461,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	return nil
 }
 
-// acquireTranscriptEdit verifies the agent exists and uses the llama.cpp
+// acquireTranscriptEdit verifies the agent exists and uses the custom-bare
 // backend, then reserves the agent's busy slot so no Chat can start during
 // the edit. Returns ErrAgentBusy if a chat or reset is already in progress.
 // The returned release func must always be called.
@@ -4321,9 +4472,9 @@ func (m *Manager) acquireTranscriptEdit(agentID string) (func(), error) {
 		m.mu.Unlock()
 		return nil, ErrAgentNotFound
 	}
-	if a.Tool != "llama.cpp" {
+	if NormalizeToolName(a.Tool) != ToolCustomBare {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("%w: only llama.cpp backend supports transcript editing", ErrUnsupportedTool)
+		return nil, fmt.Errorf("%w: only the custom-bare backend supports transcript editing", ErrUnsupportedTool)
 	}
 	// Hold m.mu while taking busyMu to close the TOCTOU window with Update()
 	// (which changes Tool while holding m.mu). Chat acquires busyMu without

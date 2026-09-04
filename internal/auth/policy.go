@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -112,15 +113,35 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
 //     reset-session. Permitted for self by Agent, or for any target by
 //     PrivAgent.
+//  4. Owner-deputy-cross-agent — an agent the Owner deputised
+//     (Principal.OwnerDeputy) gets buckets 2 and 3's surface on OTHER
+//     agents, plus agent creation, fork and chat injection, so it can
+//     stand in for the Owner over the fleet. The grant-management
+//     routes (/privilege, /owner-deputy) and /handoff/switch stay
+//     Owner-only so it can neither propagate itself nor move someone
+//     else's runtime.
 //
 // Owner-only routes (sessions, git, files browser, embedding,
-// push, custom-models, group DM mutate-as-owner, fork, /privilege,
-// generate-*) fall through and 403. Note: POST /api/v1/groupdms
+// push, custom-models, group DM mutate-as-owner, /privilege,
+// /owner-deputy, generate-*) fall through and 403. Note: POST /api/v1/groupdms
 // (group creation) is exposed to Agent / PrivAgent below — the handler
 // then enforces the caller-in-memberIds invariant.
+// localeTagRe mirrors extpkg's tag validation so only an actual language
+// tag is public. A future GET /api/v1/locales/<something-else> is not a
+// tag, so it keeps the owner-only default instead of inheriting this
+// exemption from a loose path match.
+var localeTagRe = regexp.MustCompile(`^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$`)
+
 func AllowNonOwner(p Principal, method, path string) bool {
 	if p.IsOwner() {
 		return true
+	}
+
+	// Extensions are entirely scope-driven and share no routes with
+	// the agent/peer buckets below, so they resolve here and return
+	// without falling through into the agent allowlist.
+	if p.IsExtension() {
+		return allowExtension(p, method, path)
 	}
 
 	// RolePeer is scoped to the inter-peer surface (status push
@@ -265,6 +286,20 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/info" {
 		return true
 	}
+	// UI languages contributed by extensions. Every dashboard client
+	// fetches these at boot regardless of who is looking, and a list of
+	// language tags plus their endonyms — and the translated strings
+	// themselves — carry no identity or instance data. Owner-gating them
+	// would silently leave non-owner dashboards stuck in English.
+	// Only the list and one tag below it: an exact match plus a single
+	// non-empty segment, so a route added under this prefix later is not
+	// published to the world by accident.
+	if method == http.MethodGet && path == "/api/v1/locales" {
+		return true
+	}
+	if method == http.MethodGet && strings.HasPrefix(path, "/api/v1/locales/") {
+		return localeTagRe.MatchString(strings.TrimPrefix(path, "/api/v1/locales/"))
+	}
 	// Peer list: agents need this to discover handoff targets
 	// by Tailscale machine name. The wire shape carries no
 	// identity-sensitive fields, so Owner and Agent see the same
@@ -280,6 +315,11 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	}
 	if method == http.MethodGet && path == "/api/v1/agents" {
 		return true
+	}
+	// Agent creation on the Owner's behalf (forking someone else is
+	// allowed too — see the per-agent /fork case below).
+	if method == http.MethodPost && path == "/api/v1/agents" {
+		return p.IsOwnerDeputy()
 	}
 	if method == http.MethodGet && matchAgentSubpath(path) {
 		return true
@@ -316,7 +356,11 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			switch sub {
 			case "/reset", "/unarchive", "/checkin", "/reset-session", "/memory/truncate":
 				return p.CanDeleteOrReset(id)
-			case "/fork", "/privilege":
+			case "/fork":
+				// Owner is short-circuited above; a deputy may
+				// fork someone else (CanFork excludes self).
+				return p.CanFork(id)
+			case "/privilege", "/owner-deputy":
 				// Owner-only — already filtered out above.
 				return false
 			case "/handoff/switch":
@@ -328,7 +372,43 @@ func AllowNonOwner(p Principal, method, path string) bool {
 				// able to migrate someone else's data.
 				return p.IsAgent() && p.AgentID == id
 			}
+			// POST /messages/{msgId}/rewind rolls the transcript AND
+			// the backend session state back to a message — the same
+			// destructive reach as /memory/truncate, so it takes the
+			// same permission. Only grant here; a principal without it
+			// falls through to the deputy / self-scoped checks below.
+			if strings.HasPrefix(sub, "/messages/") && strings.HasSuffix(sub, "/rewind") &&
+				p.CanDeleteOrReset(id) {
+				return true
+			}
 		}
+		// Deputy acting on someone ELSE: the surface a regular agent
+		// has over itself, plus fork, chat injection (the Owner's way
+		// of talking to an agent without a DM) and the persona/memory
+		// writes — minus the routes that would let the grant spread or
+		// move another agent's runtime.
+		if p.IsOwnerDeputyOver(id) {
+			switch sub {
+			case "/privilege", "/owner-deputy", "/handoff/switch":
+				return false
+			case "/messages":
+				if method == http.MethodPost {
+					return true
+				}
+			case "/persona", "/memory", "/memory-entries":
+				// Owner-only for a plain agent (an agent edits its own
+				// persona.md / MEMORY.md on disk, not through the API),
+				// so they are listed here rather than in
+				// isSelfScopedRoute — a deputy has no disk-level
+				// equivalent for someone else's workspace.
+				return true
+			}
+			if strings.HasPrefix(sub, "/memory-entries/") {
+				return true
+			}
+			return isSelfScopedRoute(method, sub)
+		}
+
 		// Everything else is self-scoped read/write. The handler still
 		// applies its own access checks; this layer just refuses
 		// requests that target a different agent.
@@ -497,4 +577,111 @@ func matchAgentSubpath(path string) bool {
 		return false
 	}
 	return sub == ""
+}
+
+// allowExtension gates a RoleExtension principal. The surface is the
+// intersection of three things: the scope the Owner acknowledged at
+// install time, an explicit route allowlist per scope, and — for
+// anything addressed at a specific agent — the operator having bound
+// the package to that agent. Nothing here is reachable without a
+// granted scope, so an assets-only package (no scopes) can read
+// /api/v1/info and nothing else.
+func allowExtension(p Principal, method, path string) bool {
+	// Version/capability discovery is unconditional: an extension has
+	// to be able to tell which kojo it is talking to before it can
+	// decide whether its scoped calls are even supported.
+	if method == http.MethodGet && path == "/api/v1/info" {
+		return true
+	}
+
+	// KV, scoped to the package's own namespace. The namespace is
+	// derived from the extension ID rather than accepted from the
+	// request, so one package can never read another's rows.
+	if strings.HasPrefix(path, "/api/v1/kv/") && p.HasScope("kv:own") {
+		rest := strings.TrimPrefix(path, "/api/v1/kv/")
+		ns, _, _ := strings.Cut(rest, "/")
+		// own is "" only for a malformed principal with no extension
+		// ID; comparing against it would match the empty namespace in
+		// "/api/v1/kv//k" and hand out someone else's rows.
+		if own := ExtensionKVNamespace(p.ExtensionID); own != "" && ns == own {
+			switch method {
+			case http.MethodGet, http.MethodPut, http.MethodDelete:
+				return true
+			}
+		}
+		return false
+	}
+
+	// Event streams carry every agent's traffic, so they need the
+	// dedicated subscribe scope rather than riding on chat:read.
+	if method == http.MethodGet && (path == "/api/v1/events" || path == "/api/v1/ws") {
+		return p.HasScope("events:subscribe")
+	}
+
+	// Blob reads are instance-wide (attachment scopes are not agent
+	// paths), which is why they are their own scope.
+	if (method == http.MethodGet || method == http.MethodHead) &&
+		strings.HasPrefix(path, "/api/v1/blob/") {
+		return p.HasScope("blob:read")
+	}
+
+	// The fleet roster. Individual agent records are handled below;
+	// this is the list/directory read only.
+	if method == http.MethodGet &&
+		(path == "/api/v1/agents" || path == "/api/v1/agents/directory") {
+		return p.HasScope("agents:read")
+	}
+
+	id, sub, ok := SplitAgentIDPath(path)
+	if !ok {
+		return false
+	}
+	// Binding check first: an unbound agent is invisible regardless of
+	// which scopes the package holds.
+	if !p.BoundTo(id) {
+		return false
+	}
+	switch method {
+	case http.MethodGet:
+		switch sub {
+		case "", "/status", "/active", "/avatar", "/ratelimit":
+			return p.HasScope("agents:read")
+		case "/messages", "/queued-messages":
+			return p.HasScope("chat:read")
+		case "/files", "/files/raw", "/files/view", "/files/thumb":
+			return p.HasScope("files:agent")
+		}
+	case http.MethodPost:
+		switch sub {
+		case "/messages", "/steer", "/answer":
+			return p.HasScope("chat:send")
+		case "/attention":
+			// Paging the operator is a notification, not a config
+			// change; it rides on the same scope as sending chat.
+			return p.HasScope("chat:send")
+		}
+	case http.MethodDelete:
+		if sub == "/attention" {
+			return p.HasScope("chat:send")
+		}
+	case http.MethodPatch:
+		if sub == "" {
+			return p.HasScope("agents:write")
+		}
+	case http.MethodPut:
+		if sub == "/status" {
+			return p.HasScope("agents:write")
+		}
+	}
+	return false
+}
+
+// ExtensionKVNamespace is the only KV namespace an extension may touch.
+// Prefixing with "ext." keeps package rows from colliding with kojo's
+// own namespaces even if a package IDs itself "auth".
+func ExtensionKVNamespace(extensionID string) string {
+	if extensionID == "" {
+		return ""
+	}
+	return "ext." + extensionID
 }

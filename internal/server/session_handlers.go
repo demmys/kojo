@@ -100,7 +100,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		req.WorkDir = home
 	}
 
-	if req.SimpleSystemPrompt && (req.Tool == "claude" || req.Tool == "custom") {
+	if t := session.NormalizeToolName(req.Tool); req.SimpleSystemPrompt && (t == "claude" || t == "custom-claude") {
 		hasSystemPrompt := false
 		for _, a := range req.Args {
 			if a == "--system-prompt" ||

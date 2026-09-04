@@ -88,7 +88,7 @@ func newAuthTsnetTestServer(t *testing.T, nodeKey string, unsafe bool) (*Server,
 // policy.AllowNonOwner, and the handler sees the principal.
 func TestServeAuthTsnet_PeerRegistryHitStampsRolePeer(t *testing.T) {
 	s, _, deviceID, got := newAuthTsnetTestServer(t, "nodekey:peerB", false)
-	resolver := auth.NewResolver(nil, nil)
+	resolver := auth.NewResolver(nil, nil, nil)
 	srv := s.ensureAuthTsnetServer(resolver)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", nil)
@@ -118,7 +118,7 @@ func TestServeAuthTsnet_UnpairedTailnetCallerNoBearerForbidden(t *testing.T) {
 	s.SetNodeKeyResolver(func(ctx context.Context, addr string) (string, error) {
 		return "nodekey:stranger", nil
 	})
-	resolver := auth.NewResolver(nil, nil)
+	resolver := auth.NewResolver(nil, nil, nil)
 	srv := s.ensureAuthTsnetServer(resolver)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", nil)
@@ -145,7 +145,7 @@ func TestServeAuthTsnet_UnpairedTailnetCallerNoBearerForbidden(t *testing.T) {
 func TestServeAuthTsnet_SelfNodeKeyDemotedToGuest(t *testing.T) {
 	s, _, _, got := newAuthTsnetTestServer(t, "nodekey:self", false)
 	s.SetSelfNodeKey("nodekey:self")
-	resolver := auth.NewResolver(nil, nil)
+	resolver := auth.NewResolver(nil, nil, nil)
 	srv := s.ensureAuthTsnetServer(resolver)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", nil)
@@ -181,7 +181,7 @@ func TestServeAuthTsnet_SelfDeviceIDDemotedDespiteStartupRace(t *testing.T) {
 	s.peerID = &peer.Identity{DeviceID: selfDeviceID, Name: "self"}
 	// Do NOT call SetSelfNodeKey: the resolver wrapper's check is
 	// inert in this state.
-	resolver := auth.NewResolver(nil, nil)
+	resolver := auth.NewResolver(nil, nil, nil)
 	srv := s.ensureAuthTsnetServer(resolver)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", nil)
@@ -204,7 +204,7 @@ func TestServeAuthTsnet_SelfDeviceIDDemotedDespiteStartupRace(t *testing.T) {
 // empty PeerID — that's the LAN / CI trust-the-boundary contract.
 func TestServeAuthTsnet_UnsafeStampsOwner(t *testing.T) {
 	s, _, _, got := newAuthTsnetTestServer(t, "nodekey:peerB", true)
-	resolver := auth.NewResolver(nil, nil)
+	resolver := auth.NewResolver(nil, nil, nil)
 	srv := s.ensureAuthTsnetServer(resolver)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", nil)

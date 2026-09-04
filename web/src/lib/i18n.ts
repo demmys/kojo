@@ -1,4 +1,5 @@
-// Lightweight, dependency-free UI internationalization (Japanese / English).
+// Lightweight UI internationalization (Japanese / English built in, plus any
+// language an installed extension contributes).
 //
 // Design:
 //   - Locale is a global module-level value with a subscriber set, exposed to
@@ -8,6 +9,11 @@
 //   - Detection order: localStorage "kojo.locale" override → navigator.language
 //     ("ja*" → ja) → "en".
 //   - Dictionaries are keyed by stable English-ish keys; each entry has ja+en.
+//   - Extension locales are overlays: a flat key→string map fetched from
+//     /api/v1/locales/{tag} and registered at boot. Keys an overlay omits fall
+//     back to English, so a half-finished translation is still usable. The
+//     bundle is built ahead of time, so this is the only way a package can add
+//     a language — it ships data, never code.
 //   - t(key, params?) interpolates {name}-style placeholders. A missing key
 //     returns the key itself (fail-soft) and console.warns in dev.
 //
@@ -15,19 +21,42 @@
 // model/tool names, file paths, and anything sent to the server stay literal.
 
 import { useSyncExternalStore } from "react";
+import { authHeaders } from "./auth";
 
-export type Locale = "ja" | "en";
+/** The languages compiled into the bundle. Every message has these two. */
+export type BuiltinLocale = "ja" | "en";
+
+/**
+ * A language tag. Either a builtin or an extension-contributed BCP 47 tag;
+ * `string` rather than a union because the set is only known at runtime.
+ */
+export type Locale = string;
 
 const STORAGE_KEY = "kojo.locale";
+
+/** Mirrors the server's localeTagRe so a junk localStorage value is ignored. */
+const TAG_RE = /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,3}$/;
+
+function isBuiltin(loc: Locale): loc is BuiltinLocale {
+  return loc === "ja" || loc === "en";
+}
 
 function detect(): Locale {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved === "ja" || saved === "en") return saved;
+    // Any well-formed tag is accepted, not just the ones currently
+    // installed: extension locales load asynchronously, so a saved tag
+    // is generally still unknown at this point. Until its catalogue
+    // arrives the UI reads English, which is also what happens if the
+    // extension providing it was uninstalled.
+    if (saved && TAG_RE.test(saved)) return saved;
   } catch {
     /* localStorage unavailable (private mode / SSR) — fall through */
   }
-  if (typeof navigator !== "undefined" && navigator.language?.startsWith("ja")) {
+  if (
+    typeof navigator !== "undefined" &&
+    navigator.language?.startsWith("ja")
+  ) {
     return "ja";
   }
   return "en";
@@ -36,6 +65,25 @@ function detect(): Locale {
 let current: Locale = detect();
 const listeners = new Set<() => void>();
 
+// useSyncExternalStore re-renders only when getSnapshot returns a value
+// Object.is says is different. The locale alone is not enough: a
+// catalogue arriving or the contributed-language list changing must
+// re-render too, and neither of those changes `current`. So the
+// snapshot is the locale plus a revision counter that every mutation
+// bumps.
+let revision = 0;
+let snapshot = `${revision}:${current}`;
+
+function notify(): void {
+  revision++;
+  snapshot = `${revision}:${current}`;
+  for (const l of listeners) l();
+}
+
+function getSnapshot(): string {
+  return snapshot;
+}
+
 export function getLocale(): Locale {
   return current;
 }
@@ -43,12 +91,17 @@ export function getLocale(): Locale {
 export function setLocale(loc: Locale): void {
   if (loc === current) return;
   current = loc;
+  if (!isBuiltin(loc) && !overlays.has(loc)) {
+    // Picked before its catalogue was fetched — load it now. The UI
+    // renders English in the meantime and re-renders when it lands.
+    void loadLocaleMessages(loc);
+  }
   try {
     localStorage.setItem(STORAGE_KEY, loc);
   } catch {
     /* ignore persistence failure */
   }
-  for (const l of listeners) l();
+  notify();
 }
 
 function subscribe(cb: () => void): () => void {
@@ -58,7 +111,8 @@ function subscribe(cb: () => void): () => void {
 
 /** Subscribe a component to locale changes; returns the current locale. */
 export function useLocale(): Locale {
-  return useSyncExternalStore(subscribe, getLocale, getLocale);
+  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return current;
 }
 
 /**
@@ -73,6 +127,106 @@ export function useT(): typeof t {
 interface Entry {
   ja: string;
   en: string;
+}
+
+// ── Extension-contributed locales ──
+
+/** Fetched catalogues, keyed by tag. */
+const overlays = new Map<string, Record<string, string>>();
+/** Endonyms for the language picker, keyed by tag. */
+const localeNames = new Map<string, string>();
+// Serialises overlapping bootstrapLocales calls. ExtensionsSection
+// calls it after every registry mutation, so two can easily be in
+// flight at once; without this the slower one — carrying the older
+// list — lands last and resurrects languages the operator just removed.
+let listGeneration = 0;
+// Generation of the list that is actually in localeNames. Only a
+// successful bootstrap moves it, so a refresh that fails (offline, server
+// error) neither discards a good response still in flight nor invalidates
+// a catalogue fetch that has nothing left to re-request it.
+let appliedGeneration = 0;
+
+/** One language offered by an installed extension. */
+export interface ExtensionLocale {
+  tag: string;
+  name: string;
+}
+
+/**
+ * Every language the picker should offer: the two builtins first, then
+ * extension-contributed tags in the order the server listed them.
+ */
+export function availableLocales(): { tag: Locale; name: string }[] {
+  const out: { tag: Locale; name: string }[] = [
+    { tag: "ja", name: "日本語" },
+    { tag: "en", name: "English" },
+  ];
+  for (const [tag, name] of localeNames) out.push({ tag, name });
+  return out;
+}
+
+/** Make a catalogue available under `tag` and re-render subscribers. */
+export function registerLocale(
+  tag: string,
+  messages: Record<string, string>,
+): void {
+  overlays.set(tag, messages);
+  if (tag === current) notify();
+}
+
+async function loadLocaleMessages(tag: string): Promise<void> {
+  // A catalogue fetch outlives the list it was started from: by the time
+  // it lands the operator may have removed the package. Re-check both the
+  // generation and the current list before registering, or a slow response
+  // resurrects a language bootstrapLocales just pruned.
+  const generation = appliedGeneration;
+  try {
+    const res = await fetch(`/api/v1/locales/${encodeURIComponent(tag)}`, {
+      headers: authHeaders(),
+    });
+    if (!res.ok) return;
+    const messages = (await res.json()) as Record<string, string>;
+    if (generation !== appliedGeneration || !localeNames.has(tag)) return;
+    registerLocale(tag, messages);
+  } catch {
+    /* offline or the extension went away — English is the fallback */
+  }
+}
+
+/**
+ * Fetch the list of extension-contributed languages and, if one of them is
+ * the active locale, its catalogue. Called once at startup; failure is
+ * silent because the builtin languages work regardless.
+ */
+export async function bootstrapLocales(): Promise<void> {
+  const generation = ++listGeneration;
+  let list: ExtensionLocale[];
+  try {
+    const res = await fetch("/api/v1/locales", { headers: authHeaders() });
+    if (!res.ok) return;
+    list = (await res.json()) as ExtensionLocale[];
+  } catch {
+    return;
+  }
+  // Older than what is already applied — a newer call won the race. A
+  // newer generation that failed is not in the way, because failure never
+  // moves appliedGeneration.
+  if (generation <= appliedGeneration) return;
+  appliedGeneration = generation;
+  localeNames.clear();
+  for (const loc of list) localeNames.set(loc.tag, loc.name);
+  // Drop catalogues whose package was disabled or uninstalled, so the
+  // UI stops rendering a language the instance no longer offers instead
+  // of keeping it alive until the next reload.
+  for (const tag of overlays.keys()) {
+    if (!localeNames.has(tag)) overlays.delete(tag);
+  }
+  // Notify regardless of whether the active locale changed: the picker
+  // itself has to re-render to show the new entries.
+  notify();
+  if (!isBuiltin(current) && localeNames.has(current)) {
+    await loadLocaleMessages(current);
+  }
 }
 
 const messages = {
@@ -160,9 +314,15 @@ const messages = {
     ja: '"{name}" をこの端末に強制復帰する?\n現在の holder ({holder}) との通信を放棄し、この端末でランタイムを再起動する。',
     en: 'Force-reclaim "{name}" to this host?\nAbandon communication with the current holder ({holder}) and restart the runtime on this device.',
   },
-  "dash.forceReclaimFailed": { ja: "強制復帰に失敗: {err}", en: "Force-reclaim failed: {err}" },
+  "dash.forceReclaimFailed": {
+    ja: "強制復帰に失敗: {err}",
+    en: "Force-reclaim failed: {err}",
+  },
   "dash.newThread": { ja: "新規スレッド", en: "New thread" },
-  "dash.newThreadWith": { ja: "{name} との新規スレッド", en: "New thread with {name}" },
+  "dash.newThreadWith": {
+    ja: "{name} との新規スレッド",
+    en: "New thread with {name}",
+  },
   "dash.plusGroup": { ja: "+ グループ", en: "+ Group" },
   "dash.newSession": { ja: "新規セッション", en: "New session" },
   "dash.remove": { ja: "削除", en: "Remove" },
@@ -175,15 +335,24 @@ const messages = {
   "dash.notifyMembers": { ja: "メンバーに通知", en: "Notify members" },
   "dash.members": { ja: "メンバー", en: "Members" },
   "dash.selected": { ja: "{count} 人選択", en: "{count} selected" },
-  "dash.selectMin2": { ja: "メンバーを2人以上選んで", en: "Select at least 2 members" },
-  "dash.createGroupFailed": { ja: "グループ作成に失敗", en: "Failed to create group" },
+  "dash.selectMin2": {
+    ja: "メンバーを2人以上選んで",
+    en: "Select at least 2 members",
+  },
+  "dash.createGroupFailed": {
+    ja: "グループ作成に失敗",
+    en: "Failed to create group",
+  },
   "dash.creating": { ja: "作成中...", en: "Creating..." },
   "dash.create": { ja: "作成", en: "Create" },
 
   // ── AgentChat ──
   "chat.errorPrefix": { ja: "⚠️ エラー: {msg}", en: "⚠️ Error: {msg}" },
   "chat.errorGeneric": { ja: "エラーが発生した", en: "An error occurred" },
-  "chat.hostOffline": { ja: "ホストがオフライン @ {peer}", en: "host offline @ {peer}" },
+  "chat.hostOffline": {
+    ja: "ホストがオフライン @ {peer}",
+    en: "host offline @ {peer}",
+  },
   "chat.typing": { ja: "出力中…", en: "typing…" },
   "chat.online": { ja: "オンライン", en: "online" },
   "chat.connecting": { ja: "接続中…", en: "connecting…" },
@@ -213,7 +382,10 @@ const messages = {
     ja: "別の場所で先に更新されていた。最新の状態を読み込み直した",
     en: "Changed elsewhere first — reloaded the latest state",
   },
-  "chat.emptyPrompt": { ja: "メッセージを送って会話を始めて", en: "Send a message to start chatting" },
+  "chat.emptyPrompt": {
+    ja: "メッセージを送って会話を始めて",
+    en: "Send a message to start chatting",
+  },
   "chat.holderOfflineBannerPre": { ja: "ホスト端末 ", en: "Host device " },
   "chat.holderOfflineBannerPost": {
     ja: " がオフライン。送信したメッセージは復帰時に配送する。",
@@ -235,14 +407,23 @@ const messages = {
     ja: "xAI API キーが未設定。設定画面で登録して。",
     en: "xAI API key is not set. Register it in Settings.",
   },
-  "chat.holderPeerOffline": { ja: "ホストピアがオフライン", en: "Holder peer offline" },
+  "chat.holderPeerOffline": {
+    ja: "ホストピアがオフライン",
+    en: "Holder peer offline",
+  },
   "chat.steerPlaceholder": {
     ja: "実行中のターンに割り込む… ({key} で送信)",
     en: "Steer the running turn… ({key} to send)",
   },
-  "chat.messagePlaceholder": { ja: "メッセージ… ({key} で送信)", en: "Message… ({key} to send)" },
+  "chat.messagePlaceholder": {
+    ja: "メッセージ… ({key} で送信)",
+    en: "Message… ({key} to send)",
+  },
   "chat.listening": { ja: "聞き取り中…", en: "Listening…" },
-  "chat.steerTitle": { ja: "実行中のターンに割り込む", en: "Steer the running turn" },
+  "chat.steerTitle": {
+    ja: "実行中のターンに割り込む",
+    en: "Steer the running turn",
+  },
   "chat.steerDeliveryUncertain": {
     ja: "割り込みは届いた可能性があります。重複を避けるため再送しません。",
     en: "The steer may have arrived. It was not retried to avoid a duplicate.",
@@ -261,7 +442,10 @@ const messages = {
 
   // ── AgentSettings: sections ──
   "settings.sec.identity": { ja: "アイデンティティ", en: "Identity" },
-  "settings.sec.injections": { ja: "コンテキスト注入", en: "Context Injections" },
+  "settings.sec.injections": {
+    ja: "コンテキスト注入",
+    en: "Context Injections",
+  },
   "settings.sec.model": { ja: "モデルとツール", en: "Model & Tools" },
   "settings.sec.schedule": { ja: "スケジュール", en: "Schedule" },
   "settings.sec.voice": { ja: "音声", en: "Voice" },
@@ -270,26 +454,44 @@ const messages = {
   "settings.sec.danger": { ja: "危険", en: "Danger" },
 
   // ── AgentSettings: injection checklist ──
-  "settings.inj.user_context.label": { ja: "ユーザーコンテキスト", en: "User Context" },
-  "settings.inj.user_context.desc": { ja: "ユーザープロフィール (user.md)", en: "User profile (user.md)" },
+  "settings.inj.user_context.label": {
+    ja: "ユーザーコンテキスト",
+    en: "User Context",
+  },
+  "settings.inj.user_context.desc": {
+    ja: "ユーザープロフィール (user.md)",
+    en: "User profile (user.md)",
+  },
   "settings.inj.memory_md.label": { ja: "MEMORY.md", en: "MEMORY.md" },
   "settings.inj.memory_md.desc": {
     ja: "システムプロンプトに MEMORY.md の内容",
     en: "MEMORY.md contents in system prompt",
   },
   "settings.inj.credentials.label": { ja: "認証情報", en: "Credentials" },
-  "settings.inj.credentials.desc": { ja: "認証情報の使い方ガイド", en: "Credentials usage guide" },
+  "settings.inj.credentials.desc": {
+    ja: "認証情報の使い方ガイド",
+    en: "Credentials usage guide",
+  },
   "settings.inj.groupdm.label": { ja: "グループ DM", en: "Group DM" },
-  "settings.inj.groupdm.desc": { ja: "グループ DM 機能", en: "Group DM capability" },
+  "settings.inj.groupdm.desc": {
+    ja: "グループ DM 機能",
+    en: "Group DM capability",
+  },
   "settings.inj.todo_api.label": { ja: "Todo", en: "Todos" },
   "settings.inj.todo_api.desc": {
     ja: "永続 Todo (ガイド + 毎ターンのリスト)",
     en: "Persistent todos (guide + per-turn list)",
   },
   "settings.inj.attachments.label": { ja: "添付", en: "Attachments" },
-  "settings.inj.attachments.desc": { ja: "ファイル添付のステージング", en: "File attachment staging" },
+  "settings.inj.attachments.desc": {
+    ja: "ファイル添付のステージング",
+    en: "File attachment staging",
+  },
   "settings.inj.status.label": { ja: "ステータス", en: "Status" },
-  "settings.inj.status.desc": { ja: "エージェントのステータスブロック", en: "Agent status block" },
+  "settings.inj.status.desc": {
+    ja: "エージェントのステータスブロック",
+    en: "Agent status block",
+  },
   "settings.inj.diary_notes.label": { ja: "日誌ノート", en: "Diary Notes" },
   "settings.inj.diary_notes.desc": {
     ja: "最近の活動日誌 (毎ターン)",
@@ -300,17 +502,30 @@ const messages = {
     ja: "メモリ検索結果 (毎ターン)",
     en: "Memory search results (per turn)",
   },
-  "settings.inj.recent_conversation.label": { ja: "直近の会話", en: "Recent Conversation" },
-  "settings.inj.recent_conversation.desc": {
-    ja: "セッション再開時の直近会話フォールバック",
-    en: "Recent conversation fallback on session resume",
+  "settings.inj.unsupportedByTool": {
+    ja: "custom-bare では注入されない (ツールを使う手順なので届いても実行できない)",
+    en: "Not injected for custom-bare: the section is a tool recipe a single stateless completion cannot act on",
   },
-  "settings.inj.persona_anchor.label": { ja: "口調アンカー", en: "Persona Anchor" },
+  "settings.inj.recent_conversation.label": {
+    ja: "直近の会話",
+    en: "Recent Conversation",
+  },
+  "settings.inj.recent_conversation.desc": {
+    ja: "セッション再開時の直近会話フォールバック。custom-bare では毎ターンの会話履歴そのもの",
+    en: "Recent conversation fallback on session resume; for custom-bare, the per-turn conversation history itself",
+  },
+  "settings.inj.persona_anchor.label": {
+    ja: "口調アンカー",
+    en: "Persona Anchor",
+  },
   "settings.inj.persona_anchor.desc": {
     ja: "毎ターンの文脈末尾に注入される人格アンカー (anchor.md)",
     en: "Persona anchor appended to the per-turn context tail (anchor.md)",
   },
-  "settings.inj.call_user.label": { ja: "ユーザー呼び出し", en: "Call the User" },
+  "settings.inj.call_user.label": {
+    ja: "ユーザー呼び出し",
+    en: "Call the User",
+  },
   "settings.inj.call_user.desc": {
     ja: "待機せずに操作者を呼ぶ API の手順 (一覧を強調表示)",
     en: "How to page the operator without waiting (highlights the row)",
@@ -356,9 +571,18 @@ const messages = {
     en: "The current avatar was kept because AI image generation failed: {error}",
   },
   "settings.name": { ja: "名前", en: "Name" },
-  "settings.personaPromptPlaceholder": { ja: "例: もっと毒舌にして", en: "e.g. make it snarkier" },
-  "settings.templateNotSaved": { ja: "テンプレート — 未保存。", en: "Template — not yet saved." },
-  "settings.userContextLabel": { ja: "ユーザーコンテキスト", en: "User Context" },
+  "settings.personaPromptPlaceholder": {
+    ja: "例: もっと毒舌にして",
+    en: "e.g. make it snarkier",
+  },
+  "settings.templateNotSaved": {
+    ja: "テンプレート — 未保存。",
+    en: "Template — not yet saved.",
+  },
+  "settings.userContextLabel": {
+    ja: "ユーザーコンテキスト",
+    en: "User Context",
+  },
   "settings.userContextHelp": {
     ja: "このエージェントが関わる人についてのメモ — 名前・タイムゾーン・コミュニケーションの好みなど。データとしてシステムプロンプトに注入される (1500文字超は前後を残して省略)。",
     en: "Notes about the people this agent works with — name, timezone, communication preferences, etc. Injected into the system prompt as data (head/tail truncated above 1500 chars).",
@@ -443,22 +667,43 @@ const messages = {
   },
   "settings.allowedTools": { ja: "許可ツール", en: "Allowed Tools" },
   "settings.allEmpty": { ja: "(空 = すべて)", en: "(empty = all)" },
-  "settings.allowProtectedPaths": { ja: "保護パスの編集を許可", en: "Allow Edits in Protected Paths" },
-  "settings.bypassGuard": { ja: "(claude-code ガードを回避)", en: "(bypass claude-code guard)" },
+  "settings.allowProtectedPaths": {
+    ja: "保護パスの編集を許可",
+    en: "Allow Edits in Protected Paths",
+  },
+  "settings.bypassGuard": {
+    ja: "(claude-code ガードを回避)",
+    en: "(bypass claude-code guard)",
+  },
   "settings.allowProtectedPathsHelp": {
     ja: "最近の claude-code は bypassPermissions でも .claude / .git / .husky への Edit/Write で確認を求める。抑制するにはチェック。",
     en: "Recent claude-code versions prompt on Edit/Write to .claude, .git, .husky even with bypassPermissions. Check to suppress.",
   },
   "settings.thinking": { ja: "思考", en: "Thinking" },
-  "settings.thinkingAuto": { ja: "auto (サーバー既定)", en: "auto (server default)" },
+  "settings.thinkingAuto": {
+    ja: "auto (サーバー既定)",
+    en: "auto (server default)",
+  },
   "settings.privileged": { ja: "特権エージェント", en: "Privileged Agent" },
   "settings.privilegedDesc": {
     ja: "このエージェントに API 経由で他のエージェントの削除 / リセット / アーカイブを許可する。他エージェントのフォークや完全な記録の読み取りはできない。",
     en: "Allow this agent to delete / reset / archive other agents via the API. Cannot fork or read other agents' full record.",
   },
 
+  "settings.ownerDeputy": {
+    ja: "オーナー代理 (特権より強い)",
+    en: "Owner Deputy (stronger than Privileged)",
+  },
+  "settings.ownerDeputyDesc": {
+    ja: "このエージェントをオーナーの代理にする。特権エージェントの権限に加えて、他エージェントの作成 / フォーク / 完全な記録の読み取り / 設定の変更 / persona・user.md・status・MEMORY.md の編集 / チャットへの発言ができる。権限の付与だけはオーナー専用のまま。自分自身に対しては何も増えない。",
+    en: "Make this agent your deputy. On top of everything a privileged agent can do, it may create and fork agents, read their full record, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Only granting privileges stays Owner-only, and the grant adds nothing over the agent itself.",
+  },
+
   // ── AgentSettings: Schedule ──
-  "settings.notifyDuringSilent": { ja: "静音時間中も DM を受信", en: "Receive DM During Silent Hours" },
+  "settings.notifyDuringSilent": {
+    ja: "静音時間中も DM を受信",
+    en: "Receive DM During Silent Hours",
+  },
   "settings.notifyDuringSilentDesc": {
     ja: "有効時は静音時間中でもグループ DM 通知を配送する。無効時は通知を抑制する (メッセージ自体は残る)。",
     en: "When enabled, group DM notifications are delivered even during silent hours. When disabled, notifications are suppressed (messages remain in the transcript).",
@@ -479,7 +724,10 @@ const messages = {
   "settings.voiceHelpPre": { ja: "", en: "Use " },
   "settings.voiceHelpLink": { ja: "プレビュー", en: "Preview" },
   "settings.voiceHelpPost": { ja: " で試聴。", en: " to listen." },
-  "settings.browseVoices": { ja: "{count} 個の音声を一覧", en: "Browse all {count} voices" },
+  "settings.browseVoices": {
+    ja: "{count} 個の音声を一覧",
+    en: "Browse all {count} voices",
+  },
   "settings.grokNoStyle": {
     ja: "Grok にスタイルプロンプトはない。話し方は音声と返信テキスト中のインライン音声タグで決まる — 例: ",
     en: "Grok has no style prompt. Delivery is set by the voice and by inline speech tags in the reply text — e.g. ",
@@ -490,7 +738,10 @@ const messages = {
     en: "Free-form prompt prepended to the text. Audio tags such as [whispers], [excited], [laughs] can be embedded inline.",
   },
   "settings.stylePromptReference": { ja: "参考: ", en: "Reference: " },
-  "settings.stylePromptGuide": { ja: "Gemini TTS プロンプトガイド", en: "Gemini TTS prompt guide" },
+  "settings.stylePromptGuide": {
+    ja: "Gemini TTS プロンプトガイド",
+    en: "Gemini TTS prompt guide",
+  },
   "settings.stylePromptPlaceholder": {
     ja: "落ち着いた日本語で、淡々と短く読み上げて。",
     en: "Read in calm Japanese, plainly and briefly.",
@@ -503,13 +754,19 @@ const messages = {
   "settings.enableTts": { ja: "TTS を有効化", en: "Enable TTS" },
 
   // ── AgentSettings: Memory ──
-  "settings.truncateLabel": { ja: "この時刻以降のメモリを削除", en: "Truncate memory since" },
+  "settings.truncateLabel": {
+    ja: "この時刻以降のメモリを削除",
+    en: "Truncate memory since",
+  },
   "settings.truncateHelp": {
     ja: "この時刻以降に記録されたトランスクリプト・Claude --resume セッションエントリ・grok --resume セッション (丸ごと削除)・日次日誌の項目を削除する。人格・MEMORY.md・プロジェクト / 人物 / トピックのノート・アーカイブ・認証情報は保持される。",
     en: "Drop transcript records, Claude --resume session entries, the grok --resume session (dropped wholesale), and daily diary bullets recorded at or after this instant. Persona, MEMORY.md, project / people / topic notes, archive, and credentials are kept.",
   },
   "settings.truncating": { ja: "削除中...", en: "Truncating..." },
-  "settings.truncateButton": { ja: "この時刻以降のメモリを削除", en: "Truncate Memory From This Time" },
+  "settings.truncateButton": {
+    ja: "この時刻以降のメモリを削除",
+    en: "Truncate Memory From This Time",
+  },
   "settings.truncateThreshold": { ja: "しきい値: ", en: "Threshold: " },
   "settings.truncateResult": {
     ja: "トランスクリプト: {messages} · Claude セッション: {claudeEntries} エントリ / {claudeFiles} ファイル · Grok セッション: {grokSessions} セッション / {grokFiles} ファイル · 日誌: {diaryEntries} エントリ / {diaryFiles} ファイル",
@@ -522,17 +779,49 @@ const messages = {
     en: "Clear conversation logs and memory. Settings, persona, avatar, and credentials are kept.",
   },
 
+  // ── AgentSettings: attachment blob cache ──
+  "settings.attachCacheButton": {
+    ja: "添付ファイルのキャッシュを削除",
+    en: "Clear attachment cache",
+  },
+  "settings.attachCacheButtonSized": {
+    ja: "添付ファイルのキャッシュを削除 ({count} 件 / {size})",
+    en: "Clear attachment cache ({count} files / {size})",
+  },
+  "settings.attachCacheClearing": {
+    ja: "削除中…",
+    en: "Clearing…",
+  },
+  "settings.attachCacheHelp": {
+    ja: "このエージェントが送受信した添付ファイルの実体を消してディスクを空ける。過去のチャットに残る添付は表示できなくなる。",
+    en: "Frees disk by deleting the stored files this agent sent or received. Attachments in past chats stop rendering.",
+  },
+  "settings.attachCacheConfirm": {
+    ja: "添付ファイルのキャッシュを削除する。過去のチャットの添付は表示できなくなる。続行する?",
+    en: "Delete the attachment cache? Attachments in past chats will stop rendering.",
+  },
+  "settings.attachCacheFailed": {
+    ja: "{failed} 件を削除できなかった。",
+    en: "Failed to delete {failed} file(s).",
+  },
+
   // ── AgentSettings: banners / save ──
   "settings.saveConflict": {
     ja: "他の誰かがこのエージェントを更新した。再読み込み中…",
     en: "Someone else updated this agent. Reloading…",
   },
   "settings.saveChanges": { ja: "変更を保存", en: "Save Changes" },
-  "settings.unsavedChanges": { ja: "未保存の変更がある", en: "Unsaved changes" },
+  "settings.unsavedChanges": {
+    ja: "未保存の変更がある",
+    en: "Unsaved changes",
+  },
   "settings.discard": { ja: "破棄", en: "Discard" },
 
   // ── AgentSettings: Danger Zone ──
-  "settings.resetCliSession": { ja: "CLI セッションをリセット", en: "Reset CLI Session" },
+  "settings.resetCliSession": {
+    ja: "CLI セッションをリセット",
+    en: "Reset CLI Session",
+  },
   "settings.resetCliSessionHelp": {
     ja: "コンテキストウィンドウを作り直す。履歴とメモリは保持されるが、AI は全部を一から読み直す。",
     en: "Force a fresh context window. History and memory are kept, but the AI re-reads everything from scratch.",
@@ -543,7 +832,10 @@ const messages = {
     en: "Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.",
   },
   "settings.archiving": { ja: "アーカイブ中...", en: "Archiving..." },
-  "settings.archiveAgent": { ja: "エージェントをアーカイブ", en: "Archive Agent" },
+  "settings.archiveAgent": {
+    ja: "エージェントをアーカイブ",
+    en: "Archive Agent",
+  },
   "settings.archiveAgentHelp": {
     ja: "メインリストから隠してランタイム活動を止める。データは保持され、設定から復元できる。全グループ DM から外れる (アーカイブ解除しても復帰しない)。",
     en: "Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).",
@@ -554,8 +846,14 @@ const messages = {
   "settings.createdLabel": { ja: "作成: {date}", en: "Created: {date}" },
 
   // ── AgentSettings: Fork dialog ──
-  "settings.forkDialogTitle": { ja: "エージェントをフォーク", en: "Fork agent" },
-  "settings.forkIncludeHistory": { ja: "会話履歴を含める", en: "Include conversation history" },
+  "settings.forkDialogTitle": {
+    ja: "エージェントをフォーク",
+    en: "Fork agent",
+  },
+  "settings.forkIncludeHistory": {
+    ja: "会話履歴を含める",
+    en: "Include conversation history",
+  },
   "settings.forkAlwaysCopied": {
     ja: "人格とメモリは常にコピーされる。",
     en: "Persona and memory are always copied.",
@@ -584,7 +882,10 @@ const messages = {
     ja: "CLI セッションをリセットする? 会話履歴とメモリは保持されるが、AI は新しいコンテキストウィンドウで始める。",
     en: "Reset CLI session? Conversation history and memory are kept, but the AI will start a fresh context window.",
   },
-  "settings.pickDate": { ja: "削除する起点の日時を選んで。", en: "Pick a date/time to truncate from." },
+  "settings.pickDate": {
+    ja: "削除する起点の日時を選んで。",
+    en: "Pick a date/time to truncate from.",
+  },
   "settings.truncateConfirm": {
     ja: "{iso} 以降に記録された全メモリを削除する? kojo のトランスクリプト・Claude --resume セッションエントリ (末尾ターンの後処理あり)・grok --resume セッション全体 (events.jsonl にレコード単位のタイムスタンプがなく部分削除は安全でない — 次ターンは新セッションで開く)・該当する日次日誌の項目を削除する。人格・MEMORY.md・プロジェクト / 人物 / トピックのノート・認証情報は保持される。",
     en: "Delete every memory recorded at or after {iso}? This drops kojo transcript records, Claude --resume session entries (with trailing-turn cleanup), the entire grok --resume session (events.jsonl has no per-record timestamp so partial cuts are not safe — the next turn opens a fresh session), and matching daily diary bullets. Persona, MEMORY.md, project / people / topic notes, and credentials are kept.",
@@ -655,10 +956,29 @@ const messages = {
   "msg.copied": { ja: "コピーした", en: "Copied" },
   "msg.edit": { ja: "編集", en: "Edit" },
   "msg.delete": { ja: "削除", en: "Delete" },
-  "msg.deleteConfirm": { ja: "このメッセージを削除する?", en: "Delete this message?" },
-  "msg.deleteFailed": { ja: "メッセージの削除に失敗", en: "Failed to delete message" },
-  "msg.saveFailed": { ja: "メッセージの保存に失敗", en: "Failed to save message" },
+  "msg.deleteConfirm": {
+    ja: "このメッセージを削除する?",
+    en: "Delete this message?",
+  },
+  "msg.deleteFailed": {
+    ja: "メッセージの削除に失敗",
+    en: "Failed to delete message",
+  },
+  "msg.saveFailed": {
+    ja: "メッセージの保存に失敗",
+    en: "Failed to save message",
+  },
   "msg.regenerate": { ja: "再生成", en: "Regenerate" },
+  "msg.rewind": { ja: "送る前に戻す", en: "Undo send" },
+  "msg.rewindTitle": {
+    ja: "この発言を送る前に戻す (入力欄が空なら本文を書き戻し、以降のやりとりを削除)",
+    en: "Undo sending this message (drops everything from here; the text returns to the composer if it is empty)",
+  },
+  "msg.rewindConfirm": {
+    ja: "この発言を送る前の状態に戻す。この発言以降のやりとりとエージェントのコンテキストは削除される (入力欄が空なら本文を書き戻す)。元に戻せない。続ける?",
+    en: "Return to just before this message was sent? This message and everything after it — including the agent's context — is dropped, and the text goes back to the composer if it is empty. This cannot be undone.",
+  },
+  "msg.rewindFailed": { ja: "巻き戻しに失敗した", en: "Rewind failed" },
   "msg.ttsLoading": { ja: "読み込み中...", en: "Loading..." },
   "msg.ttsStop": { ja: "停止", en: "Stop" },
   "msg.ttsError": { ja: "TTS エラー — 再試行", en: "TTS error — retry" },
@@ -674,7 +994,10 @@ const messages = {
   // ── ToolUseCard ──
   "tool.subCount": { ja: "{count} sub", en: "{count} sub" },
   "tool.backgroundDone": { ja: "バックグラウンド完了", en: "background done" },
-  "tool.backgroundRunning": { ja: "バックグラウンド実行中", en: "background running" },
+  "tool.backgroundRunning": {
+    ja: "バックグラウンド実行中",
+    en: "background running",
+  },
   "tool.input": { ja: "入力", en: "Input" },
   "tool.output": { ja: "出力", en: "Output" },
   "tool.subagent": { ja: "サブエージェント", en: "Subagent" },
@@ -692,7 +1015,10 @@ const messages = {
 
   // ── QueuedMessages ──
   "queued.one": { ja: "1 件のメッセージをキュー登録", en: "1 message queued" },
-  "queued.many": { ja: "{count} 件のメッセージをキュー登録", en: "{count} messages queued" },
+  "queued.many": {
+    ja: "{count} 件のメッセージをキュー登録",
+    en: "{count} messages queued",
+  },
   "queued.deliverPre": { ja: " — 端末 ", en: " — will deliver when device " },
   "queued.deliverPost": { ja: " の復帰時に配送する", en: " reconnects" },
   "queued.cancelAria": {
@@ -705,16 +1031,28 @@ const messages = {
     ja: "接続した: team={team}, bot={bot}",
     en: "Connected: team={team}, bot={bot}",
   },
-  "slack.removeConfirm": { ja: "Slack ボット設定を削除する?", en: "Remove Slack bot configuration?" },
+  "slack.removeConfirm": {
+    ja: "Slack ボット設定を削除する?",
+    en: "Remove Slack bot configuration?",
+  },
   "slack.connected": { ja: "接続済み", en: "Connected" },
   "slack.enableAria": { ja: "Slack ボットを有効化", en: "Enable Slack bot" },
-  "slack.appToken": { ja: "App-Level Token (xapp-...)", en: "App-Level Token (xapp-...)" },
+  "slack.appToken": {
+    ja: "App-Level Token (xapp-...)",
+    en: "App-Level Token (xapp-...)",
+  },
   "slack.botToken": { ja: "Bot Token (xoxb-...)", en: "Bot Token (xoxb-...)" },
   "slack.configured": { ja: "設定済み", en: "configured" },
-  "slack.threadReplies": { ja: "常にスレッドで返信", en: "Always reply in thread" },
+  "slack.threadReplies": {
+    ja: "常にスレッドで返信",
+    en: "Always reply in thread",
+  },
   "slack.respondTo": { ja: "応答する対象", en: "Respond to" },
   "slack.respondDM": { ja: "ダイレクトメッセージ", en: "Direct messages" },
-  "slack.respondMention": { ja: "チャンネル内の @メンション", en: "@mentions in channels" },
+  "slack.respondMention": {
+    ja: "チャンネル内の @メンション",
+    en: "@mentions in channels",
+  },
   "slack.respondThread": {
     ja: "スレッドの続き (メンションなしで自動返信)",
     en: "Thread follow-ups (auto-reply without mention)",
@@ -728,8 +1066,14 @@ const messages = {
   },
 
   // ── MessageAttachments ──
-  "attach.imageUnavailable": { ja: "画像を取得できない", en: "image unavailable" },
-  "attach.downloadTitle": { ja: "{name} をダウンロード", en: "Download {name}" },
+  "attach.imageUnavailable": {
+    ja: "画像を取得できない",
+    en: "image unavailable",
+  },
+  "attach.downloadTitle": {
+    ja: "{name} をダウンロード",
+    en: "Download {name}",
+  },
 
   // ── ScheduleEditor ──
   "sched.modeOff": { ja: "オフ", en: "Off" },
@@ -785,7 +1129,10 @@ const messages = {
   "sched.saveToUpdate": { ja: "保存すると更新される", en: "save to update" },
   "sched.checkingIn": { ja: "チェックイン中…", en: "Checking in…" },
   "sched.checkinNow": { ja: "今すぐチェックイン", en: "Check in now" },
-  "sched.checkinMessage": { ja: "チェックインメッセージ", en: "Check-in Message" },
+  "sched.checkinMessage": {
+    ja: "チェックインメッセージ",
+    en: "Check-in Message",
+  },
   "sched.checkinMessageHelpPre": {
     ja: "定期・手動チェックインのプロンプト末尾の指示を置き換える。今日の日付 (YYYY-MM-DD) のプレースホルダとして ",
     en: "Replaces the trailing instruction in periodic and manual check-in prompts. Use ",
@@ -821,9 +1168,15 @@ const messages = {
     ja: "先に人格の説明を書いて",
     en: "Write a persona description first",
   },
-  "create.generatingPersona": { ja: "人格を生成中...", en: "Generating persona..." },
+  "create.generatingPersona": {
+    ja: "人格を生成中...",
+    en: "Generating persona...",
+  },
   "create.generatingName": { ja: "名前を生成中...", en: "Generating name..." },
-  "create.generatingAvatar": { ja: "アバターを生成中...", en: "Generating avatar..." },
+  "create.generatingAvatar": {
+    ja: "アバターを生成中...",
+    en: "Generating avatar...",
+  },
   "create.personaPlaceholder": {
     ja: "エージェントの性格・話し方・興味などを書いて...",
     en: "Describe the agent's personality, speaking style, interests...",
@@ -837,8 +1190,14 @@ const messages = {
     en: "Click to upload avatar",
   },
   "create.avatarAlt": { ja: "アバター", en: "Avatar" },
-  "create.regenAvatarTitle": { ja: "アバターを再生成", en: "Regenerate avatar" },
-  "create.genNameTitle": { ja: "人格から名前を生成", en: "Generate name from persona" },
+  "create.regenAvatarTitle": {
+    ja: "アバターを再生成",
+    en: "Regenerate avatar",
+  },
+  "create.genNameTitle": {
+    ja: "人格から名前を生成",
+    en: "Generate name from persona",
+  },
   "create.genHintAria": { ja: "生成ヒント", en: "Generation hint" },
   "create.genHintPlaceholder": {
     ja: "生成ヒント (任意)",
@@ -872,7 +1231,10 @@ const messages = {
   },
   "create.nameAndAvatar": { ja: "名前とアバター", en: "Name & Avatar" },
   "create.setNameFirst": { ja: "先に名前を設定して", en: "Set a name first" },
-  "create.genAvatarOnly": { ja: "アバターだけ生成", en: "Generate avatar only" },
+  "create.genAvatarOnly": {
+    ja: "アバターだけ生成",
+    en: "Generate avatar only",
+  },
   "create.avatarProgress": { ja: "アバター...", en: "Avatar..." },
   "create.avatar": { ja: "アバター", en: "Avatar" },
   "create.apiBaseUrl": { ja: "API Base URL", en: "API Base URL" },
@@ -896,8 +1258,14 @@ const messages = {
     ja: "生成への追加要望 (任意)。例: 女性、関西弁",
     en: "Extra wishes for generation (optional)",
   },
-  "create.tonePreview": { ja: "生成された人格 (編集可)", en: "Generated persona (editable)" },
-  "create.tonePreviewTemplate": { ja: "テンプレートの人格", en: "Template persona" },
+  "create.tonePreview": {
+    ja: "生成された人格 (編集可)",
+    en: "Generated persona (editable)",
+  },
+  "create.tonePreviewTemplate": {
+    ja: "テンプレートの人格",
+    en: "Template persona",
+  },
   "create.taskRequired": { ja: "タスクを入力して", en: "Enter a task first" },
   "create.tonePersonaRequired": {
     ja: "先に「性格を生成」を実行して",
@@ -913,7 +1281,10 @@ const messages = {
   "cred.qrImage": { ja: "QR 画像", en: "QR Image" },
   "cred.uriText": { ja: "URI テキスト", en: "URI Text" },
   "cred.decoding": { ja: "解析中...", en: "Decoding..." },
-  "cred.tapSelectQr": { ja: "タップして QR 画像を選択", en: "Tap to select QR image" },
+  "cred.tapSelectQr": {
+    ja: "タップして QR 画像を選択",
+    en: "Tap to select QR image",
+  },
   "cred.parsing": { ja: "パース中...", en: "Parsing..." },
   "cred.parse": { ja: "パース", en: "Parse" },
   "cred.entriesFound": {
@@ -933,7 +1304,10 @@ const messages = {
     ja: "新しい TOTP シークレット (空なら現状維持)",
     en: "New TOTP secret (leave empty to keep)",
   },
-  "cred.totpOptional": { ja: "TOTP シークレット (任意)", en: "TOTP Secret (optional)" },
+  "cred.totpOptional": {
+    ja: "TOTP シークレット (任意)",
+    en: "TOTP Secret (optional)",
+  },
   "cred.switchingNoSave": {
     ja: "デバイス転移中。完了するまで保存できない。",
     en: "Device transfer in progress. Cannot save until it finishes.",
@@ -958,17 +1332,26 @@ const messages = {
     ja: "エージェントレコードの取得に失敗: {msg}",
     en: "agent record fetch failed: {msg}",
   },
-  "cred.deleteConfirm": { ja: "この認証情報を削除する?", en: "Delete this credential?" },
+  "cred.deleteConfirm": {
+    ja: "この認証情報を削除する?",
+    en: "Delete this credential?",
+  },
   "cred.addButton": { ja: "+ 追加", en: "+ Add" },
   "cred.retry": { ja: "再試行", en: "Retry" },
   "cred.adding": { ja: "追加中...", en: "Adding..." },
   "cred.add": { ja: "追加", en: "Add" },
   "cred.copyPw": { ja: "PW をコピー", en: "Copy PW" },
-  "cred.none": { ja: "登録済みの認証情報はない", en: "No credentials registered" },
+  "cred.none": {
+    ja: "登録済みの認証情報はない",
+    en: "No credentials registered",
+  },
 
   // ── Agent settings fields ──
   "field.persona": { ja: "人格", en: "Persona" },
-  "field.personaGenPrompt": { ja: "人格生成プロンプト", en: "Persona generation prompt" },
+  "field.personaGenPrompt": {
+    ja: "人格生成プロンプト",
+    en: "Persona generation prompt",
+  },
   "field.effort": { ja: "Effort", en: "Effort" },
   "field.effortDefault": { ja: "既定 ({level})", en: "default ({level})" },
   "field.modelDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
@@ -988,7 +1371,10 @@ const messages = {
   "field.statusValue": { ja: "値", en: "value" },
   "field.statusKeyAria": { ja: "ステータスのキー {n}", en: "status key {n}" },
   "field.statusValueAria": { ja: "ステータスの値 {n}", en: "status value {n}" },
-  "field.statusRemoveAria": { ja: "ステータス行 {n} を削除", en: "remove status row {n}" },
+  "field.statusRemoveAria": {
+    ja: "ステータス行 {n} を削除",
+    en: "remove status row {n}",
+  },
 
   // ── GlobalSettings sections ──
   "gs.apiKeys": { ja: "API キー", en: "API Keys" },
@@ -1002,24 +1388,39 @@ const messages = {
   "gs.keyStatusError": { ja: "状態を取得できません", en: "Status unavailable" },
   "gs.update": { ja: "更新", en: "Update" },
   "gs.configure": { ja: "設定する", en: "Configure" },
-  "gs.removeGeminiKey": { ja: "Gemini API キーを削除", en: "Remove Gemini API key" },
+  "gs.removeGeminiKey": {
+    ja: "Gemini API キーを削除",
+    en: "Remove Gemini API key",
+  },
   "gs.removeOpenaiKey": { ja: "OpenAI API キーを削除", en: "Remove OpenAI API key" },
   "gs.removeXaiKey": { ja: "xAI API キーを削除", en: "Remove xAI API key" },
   "gs.save": { ja: "保存", en: "Save" },
   "gs.embeddingModel": { ja: "埋め込みモデル", en: "Embedding Model" },
   "gs.loadingModels": { ja: "モデルを読み込み中...", en: "Loading models..." },
-  "gs.modelUnavailable": { ja: "{model} (利用不可)", en: "{model} (unavailable)" },
-  "gs.loadModelsFailed": { ja: "モデル一覧の取得に失敗", en: "Failed to load models" },
+  "gs.modelUnavailable": {
+    ja: "{model} (利用不可)",
+    en: "{model} (unavailable)",
+  },
+  "gs.loadModelsFailed": {
+    ja: "モデル一覧の取得に失敗",
+    en: "Failed to load models",
+  },
   "gs.configureKeyForModels": {
     ja: "API キーを設定すると利用可能なモデルが出る",
     en: "Configure API key to see available models",
   },
-  "gs.voiceInputStt": { ja: "音声入力 (音声認識)", en: "Voice input (speech-to-text)" },
+  "gs.voiceInputStt": {
+    ja: "音声入力 (音声認識)",
+    en: "Voice input (speech-to-text)",
+  },
   "gs.openaiImageHelp": {
     ja: "GPT Image 2によるエージェントのアバター生成",
     en: "Agent avatar generation with GPT Image 2",
   },
-  "gs.archivedAgents": { ja: "アーカイブ済みエージェント", en: "Archived Agents" },
+  "gs.archivedAgents": {
+    ja: "アーカイブ済みエージェント",
+    en: "Archived Agents",
+  },
   "gs.archivedAgentsDesc": {
     ja: "アーカイブ済みエージェントはメインリストから隠れ、ランタイム活動もない。エージェント自身のデータ (1:1 チャット履歴・メモリ・人格・認証情報・通知トークン) は保持される。グループ DM のメンバーシップは保持されない — アーカイブ時に全グループから外れ (2人グループは解散してトランスクリプトも削除)、アーカイブ解除でも復帰しない。削除はすべてを完全に消す。",
     en: "Archived agents are hidden from the main list and have no runtime activity. The agent's own data (1:1 chat history, memory, persona, credentials, notify tokens) is preserved. Group DM memberships are not — the agent was removed from every group on archive (2-person groups were dissolved and their transcripts deleted), and memberships are NOT restored on unarchive. Delete wipes everything permanently.",
@@ -1029,7 +1430,10 @@ const messages = {
     en: 'Permanently delete "{name}" and all of its data? This cannot be undone.',
   },
   "gs.loading": { ja: "読み込み中...", en: "Loading..." },
-  "gs.noArchivedAgents": { ja: "アーカイブ済みエージェントはない", en: "No archived agents" },
+  "gs.noArchivedAgents": {
+    ja: "アーカイブ済みエージェントはない",
+    en: "No archived agents",
+  },
   "gs.archivedOn": { ja: "{date} にアーカイブ", en: "archived {date}" },
   "gs.restore": { ja: "復元", en: "Restore" },
   "gs.chat": { ja: "チャット", en: "Chat" },
@@ -1060,10 +1464,82 @@ const messages = {
     ja: "サーバーを再ビルド (`make build`) して再起動する? 数分かかることがある。",
     en: "Rebuild the server (`make build`) and restart? This can take several minutes.",
   },
-  "gs.building": { ja: "ビルド中... (数分かかることがある)", en: "Building... (this can take several minutes)" },
+  "gs.building": {
+    ja: "ビルド中... (数分かかることがある)",
+    en: "Building... (this can take several minutes)",
+  },
   "gs.rebuilding": { ja: "再ビルド中...", en: "Rebuilding..." },
   "gs.rebuildRestart": { ja: "再ビルドして再起動", en: "Rebuild & Restart" },
   "gs.restart": { ja: "再起動", en: "Restart" },
+  // --- extension packages ---
+  "gs.extensions": { ja: "拡張機能", en: "Extensions" },
+  "gs.extensionsHelp": {
+    ja: "git リポジトリから拡張パッケージを導入する。導入前に要求される権限を確認できる",
+    en: "Install extension packages from a git repository. Requested capabilities are shown before installing",
+  },
+  "gs.extRepoUrl": { ja: "リポジトリ URL", en: "Repository URL" },
+  "gs.extRepoUrlHelp": {
+    ja: "kojo-package.json をルートに持つ git リポジトリ",
+    en: "A git repository with kojo-package.json at its root",
+  },
+  "gs.extRef": { ja: "タグ / ブランチ", en: "Tag / branch" },
+  "gs.extRefHelp": {
+    ja: "空ならリモートの既定ブランチ。タグ指定を推奨",
+    en: "Empty uses the remote default branch. A tag is recommended",
+  },
+  "gs.extCheck": { ja: "内容を確認", en: "Inspect" },
+  "gs.extInstall": { ja: "権限を承認して導入", en: "Approve & install" },
+  "gs.extInstalled": { ja: "導入済み", en: "Installed" },
+  "gs.extNone": { ja: "まだ何も導入していない", en: "Nothing installed yet" },
+  "gs.extContributes": { ja: "追加される機能", en: "Contributes" },
+  "gs.extScopes": { ja: "要求される権限", en: "Requested capabilities" },
+  "gs.extScopesNone": { ja: "権限の要求なし", en: "No capabilities requested" },
+  "gs.extAlreadyInstalled": {
+    ja: "この ID は導入済み。更新は一覧側から行う",
+    en: "This id is already installed — update it from the list below",
+  },
+  "gs.extEnable": { ja: "有効", en: "Enabled" },
+  "gs.extUpdate": { ja: "更新", en: "Update" },
+  "gs.extRemove": { ja: "削除", en: "Remove" },
+  "gs.extSave": { ja: "設定を保存", en: "Save settings" },
+  "gs.extUrlRequired": {
+    ja: "リポジトリ URL を入力して",
+    en: "Repository URL is required",
+  },
+  "gs.extRemoveConfirm": {
+    ja: "{name} を削除する？",
+    en: "Remove {name}?",
+  },
+  "gs.extUpdateScopeConfirm": {
+    ja: "この更新は権限の追加を要求している: {scopes}\n承認して更新する？",
+    en: "This update requests additional capabilities: {scopes}\nApprove and update?",
+  },
+  "gs.extAgents": {
+    ja: "エージェントごとの有効化",
+    en: "Per-agent enablement",
+  },
+  "gs.extAgentsHelp": {
+    ja: "拡張機能がエージェントを操作できるのは、ここで有効にしたエージェントだけ",
+    en: "An extension can only reach the agents you enable here",
+  },
+  "gs.extAgentSettings": {
+    ja: "このエージェント向けの設定",
+    en: "Settings for this agent",
+  },
+  "gs.extServiceRunning": { ja: "サービス稼働中", en: "Service running" },
+  "gs.extServiceStopped": { ja: "サービス停止中", en: "Service not running" },
+  "gs.extToken": { ja: "アクセストークン", en: "Access token" },
+  "gs.extTokenHelp": {
+    ja: "拡張機能のサービスが kojo API を呼ぶときに使う。手元で動かすときだけ必要",
+    en: "The token a package's service uses to call the kojo API. Only needed to run one by hand",
+  },
+  "gs.extTokenShow": { ja: "トークンを表示", en: "Show token" },
+  "gs.extTokenHide": { ja: "隠す", en: "Hide" },
+  "gs.extTokenRotate": { ja: "再発行", en: "Rotate" },
+  "gs.extTokenRotateConfirm": {
+    ja: "再発行すると今のトークンは即座に無効になる。続ける？",
+    en: "Rotating invalidates the current token immediately. Continue?",
+  },
   "gs.personaTemplates": { ja: "人格テンプレート", en: "Persona templates" },
   "gs.personaTemplatesHelp": {
     ja: "新規エージェント作成の「性格・口調」で選べるカスタムテンプレート",
@@ -1076,8 +1552,14 @@ const messages = {
   "gs.tplPersona": { ja: "人格 (persona)", en: "Persona" },
   "gs.tplSave": { ja: "保存", en: "Save" },
   "gs.tplCancel": { ja: "キャンセル", en: "Cancel" },
-  "gs.tplEmpty": { ja: "カスタムテンプレートはまだない", en: "No custom templates yet" },
-  "gs.tplNameRequired": { ja: "テンプレート名を入力して", en: "Enter a template name" },
+  "gs.tplEmpty": {
+    ja: "カスタムテンプレートはまだない",
+    en: "No custom templates yet",
+  },
+  "gs.tplNameRequired": {
+    ja: "テンプレート名を入力して",
+    en: "Enter a template name",
+  },
   "gs.tplPersonaRequired": { ja: "人格を入力して", en: "Enter a persona" },
   "gs.tplDeleteConfirm": {
     ja: "テンプレート「{name}」を削除する?",
@@ -1119,14 +1601,23 @@ const messages = {
     ja: "保留中ピアの取得に失敗: {msg}",
     en: "Failed to load pending peers: {msg}",
   },
-  "peers.loadFailed": { ja: "ピアの取得に失敗: {msg}", en: "Failed to load peers: {msg}" },
-  "peers.registerFailed": { ja: "登録に失敗: {msg}", en: "Register failed: {msg}" },
+  "peers.loadFailed": {
+    ja: "ピアの取得に失敗: {msg}",
+    en: "Failed to load peers: {msg}",
+  },
+  "peers.registerFailed": {
+    ja: "登録に失敗: {msg}",
+    en: "Register failed: {msg}",
+  },
   "peers.editBothRequired": {
     ja: "編集: name と url を両方入力する必要がある",
     en: "Edit: both name and url are required",
   },
   "peers.editFailed": { ja: "編集に失敗: {msg}", en: "Edit failed: {msg}" },
-  "peers.approveFailed": { ja: "承認に失敗: {msg}", en: "Approve failed: {msg}" },
+  "peers.approveFailed": {
+    ja: "承認に失敗: {msg}",
+    en: "Approve failed: {msg}",
+  },
   "peers.rejectConfirm": {
     ja: "「{name}」からの参加リクエストを却下する?",
     en: 'Reject join request from "{name}"?',
@@ -1151,7 +1642,10 @@ const messages = {
   "peers.parsePrefix": { ja: "パース: ", en: "Parse: " },
   "peers.registering": { ja: "登録中...", en: "Registering..." },
   "peers.registerPeer": { ja: "ピアを登録", en: "Register peer" },
-  "peers.pendingTitle": { ja: "保留中の参加リクエスト", en: "Pending join requests" },
+  "peers.pendingTitle": {
+    ja: "保留中の参加リクエスト",
+    en: "Pending join requests",
+  },
   "peers.pendingHelpPre": {
     ja: "この Hub を ",
     en: "Peers that auto-discovered this Hub via ",
@@ -1258,8 +1752,14 @@ const messages = {
     ja: "--dangerously-bypass-approvals-and-sandbox 付きで起動する",
     en: "Launches with --dangerously-bypass-approvals-and-sandbox",
   },
-  "ns.yoloOther": { ja: "権限確認をスキップする", en: "Skip permission prompts" },
-  "ns.minimalPrompt": { ja: "最小システムプロンプト", en: "Minimal system prompt" },
+  "ns.yoloOther": {
+    ja: "権限確認をスキップする",
+    en: "Skip permission prompts",
+  },
+  "ns.minimalPrompt": {
+    ja: "最小システムプロンプト",
+    en: "Minimal system prompt",
+  },
   "ns.minimalPromptHelp": {
     ja: "既定のプロンプトを作業ディレクトリの注記だけに置き換える",
     en: "Replace the default prompt with just a working-directory note",
@@ -1277,7 +1777,10 @@ const messages = {
   "fdb.sortName": { ja: "名前", en: "Name" },
   "fdb.sortSize": { ja: "サイズ", en: "Size" },
   "fdb.sortMod": { ja: "更新", en: "Mod" },
-  "fdb.toggleHidden": { ja: "隠しファイルの表示を切り替え", en: "Toggle hidden files" },
+  "fdb.toggleHidden": {
+    ja: "隠しファイルの表示を切り替え",
+    en: "Toggle hidden files",
+  },
   "fdb.loading": { ja: "読み込み中…", en: "Loading…" },
   "fdb.noMatches": { ja: "一致なし。", en: "No matches." },
   "fdb.emptyFolder": { ja: "空のフォルダ。", en: "Empty folder." },
@@ -1304,7 +1807,10 @@ const messages = {
     ja: "tmux が入っていない。\nインストール: brew install tmux",
     en: "tmux is not installed.\nInstall: brew install tmux",
   },
-  "term.toolUnavailable": { ja: "{tool} は利用できない。", en: "{tool} is not available." },
+  "term.toolUnavailable": {
+    ja: "{tool} は利用できない。",
+    en: "{tool} is not available.",
+  },
   "term.tmuxNewWin": { ja: "+ウィンドウ", en: "+Win" },
   "term.tmuxPrevWin": { ja: "←ウィンドウ", en: "←Win" },
   "term.tmuxNextWin": { ja: "ウィンドウ→", en: "Win→" },
@@ -1330,7 +1836,10 @@ const messages = {
   "gdm.styleEfficient": { ja: "効率重視", en: "Efficient" },
   "gdm.styleExpressive": { ja: "表現重視", en: "Expressive" },
   "gdm.venueTitle": { ja: "場: {venue}", en: "Venue: {venue}" },
-  "gdm.venueChatroom": { ja: "クローズドなチャットルーム", en: "Closed chat room" },
+  "gdm.venueChatroom": {
+    ja: "クローズドなチャットルーム",
+    en: "Closed chat room",
+  },
   "gdm.venueChatroomHint": {
     ja: "テキストのみ、同じ場所にはいない",
     en: "Text-only, not co-present",
@@ -1340,14 +1849,20 @@ const messages = {
     ja: "メンバーが実空間で同席している",
     en: "Members are co-present in real space",
   },
-  "gdm.cooldownTitle": { ja: "通知クールダウン (秒)", en: "Notification cooldown (seconds)" },
+  "gdm.cooldownTitle": {
+    ja: "通知クールダウン (秒)",
+    en: "Notification cooldown (seconds)",
+  },
   "gdm.maxHops": { ja: "最大ホップ数", en: "Max hops" },
   "gdm.hopsUnit": { ja: "ホップ", en: "hops" },
   "gdm.maxHopsTitle": {
     ja: "リレーの最大ホップ数 (空 = 既定 4、最大 20)",
     en: "Max relay hops (empty = default 4, max 20)",
   },
-  "gdm.clearHistoryTitle": { ja: "メッセージ履歴を消去", en: "Clear message history" },
+  "gdm.clearHistoryTitle": {
+    ja: "メッセージ履歴を消去",
+    en: "Clear message history",
+  },
   "gdm.archiveThread": { ja: "スレッドをアーカイブ", en: "Archive thread" },
   "gdm.deleteGroup": { ja: "グループを削除", en: "Delete group" },
   "gdm.replying": { ja: "返信中…", en: "replying…" },
@@ -1383,11 +1898,17 @@ const messages = {
   "gdm.clearFailed": { ja: "履歴の消去に失敗", en: "Failed to clear history" },
   "gdm.clearing": { ja: "消去中…", en: "Clearing…" },
   "gdm.clear": { ja: "消去", en: "Clear" },
-  "gdm.deleteConfirmTitle": { ja: "「{name}」を削除する?", en: "Delete \u201c{name}\u201d?" },
+  "gdm.deleteConfirmTitle": {
+    ja: "「{name}」を削除する?",
+    en: "Delete \u201c{name}\u201d?",
+  },
   "gdm.deleteFailed": { ja: "削除に失敗", en: "Failed to delete" },
   "gdm.deleting": { ja: "削除中…", en: "Deleting…" },
   "gdm.delete": { ja: "削除", en: "Delete" },
-  "gdm.archiveConfirmTitle": { ja: "「{name}」をアーカイブする?", en: "Archive \u201c{name}\u201d?" },
+  "gdm.archiveConfirmTitle": {
+    ja: "「{name}」をアーカイブする?",
+    en: "Archive \u201c{name}\u201d?",
+  },
   "gdm.archiveConfirmBody": {
     ja: "スレッドを完全に閉じる。復元はできない。",
     en: "This permanently closes the thread. It cannot be restored.",
@@ -1403,7 +1924,10 @@ export type MessageKey = keyof typeof messages;
  * Translate a key for the current locale, interpolating {name}-style params.
  * Missing key → returns the key itself (fail-soft, warns in dev).
  */
-export function t(key: MessageKey, params?: Record<string, string | number>): string {
+export function t(
+  key: MessageKey,
+  params?: Record<string, string | number>,
+): string {
   const entry = messages[key];
   if (!entry) {
     // import.meta.env is Vite-injected; cast since vite/client types aren't
@@ -1413,7 +1937,9 @@ export function t(key: MessageKey, params?: Record<string, string | number>): st
     }
     return key;
   }
-  const out = entry[current];
+  const out = isBuiltin(current)
+    ? entry[current]
+    : (overlays.get(current)?.[key] ?? entry.en);
   if (!params) return out;
   // Single pass with a function replacer so param values containing `$`
   // sequences ($&, $1, …) are inserted verbatim rather than interpreted as

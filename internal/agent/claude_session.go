@@ -269,6 +269,9 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 	// flushed yet; only a newly spawned --session-id process is fresh.
 	fresh := spawned && inv.bootstrapRecentContext
 	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, !fresh)
+	if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
+		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
+	}
 
 	// A question can be surfaced whenever the caller wired an answer channel.
 	// Automated turns surface it too (held with a timeout by handleControlRequest)

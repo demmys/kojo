@@ -39,17 +39,23 @@ func isGrokSessionID(s string) bool {
 // --prompt-file plus --output-format streaming-json and parses the
 // resulting thought/text/end events into ChatEvents.
 //
-// Session continuity uses an explicit per-agent session ID captured
-// from the streaming "end" event, persisted to <agentDir>/.grok/session_id,
-// and replayed on the next non-OneShot turn via `--resume <id>`. We
-// do NOT rely on grok's `--continue` (which picks the most-recently-
-// modified session for a cwd) because that would let an OneShot Slack
-// thread silently take over the agent's primary session — see the
-// Codex review on the original `--continue` implementation.
+// Session continuity uses an explicit session ID captured from the
+// streaming "end" event and replayed on the next turn via
+// `--resume <id>`. We do NOT rely on grok's `--continue` (which picks
+// the most-recently-modified session for a cwd) because that would let
+// a Slack thread silently take over the agent's primary session — see
+// the Codex review on the original `--continue` implementation.
 //
-// OneShot turns never read or write the stored session ID and the
-// session directory grok creates for them is removed after the turn
-// completes, so the persistent session stays isolated.
+// The ID is stored per ChatOptions.SessionKey: the agent's own chat
+// (empty key) keeps <agentDir>/.grok/session_id, and every keyed
+// caller — a Slack thread, a GroupDM thread — gets its own
+// <agentDir>/.grok/threads/key-<hash> file. Because the ID is always
+// explicit, one caller can never resume another's session, which is
+// what made `--continue` unusable here.
+//
+// A turn with neither a SessionKey nor persistence (OneShot with no
+// key) never reads or writes any stored ID, and the session directory
+// grok creates for it is removed after the turn completes.
 //
 // MCP injection is intentionally unsupported here: the grok CLI loads
 // MCP servers from `~/.grok/config.toml` (global) or a project-scoped
@@ -80,13 +86,110 @@ func grokSessionIDFile(agentDirPath string) string {
 	return filepath.Join(agentDirPath, ".grok", "session_id")
 }
 
+// grokThreadRefDir holds one resume-ID file per ChatOptions.SessionKey.
+// Kept beside session_id rather than inside it so the primary session
+// and the keyed ones can never collide on a path.
+func grokThreadRefDir(agentDirPath string) string {
+	return filepath.Join(agentDirPath, ".grok", "threads")
+}
+
+// grokSessionRefPath maps a SessionKey to the file holding its resume
+// ID. The empty key is the agent's own session and keeps the original
+// path, so an agent that predates keyed threads resumes as before.
+//
+// The key is hashed rather than used verbatim: it is caller-supplied
+// (Slack channel + thread timestamp today) and must not be able to
+// steer the join out of the threads directory.
+func grokSessionRefPath(agentDirPath, sessionKey string) string {
+	if sessionKey == "" {
+		return grokSessionIDFile(agentDirPath)
+	}
+	return filepath.Join(grokThreadRefDir(agentDirPath), "key-"+agentIDToUUID(sessionKey))
+}
+
+// grokSessionIDPersisted reports whether sessionID is the resume target
+// of ANY stored key for this agent. Used before deleting a disposable
+// session directory, so a turn can never remove a session another key
+// still resumes.
+func grokSessionIDPersisted(agentDirPath, sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	if readGrokSessionID(agentDirPath) == sessionID {
+		return true
+	}
+	entries, err := os.ReadDir(grokThreadRefDir(agentDirPath))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		body, rerr := os.ReadFile(filepath.Join(grokThreadRefDir(agentDirPath), e.Name()))
+		if rerr != nil {
+			continue
+		}
+		if strings.TrimSpace(string(body)) == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+// grokSessionExists reports whether grok still has state on disk for
+// sessionID under the agent's cwd. A ref pointing at a session grok has
+// GC'd is worthless: resuming it fails the whole turn.
+func grokSessionExists(agentDirPath, sessionID string) bool {
+	if !isGrokSessionID(sessionID) {
+		return false
+	}
+	sessionsDir := grokSessionDir(agentDirPath)
+	if sessionsDir == "" {
+		// The session root could not be resolved, so absence proves
+		// nothing. Let the resume proceed and fall back to the existing
+		// stale-session recovery.
+		return true
+	}
+	info, err := os.Stat(filepath.Join(sessionsDir, sessionID))
+	return err == nil && info.IsDir()
+}
+
+// grokCanResumeSession reports whether a keyed grok session exists and
+// still has state on disk. Mirrors codexCanResumeSession: the caller
+// uses it to decide how much thread history to re-inject.
+func grokCanResumeSession(agentID, sessionKey string) bool {
+	if sessionKey == "" {
+		return false
+	}
+	dir := agentDir(agentID)
+	id := readGrokSessionIDFor(dir, sessionKey)
+	if id == "" {
+		return false
+	}
+	sessionsDir := grokSessionDir(dir)
+	if sessionsDir == "" {
+		// Unlike the backend's own probe, an unresolvable session root
+		// answers "no": the caller uses this to decide whether it can
+		// SKIP re-injecting history, and guessing yes loses context.
+		return false
+	}
+	info, err := os.Stat(filepath.Join(sessionsDir, id))
+	return err == nil && info.IsDir()
+}
+
 // readGrokSessionID returns the saved primary grok session ID for the
 // agent, or "" if none is stored / readable / well-formed. A
 // malformed value (anything other than a grok UUID) is treated as
 // absent AND deleted from disk so a poisoned file can't keep
 // failing future turns.
 func readGrokSessionID(agentDirPath string) string {
-	path := grokSessionIDFile(agentDirPath)
+	return readGrokSessionIDFor(agentDirPath, "")
+}
+
+// readGrokSessionIDFor is readGrokSessionID for a specific SessionKey.
+func readGrokSessionIDFor(agentDirPath, sessionKey string) string {
+	path := grokSessionRefPath(agentDirPath, sessionKey)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
@@ -110,11 +213,16 @@ func readGrokSessionID(agentDirPath string) string {
 // the file just means the next turn starts a fresh session, which
 // is correct fallback behaviour.
 func writeGrokSessionID(agentDirPath, sessionID string, logger *slog.Logger) {
+	writeGrokSessionIDFor(agentDirPath, "", sessionID, logger)
+}
+
+// writeGrokSessionIDFor is writeGrokSessionID for a specific SessionKey.
+func writeGrokSessionIDFor(agentDirPath, sessionKey, sessionID string, logger *slog.Logger) {
 	if !isGrokSessionID(sessionID) {
 		logger.Warn("grok: refusing to persist non-UUID session_id", "value", sessionID)
 		return
 	}
-	path := grokSessionIDFile(agentDirPath)
+	path := grokSessionRefPath(agentDirPath, sessionKey)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		logger.Warn("grok: mkdir for session_id failed", "path", path, "err", err)
 		return
@@ -122,6 +230,17 @@ func writeGrokSessionID(agentDirPath, sessionID string, logger *slog.Logger) {
 	if err := os.WriteFile(path, []byte(sessionID), 0o644); err != nil {
 		logger.Warn("grok: write session_id failed", "path", path, "err", err)
 	}
+}
+
+// deleteGrokThreadRefStrict makes the next keyed turn start a fresh grok
+// session. The old session directory may still be referenced by another key,
+// so only the key-to-session ref is removed here.
+func deleteGrokThreadRefStrict(agentID, sessionKey string) error {
+	err := os.Remove(grokSessionRefPath(agentDir(agentID), sessionKey))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string) []string {
@@ -173,15 +292,44 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
 
-	// Resume strategy:
-	//   non-OneShot + stored session ID present → --resume <id>
-	//   non-OneShot + no stored ID             → fresh session; capture ID on completion
-	//   OneShot                                 → always fresh; never read/write stored ID
+	// Resume strategy, per (OneShot, SessionKey):
+	//   !OneShot            → resume the ID stored for opts.SessionKey
+	//                         ("" = the agent's own session), or start
+	//                         fresh and capture the ID on completion
+	//   OneShot             → always fresh; never read or write a stored ID
+	//
+	// The manager only sets a SessionKey when the backend is listed in
+	// backendSupportsSessionKey, and clears OneShot in the same breath,
+	// so the keyed case always arrives here as !OneShot.
+	persistKey := opts.SessionKey
 	var resumeID string
 	if !opts.OneShot {
-		resumeID = readGrokSessionID(dir)
+		resumeID = readGrokSessionIDFor(dir, persistKey)
+		// A ref whose session grok has since GC'd (or that a device
+		// transfer left behind) would spend the turn on a resume that
+		// can only fail. Manager.CanResumeSession applies the same
+		// existence check when deciding how much history to re-inject,
+		// so honouring it here keeps the two in agreement.
+		if resumeID != "" && !grokSessionExists(dir, resumeID) {
+			_ = os.Remove(grokSessionRefPath(dir, persistKey))
+			b.logger.Info("grok: dropped session_id with no session on disk",
+				"agent", agent.ID, "staleId", resumeID)
+			resumeID = ""
+		}
 	}
+
 	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumeID != "")
+
+	// A fresh session has no history of its own, so bootstrap it with a
+	// bounded transcript excerpt (including the recent tool calls) the
+	// same way ClaudeBackend does. Without this, a session that was
+	// reset / GC'd / lost to a stale ref leaves the agent blind to what
+	// it just did — re-running commands it already ran. Resumed sessions
+	// skip it: their context is already on disk. OneShot turns skip it
+	// too — Slack / Discord / Group DM carry their own context.
+	if !opts.OneShot && resumeID == "" && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
+		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
+	}
 
 	// Materialise the user message via --prompt-file. Passing the
 	// prompt through argv works for short inputs but risks ARG_MAX
@@ -275,7 +423,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 			// mid-cancel so it doesn't leak into the persistent
 			// store. We tolerate empty sessionID (turn died before
 			// the end event) — there's nothing reliable to remove.
-			if opts.OneShot && result.sessionID != "" {
+			if opts.OneShot && result.sessionID != "" && !grokSessionIDPersisted(dir, result.sessionID) {
 				removeGrokSessionDir(dir, result.sessionID)
 			}
 			return
@@ -323,21 +471,31 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		// the caller still sees the underlying grok error this
 		// turn; the recovery only takes effect on the next call.
 		if resumeID != "" && result.text == "" && isStaleSessionError(processError) {
-			_ = os.Remove(grokSessionIDFile(dir))
+			_ = os.Remove(grokSessionRefPath(dir, persistKey))
 			b.logger.Info("grok: dropped stale session_id after resume failure",
 				"agent", agent.ID, "staleId", resumeID)
 		}
+		// Cleanup runs before the error return: a failed OneShot turn
+		// can still have created a session directory, and leaving it
+		// would leak disposable state on exactly the turns that repeat.
+		cleanupOneShot := func() {
+			if opts.OneShot && result.sessionID != "" && !grokSessionIDPersisted(dir, result.sessionID) {
+				removeGrokSessionDir(dir, result.sessionID)
+			}
+		}
+
 		if processError != "" && result.text == "" {
+			cleanupOneShot()
 			send(ChatEvent{Type: "error", ErrorMessage: processError})
 			return
 		}
 
-		// Persist the primary session ID on first non-OneShot turn
-		// so subsequent turns can `--resume <id>`. OneShot turns
-		// must NEVER write here — that's the rule that keeps Slack
-		// threads from hijacking the agent's WebUI session.
+		// Persist the session ID on the first turn for this key so
+		// subsequent turns can `--resume <id>`. Keyless OneShot turns
+		// must NEVER write here — that's the rule that keeps a
+		// disposable call from hijacking the agent's own session.
 		if !opts.OneShot && resumeID == "" && result.sessionID != "" {
-			writeGrokSessionID(dir, result.sessionID, b.logger)
+			writeGrokSessionIDFor(dir, persistKey, result.sessionID, b.logger)
 		}
 
 		enrichGrokToolUsesFromSessionHistory(dir, result, b.logger)
@@ -345,12 +503,9 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		// OneShot cleanup: remove the disposable session directory
 		// grok just created. Done outside the resumeID branch so
 		// a OneShot that happened to land on the same cwd as the
-		// persistent session is still cleaned up (sessionID is per-
-		// session, not per-cwd, so this can't accidentally delete
-		// the agent's primary session).
-		if opts.OneShot && result.sessionID != "" && result.sessionID != readGrokSessionID(dir) {
-			removeGrokSessionDir(dir, result.sessionID)
-		}
+		// persistent session is still cleaned up; the persisted-ID
+		// check keeps it from touching a session some key resumes.
+		cleanupOneShot()
 
 		msg := assembleAssistantMessage(result.text, result.thinking, result.toolUses, nil)
 
@@ -1214,6 +1369,14 @@ func clearGrokSessionCounted(agentID string) (filesRemoved, sessionsRemoved int,
 		}
 	}
 	if rerr := os.Remove(grokSessionIDFile(dir)); rerr != nil && !os.IsNotExist(rerr) {
+		if err == nil {
+			err = rerr
+		}
+	}
+	// The keyed thread refs point at sessions that were just removed, so
+	// leaving them would make every thread's next turn attempt a resume
+	// that can only fail into stale-session recovery.
+	if rerr := os.RemoveAll(grokThreadRefDir(dir)); rerr != nil && !os.IsNotExist(rerr) {
 		if err == nil {
 			err = rerr
 		}

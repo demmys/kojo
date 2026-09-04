@@ -86,10 +86,11 @@ func (s *Server) tryPatchRemoteAgentHubLocal(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusForbidden, "forbidden", "agents may only PATCH themselves")
 		return true
 	}
-	// Same owner-only rule as handleUpdateAgent (peers never reach this
-	// path — the middleware passes RolePeer through before proxying).
+	// Same rule as handleUpdateAgent: Owner, or a deputy acting on
+	// someone else (peers never reach this path — the middleware passes
+	// RolePeer through before proxying).
 	for k := range raw {
-		if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() {
+		if strings.EqualFold(k, "disabledInjections") && !p.IsOwner() && !p.IsOwnerDeputyOver(id) {
 			writeError(w, http.StatusForbidden, "forbidden", "disabledInjections is owner-only")
 			return true
 		}

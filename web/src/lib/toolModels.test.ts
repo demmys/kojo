@@ -16,14 +16,24 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(modelsForTool("claude")).toContain("claude-opus-4-8");
   });
 
-  it("lists claude-fable-5 as a claude model", () => {
-    expect(modelsForTool("claude")).toContain("claude-fable-5");
+  it("lists both Fable models, newest first, as claude models", () => {
+    const models = modelsForTool("claude");
+    expect(models).toContain("claude-fable-5-1");
+    expect(models).toContain("claude-fable-5");
+    // The list is the dropdown order, and every other family in it runs
+    // newest to oldest. Pin the adjacency so a later Fable lands above 5.1
+    // rather than at the bottom of the list.
+    expect(models.indexOf("claude-fable-5-1")).toBe(
+      models.indexOf("claude-fable-5") - 1,
+    );
   });
 
-  it("Fable 5 supports xhigh and max but defaults to high", () => {
-    expect(effortLevelsForModel("claude-fable-5")).toContain("xhigh");
-    expect(effortLevelsForModel("claude-fable-5")).toContain("max");
-    expect(defaultEffortForModel("claude-fable-5")).toBe("high");
+  it("Fable 5 and 5.1 support xhigh and max but default to high", () => {
+    for (const m of ["claude-fable-5-1", "claude-fable-5"]) {
+      expect(effortLevelsForModel(m)).toContain("xhigh");
+      expect(effortLevelsForModel(m)).toContain("max");
+      expect(defaultEffortForModel(m)).toBe("high");
+    }
   });
 
   it("Opus 5 supports xhigh and max but defaults to high", () => {
@@ -129,6 +139,7 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
   it("does not add ultra for gpt-5.6-luna or other models", () => {
     expect(sessionEffortLevelsForModel("gpt-5.6-luna")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.5")).not.toContain("ultra");
+    expect(sessionEffortLevelsForModel("claude-fable-5-1")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("claude-fable-5")).not.toContain("ultra");
   });
 
@@ -136,5 +147,21 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
     for (const m of ["gpt-5.6-sol", "gpt-5.6-terra"]) {
       expect(effortLevelsForModel(m)).not.toContain("ultra" as never);
     }
+  });
+});
+
+describe("toolModels — custom backends", () => {
+  // The three custom-* backends point at an operator-supplied endpoint, so
+  // kojo cannot know the model list: the UI has to fall back to free text.
+  for (const tool of ["custom-claude", "custom-codex", "custom-bare"]) {
+    it(`${tool} ships no preset models and no default`, () => {
+      expect(modelsForTool(tool)).toEqual([]);
+      expect(defaultModelForTool(tool)).toBe("");
+    });
+  }
+
+  it("the pre-rename ids are gone from the table", () => {
+    expect(modelsForTool("custom")).toEqual([]);
+    expect(modelsForTool("llama.cpp")).toEqual([]);
   });
 });

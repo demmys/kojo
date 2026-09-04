@@ -1530,7 +1530,7 @@ func (s *Server) noteSwitchFailure(agentID, reason string) {
 	if s.agents == nil {
 		return
 	}
-	if err := s.agents.AppendSystemNote(agentID, "⚠️ デバイス移行を中断した: "+reason); err != nil {
+	if err := s.agents.AppendSystemNote(agentID, agent.NoticeSwitchAbortedPrefix+reason); err != nil {
 		s.logger.Warn("switch-device: failed to append failure note to transcript",
 			"agent", agentID, "err", err)
 	}
@@ -1815,7 +1815,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// artifacts left by a previous backend are not part of the running
 	// agent state and previously accounted for tens of MiB of duplicate
 	// history on codex agents.
-	if tool == "claude" || tool == "custom" {
+	if tool == agent.ToolClaude || tool == agent.ToolCustomClaude {
 		// Claude's cwd is AgentDir(agentID), NOT Settings.workDir. Read from
 		// source's AgentDir; target writes into its own AgentDir.
 		files, skipped, ferr := agent.ReadClaudeSessionFiles(agentID)
@@ -1900,7 +1900,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
-	if tool == "codex" {
+	if agentRecordUsesCodex(rec) {
 		codexTransfer, codexSkipped, cerr := agent.ReadCodexSessionFiles(agentID)
 		if cerr != nil {
 			return nil, fmt.Errorf("read codex session: %w", cerr)

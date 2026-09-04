@@ -21,6 +21,21 @@ export const USER_SENDER_ID = "user";
  * "thread" = parallel human↔agent thread room (always freshly created). */
 export type GroupDMKind = "group" | "dm" | "thread";
 
+/** True when a room is a human↔agent side conversation rather than a room
+ * with a roster: kind "thread", or the older kind "dm" shape a thread was
+ * created as before "thread" existed.
+ *
+ * The member-count test is load-bearing. kind "dm" is also what
+ * `POST /api/v1/dms` produces for a real 1:1 DM between TWO agents, and
+ * classifying that as a thread listed it under Threads on the dashboard and
+ * stripped the room affordances (cooldown, hops, style) it actually needs. */
+export function isThreadRoom(
+  room: { kind?: GroupDMKind; members: unknown[] } | null | undefined,
+): boolean {
+  if (!room) return false;
+  return room.kind === "thread" || (room.kind === "dm" && room.members.length === 1);
+}
+
 /** Per-message token usage (agent thread replies only). Mirrors the server's
  * agent.Usage. */
 export interface GroupMessageUsage {

@@ -82,6 +82,26 @@ type ChatOptions struct {
 	// native session and canonical transcript advance together.
 	ResumeSessionContext string
 
+	// RecentMessagesContext is a short, bounded transcript excerpt the
+	// backend may prepend when it has to start a fresh persistent session
+	// instead of resuming an existing one. It is used for ordinary WebUI
+	// turns; response surfaces with their own canonical history use the
+	// FreshSessionContext/ResumeSessionContext pair above instead.
+	RecentMessagesContext string
+
+	// History is a bounded replay of the prior conversation, oldest
+	// first, for backends that keep no session of their own. Only
+	// custom-bare receives it (see backendReplaysHistory): it POSTs a
+	// plain /v1/chat/completions request, so the transcript has to
+	// travel in the messages array or the model sees nothing but the
+	// current turn.
+	//
+	// It never contains the current user message — that arrives as the
+	// userMessage argument — and never a "system" entry, so a backend
+	// can splice it straight between its system prompt and the current
+	// turn.
+	History []HistoryTurn
+
 	// SystemPromptExtra is appended verbatim to the systemPrompt argument
 	// AFTER the backend's normal prompt assembly. Use it to inject
 	// per-conversation context (e.g. Slack channel/thread info) without
@@ -146,10 +166,10 @@ var ErrSteerUnsupported = errors.New("steering is not supported for this backend
 
 // backendSupportsSessionKey reports whether the backend honors
 // ChatOptions.SessionKey when building its CLI invocation. Backends that
-// ignore SessionKey (grok, llama.cpp) cannot isolate a
-// per-thread session from the agent's main session, so the manager drops
-// SessionKey for them and degrades to OneShot=true — keeping the chat
-// ephemeral rather than silently mixing thread contexts.
+// ignore SessionKey (custom-bare) cannot isolate a per-thread session
+// from the agent's main session, so the manager drops SessionKey for
+// them and degrades to OneShot=true — keeping the chat ephemeral rather
+// than silently mixing thread contexts.
 //
 // Keep this list in sync with the backends that actually read
 // opts.SessionKey when assembling their argv / config.
@@ -158,9 +178,11 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case "claude", "custom", "codex":
-		// custom delegates to ClaudeBackend.Chat, and codex stores a
-		// deterministic per-key thread ref under agentDir/.codex/threads.
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok:
+		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
+		// CodexBackend.Chat; codex stores a deterministic per-key thread ref
+		// under agentDir/.codex/threads, and grok the equivalent under
+		// agentDir/.grok/threads, resumed by explicit `--resume <id>`.
 		return true
 	default:
 		return false
@@ -169,15 +191,16 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 
 // backendLoadsClaudeSkills reports whether the given Agent.Tool value
 // belongs to a backend that loads `.claude/skills/<name>/SKILL.md`
-// at session start. claude / custom obviously do. grok also does:
+// at session start. claude / custom-claude obviously do. grok also does:
 // its skill loader treats `.claude/skills/` as a Claude-Code-
 // compatibility source (verified empirically via `grok inspect` from
 // an agentDir that has the kojo-* skills installed — they list as
 // `project` scope alongside the user-scoped `~/.grok/skills/` ones).
 // codex has its own `.codex/skills/<name>/SKILL.md` loader, so it
 // intentionally remains false here even though Kojo can install
-// codex-native skills via Sync*SkillForTool dispatchers. llama.cpp
-// has no skill loader.
+// codex-native skills via Sync*SkillForTool dispatchers. custom-codex
+// follows codex for the same reason. custom-bare has no skill loader
+// (and no tools at all).
 //
 // Kept as the loader half of the device-switch invariant below: every
 // backend that supports handoff must also have a compatible project-skill
@@ -188,8 +211,8 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 // not sufficient; the handoff orchestrator must also know how to
 // migrate the backend's session state to the target peer.
 func backendLoadsClaudeSkills(tool string) bool {
-	switch tool {
-	case "claude", "custom", "grok":
+	switch NormalizeToolName(tool) {
+	case ToolClaude, ToolCustomClaude, ToolGrok:
 		return true
 	default:
 		return false
@@ -199,7 +222,7 @@ func backendLoadsClaudeSkills(tool string) bool {
 // backendSupportsDeviceSwitch reports whether the device-switch
 // handoff can carry the backend's session state to the target peer.
 //
-//   - claude / custom: switch_device_handler.go transfers the
+//   - claude / custom-claude: switch_device_handler.go transfers the
 //     ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl session files
 //     via ClaudeSessions on the peer-sync wire; backend_claude.go
 //     on target resumes with `claude --continue`.
@@ -212,20 +235,23 @@ func backendLoadsClaudeSkills(tool string) bool {
 //     the resume pointer at the next chat and issues
 //     `grok --resume <uuid>`.
 //
-//   - codex: switch_device_handler.go transfers the per-agent
+//   - codex / custom-codex: switch_device_handler.go transfers the per-agent
 //     `.codex/threads/*.json` refs, rollout JSONLs, and Codex state
 //     sqlite rows via CodexSession; backend_codex.go resumes with
 //     app-server `thread/resume`.
 //
-// llama.cpp has no session transfer wired up; it stays off.
+// custom-bare has no session state to transfer: every turn is a fresh
+// stateless request, and its continuity comes from kojo replaying the
+// transcript it already stores (ChatOptions.History), which the target
+// peer reads from the synced store anyway. It stays off.
 //
 // Gating the SKILL.md install (instead of, say, a runtime 4xx) keeps
 // the failure mode obvious for unsupported tools: the skill simply
 // doesn't appear in the backend's skill listing, so the agent never
 // offers a switch it cannot fulfil.
 func backendSupportsDeviceSwitch(tool string) bool {
-	switch tool {
-	case "claude", "custom", "grok", "codex":
+	switch NormalizeToolName(tool) {
+	case ToolClaude, ToolCustomClaude, ToolGrok, ToolCodex, ToolCustomCodex:
 		return true
 	default:
 		return false
@@ -254,6 +280,12 @@ var kojoAPIBase string
 // SetKojoAPIBase records the URL agents should use for self-authenticated
 // API calls. Idempotent; safe to call repeatedly during boot.
 func SetKojoAPIBase(base string) { kojoAPIBase = base }
+
+// KojoAPIBase returns the auth-listener URL recorded by
+// SetKojoAPIBase, or "" before any listener is bound. Callers that
+// need the same value for non-agent subprocesses (extension services)
+// read it here instead of re-deriving it per listener branch.
+func KojoAPIBase() string { return kojoAPIBase }
 
 // agentTokenLookup, when set, returns the per-agent auth token kojo
 // should expose via $KOJO_AGENT_TOKEN to the PTY. Wired up by the

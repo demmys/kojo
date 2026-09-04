@@ -834,6 +834,107 @@ func TestParseCodexStream_ReasoningDelta(t *testing.T) {
 	}
 }
 
+// A custom model provider (custom-codex) publishes no reasoning deltas at
+// all: app-server only emits the finished reasoning item, with the thinking
+// text in plain-string `content` entries.
+func TestParseCodexStream_ReasoningCompletedItemWithoutDeltas(t *testing.T) {
+	events, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "rs_1", "type": "reasoning", "summary": []any{}, "content": []any{}},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id": "rs_1", "type": "reasoning",
+				"summary": []any{},
+				"content": []any{"step one", "step two"},
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if want := "step one\nstep two"; result.thinking.String() != want {
+		t.Errorf("thinking = %q, want %q", result.thinking.String(), want)
+	}
+	found := false
+	for _, e := range events {
+		if e.Type == "thinking" && e.Delta == "step one\nstep two" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a thinking event carrying the completed reasoning item")
+	}
+}
+
+// The OpenAI provider streams reasoning deltas and then repeats the same text
+// in the completed item's `summary`; the completed item must not double it.
+func TestParseCodexStream_ReasoningCompletedItemDoesNotDuplicateDeltas(t *testing.T) {
+	_, result := collectCodexEvents(t, 1,
+		rpcLine("item/reasoning/summaryTextDelta", map[string]any{
+			"itemId": "rs_1", "delta": "thought",
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id": "rs_1", "type": "reasoning",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "thought"}},
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if result.thinking.String() != "thought" {
+		t.Errorf("thinking = %q, want %q", result.thinking.String(), "thought")
+	}
+}
+
+// A provider that streams deltas but leaves itemId empty cannot be matched per
+// id, so the completed item is suppressed wholesale rather than duplicated.
+func TestParseCodexStream_ReasoningCompletedItemWithoutIDsAfterDeltas(t *testing.T) {
+	_, result := collectCodexEvents(t, 1,
+		rpcLine("item/reasoning/summaryTextDelta", map[string]any{
+			"delta": "thought",
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"type":    "reasoning",
+				"summary": []any{"thought"},
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if result.thinking.String() != "thought" {
+		t.Errorf("thinking = %q, want %q", result.thinking.String(), "thought")
+	}
+}
+
+// An object-shaped summary from a provider that sends no deltas still renders
+// as text rather than raw JSON.
+func TestParseCodexStream_ReasoningCompletedItemObjectSummary(t *testing.T) {
+	_, result := collectCodexEvents(t, 1,
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id": "rs_1", "type": "reasoning",
+				"summary": []any{map[string]any{"type": "summary_text", "text": "planned it"}},
+				"content": []any{"raw trace"},
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if result.thinking.String() != "planned it" {
+		t.Errorf("thinking = %q, want %q", result.thinking.String(), "planned it")
+	}
+}
+
 func TestParseCodexStream_EmptyLines(t *testing.T) {
 	_, result := collectCodexEvents(t, 1,
 		"",

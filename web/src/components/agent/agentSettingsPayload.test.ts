@@ -36,9 +36,12 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
 }
 
 describe("needsCustomURLFor", () => {
-  it.each(["custom", "llama.cpp"])("returns true for %s", (tool) => {
-    expect(needsCustomURLFor(tool)).toBe(true);
-  });
+  it.each(["custom-claude", "custom-codex", "custom-bare", "custom", "llama.cpp"])(
+    "returns true for %s",
+    (tool) => {
+      expect(needsCustomURLFor(tool)).toBe(true);
+    },
+  );
 
   it.each(["claude", "codex", ""])("returns false for %s", (tool) => {
     expect(needsCustomURLFor(tool)).toBe(false);
@@ -70,7 +73,7 @@ describe("buildAgentSavePayload", () => {
   });
 
   it("omits effort for tools that don't support an effort selector", () => {
-    const out = buildAgentSavePayload(baseState({ tool: "llama.cpp" }));
+    const out = buildAgentSavePayload(baseState({ tool: "custom-bare" }));
     expect(out.effort).toBeUndefined();
   });
 
@@ -85,44 +88,48 @@ describe("buildAgentSavePayload", () => {
     expect(buildAgentSavePayload(baseState({ tool: "codex", effort: "medium" })).effort).toBe("medium");
   });
 
-  it("emits customBaseURL only for custom / llama.cpp", () => {
+  it("emits customBaseURL only for the custom-* backends", () => {
     expect(buildAgentSavePayload(baseState({ tool: "claude" })).customBaseURL).toBeUndefined();
-    expect(buildAgentSavePayload(baseState({ tool: "custom" })).customBaseURL).toBe("http://x");
+    expect(buildAgentSavePayload(baseState({ tool: "custom-claude" })).customBaseURL).toBe("http://x");
+    expect(buildAgentSavePayload(baseState({ tool: "custom-codex" })).customBaseURL).toBe("http://x");
     expect(
-      buildAgentSavePayload(baseState({ tool: "llama.cpp", customBaseURL: " http://y " })).customBaseURL,
+      buildAgentSavePayload(baseState({ tool: "custom-bare", customBaseURL: " http://y " }))
+        .customBaseURL,
     ).toBe("http://y");
   });
 
-  it("emits thinkingMode ONLY for llama.cpp", () => {
+  it("emits thinkingMode ONLY for custom-bare", () => {
     expect(buildAgentSavePayload(baseState({ tool: "claude" })).thinkingMode).toBeUndefined();
-    expect(buildAgentSavePayload(baseState({ tool: "custom" })).thinkingMode).toBeUndefined();
+    expect(buildAgentSavePayload(baseState({ tool: "custom-claude" })).thinkingMode).toBeUndefined();
+    expect(buildAgentSavePayload(baseState({ tool: "custom-codex" })).thinkingMode).toBeUndefined();
     expect(
-      buildAgentSavePayload(baseState({ tool: "llama.cpp", thinkingMode: "deep" })).thinkingMode,
+      buildAgentSavePayload(baseState({ tool: "custom-bare", thinkingMode: "deep" })).thinkingMode,
     ).toBe("deep");
   });
 
-  it("emits allowedTools ONLY for custom", () => {
+  it("emits allowedTools ONLY for custom-claude", () => {
     expect(buildAgentSavePayload(baseState({ tool: "claude" })).allowedTools).toBeUndefined();
+    expect(buildAgentSavePayload(baseState({ tool: "custom-codex" })).allowedTools).toBeUndefined();
     expect(
-      buildAgentSavePayload(baseState({ tool: "custom", allowedTools: ["Bash", "Edit"] }))
+      buildAgentSavePayload(baseState({ tool: "custom-claude", allowedTools: ["Bash", "Edit"] }))
         .allowedTools,
     ).toEqual(["Bash", "Edit"]);
   });
 
-  it("emits allowProtectedPaths for claude AND custom, nothing else", () => {
+  it("emits allowProtectedPaths for claude AND custom-claude, nothing else", () => {
     expect(
       buildAgentSavePayload(baseState({ tool: "claude", allowProtectedPaths: ["/etc"] }))
         .allowProtectedPaths,
     ).toEqual(["/etc"]);
     expect(
-      buildAgentSavePayload(baseState({ tool: "custom", allowProtectedPaths: ["/etc"] }))
+      buildAgentSavePayload(baseState({ tool: "custom-claude", allowProtectedPaths: ["/etc"] }))
         .allowProtectedPaths,
     ).toEqual(["/etc"]);
     expect(
       buildAgentSavePayload(baseState({ tool: "codex" })).allowProtectedPaths,
     ).toBeUndefined();
     expect(
-      buildAgentSavePayload(baseState({ tool: "llama.cpp" })).allowProtectedPaths,
+      buildAgentSavePayload(baseState({ tool: "custom-bare" })).allowProtectedPaths,
     ).toBeUndefined();
   });
 

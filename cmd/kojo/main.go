@@ -402,7 +402,7 @@ func main() {
 		}
 		return t, true
 	})
-	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged)
+	resolver := auth.NewResolver(tokens, agentMgr.IsPrivileged, agentMgr.IsOwnerDeputy)
 
 	// Phase G: peer identity. Load (or generate on first run) this
 	// binary's stable {device_id, Ed25519 keypair, name} from kv. The
@@ -1731,6 +1731,13 @@ func main() {
 		tsShutdown = sync.OnceFunc(func() { _ = tsServer.Close() })
 		defer tsShutdown()
 	}
+
+	// Extension packages. Deferred to here for the same reason as the
+	// restart-wake consumer: every listener branch has already run, so
+	// agent.KojoAPIBase() is the address extension processes will be
+	// handed as KOJO_API_BASE. A PeerOnly daemon has no registry and
+	// this is a no-op.
+	srv.StartExtensions(agent.KojoAPIBase(), resolver)
 
 	// Consume a restart-wake marker if the previous process armed one
 	// (POST /api/v1/system/restart {"wake":true}) — fires ONE chat turn

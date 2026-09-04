@@ -269,8 +269,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		if !opts.OneShot {
 			if ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey); rerr == nil && ref != nil && ref.ThreadID != "" {
 				existingRef = ref
-				resumeParams := cloneStringAnyMap(threadParams)
-				resumeParams["threadId"] = ref.ThreadID
+				resumeParams := buildCodexResumeParams(threadParams, ref.ThreadID)
 				threadStartID = sendRPC("thread/resume", resumeParams)
 				msg, ok, waitErr := waitCodexRPCResponse(scanner, threadStartID, respondServerRequest, b.logger)
 				if waitErr != nil {
@@ -465,6 +464,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	}()
 
 	return ch, nil
+}
+
+// buildCodexResumeParams asks app-server to restore the thread without
+// returning its historical turns. Kojo only needs the resumed thread's ID and
+// rollout path; hydrating every turn can make the single JSON-RPC response
+// exceed the bounded line reader when a thread contains large tool outputs or
+// image data. excludeTurns affects only the response payload, not the history
+// Codex restores for subsequent turns.
+func buildCodexResumeParams(threadParams map[string]any, threadID string) map[string]any {
+	resumeParams := cloneStringAnyMap(threadParams)
+	resumeParams["threadId"] = threadID
+	resumeParams["excludeTurns"] = true
+	return resumeParams
 }
 
 // codexStreamResult holds the accumulated state from parsing a Codex stream.

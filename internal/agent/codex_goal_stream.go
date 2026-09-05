@@ -5,10 +5,30 @@ import (
 	"log/slog"
 )
 
-// Native app-server owns continuation. There is deliberately no turn/start or
-// empty-answer retry here: goal/set active starts idle work itself.
+// Native app-server owns continuation: goal/set active starts idle work itself.
 func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime, steer *codexSteerer, respond codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool, questions ...*codexQuestionState) *codexStreamResult {
+	return runCodexGoalWithReply(scanner, q, r, steer, respond, logger, send, nil, questions...)
+}
+
+// A reply is accepted as a user turn while the stored goal is paused, before
+// reactivation. Do not resume autonomous work if the input is rejected.
+func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime, steer *codexSteerer, respond codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool, replyStart func() (int64, error), questions ...*codexQuestionState) *codexStreamResult {
 	combined := &codexStreamResult{}
+	activated := false
+	defer func() {
+		if replyStart != nil && !activated {
+			// Never recover autonomous work when reply acceptance/reactivation
+			// failed or its outcome is unknown. A fresh user reply can retry.
+			if err := updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) {
+				b.DesiredPaused = true
+				b.ActivationPending = false
+				b.RecoveryPending = false
+			}); err != nil {
+				combined.processError += "; persist failed reply pause: " + err.Error()
+			}
+		}
+	}()
+
 	var qs *codexQuestionState
 	if len(questions) > 0 {
 		qs = questions[0]
@@ -16,18 +36,23 @@ func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime
 	current := &codexStreamResult{questions: qs}
 	phases := map[string]string{}
 	method, params := goalRPC(q, r.threadID)
-	startID, err := r.write(method, params)
+	var startID, replyID int64
+	var err error
+	if replyStart != nil {
+		replyID, err = replyStart()
+	} else {
+		startID, err = r.write(method, params)
+	}
 	if err != nil {
 		combined.processError = err.Error()
 		return combined
 	}
 	r.mu.Lock()
-	r.ready = true
+	r.ready = replyStart == nil
 	r.mu.Unlock()
 	var goal *CodexGoal
 	defer func() { combined.fullText.WriteString("\n\n" + goalSummary(goal)) }()
 	inTurn := false
-	activated := false
 	currentTurnID := ""
 	var checkID int64
 	publish := func(g *CodexGoal) bool {
@@ -54,12 +79,30 @@ func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime
 			if !handled && steer != nil {
 				steer.resolve(id, msg.Error)
 			}
-			if id == startID || id == checkID {
+			if replyID != 0 && id == replyID {
+				if msg.Error != nil {
+					combined.processError = "goal reply rejected: " + msg.Error.Message
+					return combined
+				}
+				replyID = 0
+				r.mu.Lock()
+				if r.stopRequested {
+					r.mu.Unlock()
+					combined.processError = "goal stopped before reply reactivation"
+					return combined
+				}
+				startID, err = r.write(method, params)
+				r.ready = err == nil
+				r.mu.Unlock()
+				if err != nil {
+					combined.processError = err.Error()
+					return combined
+				}
+				continue
+			}
+			if (startID != 0 && id == startID) || (checkID != 0 && id == checkID) {
 				if id == checkID {
 					checkID = 0
-				}
-				if id == startID {
-					activated = true
 				}
 				if msg.Error != nil {
 					combined.processError = msg.Error.Message
@@ -78,7 +121,10 @@ func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime
 				if !publish(decodeGoal(msg.Result)) {
 					break
 				}
-				if !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
+				if id == startID {
+					activated = true
+				}
+				if activated && !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
 					combined.turnCompleted = true
 					return combined
 				}
@@ -99,7 +145,7 @@ func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime
 			}
 			// A goal may complete during a turn. Drain the final response before
 			// releasing the runner, attachment ownership, and Slack stream.
-			if !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
+			if activated && !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
 				combined.turnCompleted = true
 				return combined
 			}

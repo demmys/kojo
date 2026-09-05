@@ -2740,6 +2740,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	} else {
 		sessionKey = ""
 	}
+	resumeGoalOnReply := prep.backend.Name() == ToolCodex && opts.Goal == nil && opts.GoalUserID != "" && strings.HasPrefix(sessionKey, agentID+":slack:")
 	if opts.ForceFreshSession && sessionKey != "" && prep.backend.Name() == ToolCodex {
 		binding, err := goalBindingFor(agentID, sessionKey)
 		if err != nil {
@@ -2749,7 +2750,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 		if binding != nil && binding.State != nil {
 			opts.ForceFreshSession = false
-			if !binding.DesiredPaused && binding.State.Status == "active" {
+			if !resumeGoalOnReply && !binding.DesiredPaused && binding.State.Status == "active" {
 				opts.Goal = &GoalRequest{Action: "resume"}
 			}
 		}
@@ -2780,6 +2781,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// ChatOptions for future backends that want to inject it at a custom
 	// offset rather than the end of the system prompt.
 	chatOpts := ChatOptions{
+		ResumeGoalOnReply:    resumeGoalOnReply,
 		Goal:                 opts.Goal,
 		GoalRunID:            opts.GoalRunID,
 		GoalUserID:           opts.GoalUserID,

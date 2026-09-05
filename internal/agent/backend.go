@@ -30,6 +30,8 @@ const ErrMsgCancelled = "cancelled: process was terminated"
 
 // ChatOptions holds optional parameters for a chat invocation.
 type ChatOptions struct {
+	// ResumeGoalOnReply resumes unfinished native goals while delivering this human reply.
+	ResumeGoalOnReply    bool
 	Goal                 *GoalRequest
 	GoalRunID            string
 	GoalUserID           string

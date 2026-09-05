@@ -665,7 +665,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			err: fmt.Errorf("holder %s is not ready: %s", holder, ready.Unavailable)}
 	}
 
-	if req.Goal != nil || req.ForceFreshSession {
+	if req.Goal != nil || req.ForceFreshSession || (req.GoalUserID != "" && strings.HasPrefix(req.SessionKey, agentID+":slack:")) {
 		raw := make([]byte, 32)
 		if _, err := rand.Read(raw); err != nil {
 			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}

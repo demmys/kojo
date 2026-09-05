@@ -1388,7 +1388,7 @@ func TestBotPostMessageSendsMarkdownTextOnly(t *testing.T) {
 }
 
 func TestBotPostMessageFallsBackToLegacyTextOnMarkdownTextErrors(t *testing.T) {
-	for _, slackError := range []string{"invalid_blocks_format", "markdown_text_conflict"} {
+	for _, slackError := range []string{"invalid_blocks", "invalid_blocks_format", "markdown_text_conflict"} {
 		t.Run(slackError, func(t *testing.T) {
 			type captured struct{ text, markdownText, threadTS string }
 			var calls []captured

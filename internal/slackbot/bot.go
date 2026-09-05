@@ -2255,7 +2255,9 @@ func shouldFallbackToLegacyText(err error) bool {
 	var slackErr slack.SlackErrorResponse
 	if errors.As(err, &slackErr) {
 		switch slackErr.Err {
-		case "invalid_blocks_format", "markdown_text_conflict":
+		// Slack can reject the blocks produced from markdown_text even
+		// though we did not submit blocks ourselves. Retry as legacy text.
+		case "invalid_blocks", "invalid_blocks_format", "markdown_text_conflict":
 			return true
 		}
 	}

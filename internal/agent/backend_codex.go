@@ -124,6 +124,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	for _, kv := range b.extraConfig {
 		args = append(args, "-c", kv)
 	}
+	// Default mode otherwise rejects request_user_input before emitting its
+	// server request. Enable it only when this caller can answer questions;
+	// keep execution in Default mode (Plan mode would prevent normal work).
+	if opts.OnQuestionReady != nil {
+		args = append(args, "-c", "features.default_mode_request_user_input=true")
+	}
 	for name, srv := range opts.MCPServers {
 		if srv.isStdio() {
 			// Extension-contributed stdio server. Codex spawns it

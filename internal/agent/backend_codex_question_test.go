@@ -63,7 +63,7 @@ func TestCodexQuestionTimeoutResolutionAndClose(t *testing.T) {
 	writes := make(chan any, 10)
 	q := newCodexQuestionState(func(v any) error { writes <- v; return nil }, func(ev ChatEvent) bool { events <- ev; return true }, nil)
 	req := codexQuestionRequest(`1`)
-	raw := json.RawMessage(`{"autoResolutionMs":1,"questions":[{"id":"x","question":"X?"}]}`)
+	raw := json.RawMessage(`{"isBlocking":false,"autoResolutionMs":1,"questions":[{"id":"x","question":"X?"}]}`)
 	req.Params = &raw
 	if _, err := q.register(req, true); err != nil {
 		t.Fatal(err)
@@ -237,7 +237,7 @@ func TestQuestionSingleChoiceAndTransportLimits(t *testing.T) {
 	}
 }
 
-func TestCodexAsyncQuestionUsesServerResolution(t *testing.T) {
+func TestCodexDefaultModeRPCQuestionWaitsForAnswer(t *testing.T) {
 	events := make(chan ChatEvent, 10)
 	writes := 0
 	q := newCodexQuestionState(func(any) error { writes++; return nil }, func(ev ChatEvent) bool { events <- ev; return true }, nil)
@@ -245,19 +245,19 @@ func TestCodexAsyncQuestionUsesServerResolution(t *testing.T) {
 	req := codexQuestionRequest(`1`)
 	raw := json.RawMessage(`{"isBlocking":false,"autoResolutionMs":1,"questions":[{"id":"x","question":"X?"}]}`)
 	req.Params = &raw
-	_, err := q.register(req, true)
+	_, err := q.register(req, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ev := <-events
-	if ev.QuestionBlocking == nil || *ev.QuestionBlocking {
-		t.Fatal("lost nonblocking semantics")
+	if ev.QuestionBlocking == nil || !*ev.QuestionBlocking {
+		t.Fatal("RPC question must be shown as waiting for an answer")
 	}
 	q.mu.Lock()
 	timer := q.pending[ev.RequestID].timer
 	q.mu.Unlock()
 	if timer != nil {
-		t.Fatal("async question armed a client timeout")
+		t.Fatal("interactive question armed a client timeout")
 	}
 	q.resolveRPC(json.RawMessage(`1`))
 	if writes != 0 {

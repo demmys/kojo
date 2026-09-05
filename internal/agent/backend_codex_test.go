@@ -1364,8 +1364,9 @@ func TestCodexStreamResult_HasOutput(t *testing.T) {
 }
 
 func TestCodexEffortForProtocol_MaxGating(t *testing.T) {
-	// gpt-5.6 family: max passes through (codex CLI 0.144.1).
-	for _, m := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	// gpt-6-astra and the gpt-5.6 family: max passes through (codex CLI
+	// 0.153.3).
+	for _, m := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if got := codexEffortForProtocol(m, "max"); got != "max" {
 			t.Errorf("codexEffortForProtocol(%q, max) = %q, want max", m, got)
 		}

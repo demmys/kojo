@@ -11,8 +11,9 @@ export const toolModels: Record<string, ToolModelConfig> = {
     models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
-    default: "gpt-5.6-sol",
+    default: "gpt-6-astra",
     models: [
+      "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -60,14 +61,14 @@ export type EffortLevel = (typeof effortLevels)[number];
 /** Models that support the xhigh effort level. */
 const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
-// codex CLI 0.144.1 models_cache.json: the gpt-5.6 family advertises
-// low/medium/high/xhigh/max (sol and terra also list "ultra", which kojo's
-// effort scale doesn't model). Older gpt-5.x models stop at xhigh.
-// Keep in sync with agent.go codexMaxEffortModels.
-const codexMaxModels = new Set(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// gpt-5.6-sol advertises default_reasoning_level "low"; every other codex
-// model defaults to medium.
-const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
+// codex CLI 0.153.3 models_cache.json: gpt-6-astra and the gpt-5.6 family
+// advertise low/medium/high/xhigh/max (astra, sol and terra also list
+// "ultra", which kojo's effort scale doesn't model). Older gpt-5.x models
+// stop at xhigh. Keep in sync with agent.go codexMaxEffortModels.
+const codexMaxModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+// gpt-6-astra and gpt-5.6-sol advertise default_reasoning_level "low";
+// every other codex model defaults to medium.
+const codexLowDefaultModels = new Set(["gpt-6-astra", "gpt-5.6-sol"]);
 // grok CLI 1.0.3 models_cache.json: grok-4.6 lists efforts
 // [xhigh,high,medium,low]; grok-4.5 lists [high,medium,low]. Neither
 // advertises "max". Keep in sync with agent.go grokEffortModels /
@@ -89,12 +90,13 @@ export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex";
 }
 
-// codex CLI 0.144.1: gpt-5.6-sol and gpt-5.6-terra additionally advertise
-// the "ultra" reasoning level (multi-agent orchestration mode). It is a
-// different beast from the plain effort ladder — long-running and
-// expensive — so kojo's per-agent effort scale intentionally stops at
-// "max"; ultra is offered ONLY as a per-session choice in NewSession.
-const codexUltraModels = new Set(["gpt-5.6-sol", "gpt-5.6-terra"]);
+// codex CLI 0.153.3: gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
+// additionally advertise the "ultra" reasoning level (multi-agent
+// orchestration mode). It is a different beast from the plain effort
+// ladder — long-running and expensive — so kojo's per-agent effort scale
+// intentionally stops at "max"; ultra is offered ONLY as a per-session
+// choice in NewSession.
+const codexUltraModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
 
 /**
  * Effort levels offered when starting an ad-hoc session for the given

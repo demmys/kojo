@@ -206,8 +206,9 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected minimal to be valid for codex model %q", m)
 		}
 	}
-	// gpt-5.6 family (codex CLI 0.144.1): xhigh AND max are valid.
-	for _, m := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	// gpt-6-astra and the gpt-5.6 family (codex CLI 0.153.3): xhigh AND
+	// max are valid.
+	for _, m := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for codex model %q", m)
 		}
@@ -426,4 +427,34 @@ func TestBuildSystemPrompt_MemoryInject(t *testing.T) {
 			t.Errorf("oversized branch did not restore Read instruction")
 		}
 	})
+}
+
+func TestNewAgentModelFallbackIsClaudeOnly(t *testing.T) {
+	cases := map[string]string{
+		ToolClaude:     "sonnet",
+		ToolCodex:      "",
+		ToolGrok:       "",
+		"custom-codex": "",
+	}
+	for tool, want := range cases {
+		cfg := AgentConfig{Name: "x", Tool: tool}
+		if ToolRequiresCustomBaseURL(tool) {
+			cfg.CustomBaseURL = "http://127.0.0.1:1/v1"
+		}
+		a, err := newAgent(cfg)
+		if err != nil {
+			t.Fatalf("newAgent(%q): %v", tool, err)
+		}
+		if a.Model != want {
+			t.Errorf("newAgent(%q).Model = %q, want %q", tool, a.Model, want)
+		}
+	}
+	// An explicit model is never overridden.
+	a, err := newAgent(AgentConfig{Name: "x", Tool: ToolCodex, Model: "gpt-6-astra"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Model != "gpt-6-astra" {
+		t.Errorf("explicit model clobbered: %q", a.Model)
+	}
 }

@@ -248,8 +248,8 @@ func (m *Manager) injectSteer(agentID string, entry busyEntry, text string) erro
 }
 
 // AnswerQuestion resolves a pending interactive AskUserQuestion raised by the
-// agent's running turn (claude backend only — see ChatOptions.OnQuestionReady).
-// On allow, answers maps each question string to the chosen answer; on deny the
+// agent's running turn (claude/codex backends — see ChatOptions.OnQuestionReady).
+// On allow, answers maps each question ID (Codex) or text (Claude) to its answer; on deny the
 // tool call is refused with denyMessage. Returns ErrAgentNotBusy when no turn is
 // running (or the backend can't answer) and ErrQuestionNotFound when requestID
 // doesn't match a pending question. On a successful allow it appends a readable
@@ -288,7 +288,7 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 	m.busyMu.Lock()
 	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {
 		select {
-		case cur.outCh <- ChatEvent{Type: "message", Message: msg}:
+		case cur.outCh <- ChatEvent{Type: "message", Message: msg, RequestID: requestID}:
 		default:
 		}
 	}
@@ -330,13 +330,20 @@ func (m *Manager) markQuestionRaised(agentID, requestID string) {
 // the same question) or an agent with no tracked questions at all.
 func (m *Manager) clearQuestion(agentID, requestID string) {
 	m.busyMu.Lock()
-	if set, ok := m.pendingQuestions[agentID]; ok {
+	if set := m.pendingQuestions[agentID]; set != nil {
 		delete(set, requestID)
 		if len(set) == 0 {
 			delete(m.pendingQuestions, agentID)
 		}
 	}
+	lifecycle := m.questionLifecycleLocked(agentID)
 	m.busyMu.Unlock()
+	if lifecycle != nil {
+		select {
+		case lifecycle.events <- ChatEvent{Type: "question_resolved", RequestID: requestID}:
+		case <-lifecycle.done:
+		}
+	}
 }
 
 // clearAllQuestionsForAgent drops every pending question tracked for
@@ -350,10 +357,29 @@ func (m *Manager) clearAllQuestionsForAgent(agentID string) {
 	m.busyMu.Unlock()
 }
 
-// HasPendingQuestion reports whether agentID currently has an unanswered
-// AskUserQuestion prompt outstanding. Folded into Agent.AwaitingAnswer by
+// HasPendingQuestion reports whether agentID has an unanswered blocking
+// question. Nonblocking Codex prompts remain answerable without setting this. Folded into Agent.AwaitingAnswer by
 // Manager.List.
 func (m *Manager) HasPendingQuestion(agentID string) bool {
+	m.oneShotCancelsMu.Lock()
+	hasExternal := false
+	for _, q := range m.oneShotQuestions {
+		if q.agentID == agentID {
+			for _, p := range q.pending {
+				if p.blocking {
+					hasExternal = true
+					break
+				}
+			}
+		}
+		if hasExternal {
+			break
+		}
+	}
+	m.oneShotCancelsMu.Unlock()
+	if hasExternal {
+		return true
+	}
 	m.busyMu.Lock()
 	defer m.busyMu.Unlock()
 	return len(m.pendingQuestions[agentID]) > 0
@@ -793,6 +819,9 @@ func (m *Manager) releasePreparing(agentID string) {
 
 func (m *Manager) clearBusy(agentID string) {
 	m.busyMu.Lock()
+	if entry, ok := m.busy[agentID]; ok {
+		entry.questionLifecycle.close()
+	}
 	delete(m.busy, agentID)
 	m.busyMu.Unlock()
 }

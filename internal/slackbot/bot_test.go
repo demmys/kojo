@@ -935,8 +935,11 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 	for {
 		bot.activeTurnsMu.Lock()
 		remaining := len(bot.activeTurns[activeTurnKey("C1", "thread.1")])
+		stopping := bot.stoppingTurns[activeTurnKey("C1", "thread.1")] != nil
 		bot.activeTurnsMu.Unlock()
-		if remaining == 0 {
+		// Unregistration precedes stop-notice delivery and transaction cleanup.
+		// Wait for the complete transaction before admitting a successor stop.
+		if remaining == 0 && !stopping {
 			break
 		}
 		if time.Now().After(deadline) {

@@ -1318,6 +1318,7 @@ func main() {
 
 	// graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), session.ShutdownSignals()...)
+	agentMgr.SetNativeGoalLifecycle(ctx)
 	defer stop()
 
 	// Self-restart (POST /api/v1/system/restart): after the server's
@@ -1746,8 +1747,10 @@ func main() {
 	// into the system prompt the woken turn will be built with. The
 	// timestamp fences the consumer to pre-boot markers only.
 	go agentMgr.ConsumeRestartWake(version, time.Now())
+	go srv.RunNativeGoalRecovery(ctx)
 
 	<-ctx.Done()
+	agentMgr.PreserveNativeGoalsOnShutdown()
 	logger.Info("received shutdown signal")
 
 	// Shutdown ordering (each step is bounded internally so a stuck

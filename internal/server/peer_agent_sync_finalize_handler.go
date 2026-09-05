@@ -370,6 +370,13 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	// now instead of waiting out the drain's backoff timer; on a
 	// non-hub peer the queue table is empty and this is a no-op.
 	s.kickHandoffQueueDrain()
+	// The designated arrival owns one conversation; restore any other active
+	// goals transferred with the same agent through their original surfaces.
+	excludeGoalKey := ""
+	if req.Continuation != nil {
+		excludeGoalKey = req.Continuation.SessionKey
+	}
+	go s.recoverNativeGoals(req.AgentID, excludeGoalKey, false)
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
@@ -93,13 +94,15 @@ type busyEntry struct {
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
 type Manager struct {
-	mu       sync.Mutex
-	agents   map[string]*Agent
-	backends map[string]ChatBackend
-	store    *agentStore
-	creds    *CredentialStore
-	cron     *cronScheduler
-	logger   *slog.Logger
+	goalShutdown  atomic.Bool
+	goalLifecycle atomic.Pointer[context.Context]
+	mu            sync.Mutex
+	agents        map[string]*Agent
+	backends      map[string]ChatBackend
+	store         *agentStore
+	creds         *CredentialStore
+	cron          *cronScheduler
+	logger        *slog.Logger
 	// fileWatcher reflects agent-CLI disk writes (MEMORY.md, memory/,
 	// persona.md, workspace files) into the DB promptly. nil until
 	// StartFileWatcher runs; guarded by mu.
@@ -2255,6 +2258,19 @@ func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turn
 // An optional BusySource may be passed to tag the busy entry; defaults to
 // BusySourceUser when omitted.
 func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment, source ...BusySource) (<-chan ChatEvent, error) {
+	goal, _ := ctx.Value(goalRequestContextKey{}).(*GoalRequest)
+	if goal == nil && role != "system" {
+		var err error
+		goal, err = ParseGoalCommand(userMessage)
+		if err != nil {
+			return nil, err
+		}
+		if goal != nil {
+			if err = m.validateGoalBackend(agentID, goal); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// acquirePreparing checks switching AND increments the
 	// preparing counter under one busyMu lock — Step -1's
 	// WaitChatIdle observes the counter so a race between
@@ -2367,6 +2383,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+		Goal:                  goal,
+		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system",
 		FreshSessionContext:   prep.freshSessionContext,
@@ -2480,6 +2498,8 @@ func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
 // pass OneShotOpts{} for the legacy ephemeral-session behaviour.
 type OneShotOpts struct {
+	GoalRunID string // transport-owned nonce; never model input
+	Goal      *GoalRequest
 	// PreserveTerminalOnCancel keeps a cancelled terminal event pending until
 	// the response adapter consumes it. Slack enables this because its live text
 	// deltas are intentionally lossy and the terminal message is authoritative.
@@ -2586,6 +2606,17 @@ type HandoffArrivalReservation interface {
 // conversation (e.g. Slack thread) share context. Otherwise the chat runs
 // as a fresh ephemeral session each time, matching the legacy behaviour.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+	if opts.SessionKey != "" {
+		unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, opts.SessionKey))
+		defer unlock()
+	}
+
+	if opts.Goal != nil {
+		if err := m.validateGoalBackend(agentID, opts.Goal); err != nil {
+			return nil, err
+		}
+	}
+
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -2593,6 +2624,21 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	defer m.releasePreparing(agentID)
+	// Control requests must not register a second one-shot or replace the
+	// active run's steer/cancel callbacks. The holder fence above still applies.
+	if opts.Goal != nil {
+		if active, ok := codexGoalRuntimes.Load(codexThreadRefPath(agentID, opts.SessionKey)); ok {
+			runtime := active.(*codexGoalRuntime)
+			if opts.OriginPeerID != "" && runtime.origin != opts.OriginPeerID {
+				return nil, ErrSteerOriginForbidden
+			}
+			g, err := runtime.control(ctx, opts.Goal)
+			if err != nil {
+				return nil, err
+			}
+			return goalControlEvents(g), nil
+		}
+	}
 
 	// Concurrent dynamic-effort resolution, same as Chat. One-shot
 	// callers (Slack/Discord) are always human-driven → systemTurn=false.
@@ -2687,6 +2733,20 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	} else {
 		sessionKey = ""
 	}
+	if opts.ForceFreshSession && sessionKey != "" && prep.backend.Name() == ToolCodex {
+		binding, err := goalBindingFor(agentID, sessionKey)
+		if err != nil {
+			cancel()
+			m.untrackOneShot(agentID, osID)
+			return nil, err
+		}
+		if binding != nil && binding.State != nil {
+			opts.ForceFreshSession = false
+			if !binding.DesiredPaused && binding.State.Status == "active" {
+				opts.Goal = &GoalRequest{Action: "resume"}
+			}
+		}
+	}
 	if opts.ForceFreshSession && sessionKey != "" {
 		var resetErr error
 		switch prep.backend.Name() {
@@ -2713,10 +2773,14 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// ChatOptions for future backends that want to inject it at a custom
 	// offset rather than the end of the system prompt.
 	chatOpts := ChatOptions{
-		OneShot:         oneShotMode,
-		MCPServers:      prep.mcpServers,
-		SessionKey:      sessionKey,
-		ConversationKey: opts.SessionKey,
+		Goal:                 opts.Goal,
+		GoalRunID:            opts.GoalRunID,
+		OriginPeerID:         opts.OriginPeerID,
+		PreserveGoalOnCancel: func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
+		OneShot:              oneShotMode,
+		MCPServers:           prep.mcpServers,
+		SessionKey:           sessionKey,
+		ConversationKey:      opts.SessionKey,
 	}
 	chatOpts.FreshSessionContext = opts.FreshSessionContext
 	chatOpts.ResumeSessionContext = opts.ResumeSessionContext

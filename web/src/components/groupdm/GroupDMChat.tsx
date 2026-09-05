@@ -39,6 +39,8 @@ import { agentApi } from "../../lib/agentApi";
 import { estimateTurnCost } from "../../lib/pricing";
 import { useT } from "../../lib/i18n";
 
+import { GoalControls } from "../GoalControls";
+
 const PAGE_SIZE = 50;
 
 export function GroupDMChat() {
@@ -76,7 +78,11 @@ export function GroupDMChat() {
   const [notFound, setNotFound] = useState(false);
   // Model of a thread room's single agent member — used to price the token
   // usage line under agent replies.
-  const [threadAgentModel, setThreadAgentModel] = useState<string | undefined>(undefined);
+  const [goalMode,setGoalMode]=useState(false);
+ const [goalBudget,setGoalBudget]=useState("");
+ useEffect(() => {setGoalMode(false);setGoalBudget("");}, [id, draftAgentId]);
+ const [threadAgentTool,setThreadAgentTool]=useState("");
+ const [threadAgentModel, setThreadAgentModel] = useState<string | undefined>(undefined);
   const [showStyleMenu, setShowStyleMenu] = useState(false);
   const [showVenueMenu, setShowVenueMenu] = useState(false);
   const [editingCooldown, setEditingCooldown] = useState(false);
@@ -240,12 +246,13 @@ export function GroupDMChat() {
   useEffect(() => {
     if (!group) return;
     const threadLike = isThreadRoom(group);
+    setThreadAgentTool("");
     if (!threadLike || group.members.length === 0) return;
     let cancelled = false;
     agentApi
       .get(group.members[0].agentId)
       .then((a) => {
-        if (!cancelled) setThreadAgentModel(a.model);
+        if (!cancelled) {setThreadAgentModel(a.model);setThreadAgentTool(a.tool);}
       })
       .catch(() => {});
     return () => {
@@ -404,12 +411,14 @@ export function GroupDMChat() {
     };
   }, [id, awaitingReply, pendingThreadHead]);
 
-  const handleSend = useCallback(async () => {
-    const text = input.trim();
-    if ((!text && pendingFiles.length === 0) || sending) return;
+  const handleSend = useCallback(async (command?: string) => {
+    const files = command === undefined ? pendingFiles : [];
+    const text = command ?? (goalMode && !awaitingReply && input.trim() ? "!goal " + (goalBudget ? "--tokens " + goalBudget + " " : "") + input.trim() : input.trim());
+    if ((!text && files.length === 0) || sending) return;
     if (!id && !isDraft) return;
     if (isDraft && !draftAgentId) return;
     setSending(true);
+    if (command === undefined) setGoalMode(false);
     setSendError(null);
     try {
       // Steer path: a thread reply is currently in flight. Inject the
@@ -419,11 +428,11 @@ export function GroupDMChat() {
       // Attachments can't ride a steer (the API is text-only), so a send
       // with pending files takes the normal post path instead of silently
       // dropping them.
-      if (awaitingReply && !isDraft && id && pendingFiles.length === 0) {
+      if (awaitingReply && !isDraft && id && files.length === 0) {
         try {
           const sent = await groupdmApi.steer(id, text);
-          clearDraft();
-          setPendingFiles([]);
+          if (command === undefined) clearDraft();
+          if (command === undefined) setPendingFiles([]);
           setUploadError(null);
           if (textareaRef.current) textareaRef.current.style.height = "auto";
           setLastRead(id, sent.id);
@@ -440,7 +449,7 @@ export function GroupDMChat() {
             // holder may already have injected it. Clear the draft so an
             // operator retry cannot duplicate the steer; polling will render
             // the retained row.
-            clearDraft();
+            if (command === undefined) clearDraft();
             setSendError(t("gdm.steerDeliveryUncertain"));
             return;
           }
@@ -480,11 +489,11 @@ export function GroupDMChat() {
       const sent = await groupdmApi.postUserMessage(
         targetId!,
         text,
-        pendingFiles.length > 0 ? pendingFiles : undefined,
+        files.length > 0 ? files : undefined,
       );
       // Clear input + draft on success
-      clearDraft();
-      setPendingFiles([]);
+      if (command === undefined) clearDraft();
+      if (command === undefined) setPendingFiles([]);
       setUploadError(null);
       if (textareaRef.current) {
         textareaRef.current.style.height = "auto";
@@ -516,7 +525,7 @@ export function GroupDMChat() {
     } finally {
       setSending(false);
     }
-  }, [id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
+  }, [goalBudget, goalMode, id, isDraft, draftAgentId, navigate, input, pendingFiles, sending, awaitingReply, clearDraft, setPendingFiles, setUploadError, textareaRef]);
 
   // Stop the in-flight thread turn. The partial reply lands through the
   // normal message poll (server persists it with interrupted=true), so no
@@ -1060,6 +1069,7 @@ export function GroupDMChat() {
         <div className="mx-auto max-w-[760px] px-4 py-3">
         {sendError && <DismissibleError message={sendError} onDismiss={() => setSendError(null)} />}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
+        {isThread && threadAgentTool === "codex" && group?.members[0] && <GoalControls agentId={group.members[0].agentId} sessionKey={id ? "groupdm:"+id : null} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={awaitingReply} onCommand={(command) => void handleSend(command)} />}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb={false} />
         <div className="flex items-end gap-2">
           <input

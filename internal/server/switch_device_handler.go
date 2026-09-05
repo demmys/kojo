@@ -382,6 +382,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// turn. Pre-existing limitation — the non-selfCall path also
 	// produces a torn turn at the SIGTERM point.
 	selfCall := p.IsAgent() && p.AgentID == agentID
+	if selfCall && agent.NativeGoalRunning(agentID, strings.TrimSpace(r.Header.Get("X-Kojo-Session-Key"))) {
+		writeError(w, http.StatusConflict, "goal_requires_operator_handoff", "An active native goal cannot migrate itself safely. Use the WebUI device switch (which drains the runner), or pause the goal, move, then resume it on the target.")
+		return
+	}
 	var callerOneShot agent.OneShotOrigin
 	var continuation *handoffContinuation
 	if selfCall {
@@ -1915,14 +1919,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 				Threads: make([]codexThreadWire, 0, len(codexTransfer.Threads)),
 			}
 			for _, th := range codexTransfer.Threads {
-				cw.Threads = append(cw.Threads, codexThreadWire{
-					RefName:           th.RefName,
-					ThreadID:          th.ThreadID,
-					RolloutRelPath:    th.RolloutRelPath,
-					RolloutContentB64: base64.StdEncoding.EncodeToString(th.RolloutContent),
-					ThreadRow:         th.ThreadRow,
-					DynamicToolRows:   th.DynamicToolRows,
-				})
+				cw.Threads = append(cw.Threads, codexThreadToWire(th))
 			}
 			req.CodexSession = cw
 		}
@@ -1984,6 +1981,9 @@ func (s *Server) dispatchPeerAgentSyncState(ctx context.Context, targetAddr, tar
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if agent.HasCodexGoals(agentID) && resp.Header.Get("X-Kojo-Native-Goal") != "v1" {
+		return nil, errors.New("target peer does not support native goal transfer; upgrade it before moving this agent")
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Backward compat: older target binary without the
 		// /state endpoint. Sentinel lets the caller downgrade

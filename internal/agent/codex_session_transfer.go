@@ -52,12 +52,14 @@ type CodexSQLiteRow struct {
 }
 
 type CodexThreadTransfer struct {
-	RefName         string           `json:"ref_name"`
-	ThreadID        string           `json:"thread_id"`
-	RolloutRelPath  string           `json:"rollout_rel_path"`
-	RolloutContent  []byte           `json:"rollout_content"`
-	ThreadRow       *CodexSQLiteRow  `json:"thread_row,omitempty"`
-	DynamicToolRows []CodexSQLiteRow `json:"dynamic_tool_rows,omitempty"`
+	Goal            *GoalBinding       `json:"goal,omitempty"`
+	NativeGoal      *CodexGoalTransfer `json:"native_goal,omitempty"`
+	RefName         string             `json:"ref_name"`
+	ThreadID        string             `json:"thread_id"`
+	RolloutRelPath  string             `json:"rollout_rel_path"`
+	RolloutContent  []byte             `json:"rollout_content"`
+	ThreadRow       *CodexSQLiteRow    `json:"thread_row,omitempty"`
+	DynamicToolRows []CodexSQLiteRow   `json:"dynamic_tool_rows,omitempty"`
 }
 
 type CodexSessionTransfer struct {
@@ -268,7 +270,12 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 			}
 		}
 
+		nativeGoal, gerr := readCodexGoalTransfer(ref.ThreadID)
+		if gerr != nil {
+			return nil, skipped, fmt.Errorf("read native goal: %w", gerr)
+		}
 		out.Threads = append(out.Threads, CodexThreadTransfer{
+			Goal: ref.Goal, NativeGoal: nativeGoal,
 			RefName:         refName,
 			ThreadID:        ref.ThreadID,
 			RolloutRelPath:  rel,
@@ -276,6 +283,28 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 			ThreadRow:       threadRow,
 			DynamicToolRows: toolRows,
 		})
+	}
+	// Capacity limits may drop old ordinary sessions, but must never silently
+	// drop a durable unfinished goal. Refuse the handoff instead.
+	selected := map[string]bool{}
+	for _, th := range out.Threads {
+		selected[th.RefName] = true
+	}
+	entries, readErr := os.ReadDir(codexThreadRefDir(agentID))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, skipped, readErr
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !validCodexThreadRefName(entry.Name()) || selected[entry.Name()] {
+			continue
+		}
+		ref, err := readCodexThreadRefFile(filepath.Join(codexThreadRefDir(agentID), entry.Name()))
+		if err != nil {
+			return nil, skipped, err
+		}
+		if ref.Goal != nil && ref.Goal.State != nil && ref.Goal.State.Status != "complete" {
+			return nil, skipped, errors.New("handoff would omit an unfinished native goal; clear it or increase transfer capacity")
+		}
 	}
 	if len(out.Threads) == 0 {
 		return nil, skipped, nil
@@ -395,6 +424,9 @@ func clearCodexSessionCounted(agentID string) (filesRemoved, threadsRemoved int,
 	}
 
 	if len(threadIDs) > 0 {
+		if gerr := clearNativeGoalRows(threadIDs); gerr != nil {
+			err = errors.Join(err, gerr)
+		}
 		threadsRemoved = len(threadIDs)
 		if dbPath := codexStateDBPath(); dbPath != "" {
 			if db, oerr := sql.Open("sqlite", codexSQLiteDSN(dbPath, false)); oerr == nil {
@@ -502,6 +534,16 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 	seenRollouts := map[string]struct{}{}
 	var totalBytes int64
 	for _, th := range transfer.Threads {
+		if th.Goal != nil && (codexThreadRefName(th.Goal.SessionKey) != th.RefName || th.Goal.Generation < 0 || len(th.Goal.SetupContext) > 1<<20 || (th.Goal.State != nil && th.Goal.State.ThreadID != th.ThreadID)) {
+			cleanupTmps()
+			return nil, nil, errors.New("native goal binding does not match conversation pointer")
+		}
+		if th.NativeGoal != nil {
+			if err := validateGoalRow(th.NativeGoal.Row, th.ThreadID); err != nil {
+				cleanupTmps()
+				return nil, nil, err
+			}
+		}
 		if !isCodexThreadID(th.ThreadID) {
 			cleanupTmps()
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: invalid thread_id %q", th.ThreadID)
@@ -547,6 +589,7 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: stage rollout %s: %w", rel, err)
 		}
 		refBody, _ := json.MarshalIndent(codexThreadRef{
+			Goal:        th.Goal,
 			ThreadID:    th.ThreadID,
 			RolloutPath: rolloutFinal,
 		}, "", "  ")
@@ -634,6 +677,14 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		return nil, nil, dbErr
 	}
 
+	goalCommit, goalRollback, goalErr := stageCodexGoals(absRoot, transfer)
+	if goalErr != nil {
+		if dbRollback != nil {
+			dbRollback()
+		}
+		rollbackFiles()
+		return nil, nil, goalErr
+	}
 	lockReleasedToCallbacks = true
 	var done bool
 	commit = func() {
@@ -642,6 +693,9 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		}
 		done = true
 		defer releaseOnce()
+		if goalCommit != nil {
+			goalCommit()
+		}
 		if dbCommit != nil {
 			dbCommit()
 		}
@@ -657,6 +711,9 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		}
 		done = true
 		defer releaseOnce()
+		if goalRollback != nil {
+			goalRollback()
+		}
 		if dbRollback != nil {
 			dbRollback()
 		}

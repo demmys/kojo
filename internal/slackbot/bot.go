@@ -633,6 +633,38 @@ func isStopCommand(text string) bool {
 }
 
 func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, text string) bool {
+	q, qerr := agent.ParseGoalCommand(SlackToPlain(text, nil))
+	if qerr != nil {
+		b.postMessage(ctx, channel, threadTS, qerr.Error())
+		return true
+	}
+	if q != nil && messageTS != "" {
+		q.OperationID = "slack:" + channel + ":" + messageTS
+	}
+	if q != nil && q.Action != "start" && q.Action != "resume" {
+		replyTS := threadTS
+		if replyTS == "" && b.config.ThreadReplies {
+			replyTS = messageTS
+		}
+		go func() {
+			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q})
+			if err != nil {
+				b.postMessage(ctx, channel, replyTS, err.Error())
+				return
+			}
+			for ev := range events {
+				if ev.ErrorMessage != "" {
+					b.postMessage(ctx, channel, replyTS, ev.ErrorMessage)
+				} else if ev.Type == "done" && ev.Message != nil {
+					b.postMessage(ctx, channel, replyTS, ev.Message.Content)
+				}
+			}
+		}()
+		return true
+	}
+
 	// Avoid resolving user mentions just to reject an ordinary message. App
 	// mentions have already had the bot mention stripped by their handler.
 	if !isStopCommand(SlackToPlain(text, nil)) {
@@ -778,7 +810,12 @@ func (b *Bot) admitIncoming(ctx context.Context, channel, origThreadTS, replyTS,
 				close(stopWatchDone)
 			}()
 			err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS),
-				buildSlackUserMessage(channel, replyTS, text, displayName))
+				func() string {
+					if q, _ := agent.ParseGoalCommand(text); q != nil {
+						return text
+					}
+					return buildSlackUserMessage(channel, replyTS, text, displayName)
+				}())
 			steerCancel()
 			<-stopWatchDone
 		}
@@ -1009,7 +1046,16 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
 	b.setStatus(turnCtx, channel, threadTS, typingStatus)
 
+	goal, goalErr := agent.ParseGoalCommand(text)
+	if goalErr != nil {
+		b.postMessage(ctx, channel, threadTS, goalErr.Error())
+		return
+	}
+	if goal != nil && messageTS != "" {
+		goal.OperationID = "slack:" + channel + ":" + messageTS
+	}
 	events, err := b.mgr.ChatOneShot(turnCtx, b.agentID, message, agent.OneShotOpts{
+		Goal:                              goal,
 		SessionKey:                        sessionKey,
 		History:                           history,
 		HistorySelfUserID:                 b.botUserID,

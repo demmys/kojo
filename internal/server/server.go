@@ -91,11 +91,12 @@ func httpServerErrorLog(logger *slog.Logger) *log.Logger {
 var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
 
 type Server struct {
-	sessions     *session.Manager
-	agents       *agent.Manager
-	groupdms     *agent.GroupDMManager
-	slackHub     *slackbot.Hub
-	externalChat *externalChatRouter
+	goalStopFences sync.Map // emergency in-memory stop fence when durable storage is unavailable
+	sessions       *session.Manager
+	agents         *agent.Manager
+	groupdms       *agent.GroupDMManager
+	slackHub       *slackbot.Hub
+	externalChat   *externalChatRouter
 	// extensions is the kojo extension-package registry (packages
 	// installed from a git URL). Nil on PeerOnly daemons and when
 	// the registry directory could not be opened; every handler
@@ -881,6 +882,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/steer", s.handleExternalChatSteer)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/goal-stop", s.handleExternalGoalStop)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/attachment-ack", s.handleExternalChatAttachmentAck)
 		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/file", s.handleExternalChatFile)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
@@ -986,6 +988,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// rolls them back on abort.
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/finalize", s.handlePeerAgentSyncFinalize)
 		mux.HandleFunc("POST /api/v1/peers/handoff/arrival/bind", s.handleHandoffArrivalBind)
+		mux.HandleFunc("POST /api/v1/peers/goals/resume", s.handlePeerGoalResume)
 		mux.HandleFunc("POST /api/v1/peers/handoff/arrival", s.handleHandoffArrivalContinuation)
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/drop", s.handlePeerAgentSyncDrop)
 	}
@@ -1036,6 +1039,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ratelimit", s.handleGetAgentRateLimit)
+	mux.HandleFunc("GET /api/v1/agents/{id}/goal", s.handleGetGoal)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files", s.handleListAgentFiles)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/view", s.handleViewAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)
@@ -1812,6 +1816,9 @@ func (s *Server) SetTLSConfig(tlsCfg *tls.Config) {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.agents != nil {
+		s.agents.PreserveNativeGoalsOnShutdown()
+	}
 	s.logger.Info("shutting down...")
 
 	// Drain HTTP listeners first so no new requests can land while the

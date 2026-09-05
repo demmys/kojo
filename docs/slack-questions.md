@@ -61,3 +61,16 @@ answers also join the turn's ordered history so a handoff can retain the Q&A.
 References:
 - [Slack Socket Mode interactions](https://docs.slack.dev/apis/events-api/using-socket-mode/)
 - [Codex App Server](https://learn.chatgpt.com/docs/app-server)
+
+### Codex の非同期質問
+
+`request_user_input_async` は回答待ち RPC ではなく、
+`agentMessage` の `delivery: "async"` / `questions` として届く。
+これも同じ回答フォームに変換する。選択肢がない質問・自由記述にも対応する。
+回答は質問本文と対応づけたユーザー入力として `turn/steer` で届け、
+元のツール呼び出しへの JSON-RPC 応答は送らない。
+
+質問中も処理は続く。goal の自動継続ターンを跨いでも同じ実行内なら回答できる。
+通常処理の終了、goal の終了、停止、再起動でカードは失効する。
+失効後は通常のスレッド返信で回答する（カードの回答から勝手に実行を再開しない）。
+回答の到達が不明な場合も自動再送しない。

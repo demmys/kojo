@@ -1888,6 +1888,8 @@ func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Reques
 
 	if err := s.agents.AnswerQuestion(r.Context(), id, body.RequestID, body.Answers, body.Deny, body.DenyMessage); err != nil {
 		switch {
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", "the answer may have reached the backend; do not resend it automatically")
 		case errors.Is(err, agent.ErrAgentNotBusy):
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
 		case errors.Is(err, agent.ErrInvalidQuestionAnswer):

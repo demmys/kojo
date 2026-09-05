@@ -32,7 +32,11 @@ export function EffortPicker({
         value={effort}
         onChange={(e) => setEffort(e.target.value as EffortLevel | "")}
       >
-        <option value="">{t("field.effortDefault", { level: defaultEffortForModel(model) })}</option>
+        <option value="">
+          {model
+            ? t("field.effortDefault", { level: defaultEffortForModel(model) })
+            : t("field.effortCliDefault")}
+        </option>
         {effortLevelsForModel(model).map((e) => (
           <option key={e} value={e}>
             {e}

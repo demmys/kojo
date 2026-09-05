@@ -1354,6 +1354,7 @@ const messages = {
   },
   "field.effort": { ja: "Effort", en: "Effort" },
   "field.effortDefault": { ja: "既定 ({level})", en: "default ({level})" },
+  "field.effortCliDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
   "field.modelDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
   "field.tool": { ja: "ツール", en: "Tool" },
   "field.modelName": { ja: "モデル名", en: "model name" },

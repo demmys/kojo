@@ -1689,6 +1689,7 @@ type streamScript struct {
 	lastUpdateTS string
 	lastUpdateMD string
 	lastPostMD   string
+	postedMD     []string
 }
 
 // newStreamServer returns a mock Slack server that delegates streaming
@@ -1739,6 +1740,7 @@ func newStreamServer(t *testing.T, script *streamScript) *httptest.Server {
 		case "/chat.postMessage":
 			script.postCalls++
 			script.lastPostMD = r.FormValue("markdown_text")
+			script.postedMD = append(script.postedMD, script.lastPostMD)
 			if script.failPost {
 				fmt.Fprintf(w, `{"ok":false,"error":"channel_not_found"}`)
 				return
@@ -2300,7 +2302,7 @@ func TestSendToAgentRestartBurstCapFallsBackToBatchPost(t *testing.T) {
 	// End with a text event so response.Builder is non-empty and the
 	// finalize path actually emits a chunk (no text → "something went
 	// wrong" branch instead).
-	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"}, agent.ChatEvent{Type: "done"})
 
 	mgr := &scriptedMgr{events: events}
 	bot := newBotWithStream(t, mgr, srv)
@@ -2403,7 +2405,7 @@ func TestSendToAgentAllowsSlowStreamRotation(t *testing.T) {
 	for i := range events {
 		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
 	}
-	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"}, agent.ChatEvent{Type: "done"})
 
 	mgr := &scriptedMgr{events: events}
 	bot := newBotWithStream(t, mgr, srv)
@@ -2456,7 +2458,7 @@ func TestSendToAgentBoundsDeadStreamArtifactsDuringSlowRotation(t *testing.T) {
 	for i := range events {
 		events[i] = agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
 	}
-	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"})
+	events = append(events, agent.ChatEvent{Type: "text", Delta: "final words"}, agent.ChatEvent{Type: "done"})
 	mgr := &scriptedMgr{events: events}
 	bot := newBotWithStream(t, mgr, srv)
 	var clock atomic.Int64

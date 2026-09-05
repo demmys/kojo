@@ -665,12 +665,12 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 			defer cancel()
 			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q})
 			if err != nil {
-				b.postMessage(ctx, channel, replyTS, err.Error())
+				b.postChatError(channel, replyTS, err.Error())
 				return
 			}
 			for ev := range events {
 				if ev.ErrorMessage != "" {
-					b.postMessage(ctx, channel, replyTS, ev.ErrorMessage)
+					b.postChatError(channel, replyTS, ev.ErrorMessage)
 				} else if ev.Type == "done" && ev.Message != nil {
 					b.postMessage(ctx, channel, replyTS, ev.Message.Content)
 				}
@@ -1091,7 +1091,7 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		if active.stopRequested() && errors.Is(err, context.Canceled) {
 			b.postStopNotice(channel, threadTS, active)
 		} else {
-			b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
+			b.postChatError(channel, threadTS, err.Error())
 		}
 		return
 	}
@@ -1111,6 +1111,8 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	var failedSupersededStreams []string
 	var lastAppend time.Time
 	hasError := false
+	backendError := ""
+	sawTerminal := false
 	stopped := false
 	completedCleanly := false
 	terminalContent := ""
@@ -1369,18 +1371,26 @@ streamLoop:
 			b.setStatus(turnCtx, channel, threadTS, typingStatus)
 
 		case "error":
+			sawTerminal = true
 			// Completion is observable at the terminal event, not only when
 			// the producer closes its channel. Reject late !stop immediately.
 			b.finishActiveTurn(channel, threadTS, active)
 			hasError = true
+			if backendError == "" {
+				backendError = evt.ErrorMessage
+			}
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
 		case "done":
+			sawTerminal = true
 			b.finishActiveTurn(channel, threadTS, active)
 			completedCleanly = evt.ErrorMessage == ""
 			if evt.ErrorMessage == agent.ErrMsgCancelled {
 				stopped = true
 			} else if evt.ErrorMessage != "" {
 				hasError = true
+				if backendError == "" {
+					backendError = evt.ErrorMessage
+				}
 				b.logger.Warn("agent completed slack chat with an error", "err", evt.ErrorMessage)
 			}
 			if evt.Message != nil {
@@ -1395,6 +1405,10 @@ streamLoop:
 	b.finishActiveTurn(channel, threadTS, active)
 	if active.stopRequested() {
 		stopped = true
+	}
+	if !sawTerminal && !stopped {
+		hasError = true
+		backendError = "応答の完了通知が届く前に接続が終了しました。処理結果を確認してから再試行してください。"
 	}
 
 	// Use a separate context for finalization so cleanup API calls
@@ -1595,8 +1609,7 @@ streamLoop:
 			// overwriting the stream via chat.update (which would erase
 			// the execution trail). StopStream above is best-effort;
 			// Slack auto-finalizes the stream via TTL if it failed.
-			b.postMessage(finCtx, channel, threadTS,
-				"Sorry, something went wrong while processing your request.")
+			b.postChatError(channel, threadTS, backendError)
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no
@@ -1624,7 +1637,13 @@ streamLoop:
 		// branch and go silent — the keepalive heartbeat makes this more
 		// likely by proactively dropping a TTL-dead stream during a long
 		// silence. Surface a generic failure rather than going silent.
-		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
+		b.postChatError(channel, threadTS, backendError)
+	}
+
+	// Keep diagnostics independent of partial model Markdown (which may have
+	// an unclosed code fence), and give this post a fresh delivery timeout.
+	if hasError && !stopped && response.Len() > 0 {
+		b.postChatError(channel, threadTS, backendError)
 	}
 
 	// Clear typing indicator (auto-clears on message post, but explicit

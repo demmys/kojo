@@ -132,13 +132,13 @@ export function UserQuestionCard({
               );
             })}
           </div>
-          <input
+          {(q.isOther !== false || !(q.options?.length)) && <input
             type="text"
             value={custom[qi] ?? ""}
             onChange={(e) => setCustom((prev) => ({ ...prev, [qi]: e.target.value }))}
             placeholder={t("uq.otherPlaceholder")}
             className="mt-2 w-full rounded-[8px] border border-hairline bg-app px-3 py-1.5 text-sm text-ink outline-none focus:border-copper"
-          />
+          />}
         </div>
       ))}
       {error && <div className="mb-2 text-xs text-lamp-err">{error}</div>}

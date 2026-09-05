@@ -26,4 +26,11 @@ describe("UserQuestionCard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Answer" }));
     await waitFor(() => expect(submit).toHaveBeenCalledWith({ "Your answer?": "A custom answer" }));
   });
+  it("does not add free text to a native choice-only prompt", () => {
+    render(<UserQuestionCard pending={{ requestId: "r", questions: [
+      { id: "q", question: "Choose?", isOther: false, options: [{ label: "Blue" }] },
+    ] }} onSubmit={vi.fn()} />);
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
 });

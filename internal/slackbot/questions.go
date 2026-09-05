@@ -126,7 +126,7 @@ func questionModal(q *slackQuestion) slack.ModalViewRequest {
 				element = slack.NewOptionsSelectBlockElement(slack.OptTypeStatic, questionPlain("選択肢", 150), "choice", options...)
 			}
 			input := slack.NewInputBlock(fmt.Sprintf("choice_%d", i), questionPlain("選択肢（任意）", 2000), nil, element)
-			input.Optional = true
+			input.Optional = item.AllowsFreeText()
 			blocks = append(blocks, input)
 		}
 		// Descriptions in a section avoid the option-description API length limit.
@@ -136,6 +136,9 @@ func questionModal(q *slackQuestion) slack.ModalViewRequest {
 		}
 		if detail.Len() > 0 {
 			blocks = append(blocks, slack.NewSectionBlock(questionPlain(detail.String(), 3000), nil, nil))
+		}
+		if !item.AllowsFreeText() {
+			continue
 		}
 		text := slack.NewPlainTextInputBlockElement(questionPlain("自由記述（選択肢の代わりにも使えます）", 150), "text")
 		text.Multiline = true
@@ -155,6 +158,14 @@ func questionSubmission(q *slackQuestion, state *slack.ViewState) (map[string]an
 	}
 	for i, item := range q.questions {
 		free := strings.TrimSpace(state.Values[fmt.Sprintf("text_%d", i)]["text"].Value)
+		errorBlock := fmt.Sprintf("text_%d", i)
+		if !item.AllowsFreeText() {
+			errorBlock = fmt.Sprintf("choice_%d", i)
+			if free != "" {
+				errs[errorBlock] = "自由記述は許可されていません。"
+			}
+			free = ""
+		}
 		choice := state.Values[fmt.Sprintf("choice_%d", i)]["choice"]
 		selected := choice.SelectedOptions
 		if !item.MultiSelect && choice.SelectedOption.Value != "" {
@@ -164,7 +175,7 @@ func questionSubmission(q *slackQuestion, state *slack.ViewState) (map[string]an
 		for _, opt := range selected {
 			j, err := strconv.Atoi(opt.Value)
 			if err != nil || j < 0 || j >= len(item.Options) {
-				errs[fmt.Sprintf("text_%d", i)] = "選択肢が無効です。"
+				errs[errorBlock] = "選択肢が無効です。"
 				continue
 			}
 			values = append(values, item.Options[j].Label)
@@ -176,7 +187,7 @@ func questionSubmission(q *slackQuestion, state *slack.ViewState) (map[string]an
 			values = append(values, free)
 		}
 		if len(values) == 0 {
-			errs[fmt.Sprintf("text_%d", i)] = "選択肢を選ぶか、自由記述を入力してください。"
+			errs[errorBlock] = "選択肢を選ぶか、自由記述を入力してください。"
 		}
 		if item.MultiSelect {
 			answers[item.AnswerKey()] = values
@@ -186,7 +197,11 @@ func questionSubmission(q *slackQuestion, state *slack.ViewState) (map[string]an
 	}
 	if len(errs) == 0 {
 		if err := agent.ValidateQuestionAnswers(q.questions, answers); err != nil {
-			errs["text_0"] = "回答が長すぎるか無効です。短くして再送信してください。"
+			key := "text_0"
+			if len(q.questions) > 0 && !q.questions[0].AllowsFreeText() {
+				key = "choice_0"
+			}
+			errs[key] = "回答が長すぎるか無効です。短くして再送信してください。"
 		}
 	}
 	return answers, errs
@@ -221,14 +236,14 @@ func (b *Bot) prepareQuestionInteraction(cb slack.InteractionCallback) (any, fun
 	if !valid {
 		b.questionsMu.Unlock()
 		if cb.Type == slack.InteractionTypeViewSubmission {
-			return slack.NewErrorsViewSubmissionResponse(map[string]string{"text_0": "この質問は期限切れ、回答済み、または別のユーザー宛てです。閉じてください。"}), nil
+			return slack.NewErrorsViewSubmissionResponse(map[string]string{questionErrorBlock(cb.View): "この質問は期限切れ、回答済み、または別のユーザー宛てです。閉じてください。"}), nil
 		}
 		return nil, b.questionNoticeWork(cb.Channel.ID, cb.User.ID, "この質問は期限切れ、回答済み、または別のユーザー宛てです。")
 	}
 	if b.questionOps >= 8 {
 		b.questionsMu.Unlock()
 		if cb.Type == slack.InteractionTypeViewSubmission {
-			return slack.NewErrorsViewSubmissionResponse(map[string]string{"text_0": "混み合っています。少し待って再送信してください。"}), nil
+			return slack.NewErrorsViewSubmissionResponse(map[string]string{questionErrorBlock(cb.View): "混み合っています。少し待って再送信してください。"}), nil
 		}
 		return nil, nil
 	}
@@ -372,4 +387,40 @@ func (b *Bot) questionNoticeWork(channel, user, text string) func() {
 		defer func() { b.questionsMu.Lock(); b.questionOps--; b.questionsMu.Unlock() }()
 		b.questionEphemeral(channel, user, text)
 	}
+}
+
+// A per-turn ordered worker keeps Slack card API latency out of the streaming
+// heartbeat loop. Queue saturation cancels the turn instead of losing a prompt.
+func (b *Bot) questionWorker(ctx context.Context, channel, thread, user, session string, turn *activeTurn) (chan<- agent.ChatEvent, func()) {
+	workerCtx, cancel := context.WithCancel(ctx)
+	queue := make(chan agent.ChatEvent, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case ev := <-queue:
+				if workerCtx.Err() != nil {
+					return
+				}
+				if ev.Type == "user_question" {
+					b.showQuestion(workerCtx, channel, thread, user, session, turn, ev)
+				} else {
+					b.expireQuestions(turn, ev.RequestID)
+				}
+			}
+		}
+	}()
+	return queue, func() { cancel(); <-done; b.expireQuestions(turn, "") }
+}
+
+func questionErrorBlock(view slack.View) string {
+	if view.State != nil {
+		if _, ok := view.State.Values["text_0"]; ok {
+			return "text_0"
+		}
+	}
+	return "choice_0"
 }

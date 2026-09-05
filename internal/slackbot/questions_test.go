@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/slack-go/slack"
@@ -161,5 +162,69 @@ func TestQuestionFailureRetryAndResolutionRace(t *testing.T) {
 				t.Fatal("pre-delivery failure cannot be retried")
 			}
 		})
+	}
+}
+
+func TestQuestionWorkerDoesNotBlockStreamingOnSlowSlack(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	b := newTestBot(t, agent.SlackBotConfig{})
+	defer b.cancel()
+	b.api = slack.New("test", slack.OptionAPIURL(srv.URL+"/"))
+	b.mgr = &questionTestManager{}
+	queue, stop := b.questionWorker(context.Background(), "C", "T", "U", "s", &activeTurn{})
+	queue <- agent.ChatEvent{Type: "user_question", RequestID: "r", Questions: json.RawMessage(`[{"question":"Q?"}]`)}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("worker didn't post")
+	}
+	select {
+	case queue <- agent.ChatEvent{Type: "question_resolved", RequestID: "r"}:
+	case <-time.After(time.Second):
+		t.Fatal("stream loop blocked on Slack card API")
+	}
+	stopped := make(chan struct{})
+	go func() { stop(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("worker cancellation blocked")
+	}
+}
+
+func TestQuestionNativeChoiceRestriction(t *testing.T) {
+	q := testSlackQuestion()
+	no := false
+	q.questions = q.questions[:1]
+	q.questions[0].IsOther = &no
+	modal := questionModal(q)
+	raw, _ := json.Marshal(modal)
+	if strings.Contains(string(raw), `"plain_text_input"`) {
+		t.Fatal("native choice-only prompt gained free text")
+	}
+	state := questionState()
+	_, errs := questionSubmission(q, state)
+	if len(errs) == 0 {
+		t.Fatal("injected free text accepted")
+	}
+	delete(state.Values, "text_0")
+	answers, errs := questionSubmission(q, state)
+	if len(errs) > 0 || answers["color"] != "Blue" {
+		t.Fatalf("%v %v", answers, errs)
 	}
 }

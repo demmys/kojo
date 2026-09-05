@@ -1025,7 +1025,6 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	b.setStatus(turnCtx, channel, threadTS, typingStatus)
 
 	_, canAnswerQuestions := b.mgr.(oneShotQuestionAnswerer)
-	defer b.expireQuestions(active, "")
 	events, err := b.mgr.ChatOneShot(turnCtx, b.agentID, message, agent.OneShotOpts{
 		InteractiveQuestions:              canAnswerQuestions && userID != "",
 		SessionKey:                        sessionKey,
@@ -1168,6 +1167,9 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	// it would race the main loop on streamTS / deadStreams / lastAppend
 	// and could interleave concurrent AppendStream calls on the same
 	// streamTS. Keeping everything in one goroutine avoids that entirely.
+	questionEvents, stopQuestions := b.questionWorker(turnCtx, channel, threadTS, userID, sessionKey, active)
+	defer stopQuestions()
+	questionOverflow := false
 	heartbeat := time.NewTicker(streamHeartbeatTick)
 	defer heartbeat.Stop()
 streamLoop:
@@ -1197,10 +1199,17 @@ streamLoop:
 		}
 
 		switch evt.Type {
-		case "user_question":
-			b.showQuestion(turnCtx, channel, threadTS, userID, sessionKey, active, evt)
-		case "question_resolved":
-			b.expireQuestions(active, evt.RequestID)
+		case "user_question", "question_resolved":
+			if !questionOverflow {
+				select {
+				case questionEvents <- evt:
+				default:
+					questionOverflow = true
+					hasError = true
+					b.logger.Warn("question event queue full; cancelling turn", "agent", b.agentID)
+					turnCancel()
+				}
+			}
 		case "text":
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)

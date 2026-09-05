@@ -378,6 +378,7 @@ export interface UserQuestionOption {
 
 // UserQuestion is one question in an AskUserQuestion control_request.
 export interface UserQuestion {
+  isOther?: boolean;
   id?: string;
   question: string;
   header?: string;

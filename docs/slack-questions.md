@@ -11,7 +11,8 @@ question answer resolves the original tool request, never a new chat turn.
 - Update both the Hub and runtime peers to use interactive questions remotely.
   Older peers ignore the opt-in header and retain ordinary, non-interactive chat.
 - When a question appears in the original Slack thread, choose **回答する**.
-  The modal offers single/multiple selection and free text. Free text overrides
+  The modal offers single/multiple selection and, when the native question
+  allows it, free text. Free text overrides
   a single selection, or is appended to multiple selections.
 - Only the Slack user who initiated that turn can answer its form. This identity
   is retained for the turn's post-handoff continuation. Other users' ordinary
@@ -51,6 +52,9 @@ are not downgraded to steering or FIFO messages on errors. Question lifecycle
 events use reliable delivery rather than lossy text-delta forwarding.
 
 Slack acknowledges interactions before opening a modal or contacting a peer.
+Card posting/expiry runs on a bounded, ordered per-turn worker, so slow Slack
+card APIs cannot starve the streaming heartbeat. Queue saturation stops the
+turn explicitly rather than silently dropping a question.
 Network work is bounded independently from the Socket Mode event loop. Accepted
 answers also join the turn's ordered history so a handoff can retain the Q&A.
 

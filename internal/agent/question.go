@@ -15,11 +15,16 @@ type UserQuestion struct {
 	Header      string               `json:"header,omitempty"`
 	Options     []UserQuestionOption `json:"options,omitempty"`
 	MultiSelect bool                 `json:"multiSelect,omitempty"`
+	IsOther     *bool                `json:"isOther,omitempty"`
 	IsSecret    bool                 `json:"isSecret,omitempty"`
 }
 type UserQuestionOption struct {
 	Label       string `json:"label"`
 	Description string `json:"description,omitempty"`
+}
+
+func (q UserQuestion) AllowsFreeText() bool {
+	return len(q.Options) == 0 || q.IsOther == nil || *q.IsOther
 }
 
 func (q UserQuestion) AnswerKey() string {
@@ -51,6 +56,18 @@ func ValidateQuestionAnswers(questions []UserQuestion, answers map[string]any) e
 			return ErrInvalidQuestionAnswer
 		}
 		for _, s := range vals {
+			if !q.AllowsFreeText() {
+				allowed := false
+				for _, opt := range q.Options {
+					if s == opt.Label {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					return ErrInvalidQuestionAnswer
+				}
+			}
 			if strings.TrimSpace(s) == "" || len(s) > 16384 {
 				return ErrInvalidQuestionAnswer
 			}

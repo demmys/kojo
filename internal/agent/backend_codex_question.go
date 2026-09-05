@@ -47,7 +47,12 @@ func (q *codexQuestionState) register(msg *rpcMessage, automated bool) (string, 
 		return "", fmt.Errorf("invalid question count")
 	}
 	seen := make(map[string]bool)
-	for _, item := range p.Questions {
+	for i := range p.Questions {
+		item := &p.Questions[i]
+		if item.IsOther == nil {
+			v := false
+			item.IsOther = &v
+		}
 		if item.ID == "" || item.Question == "" || seen[item.ID] || item.IsSecret {
 			return "", fmt.Errorf("invalid or secret question")
 		}

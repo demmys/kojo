@@ -166,7 +166,35 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			}
 			return nil
 		}
-		respondServerRequest := newCodexServerRequestResponder(writeLine)
+		fallbackResponder := newCodexServerRequestResponder(writeLine)
+		respondServerRequest := codexServerRequestResponder(func(msg *rpcMessage) (string, error) {
+			if msg.Method == "serverRequest/resolved" {
+				return "resolved", nil
+			}
+			return fallbackResponder(msg)
+		})
+		if opts.OnQuestionReady != nil {
+			qs := newCodexQuestionState(writeLine, send, opts.OnQuestionResolved)
+			qs.onWriteFailure = func() { _ = cmd.Process.Kill() }
+			defer qs.close()
+			opts.OnQuestionReady(qs.answer)
+			fallback := respondServerRequest
+			respondServerRequest = func(msg *rpcMessage) (string, error) {
+				if msg.Method == "serverRequest/resolved" {
+					var p struct {
+						RequestID json.RawMessage `json:"requestId"`
+					}
+					if msg.Params != nil && json.Unmarshal(*msg.Params, &p) == nil {
+						qs.resolveRPC(p.RequestID)
+					}
+					return "resolved", nil
+				}
+				if msg.Method == "item/tool/requestUserInput" {
+					return qs.register(msg, opts.AutomatedTrigger)
+				}
+				return fallback(msg)
+			}
+		}
 		sendRPCErr := func(method string, params any) (int64, error) {
 			id := reqID.Add(1)
 			err := writeLine(rpcRequest{
@@ -1176,6 +1204,13 @@ func codexDynamicToolName(msg *rpcMessage) (string, error) {
 // can continue. Infrastructure and unknown requests fail the turn instead of
 // being silently converted into a recoverable tool error.
 func handleCodexServerRequest(msg *rpcMessage, respond codexServerRequestResponder, logger *slog.Logger) (bool, error) {
+	if msg != nil && msg.Method == "serverRequest/resolved" && msg.ID == nil {
+		if respond != nil {
+			_, err := respond(msg)
+			return true, err
+		}
+		return true, nil
+	}
 	if msg == nil || msg.ID == nil || msg.Method == "" {
 		return false, nil
 	}

@@ -378,6 +378,7 @@ export interface UserQuestionOption {
 
 // UserQuestion is one question in an AskUserQuestion control_request.
 export interface UserQuestion {
+  id?: string;
   question: string;
   header?: string;
   options?: UserQuestionOption[];
@@ -402,7 +403,7 @@ export interface RateLimitSnapshot extends RateLimitInfo {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question" | "rate_limit";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question" | "question_resolved" | "rate_limit";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -416,6 +417,7 @@ export interface ChatEvent {
   // answer endpoint, and the raw AskUserQuestion questions payload.
   requestId?: string;
   questions?: UserQuestion[];
+  questionBlocking?: boolean;
   // Set on "rate_limit" events: the latest usage-window telemetry.
   rateLimit?: RateLimitInfo;
   startedAt?: string; // RFC3339 timestamp of when processing started

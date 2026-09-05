@@ -46,9 +46,9 @@ export function UserQuestionCard({
       const sel = selected[qi] ?? [];
       if (q.multiSelect) {
         const vals = free ? [...sel, free] : sel;
-        out[q.question] = vals;
+        out[q.id || q.question] = vals;
       } else {
-        out[q.question] = free || sel[0] || "";
+        out[q.id || q.question] = free || sel[0] || "";
       }
     });
     return out;
@@ -69,7 +69,7 @@ export function UserQuestionCard({
       setDone(
         questions
           .map((q) => {
-            const v = answers[q.question];
+            const v = answers[q.id || q.question];
             return `${q.header || q.question}: ${Array.isArray(v) ? v.join(", ") : v}`;
           })
           .join(" / "),

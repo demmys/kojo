@@ -58,6 +58,7 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
+	InteractiveQuestions        bool                      `json:"-"`
 	Message                     string                    `json:"message"`
 	SessionKey                  string                    `json:"sessionKey,omitempty"`
 	FreshSessionContext         string                    `json:"freshSessionContext,omitempty"`
@@ -74,8 +75,9 @@ type externalChatTextRequest struct {
 }
 
 type externalChatSteerRequest struct {
-	SessionKey string `json:"sessionKey"`
-	Content    string `json:"content"`
+	SessionKey string                `json:"sessionKey"`
+	Content    string                `json:"content,omitempty"`
+	Question   *agent.QuestionAnswer `json:"question,omitempty"`
 }
 
 type externalChatTextEnvelope struct {
@@ -238,6 +240,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	}
 	req := externalChatTextRequest{
 		Message:                     message,
+		InteractiveQuestions:        opts.InteractiveQuestions,
 		SessionKey:                  opts.SessionKey,
 		FreshSessionContext:         freshContext,
 		ResumeSessionContext:        resumeContext,
@@ -417,6 +420,16 @@ func forwardTrackedTerminalAfterCancel(in <-chan agent.ChatEvent, out chan<- age
 // is not replayable after POST: the holder may have accepted the text before
 // a transport error becomes visible to the Hub.
 func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error {
+	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content})
+}
+
+func (r *externalChatRouter) AnswerOneShotQuestion(ctx context.Context, agentID, sessionKey string, answer agent.QuestionAnswer) error {
+	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Question: &answer})
+}
+
+// sendOneShotInput shares the holder fence and no-replay transport policy for
+// steering and question answers. Questions are never converted to steering.
+func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID string, input externalChatSteerRequest) error {
 	if r == nil || r.server == nil || r.server.agents == nil {
 		return errors.New("external chat router is unavailable")
 	}
@@ -442,7 +455,11 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 				return fmt.Errorf("agent thread holder is unavailable: %s", ready.Unavailable)
 			}
 			return steerOneShotWithContext(ctx, r.localSteerSem, localSteerAdmissionWait, func() error {
-				return r.server.agents.SteerOneShotForAgent(agentID, sessionKey, content)
+				if input.Question != nil {
+					q := input.Question
+					return r.server.agents.AnswerOneShotQuestion(agentID, input.SessionKey, r.selfPeerID(), q.RequestID, q.Answers, q.Deny, q.DenyMessage)
+				}
+				return r.server.agents.SteerOneShotForAgent(agentID, input.SessionKey, input.Content)
 			})
 		}
 
@@ -460,10 +477,7 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 			r.forgetRoute(agentID, holder)
 			return fmt.Errorf("thread holder %s is not ready: %s", holder, ready.Unavailable)
 		}
-		resp, attempted, err := r.postRemoteSteer(ctx, agentID, holder, externalChatSteerRequest{
-			SessionKey: sessionKey,
-			Content:    content,
-		})
+		resp, attempted, err := r.postRemoteSteer(ctx, agentID, holder, input)
 		if err != nil {
 			if attempted {
 				return fmt.Errorf("%w: %v", agent.ErrSteerDeliveryUncertain, err)
@@ -487,6 +501,10 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 			msg = resp.Status
 		}
 		switch body.Error.Code {
+		case "question_not_found":
+			return agent.ErrQuestionNotFound
+		case "invalid_answers":
+			return agent.ErrInvalidQuestionAnswer
 		case "not_busy":
 			return fmt.Errorf("%w: %s", agent.ErrAgentNotBusy, msg)
 		case "unsupported":
@@ -594,6 +612,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 		events, err := s.agents.ChatOneShot(turnCtx, agentID, req.Message, agent.OneShotOpts{
 			SessionKey:                        req.SessionKey,
+			InteractiveQuestions:              req.InteractiveQuestions,
 			FreshSessionContext:               req.FreshSessionContext,
 			ResumeSessionContext:              req.ResumeSessionContext,
 			SystemPromptExtra:                 req.SystemPromptExtra,
@@ -713,6 +732,9 @@ func (r *externalChatRouter) postRemote(ctx context.Context, agentID, holder str
 		return nil, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if payload.InteractiveQuestions {
+		req.Header.Set("X-Kojo-Interactive-Questions", "v1")
+	}
 	req.Header.Set(externalChatAttachmentAckHeader, externalChatAttachmentAckV1)
 	if payload.HandoffCapability != "" {
 		req.Header.Set("X-Kojo-Handoff-Capability", payload.HandoffCapability)
@@ -945,6 +967,7 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	defer releaseRelay()
 	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
 		SessionKey:                        req.SessionKey,
+		InteractiveQuestions:              r.Header.Get("X-Kojo-Interactive-Questions") == "v1",
 		FreshSessionContext:               req.FreshSessionContext,
 		ResumeSessionContext:              req.ResumeSessionContext,
 		SystemPromptExtra:                 req.SystemPromptExtra,
@@ -1141,19 +1164,33 @@ func (s *Server) handleExternalChatSteer(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid external steer request: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.SessionKey) == "" || strings.TrimSpace(req.Content) == "" {
-		writeError(w, http.StatusBadRequest, "bad_request", "sessionKey and content are required")
+	if strings.TrimSpace(req.SessionKey) == "" || (req.Question == nil && strings.TrimSpace(req.Content) == "") || (req.Question != nil && (req.Question.RequestID == "" || req.Content != "")) {
+		writeError(w, http.StatusBadRequest, "bad_request", "sessionKey and exactly one of content or question.requestId are required")
 		return
 	}
 	p := auth.FromContext(r.Context())
 	var err error
-	if s.unsafePeer && p.IsOwner() {
+	if req.Question != nil {
+		origin := p.PeerID
+		if s.unsafePeer && p.IsOwner() {
+			origin = ""
+		} else if origin == "" {
+			writeError(w, http.StatusForbidden, "forbidden", "question answer requires an origin peer")
+			return
+		}
+		q := req.Question
+		err = s.agents.AnswerOneShotQuestion(agentID, req.SessionKey, origin, q.RequestID, q.Answers, q.Deny, q.DenyMessage)
+	} else if s.unsafePeer && p.IsOwner() {
 		err = s.agents.SteerOneShotForAgent(agentID, req.SessionKey, req.Content)
 	} else {
 		err = s.agents.SteerOneShotFromOrigin(agentID, req.SessionKey, p.PeerID, req.Content)
 	}
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrQuestionNotFound):
+			writeError(w, http.StatusNotFound, "question_not_found", err.Error())
+		case errors.Is(err, agent.ErrInvalidQuestionAnswer):
+			writeError(w, http.StatusBadRequest, "invalid_answers", err.Error())
 		case errors.Is(err, agent.ErrSteerOriginForbidden):
 			writeError(w, http.StatusForbidden, "forbidden", "external steer caller did not open this turn")
 		case errors.Is(err, agent.ErrSteerDeliveryUncertain):

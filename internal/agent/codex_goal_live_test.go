@@ -201,3 +201,78 @@ func TestCodexGoalLiveCancellationReasons(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexGoalLiveReplyResume(t *testing.T) {
+	if os.Getenv("KOJO_TEST_CODEX_GOAL") != "1" {
+		t.Skip("authenticated native smoke")
+	}
+	home, _ := os.UserHomeDir()
+	if os.Getenv("CODEX_HOME") == "" {
+		t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	a := &Agent{ID: "ag_native_goal_reply_smoke", Tool: ToolCodex}
+	b := NewCodexBackend(slog.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	events, err := b.Chat(ctx, a, "Return 2.", "Smoke test: no filesystem or web tools; compute arithmetic and mark native goal complete.", ChatOptions{Goal: &GoalRequest{Action: "start", Objective: "Compute 1+1, respond 2, and mark the goal complete."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused := make(chan error, 1)
+	requested := false
+	for ev := range events {
+		if ev.Goal != nil && ev.Goal.Status == "active" && !requested {
+			requested = true
+			go func() {
+				reply, err := b.Chat(ctx, a, "", "", ChatOptions{Goal: &GoalRequest{Action: "pause"}})
+				if err == nil {
+					for e := range reply {
+						if e.ErrorMessage != "" {
+							err = errors.New(e.ErrorMessage)
+						}
+					}
+				}
+				paused <- err
+			}()
+		}
+	}
+	if !requested {
+		t.Fatal("no active state")
+	}
+	if err = <-paused; err != nil {
+		t.Fatal(err)
+	}
+	binding, err := goalBindingFor(a.ID, "")
+	if err != nil || binding == nil || !binding.DesiredPaused {
+		t.Fatalf("pause not persisted: %+v %v", binding, err)
+	}
+	// Original process is gone; resume must use its persisted native thread.
+	events, err = b.Chat(ctx, a, "The answer has changed: respond with REPLY_DELIVERED_739 instead of 2, then mark the goal complete.", "Smoke test; no external tools.", ChatOptions{ResumeGoalOnReply: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete := false
+	receivedReply := false
+	for ev := range events {
+		t.Logf("event type=%s goal=%+v message=%+v delta=%s error=%s", ev.Type, ev.Goal, ev.Message, ev.Delta, ev.ErrorMessage)
+		if ev.ErrorMessage != "" {
+			t.Error(ev.ErrorMessage)
+		}
+		if ev.Message != nil && strings.Contains(ev.Message.Content+ev.Message.Thinking, "REPLY_DELIVERED_739") {
+			receivedReply = true
+		}
+		if ev.Goal != nil {
+			complete = ev.Goal.Status == "complete"
+		}
+	}
+	if !complete || !receivedReply {
+		t.Fatalf("resume complete=%v receivedReply=%v", complete, receivedReply)
+	}
+	events, err = b.Chat(ctx, a, "", "", ChatOptions{Goal: &GoalRequest{Action: "clear"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range events {
+	}
+}

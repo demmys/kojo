@@ -86,3 +86,7 @@ self-migration requires a post-turn native-tail handoff protocol.
 - Live physical peer migration, browser clicking and Slack delivery still need
   deployment verification; unit/in-process HTTP tests do not substitute for
   those end-to-end checks.
+
+### Replies in Slack goal threads
+
+A normal human reply in a Slack thread with an unfinished goal resumes that goal automatically, including blocked or paused goals. The reply (including attachment context) is delivered as a user turn before autonomous continuation is reactivated. Replies during a running turn keep the existing steer behavior. Completed or cleared goals remain ordinary conversations. Explicit `!goal` commands retain their meaning; `!goal <objective>` still starts a new goal, while `!goal clear` removes the old goal.

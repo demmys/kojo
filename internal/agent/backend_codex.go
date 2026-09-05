@@ -109,7 +109,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 
 	args := []string{"app-server"}
 	binding, bindingErr := goalBindingFor(agent.ID, opts.SessionKey)
-	if bindingErr != nil && opts.Goal != nil {
+	if bindingErr != nil && (opts.Goal != nil || opts.ResumeGoalOnReply) {
 		return nil, bindingErr
 	}
 	if opts.Goal != nil || binding != nil {
@@ -161,12 +161,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// thread/resume reconciles this fence before it can resume native goals.
 		runtime.mu.Lock()
 		stopped := runtime.stopRequested
+		isGoal := runtime.isGoal
 		runtime.mu.Unlock()
 		preserve := opts.PreserveGoalOnCancel != nil && opts.PreserveGoalOnCancel()
-		if opts.GoalRunID != "" && opts.Goal != nil {
+		if opts.GoalRunID != "" && isGoal {
 			preserve = true
 		}
-		if !opts.OneShot && (opts.Goal != nil || (binding != nil && binding.State != nil)) {
+		if !opts.OneShot && (isGoal || (binding != nil && binding.State != nil)) {
 			_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
 				if b.State != nil && b.State.Status != "complete" {
 					if stopped || !preserve {
@@ -363,7 +364,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Goal controls on an idle conversation operate on persisted native
 		// state WITHOUT thread/resume (resuming an active goal can start work).
 		refBefore, refErr := readCodexThreadRef(agent.ID, opts.SessionKey)
-		if refErr != nil && opts.Goal != nil {
+		if refErr != nil && (opts.Goal != nil || opts.ResumeGoalOnReply) {
 			send(ChatEvent{Type: "error", ErrorMessage: refErr.Error()})
 			shutdown()
 			return
@@ -438,6 +439,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			old := decodeGoal(msg.Result)
+			if opts.ResumeGoalOnReply && opts.Goal == nil && old != nil && old.Status != "complete" {
+				opts.Goal = &GoalRequest{Action: "resume"}
+				runtime.mu.Lock()
+				runtime.isGoal = true
+				runtime.mu.Unlock()
+			}
 			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && refBefore.Goal.ActivationPending))) {
 				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) { g.State = old }); err != nil {
 					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
@@ -728,7 +735,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				shutdown()
 				return
 			}
-			result := runCodexGoal(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, qs)
+			var replyStart func() (int64, error)
+			if opts.ResumeGoalOnReply {
+				replyStart = func() (int64, error) { return startTurn(userMessage) }
+			}
+			result := runCodexGoalWithReply(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, replyStart, qs)
 			if ctx.Err() != nil {
 				shutdown()
 				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)

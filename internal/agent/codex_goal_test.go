@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -90,5 +91,63 @@ func TestGoalBindingKeepsPauseIntentOnLateNativeUpdate(t *testing.T) {
 	b, _ := goalBindingFor(id, "key")
 	if !b.DesiredPaused {
 		t.Fatal("late update revived stopped goal")
+	}
+}
+
+func TestGoalReplyAcceptedBeforeActivation(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		t.Run(fmt.Sprint(reject), func(t *testing.T) {
+			id, _ := setupCodexTransferTest(t)
+			tid := "019e7cc9-dd5e-7971-b654-7840c683879e"
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			writeCodexThreadRef(id, "", codexThreadRef{ThreadID: tid}, logger)
+			lines := []string{`{"id":1,"result":{}}`, rpcLine("turn/started", map[string]any{"turn": map[string]any{"id": "reply"}}), `{"id":2,"result":{"goal":{"status":"active"}}}`, rpcLine("turn/completed", map[string]any{"turn": map[string]any{"status": "completed"}}), `{"id":3,"result":{"goal":{"status":"complete"}}}`}
+			if reject {
+				lines = []string{`{"id":1,"error":{"code":-1,"message":"rejected"}}`}
+			}
+			var methods []string
+			r := &codexGoalRuntime{agentID: id, threadID: tid, pending: map[int64]chan *rpcMessage{}, write: func(method string, _ any) (int64, error) {
+				methods = append(methods, method)
+				return int64(len(methods)), nil
+			}}
+			result := runCodexGoalWithReply(newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n"))), &GoalRequest{Action: "resume"}, r, nil, nil, logger, func(ChatEvent) bool { return true }, func() (int64, error) { return r.write("turn/start", nil) })
+			if reject {
+				binding, err := goalBindingFor(id, "")
+				if err != nil || binding == nil || !binding.DesiredPaused {
+					t.Fatalf("rejected reply can recover: %+v %v", binding, err)
+				}
+				if len(methods) != 1 || !strings.Contains(result.processError, "rejected") {
+					t.Fatalf("methods=%v error=%s", methods, result.processError)
+				}
+				return
+			}
+			if !result.turnCompleted || result.processError != "" || strings.Join(methods, ",") != "turn/start,thread/goal/set,thread/goal/get" {
+				t.Fatalf("methods=%v result=%+v", methods, result)
+			}
+		})
+	}
+}
+
+func TestGoalReplyActivationFailureRemainsPaused(t *testing.T) {
+	for _, response := range []string{`{"id":2,"error":{"code":-1,"message":"activation rejected"}}`, "", "stop"} {
+		t.Run(response, func(t *testing.T) {
+			id, _ := setupCodexTransferTest(t)
+			tid := "019e7cc9-dd5e-7971-b654-7840c683879e"
+			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+			writeCodexThreadRef(id, "", codexThreadRef{ThreadID: tid, Goal: &GoalBinding{State: &CodexGoal{Status: "active"}, RecoveryPending: true}}, logger)
+			var calls int64
+			r := &codexGoalRuntime{agentID: id, threadID: tid, pending: map[int64]chan *rpcMessage{}, write: func(string, any) (int64, error) { calls++; return calls, nil }}
+			lines := `{"id":1,"result":{}}` + "\n" + response
+			result := runCodexGoalWithReply(newCodexLineScanner(strings.NewReader(lines)), &GoalRequest{Action: "resume"}, r, nil, nil, logger, func(ChatEvent) bool { return true }, func() (int64, error) {
+				if response == "stop" {
+					r.stopRequested = true
+				}
+				return r.write("turn/start", nil)
+			})
+			binding, err := goalBindingFor(id, "")
+			if result.processError == "" || err != nil || binding == nil || !binding.DesiredPaused || binding.RecoveryPending || binding.ActivationPending {
+				t.Fatalf("result=%+v binding=%+v err=%v", result, binding, err)
+			}
+		})
 	}
 }

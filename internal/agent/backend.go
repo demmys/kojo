@@ -56,7 +56,7 @@ type ChatOptions struct {
 
 	// SessionKey overrides the default agent-ID-based session identifier.
 	// The key is hashed into a deterministic UUID so callers can pass any
-	// stable string (e.g. "slack:<channel>:<thread>") to get an independent
+	// stable string (e.g. "<agentID>:slack:<channel>:<thread>") to get an independent
 	// Claude session JSONL. Used for per-Slack-thread session resumption
 	// where each conversation thread maintains its own context, isolated
 	// from the agent's WebUI session and from other threads.

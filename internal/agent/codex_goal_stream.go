@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"log/slog"
+	"strings"
 )
 
 // Native app-server owns continuation: goal/set active starts idle work itself.
@@ -35,6 +36,14 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 	}
 	current := &codexStreamResult{questions: qs}
 	phases := map[string]string{}
+	// Slack control responses belong to each native turn, not the accumulated
+	// goal transcript. Filter before events leave this peer and before absorb.
+	slackTurn := strings.HasPrefix(r.key, r.agentID+":slack:")
+	text := newGoalTurnText(slackTurn, false, send)
+	absorbCurrent := func() {
+		text.finish(current)
+		combined.absorb(current)
+	}
 	method, params := goalRPC(q, r.threadID)
 	var startID, replyID int64
 	var err error
@@ -137,7 +146,7 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				continue
 			}
 			if !publish(decodeGoal(msg.Params)) {
-				combined.absorb(current)
+				absorbCurrent()
 				return combined
 			}
 			if goal != nil && goal.Status == "paused" && inTurn && currentTurnID != "" {
@@ -168,7 +177,7 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				steer.setTurnID(decodeCodexTurnID(msg.Params))
 			}
 		case "turn/completed":
-			current.handleNotification(&msg, phases, logger, send)
+			current.handleNotification(&msg, phases, logger, text.send)
 			if current.turnStatus == "interrupted" && (goal == nil || goal.Status == "paused") {
 				current.processError = ""
 			}
@@ -178,14 +187,15 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 					return combined
 				}
 			}
-			combined.absorb(current)
+			absorbCurrent()
 			current = &codexStreamResult{questions: qs}
+			text = newGoalTurnText(slackTurn, combined.fullText.Len() > 0, send)
 			phases = map[string]string{}
 			inTurn = false
 			if steer != nil {
 				steer.finishTurn()
 			}
-			if combined.processError != "" {
+			if combined.processError != "" || combined.cancelled {
 				return combined
 			}
 
@@ -195,16 +205,14 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				combined.processError = err.Error()
 				return combined
 			}
-			combined.fullText.WriteString("\n\n")
-			send(ChatEvent{Type: "text", Delta: "\n\n"})
 		default:
-			if current.handleNotification(&msg, phases, logger, send) && current.cancelled {
-				combined.absorb(current)
+			if current.handleNotification(&msg, phases, logger, text.send) && current.cancelled {
+				absorbCurrent()
 				return combined
 			}
 		}
 	}
-	combined.absorb(current)
+	absorbCurrent()
 	if combined.processError == "" {
 		combined.processError = "Codex goal stream ended before goal stopped"
 		if err := scanner.Err(); err != nil {

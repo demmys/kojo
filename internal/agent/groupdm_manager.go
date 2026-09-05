@@ -1744,7 +1744,16 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	if !captureOnHolder {
 		attachmentWatcher = m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
 	}
+	goal, goalErr := ParseGoalCommand(firstUserMessage)
+	if goalErr != nil {
+		m.handleThreadTurnError(groupID, agentID, payload, goalErr)
+		return
+	}
+	if goal != nil && historyBeforeID != "" {
+		goal.OperationID = "groupdm:" + groupID + ":" + historyBeforeID
+	}
 	oneShotOpts := OneShotOpts{
+		Goal:                              goal,
 		SessionKey:                        "groupdm:" + groupID,
 		History:                           history,
 		HistorySelfUserID:                 agentID,

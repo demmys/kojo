@@ -30,6 +30,11 @@ const ErrMsgCancelled = "cancelled: process was terminated"
 
 // ChatOptions holds optional parameters for a chat invocation.
 type ChatOptions struct {
+	Goal                 *GoalRequest
+	GoalRunID            string
+	GoalUserID           string
+	OriginPeerID         string
+	PreserveGoalOnCancel func() bool
 	// OneShot skips session resumption, running a fresh ephemeral session.
 	// Used for Slack and other external platform conversations that have
 	// their own conversation context.

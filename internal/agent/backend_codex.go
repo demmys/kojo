@@ -71,6 +71,32 @@ func (b *CodexBackend) Available() bool {
 }
 
 func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	if err := opts.Goal.Validate(); err != nil {
+		return nil, err
+	}
+	if opts.Goal != nil && opts.OneShot {
+		return nil, errors.New("native goals require a persistent conversation")
+	}
+	goalKey := codexThreadRefPath(agent.ID, opts.SessionKey)
+	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	if !opts.OneShot {
+		if old, loaded := codexGoalRuntimes.LoadOrStore(goalKey, runtime); loaded {
+			if opts.Goal == nil {
+				return nil, ErrAgentBusy
+			}
+			g, err := old.(*codexGoalRuntime).control(ctx, opts.Goal)
+			if err != nil {
+				return nil, err
+			}
+			return goalControlEvents(g), nil
+		}
+	}
+	launched := false
+	defer func() {
+		if !launched && !opts.OneShot {
+			codexGoalRuntimes.CompareAndDelete(goalKey, runtime)
+		}
+	}()
 	codexPath, err := exec.LookPath("codex")
 	if err != nil {
 		return nil, fmt.Errorf("codex not found in PATH")
@@ -82,6 +108,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	}
 
 	args := []string{"app-server"}
+	binding, bindingErr := goalBindingFor(agent.ID, opts.SessionKey)
+	if bindingErr != nil && opts.Goal != nil {
+		return nil, bindingErr
+	}
+	if opts.Goal != nil || binding != nil {
+		args = append(args, "-c", "features.goals=true")
+		if effort := codexEffortForProtocol(agent.Model, agent.Effort); effort != "" {
+			args = append(args, "-c", "model_reasoning_effort="+tomlString(effort))
+		}
+	} else {
+		// Only explicitly enabled conversations may create native goals.
+		args = append(args, "-c", "features.goals=false")
+	}
 	for _, kv := range b.extraConfig {
 		args = append(args, "-c", kv)
 	}
@@ -118,6 +157,26 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
 	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	cmd.Cancel = func() error {
+		// Persist intent before killing a possibly unresponsive CLI. A later
+		// thread/resume reconciles this fence before it can resume native goals.
+		runtime.mu.Lock()
+		stopped := runtime.stopRequested
+		runtime.mu.Unlock()
+		preserve := opts.PreserveGoalOnCancel != nil && opts.PreserveGoalOnCancel()
+		if opts.GoalRunID != "" && opts.Goal != nil {
+			preserve = true
+		}
+		if !opts.OneShot && (opts.Goal != nil || (binding != nil && binding.State != nil)) {
+			_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+				if b.State != nil && b.State.Status != "complete" {
+					if stopped || !preserve {
+						b.DesiredPaused = true
+						b.Generation++
+					}
+					b.RecoveryPending = preserve && !stopped && !b.DesiredPaused
+				}
+			})
+		}
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 10 * time.Second
@@ -139,10 +198,15 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, fmt.Errorf("start codex app-server: %w", err)
 	}
 
+	launched = true
 	ch := make(chan ChatEvent, 64)
 
 	go func() {
 		defer close(ch)
+		defer runtime.close()
+		if !opts.OneShot {
+			defer codexGoalRuntimes.CompareAndDelete(goalKey, runtime)
+		}
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
@@ -295,6 +359,126 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Step 2: Send initialized notification (no params per protocol)
 		sendNotify("initialized")
 
+		// Goal controls on an idle conversation operate on persisted native
+		// state WITHOUT thread/resume (resuming an active goal can start work).
+		refBefore, refErr := readCodexThreadRef(agent.ID, opts.SessionKey)
+		if refErr != nil && opts.Goal != nil {
+			send(ChatEvent{Type: "error", ErrorMessage: refErr.Error()})
+			shutdown()
+			return
+		}
+		if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil {
+			if refBefore == nil || refBefore.Goal == nil || refBefore.Goal.DesiredPaused || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal changed or paused since recovery was scheduled"})
+				shutdown()
+				return
+			}
+		}
+		if opts.Goal != nil && refBefore != nil && goalOperationSeen(refBefore.Goal, opts.Goal.OperationID) {
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State), "", nil, nil)})
+			shutdown()
+			return
+		}
+		controlOnly := opts.Goal != nil && opts.Goal.Action != "start" && opts.Goal.Action != "resume"
+		if controlOnly {
+			if refBefore == nil {
+				send(ChatEvent{Type: "done", Message: assembleAssistantMessage("Goal: none.", "", nil, nil)})
+				shutdown()
+				return
+			}
+			if opts.Goal.Action == "pause" || opts.Goal.Action == "clear" {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.DesiredPaused = true; b.Generation++ }); err != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+					shutdown()
+					return
+				}
+			}
+			method, params := goalRPC(opts.Goal, refBefore.ThreadID)
+			id := sendRPC(method, params)
+			msg, ok, err := waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+			if err != nil || !ok || msg.Error != nil {
+				detail := "goal API unavailable"
+				if err != nil {
+					detail = err.Error()
+				} else if ok && msg.Error != nil {
+					detail = msg.Error.Message
+				}
+				send(ChatEvent{Type: "error", ErrorMessage: detail})
+				shutdown()
+				return
+			}
+			goal := decodeGoal(msg.Result)
+			if opts.Goal.Action == "clear" {
+				goal = nil
+			}
+			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.State = goal; rememberGoalOperation(b, opts.Goal.OperationID) }); err != nil {
+				send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				shutdown()
+				return
+			}
+			send(ChatEvent{Type: "goal", Goal: goal})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal), "", nil, nil)})
+			shutdown()
+			return
+		}
+		if opts.Goal != nil && opts.Goal.Action == "resume" && (refBefore == nil || refBefore.Goal == nil || refBefore.Goal.State == nil) {
+			send(ChatEvent{Type: "error", ErrorMessage: "no goal to resume"})
+			shutdown()
+			return
+		}
+		if refBefore != nil && refBefore.Goal != nil {
+			// Never let resume activate a stored goal before this runner owns its
+			// stream. Pausing preserves native usage accounting.
+			id := sendRPC("thread/goal/get", map[string]any{"threadId": refBefore.ThreadID})
+			msg, ok, err := waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+			if err != nil || !ok || msg.Error != nil {
+				send(ChatEvent{Type: "error", ErrorMessage: "cannot read native goal before resume"})
+				shutdown()
+				return
+			}
+			old := decodeGoal(msg.Result)
+			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && refBefore.Goal.ActivationPending))) {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) { g.State = old }); err != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				} else {
+					send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(old), "", nil, nil)})
+				}
+				shutdown()
+				return
+			}
+
+			if opts.Goal != nil && opts.Goal.Action == "start" && old != nil && old.Status != "complete" {
+				send(ChatEvent{Type: "error", ErrorMessage: "this conversation already has a goal; clear it before starting another"})
+				shutdown()
+				return
+			}
+			if opts.Goal != nil && opts.Goal.Action == "resume" && (old == nil || old.Status == "complete") {
+				send(ChatEvent{Type: "error", ErrorMessage: "no unfinished goal to resume"})
+				shutdown()
+				return
+			}
+			if opts.Goal == nil && old != nil && old.Status == "active" && !refBefore.Goal.DesiredPaused {
+				send(ChatEvent{Type: "error", ErrorMessage: "this conversation has an active goal without a runner; use !goal resume or !goal pause"})
+				shutdown()
+				return
+			}
+			if old != nil && old.Status == "active" {
+				if opts.Goal != nil {
+					if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.ActivationPending = true }); err != nil {
+						send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+						shutdown()
+						return
+					}
+				}
+				id = sendRPC("thread/goal/set", map[string]any{"threadId": refBefore.ThreadID, "status": "paused"})
+				msg, ok, err = waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+				if err != nil || !ok || msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: "cannot pause native goal before resume"})
+					shutdown()
+					return
+				}
+			}
+		}
 		// Step 3: Start or resume thread.
 		//
 		// systemPrompt (already merged with any SystemPromptExtra by the
@@ -320,6 +504,18 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			threadParams["baseInstructions"] = systemPrompt
 		}
 
+		if opts.Goal != nil {
+			setup := userMessage
+			if opts.Goal.Action == "resume" && refBefore != nil && refBefore.Goal != nil {
+				setup = refBefore.Goal.SetupContext
+			}
+			if len(setup) > 1<<20 {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal setup context exceeds 1 MiB"})
+				shutdown()
+				return
+			}
+			threadParams["baseInstructions"] = systemPrompt + "\n\nGoal setup context (reference data for the explicit goal):\n" + setup
+		}
 		var rolloutPath string
 		var existingRef *codexThreadRef
 		resumed := false
@@ -344,6 +540,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					return
 				}
 				if msg.Error != nil {
+					if ref.Goal != nil || opts.Goal != nil {
+						send(ChatEvent{Type: "error", ErrorMessage: "goal thread resume failed: " + msg.Error.Message})
+						shutdown()
+						return
+					}
 					b.logger.Warn("codex thread/resume failed; starting a fresh thread",
 						"agent", agent.ID, "sessionKey", opts.SessionKey,
 						"thread_id", ref.ThreadID, "err", msg.Error.Message)
@@ -398,6 +599,12 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			writeCodexThreadRef(agent.ID, opts.SessionKey, codexThreadRef{
 				ThreadID:    threadID,
 				RolloutPath: rolloutPath,
+				Goal: func() *GoalBinding {
+					if existingRef != nil {
+						return existingRef.Goal
+					}
+					return nil
+				}(),
 			}, b.logger)
 		}
 
@@ -435,9 +642,110 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		if opts.OnSteerReady != nil {
 			steerer = newCodexSteerer(threadID, sendRPCErr)
 			defer steerer.close()
-			opts.OnSteerReady(steerer.steer)
+			if opts.Goal == nil {
+				opts.OnSteerReady(func(text string) error {
+					q, err := ParseGoalCommand(text)
+					if err != nil {
+						return err
+					}
+					if q != nil {
+						return errors.New("wait for the ordinary turn to finish before changing its goal")
+					}
+					return steerer.steer(text)
+				})
+			}
 		}
 
+		if opts.Goal != nil {
+			runtime.mu.Lock()
+			runtime.write = sendRPCErr
+			runtime.threadID = threadID
+			runtime.mu.Unlock()
+			if ctx.Err() != nil {
+				shutdown()
+				return
+			}
+			runtime.mu.Lock()
+			stopped := runtime.stopRequested
+			if stopped {
+				runtime.mu.Unlock()
+				shutdown()
+				return
+			}
+			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) {
+				if ctx.Err() != nil {
+					g.DesiredPaused = true
+					return
+				}
+				if opts.Goal.Action == "start" {
+					g.SetupContext = userMessage
+					g.State = &CodexGoal{ThreadID: threadID, Objective: opts.Goal.Objective, Status: "active", TokenBudget: opts.Goal.TokenBudget}
+				}
+				g.Generation++
+				g.DesiredPaused = false
+				g.RecoveryPending = false
+				g.ActivationPending = true
+				if opts.Goal.ExpectedGeneration == nil {
+					g.RecoveryAttempts = 0
+					g.RuntimeFailures = 0
+				}
+				g.RunID = opts.GoalRunID
+				if opts.GoalUserID != "" {
+					g.UserID = opts.GoalUserID
+				}
+				if opts.OriginPeerID != "" {
+					g.OriginPeerID = opts.OriginPeerID
+				}
+				// Pending activation is fenced before RPC; success is recorded on ACK.
+			}); err != nil {
+				runtime.mu.Unlock()
+				send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				shutdown()
+				return
+			}
+			runtime.mu.Unlock()
+			if opts.OnSteerReady != nil {
+				opts.OnSteerReady(func(text string) error {
+					q, err := ParseGoalCommand(text)
+					if err != nil {
+						return err
+					}
+					if q != nil {
+						g, err := runtime.control(ctx, q)
+						if err == nil {
+							send(ChatEvent{Type: "text", Delta: "\n\n" + goalSummary(g) + "\n"})
+						}
+						return err
+					}
+					return steerer.steer(text)
+				})
+			}
+			if ctx.Err() != nil {
+				shutdown()
+				return
+			}
+			result := runCodexGoal(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send)
+			if ctx.Err() != nil {
+				shutdown()
+				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)
+				return
+			}
+			if result.processError != "" {
+				_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+					if b.State != nil && b.State.Status == "active" && !b.DesiredPaused {
+						b.RuntimeFailures++
+						b.RecoveryPending = b.RuntimeFailures < 3
+						if b.RuntimeFailures >= 3 {
+							b.DesiredPaused = true
+							b.Generation++
+						}
+					}
+				})
+			}
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			shutdown()
+			return
+		}
 		if !send(ChatEvent{Type: "status", Status: "thinking"}) {
 			shutdown()
 			return

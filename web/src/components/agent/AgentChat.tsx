@@ -41,6 +41,8 @@ import {
   type StreamingTool,
 } from "./chatEventReducer";
 
+import { GoalControls } from "../GoalControls";
+
 const PAGE_SIZE = 30;
 
 export function AgentChat() {
@@ -54,7 +56,10 @@ export function AgentChat() {
   // listing it as a dependency.
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
-  const [agent, setAgent] = useState<AgentInfo | null>(null);
+  const [goalMode,setGoalMode]=useState(false);
+ const [goalBudget,setGoalBudget]=useState("");
+ useEffect(() => {setGoalMode(false);setGoalBudget("");}, [id]);
+ const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const { input, setInput } = useDraftInput("agent-draft", id);
   // Live mirrors for async completions (queued offline send) that must
@@ -722,7 +727,7 @@ export function AgentChat() {
   // backend "unsupported", a busy agent, quiescing, or a server error) — never
   // the common race — so the recovery just restores the text without the old
   // deferred WS-terminal fallback machinery.
-  const handleSteer = (text: string) => {
+  const handleSteer = (text: string, preserveDraft = false) => {
     if (!id) return;
     const pendingId = "pending_" + Date.now();
     setMessages((prev) => [...prev, {
@@ -731,7 +736,7 @@ export function AgentChat() {
       content: text,
       timestamp: localRFC3339(),
     }]);
-    setInput("");
+    if (!preserveDraft) setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     const sentForId = id;
@@ -778,14 +783,15 @@ export function AgentChat() {
       // newline-separated, when the user already typed something).
       setMessages((prev) => prev.filter((m) => m.id !== pendingId));
       const cur = textareaRef.current?.value ?? "";
-      setInput(cur ? cur + "\n" + text : text);
+      if (!preserveDraft) setInput(cur ? cur + "\n" + text : text);
     });
   };
 
-  const handleSend = () => {
-    const text = input.trim();
+  const handleSend = (command?: string) => {
+    const text = command ?? (goalMode && !streaming && input.trim() ? "!goal " + (goalBudget ? "--tokens " + goalBudget + " " : "") + input.trim() : input.trim());
+    const files = command === undefined ? pendingFiles : [];
     if (streaming) {
-      if (text) handleSteer(text);
+      if (text) handleSteer(text, command !== undefined);
       return;
     }
     // Holder peer offline → the WS frame would dead-end at the Hub
@@ -798,7 +804,7 @@ export function AgentChat() {
     if (holderOffline) {
       if (!id) return;
       if (queueSendTokenRef.current !== 0) return; // one POST at a time
-      if (pendingFiles.length > 0) {
+      if (files.length > 0) {
         // The queue endpoint is text-only. Files can be attached only
         // while online (AttachButton is disabled offline), so these
         // predate the outage — refuse rather than silently drop them.
@@ -811,7 +817,7 @@ export function AgentChat() {
       queueSendTokenRef.current = token;
       // Clear the draft up-front (same optimistic UX as the online
       // path) so a slow response can't wipe text typed in the interim.
-      setInput("");
+      if (command === undefined) setInput("");
       if (textareaRef.current) textareaRef.current.style.height = "auto";
       const sentForId = id;
       agentApi.postAgentMessage(id, text).then((r) => {
@@ -847,11 +853,11 @@ export function AgentChat() {
         );
         // The draft was cleared optimistically — put the failed text
         // back so the user can retry, unless they typed something new.
-        if (!inputRef.current.trim()) setInput(text);
+        if (command === undefined && !inputRef.current.trim()) setInput(text);
       });
       return;
     }
-    if ((!text && pendingFiles.length === 0) || !connected) return;
+    if ((!text && files.length === 0) || !connected) return;
     abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
@@ -859,19 +865,20 @@ export function AgentChat() {
       id: "pending_" + Date.now(),
       role: "user",
       content: text,
-      attachments: pendingFiles.length > 0 ? pendingFiles : undefined,
+      attachments: files.length > 0 ? files : undefined,
       timestamp: localRFC3339(),
     };
     setMessages((prev) => [...prev, userMsg]);
-    setInput("");
+    if (command === undefined) setInput("");
     setStreaming(true);
     setStreamText("");
     setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("thinking");
     setStreamStartTime(Date.now());
-    sendMessage(text, pendingFiles.length > 0 ? pendingFiles : undefined);
-    setPendingFiles([]);
+    sendMessage(text, files.length > 0 ? files : undefined);
+    if (command === undefined) setGoalMode(false);
+    if (command === undefined) setPendingFiles([]);
     setUploadError(null);
 
     // Reset textarea height
@@ -1413,6 +1420,7 @@ export function AgentChat() {
             onDismiss={() => speech.stop()}
           />
         )}
+        {agent?.tool === "codex" && id && <GoalControls agentId={id} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={streaming} onCommand={handleSend} />}
         {/* Pending file attachments */}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb />
         <div className="flex items-end gap-2">
@@ -1463,14 +1471,14 @@ export function AgentChat() {
             <>
               <StopButton onClick={handleAbort} />
               <SendButton
-                onClick={handleSend}
+                onClick={() => handleSend()}
                 disabled={!input.trim()}
                 title={t("chat.steerTitle")}
               />
             </>
           ) : (
             <SendButton
-              onClick={handleSend}
+              onClick={() => handleSend()}
               disabled={
                 holderOffline
                   // Attachments-only stays clickable so handleSend can

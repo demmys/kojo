@@ -58,6 +58,9 @@ type externalChatRouter struct {
 }
 
 type externalChatTextRequest struct {
+	GoalUserID                  string                    `json:"goalUserId,omitempty"`
+	GoalRunID                   string                    `json:"goalRunId,omitempty"`
+	Goal                        *agent.GoalRequest        `json:"goal,omitempty"`
 	InteractiveQuestions        bool                      `json:"-"`
 	Message                     string                    `json:"message"`
 	SessionKey                  string                    `json:"sessionKey,omitempty"`
@@ -239,6 +242,8 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		freshContext, resumeContext = agent.FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
 	}
 	req := externalChatTextRequest{
+		Goal:                        opts.Goal,
+		GoalUserID:                  opts.GoalUserID,
 		Message:                     message,
 		InteractiveQuestions:        opts.InteractiveQuestions,
 		SessionKey:                  opts.SessionKey,
@@ -598,6 +603,11 @@ func (r *externalChatRouter) selfPeerID() string {
 
 func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID, holder string, local bool, req externalChatTextRequest) externalChatDispatchResult {
 	s := r.server
+	if req.Goal != nil && req.Goal.ExpectedRunID != "" {
+		if err := s.checkGoalStop(routeCtx, agentID, req.Goal.ExpectedRunID); err != nil {
+			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
+		}
+	}
 	if local || holder == "" {
 		ready := s.externalChatReadiness(routeCtx, agentID)
 		if !ready.Ready {
@@ -611,6 +621,9 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 				err: errors.New(ready.Unavailable)}
 		}
 		events, err := s.agents.ChatOneShot(turnCtx, agentID, req.Message, agent.OneShotOpts{
+			Goal:                              req.Goal,
+			GoalUserID:                        req.GoalUserID,
+			GoalRunID:                         req.GoalRunID,
 			SessionKey:                        req.SessionKey,
 			InteractiveQuestions:              req.InteractiveQuestions,
 			FreshSessionContext:               req.FreshSessionContext,
@@ -652,8 +665,28 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			err: fmt.Errorf("holder %s is not ready: %s", holder, ready.Unavailable)}
 	}
 
+	if req.Goal != nil || req.ForceFreshSession {
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
+		}
+		req.GoalRunID = hex.EncodeToString(raw)
+	}
+	stopGoal := func() {
+		if req.GoalRunID != "" && !s.agents.NativeGoalsShuttingDown() {
+			if err := s.recordGoalStop(agentID, req.GoalRunID); err != nil {
+				s.logger.Error("persist native goal stop failed", "agent", agentID, "err", err)
+			}
+			if err := r.fenceRemoteGoalRun(agentID, holder, req.SessionKey, req.GoalRunID); err != nil {
+				s.logger.Warn("native goal stop not acknowledged; origin recovery remains fenced", "agent", agentID, "err", err)
+			}
+		}
+	}
 	resp, attempted, err := r.postRemote(turnCtx, agentID, holder, req)
 	if err != nil {
+		if turnCtx.Err() != nil {
+			stopGoal()
+		}
 		// The POST may have reached ChatOneShot before the connection failed.
 		// Never retry this turn on another holder.
 		state := externalChatDispatchStale
@@ -692,7 +725,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 
 	r.rememberRoute(agentID, holder)
 	out := make(chan agent.ChatEvent, 64)
-	go r.decodeExternalChatTextStream(turnCtx, agentID, holder, resp.Body, out)
+	go r.decodeExternalChatTextStream(turnCtx, agentID, holder, resp.Body, out, stopGoal)
 	return externalChatDispatchResult{events: out, state: externalChatDispatchDone}
 }
 
@@ -966,6 +999,9 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	}
 	defer releaseRelay()
 	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
+		Goal:                              req.Goal,
+		GoalUserID:                        req.GoalUserID,
+		GoalRunID:                         req.GoalRunID,
 		SessionKey:                        req.SessionKey,
 		InteractiveQuestions:              r.Header.Get("X-Kojo-Interactive-Questions") == "v1",
 		FreshSessionContext:               req.FreshSessionContext,
@@ -1216,23 +1252,38 @@ func (s *Server) externalChatPeerAllowed(w http.ResponseWriter, r *http.Request)
 	return false
 }
 
-func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, agentID, holder string, body io.ReadCloser, out chan<- agent.ChatEvent) {
+func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, agentID, holder string, body io.ReadCloser, out chan<- agent.ChatEvent, onCancel ...func()) {
 	defer body.Close()
 	// json.Decoder can otherwise remain blocked in Read after the Slack turn
 	// is cancelled. Closing the response body tears down the HTTP stream and,
 	// on the holder, cancels the request context passed to ChatOneShot.
-	stopClose := context.AfterFunc(ctx, func() { _ = body.Close() })
+	cancelOnce := sync.OnceFunc(func() {
+		for _, f := range onCancel {
+			f()
+		}
+	})
+	stopClose := context.AfterFunc(ctx, func() { cancelOnce(); _ = body.Close() })
 	defer stopClose()
 	dec := json.NewDecoder(body)
 	terminal := false
 	closed := false
 	closeOut := func() {
+		// Every close path, including attachment finalization, must commit
+		// stop intent before the adapter can admit a queued recovery.
+		if ctx.Err() != nil {
+			cancelOnce()
+		}
 		if !closed {
 			close(out)
 			closed = true
 		}
 	}
-	defer closeOut()
+	defer func() {
+		if ctx.Err() != nil {
+			cancelOnce()
+		}
+		closeOut()
+	}()
 	type pendingAttachmentAck struct {
 		event agent.ChatEvent
 		token string

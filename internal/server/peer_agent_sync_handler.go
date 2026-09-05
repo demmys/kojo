@@ -321,12 +321,14 @@ type codexSessionWire struct {
 }
 
 type codexThreadWire struct {
-	RefName           string                 `json:"ref_name"`
-	ThreadID          string                 `json:"thread_id"`
-	RolloutRelPath    string                 `json:"rollout_rel_path"`
-	RolloutContentB64 string                 `json:"rollout_content_b64"`
-	ThreadRow         *agent.CodexSQLiteRow  `json:"thread_row,omitempty"`
-	DynamicToolRows   []agent.CodexSQLiteRow `json:"dynamic_tool_rows,omitempty"`
+	Goal              *agent.GoalBinding       `json:"goal,omitempty"`
+	NativeGoal        *agent.CodexGoalTransfer `json:"native_goal,omitempty"`
+	RefName           string                   `json:"ref_name"`
+	ThreadID          string                   `json:"thread_id"`
+	RolloutRelPath    string                   `json:"rollout_rel_path"`
+	RolloutContentB64 string                   `json:"rollout_content_b64"`
+	ThreadRow         *agent.CodexSQLiteRow    `json:"thread_row,omitempty"`
+	DynamicToolRows   []agent.CodexSQLiteRow   `json:"dynamic_tool_rows,omitempty"`
 }
 
 type peerAgentSyncResponse struct {
@@ -595,14 +597,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			if !ok {
 				return
 			}
-			decodedCodex.Threads = append(decodedCodex.Threads, agent.CodexThreadTransfer{
-				RefName:         ct.RefName,
-				ThreadID:        ct.ThreadID,
-				RolloutRelPath:  ct.RolloutRelPath,
-				RolloutContent:  body,
-				ThreadRow:       ct.ThreadRow,
-				DynamicToolRows: ct.DynamicToolRows,
-			})
+			decodedCodex.Threads = append(decodedCodex.Threads, ct.toTransfer(body))
 		}
 	}
 
@@ -1127,4 +1122,11 @@ func takeSettingFold(settings map[string]any, wanted string) (any, bool) {
 		}
 	}
 	return value, found
+}
+
+func codexThreadToWire(th agent.CodexThreadTransfer) codexThreadWire {
+	return codexThreadWire{Goal: th.Goal, NativeGoal: th.NativeGoal, RefName: th.RefName, ThreadID: th.ThreadID, RolloutRelPath: th.RolloutRelPath, RolloutContentB64: base64.StdEncoding.EncodeToString(th.RolloutContent), ThreadRow: th.ThreadRow, DynamicToolRows: th.DynamicToolRows}
+}
+func (ct codexThreadWire) toTransfer(body []byte) agent.CodexThreadTransfer {
+	return agent.CodexThreadTransfer{Goal: ct.Goal, NativeGoal: ct.NativeGoal, RefName: ct.RefName, ThreadID: ct.ThreadID, RolloutRelPath: ct.RolloutRelPath, RolloutContent: body, ThreadRow: ct.ThreadRow, DynamicToolRows: ct.DynamicToolRows}
 }

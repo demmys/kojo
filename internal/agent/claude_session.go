@@ -397,6 +397,7 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		lastActivity: time.Now(),
 	}
 	s.qstate = newClaudeQuestionState(s.stdinW)
+	s.qstate.onWriteFailure = func() { _ = cmd.Process.Kill() }
 	// Background-subagent tailer: surfaces Task(run_in_background) output that
 	// outlives the spawning turn. Tied to procCtx so the poll loop dies with
 	// the process. Only started when a handler is registered.

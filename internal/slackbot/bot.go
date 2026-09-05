@@ -33,6 +33,10 @@ type oneShotSteerer interface {
 
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
+	questionsMu sync.Mutex
+	questions   map[string]*slackQuestion
+	questionOps int
+
 	agentID      string
 	agentDataDir string // agent data directory for history file storage
 	config       agent.SlackBotConfig
@@ -392,6 +396,16 @@ func TestConnection(ctx context.Context, appToken, botToken string) (team, botUs
 
 func (b *Bot) handleEvent(ctx context.Context, evt socketmode.Event) {
 	switch evt.Type {
+	case socketmode.EventTypeInteractive:
+		cb, ok := evt.Data.(slack.InteractionCallback)
+		if !ok || evt.Request == nil {
+			return
+		}
+		payload, work := b.prepareQuestionInteraction(cb)
+		b.sm.Ack(*evt.Request, payload)
+		if work != nil {
+			go work()
+		}
 	case socketmode.EventTypeEventsAPI:
 		evtAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 		if !ok {
@@ -1038,7 +1052,8 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
 	if arrival != nil {
 		arrivalReservation = &slackHandoffReservation{
-			bot: b, channel: channel, threadTS: threadTS,
+			userID: userID,
+			bot:    b, channel: channel, threadTS: threadTS,
 			reservation: arrival, history: arrivalHistory, source: active,
 		}
 	}
@@ -1054,8 +1069,11 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	if goal != nil && messageTS != "" {
 		goal.OperationID = "slack:" + channel + ":" + messageTS
 	}
+	_, canAnswerQuestions := b.mgr.(oneShotQuestionAnswerer)
 	events, err := b.mgr.ChatOneShot(turnCtx, b.agentID, message, agent.OneShotOpts{
 		Goal:                              goal,
+		GoalUserID:                        userID,
+		InteractiveQuestions:              canAnswerQuestions && userID != "",
 		SessionKey:                        sessionKey,
 		History:                           history,
 		HistorySelfUserID:                 b.botUserID,
@@ -1196,6 +1214,9 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	// it would race the main loop on streamTS / deadStreams / lastAppend
 	// and could interleave concurrent AppendStream calls on the same
 	// streamTS. Keeping everything in one goroutine avoids that entirely.
+	questionEvents, stopQuestions := b.questionWorker(turnCtx, channel, threadTS, userID, sessionKey, active)
+	defer stopQuestions()
+	questionOverflow := false
 	heartbeat := time.NewTicker(streamHeartbeatTick)
 	defer heartbeat.Stop()
 streamLoop:
@@ -1225,6 +1246,17 @@ streamLoop:
 		}
 
 		switch evt.Type {
+		case "user_question", "question_resolved":
+			if !questionOverflow {
+				select {
+				case questionEvents <- evt:
+				default:
+					questionOverflow = true
+					hasError = true
+					b.logger.Warn("question event queue full; cancelling turn", "agent", b.agentID)
+					turnCancel()
+				}
+			}
 		case "text":
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
@@ -2597,6 +2629,8 @@ type threadReservation struct {
 func (r *threadReservation) Wait() { <-r.ready }
 
 type slackHandoffReservation struct {
+	userID string // human who owns question forms across handoff
+
 	mu          sync.Mutex
 	bot         *Bot
 	channel     string
@@ -2698,7 +2732,7 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 		}
 		defer func() { <-r.bot.sem }()
 		r.bot.sendToAgentTurnReserved(r.bot.ctx, r.channel, r.threadTS, r.threadTS,
-			"", prompt, "", "", expectedHolder, nil, true, "", append([]chathistory.HistoryMessage{}, r.history...), r.reservation, nil,
+			"", prompt, "", r.userID, expectedHolder, nil, true, "", append([]chathistory.HistoryMessage{}, r.history...), r.reservation, nil,
 			arrivalCtx, arrivalCancel, arrivalActive)
 	}()
 	return nil

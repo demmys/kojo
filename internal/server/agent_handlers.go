@@ -1864,6 +1864,7 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 // {"requestId":"...","deny":true} to refuse. Mirrors the auth posture of the
 // steer handler (server-wide auth listener).
 func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	id := r.PathValue("id")
 
 	var body struct {
@@ -1889,6 +1890,8 @@ func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Reques
 		switch {
 		case errors.Is(err, agent.ErrAgentNotBusy):
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
+		case errors.Is(err, agent.ErrInvalidQuestionAnswer):
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		case errors.Is(err, agent.ErrQuestionNotFound):
 			writeError(w, http.StatusNotFound, "not_found", "no pending question with that request id")
 		default:

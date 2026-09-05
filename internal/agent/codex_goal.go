@@ -39,6 +39,7 @@ type CodexGoal struct {
 // GoalBinding travels with the native thread pointer. DesiredPaused fences
 // cancellation even when the CLI cannot acknowledge pause before being killed.
 type GoalBinding struct {
+	UserID            string     `json:"userId,omitempty"`
 	RuntimeFailures   int        `json:"runtimeFailures,omitempty"`
 	ActivationPending bool       `json:"activationPending,omitempty"`
 	RunID             string     `json:"runId,omitempty"`
@@ -373,6 +374,7 @@ func (m *Manager) GoalSnapshot(agentID, key string) (*GoalBinding, error) {
 		b.SetupContext = ""
 		b.SeenOperations = nil
 		b.RunID = ""
+		b.UserID = ""
 	}
 	return b, err
 }

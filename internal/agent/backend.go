@@ -32,6 +32,7 @@ const ErrMsgCancelled = "cancelled: process was terminated"
 type ChatOptions struct {
 	Goal                 *GoalRequest
 	GoalRunID            string
+	GoalUserID           string
 	OriginPeerID         string
 	PreserveGoalOnCancel func() bool
 	// OneShot skips session resumption, running a fresh ephemeral session.
@@ -151,8 +152,8 @@ type ChatOptions struct {
 }
 
 // AnswerFunc resolves a pending interactive AskUserQuestion by writing the
-// CLI control_response for requestID. When deny is true the tool call is
-// refused with denyMessage; otherwise answers maps each question string to
+// backend response for requestID. When deny is true the tool call is
+// refused with denyMessage; otherwise answers maps each question ID (Codex) or question string (Claude) to
 // the chosen answer (a label, a ", "-joined list of labels for multiSelect,
 // or a free-form string). Returns ErrQuestionNotFound if requestID is not
 // pending, or ErrAgentNotBusy if the turn already ended.

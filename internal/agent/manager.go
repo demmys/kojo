@@ -55,6 +55,8 @@ func (s BusySource) String() string {
 }
 
 type busyEntry struct {
+	questionLifecycle *questionLifecycle
+
 	cancel      context.CancelFunc
 	startedAt   time.Time
 	broadcaster *chatBroadcaster // fan-out for reconnecting clients
@@ -71,7 +73,7 @@ type busyEntry struct {
 	// backend's stdin pipe has become ready.
 	steer SteerFunc
 	// answer, when set, resolves a pending interactive AskUserQuestion on the
-	// running turn (claude backend only — see ChatOptions.OnQuestionReady).
+	// running turn (claude/codex backends — see ChatOptions.OnQuestionReady).
 	// nil for backends/turns that can't surface a question to a user.
 	answer AnswerFunc
 	// outCh is the raw event channel the broadcaster fans out from. Steer
@@ -263,11 +265,12 @@ type Manager struct {
 	// (e.g. Slack/group-DM thread turns — see runThreadTurn). Keyed by
 	// SessionKey rather than agentID since one agent can run several
 	// independent thread turns concurrently, each on its own session.
-	// Only populated for backends that support steering (claude);
+	// Only populated for backends that support steering (claude/codex);
 	// registered when the backend's stdin pipe becomes ready and removed
 	// when the turn's goroutine exits.
-	oneShotSteers   map[string]SteerFunc
-	oneShotSteersMu sync.Mutex
+	oneShotSteers    map[string]SteerFunc
+	oneShotQuestions map[int64]*oneShotQuestionTurn // guarded by oneShotCancelsMu
+	oneShotSteersMu  sync.Mutex
 
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
@@ -2386,7 +2389,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		Goal:                  goal,
 		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
-		AutomatedTrigger:      role == "system",
+		AutomatedTrigger:      role == "system" && goal == nil,
 		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
@@ -2498,8 +2501,12 @@ func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
 // pass OneShotOpts{} for the legacy ephemeral-session behaviour.
 type OneShotOpts struct {
-	GoalRunID string // transport-owned nonce; never model input
-	Goal      *GoalRequest
+	GoalUserID string // initiating Slack user, retained for recovery question ownership
+	GoalRunID  string // transport-owned nonce; never model input
+	Goal       *GoalRequest
+	// InteractiveQuestions opts in only when the response surface can answer.
+	InteractiveQuestions bool
+
 	// PreserveTerminalOnCancel keeps a cancelled terminal event pending until
 	// the response adapter consumes it. Slack enables this because its live text
 	// deltas are intentionally lossy and the terminal message is authoritative.
@@ -2775,6 +2782,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	chatOpts := ChatOptions{
 		Goal:                 opts.Goal,
 		GoalRunID:            opts.GoalRunID,
+		GoalUserID:           opts.GoalUserID,
 		OriginPeerID:         opts.OriginPeerID,
 		PreserveGoalOnCancel: func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		OneShot:              oneShotMode,
@@ -2803,6 +2811,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			m.oneShotSteersMu.Unlock()
 		}
 	}
+	questionTurn := m.setupOneShotQuestions(chatCtx, agentID, osID, opts, &chatOpts)
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
 		if responseAttachments != nil {
@@ -2822,6 +2831,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 		return nil, err
 	}
+	backendCh = m.oneShotQuestionEvents(chatCtx, backendCh, questionTurn)
 	if responseAttachments != nil {
 		backendCh = m.captureOneShotResponseAttachments(chatCtx, agentID,
 			opts.ResponseAttachmentMessageID, responseAttachmentStageDir, backendCh, responseAttachments)
@@ -2991,10 +3001,10 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 			if !ok {
 				return
 			}
-			// Terminal and attachment events use blocking send. Attachments carry
+			// Terminal, question lifecycle and attachment events use blocking send. Attachments carry
 			// blob ownership: dropping one after the holder ingested it would leak
 			// an unreferenced blob or leave a persisted reply without its file.
-			if event.Type == "attachment" {
+			if event.Type == "attachment" || event.Type == "user_question" || event.Type == "question_resolved" {
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
@@ -3169,6 +3179,16 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 }
 
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	m.busyMu.Lock()
+	lifecycle := m.questionLifecycleLocked(agentID)
+	m.busyMu.Unlock()
+	var resolvedEvents <-chan ChatEvent
+	if lifecycle != nil {
+		resolvedEvents = lifecycle.events
+		defer lifecycle.close()
+	}
+	resolvedQuestions := make(map[string]bool)
+
 	// Safety net: whatever happens to this turn (normal done, error, abort,
 	// or the backend process dying outright), drop every AskUserQuestion
 	// still tracked as pending for this agent. Without this, a question
@@ -3425,6 +3445,21 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 
 	for {
 		select {
+		case event := <-resolvedEvents:
+			// The callback may have fired before the queued user_question
+			// was consumed. Clear state again at this ordered boundary.
+			m.busyMu.Lock()
+			if set := m.pendingQuestions[agentID]; set != nil {
+				delete(set, event.RequestID)
+				if len(set) == 0 {
+					delete(m.pendingQuestions, agentID)
+				}
+			}
+			m.busyMu.Unlock()
+			resolvedQuestions[event.RequestID] = true
+			if !ctxSend(ctx, outCh, event) {
+				return
+			}
 		case event, ok := <-backendCh:
 			if !ok {
 				return
@@ -3445,8 +3480,23 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// the OnQuestionRaised web-push notification reflect it. Cleared
 			// via ChatOptions.OnQuestionResolved on answer/deny/timeout, or
 			// by the clearAllQuestionsForAgent defer above at turn end.
+			if event.Type == "question_resolved" {
+				resolvedQuestions[event.RequestID] = true
+				// Native lifecycle events already take the reliable path;
+				// avoid feeding them back through the callback queue.
+				m.busyMu.Lock()
+				if set := m.pendingQuestions[agentID]; set != nil {
+					delete(set, event.RequestID)
+				}
+				m.busyMu.Unlock()
+			}
 			if event.Type == "user_question" {
-				m.markQuestionRaised(agentID, event.RequestID)
+				if resolvedQuestions[event.RequestID] {
+					continue
+				}
+				if event.QuestionBlocking == nil || *event.QuestionBlocking {
+					m.markQuestionRaised(agentID, event.RequestID)
+				}
 			}
 
 			// Terminal events (done/error) use blocking send so the
@@ -3455,7 +3505,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// the UI never rendered, wedging the turn. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),
 			// they are dropped but processing continues.
-			if event.Type == "done" || event.Type == "error" || event.Type == "user_question" {
+			if event.Type == "done" || event.Type == "error" || event.Type == "user_question" || event.Type == "question_resolved" {
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
@@ -3936,6 +3986,7 @@ func (m *Manager) InFlightOneShotSessionKey(agentID string) string {
 func (m *Manager) untrackOneShot(agentID string, id int64) {
 	m.oneShotCancelsMu.Lock()
 	defer m.oneShotCancelsMu.Unlock()
+	delete(m.oneShotQuestions, id)
 	if set, ok := m.oneShotCancels[agentID]; ok {
 		delete(set, id)
 		if len(set) == 0 {

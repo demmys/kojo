@@ -16,6 +16,7 @@ import (
 )
 
 type goalRecoveryRequest struct {
+	UserID     string `json:"userId,omitempty"`
 	RunID      string `json:"runId,omitempty"`
 	AgentID    string `json:"agentId"`
 	SessionKey string `json:"sessionKey"`
@@ -60,7 +61,7 @@ func (s *Server) recoverNativeGoals(onlyID, excludeKey string, pendingOnly bool)
 			if !s.agents.ClaimGoalRecovery(id, b.SessionKey, b.Generation) {
 				continue
 			}
-			req := goalRecoveryRequest{RunID: b.RunID, AgentID: id, SessionKey: b.SessionKey, ThreadID: b.State.ThreadID, Generation: b.Generation}
+			req := goalRecoveryRequest{UserID: b.UserID, RunID: b.RunID, AgentID: id, SessionKey: b.SessionKey, ThreadID: b.State.ThreadID, Generation: b.Generation}
 			if s.peerID != nil {
 				req.HolderID = s.peerID.DeviceID
 			}
@@ -137,6 +138,9 @@ func (s *Server) handlePeerGoalResume(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
 func (s *Server) resumeGoalSurface(ctx context.Context, req goalRecoveryRequest) error {
+	if len(req.UserID) > 64 || strings.Trim(req.UserID, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != "" {
+		return errors.New("invalid recovery user identity")
+	}
 	if err := s.checkGoalStop(ctx, req.AgentID, req.RunID); err != nil {
 		return err
 	}
@@ -152,7 +156,7 @@ func (s *Server) resumeGoalSurface(ctx context.Context, req goalRecoveryRequest)
 		return s.agents.WakeThread(req.AgentID, req.SessionKey, command)
 	}
 	if strings.HasPrefix(req.SessionKey, req.AgentID+":slack:") {
-		if s.slackHub == nil || !s.slackHub.ResumeGoal(req.AgentID, req.SessionKey+"\n"+command) {
+		if s.slackHub == nil || !s.slackHub.ResumeGoal(req.AgentID, req.SessionKey+"\n"+req.UserID+"\n"+command) {
 			return errors.New("Slack bot unavailable")
 		}
 		return nil

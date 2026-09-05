@@ -525,6 +525,10 @@ export function AgentChat() {
           }
           break;
         }
+        case "question_resolved": {
+          setPendingQuestions((prev) => prev.filter((p) => p.requestId !== event.requestId));
+          break;
+        }
         case "user_question": {
           if (event.requestId && event.questions) {
             const q: UserQuestion[] = event.questions;
@@ -542,7 +546,9 @@ export function AgentChat() {
             const m = event.message;
             // An answered question comes back as a user message; drop its card.
             if (m.role === "user" && m.content.startsWith("answered:")) {
-              setPendingQuestions([]);
+              setPendingQuestions((prev) => event.requestId
+                ? prev.filter((p) => p.requestId !== event.requestId)
+                : []);
             }
             // A steered user message comes back over the WS with a real
             // server id; drop the optimistic "pending_" copy (same

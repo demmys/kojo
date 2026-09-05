@@ -97,7 +97,12 @@ func (s *claudeStdinWriter) writeControlResponse(requestID string, resp map[stri
 	if s.closed {
 		return ErrAgentNotBusy
 	}
-	if _, err = s.w.Write(append(line, '\n')); err != nil {
+	line = append(line, '\n')
+	n, err := s.w.Write(line)
+	if err == nil && n != len(line) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
 			return ErrAgentNotBusy
 		}
@@ -234,6 +239,8 @@ const automatedQuestionTimeoutMessage = "No answer arrived within the time limit
 // question and emits a user_question event) and the AnswerFunc the Manager
 // calls to resolve it. Safe for concurrent use.
 type claudeQuestionState struct {
+	onWriteFailure func() // immutable; stop the CLI instead of leaving a consumed prompt blocked
+
 	stdinW *claudeStdinWriter
 
 	mu sync.Mutex
@@ -305,6 +312,19 @@ func (q *claudeQuestionState) stopTimerLocked(requestID string) {
 func (q *claudeQuestionState) answer(requestID string, answers map[string]any, deny bool, denyMessage string) error {
 	q.mu.Lock()
 	input, ok := q.pending[requestID]
+	if ok && !deny {
+		var original struct {
+			Questions []UserQuestion `json:"questions"`
+		}
+		if json.Unmarshal(input, &original) != nil {
+			q.mu.Unlock()
+			return ErrInvalidQuestionAnswer
+		}
+		if err := ValidateQuestionAnswers(original.Questions, answers); err != nil {
+			q.mu.Unlock()
+			return err
+		}
+	}
 	var onResolved func(string)
 	if ok {
 		delete(q.pending, requestID)
@@ -339,7 +359,11 @@ func (q *claudeQuestionState) answer(requestID string, answers map[string]any, d
 			},
 		}
 	}
-	return q.stdinW.writeControlResponse(requestID, resp)
+	err := q.stdinW.writeControlResponse(requestID, resp)
+	if err != nil && q.onWriteFailure != nil {
+		q.onWriteFailure()
+	}
+	return err
 }
 
 // denyAllPending writes a deny control_response for every still-pending
@@ -650,6 +674,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	var qstate *claudeQuestionState
 	if opts.OnQuestionReady != nil {
 		qstate = newClaudeQuestionState(stdinW)
+		qstate.onWriteFailure = func() { _ = cmd.Process.Kill() }
 		qstate.setOnResolved(opts.OnQuestionResolved)
 		opts.OnQuestionReady(qstate.answer)
 	}

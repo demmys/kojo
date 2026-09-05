@@ -116,15 +116,17 @@ type ChatEvent struct {
 	// matching Task tool chip.
 	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 	// RequestID identifies a control_request the CLI raised for an
-	// interactive tool (currently AskUserQuestion). Set only on
-	// "user_question" events; the Web UI echoes it back to
+	// interactive tool (AskUserQuestion or Codex request_user_input). Set only on
+	// question lifecycle events and answer transcript messages; the Web UI echoes it back to
 	// POST /agents/{id}/answer so the server can pair the answer with the
 	// blocked control_request.
 	RequestID string `json:"requestId,omitempty"`
-	// Questions carries the raw AskUserQuestion input.questions array
-	// (the CLI's tool input) so the UI can render the question card. Only
+	// Questions carries the shared UserQuestion array (Claude question-text
+	// keys or Codex IDs) so the UI can render the question card. Only
 	// populated on "user_question" events.
 	Questions json.RawMessage `json:"questions,omitempty"`
+	// nil preserves Claude/older-peer blocking semantics.
+	QuestionBlocking *bool `json:"questionBlocking,omitempty"`
 	// RateLimit carries the latest rate-limit snapshot parsed from the
 	// backend stream. Populated only on "rate_limit" events, which arrive
 	// mid-turn whenever the Claude CLI reports a usage threshold crossing.

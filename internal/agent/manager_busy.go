@@ -277,13 +277,15 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 		m.logger.Warn("failed to save answer message", "agent", agentID, "err", appendErr)
 		return fmt.Errorf("answer accepted but not persisted: %w", appendErr)
 	}
-	if err := entry.answer(requestID, answers, deny, denyMessage); err != nil {
+	deliveryErr := entry.answer(requestID, answers, deny, denyMessage)
+	// A lost ACK is not a rejection: retain AND publish the reserved row.
+	if deliveryErr != nil && !errors.Is(deliveryErr, ErrSteerDeliveryUncertain) {
 		if delErr := deleteMessage(agentID, msg.ID, ""); delErr != nil &&
 			!errors.Is(delErr, ErrMessageNotFound) {
 			m.logger.Warn("failed to roll back answer message after delivery failure",
 				"agent", agentID, "err", delErr)
 		}
-		return err
+		return deliveryErr
 	}
 	m.busyMu.Lock()
 	if cur, ok := m.busy[agentID]; ok && cur.outCh != nil && cur.outCh == entry.outCh {
@@ -293,7 +295,7 @@ func (m *Manager) AnswerQuestion(ctx context.Context, agentID, requestID string,
 		}
 	}
 	m.busyMu.Unlock()
-	return nil
+	return deliveryErr
 }
 
 // markQuestionRaised records requestID as pending for agentID and fires

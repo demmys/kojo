@@ -7,9 +7,13 @@ import (
 
 // Native app-server owns continuation. There is deliberately no turn/start or
 // empty-answer retry here: goal/set active starts idle work itself.
-func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime, steer *codexSteerer, respond codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime, steer *codexSteerer, respond codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool, questions ...*codexQuestionState) *codexStreamResult {
 	combined := &codexStreamResult{}
-	current := &codexStreamResult{}
+	var qs *codexQuestionState
+	if len(questions) > 0 {
+		qs = questions[0]
+	}
+	current := &codexStreamResult{questions: qs}
 	phases := map[string]string{}
 	method, params := goalRPC(q, r.threadID)
 	startID, err := r.write(method, params)
@@ -129,7 +133,7 @@ func runCodexGoal(scanner *jsonlLineScanner, q *GoalRequest, r *codexGoalRuntime
 				}
 			}
 			combined.absorb(current)
-			current = &codexStreamResult{}
+			current = &codexStreamResult{questions: qs}
 			phases = map[string]string{}
 			inTurn = false
 			if steer != nil {

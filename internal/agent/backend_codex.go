@@ -237,8 +237,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			}
 			return fallbackResponder(msg)
 		})
+		var qs *codexQuestionState
 		if opts.OnQuestionReady != nil {
-			qs := newCodexQuestionState(writeLine, send, opts.OnQuestionResolved)
+			qs = newCodexQuestionState(writeLine, send, opts.OnQuestionResolved)
 			qs.onWriteFailure = func() { _ = cmd.Process.Kill() }
 			defer qs.close()
 			opts.OnQuestionReady(qs.answer)
@@ -639,10 +640,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// response by parseCodexStream), so the steerer blocks steer calls
 		// until that id lands.
 		var steerer *codexSteerer
-		if opts.OnSteerReady != nil {
+		if opts.OnSteerReady != nil || qs != nil {
 			steerer = newCodexSteerer(threadID, sendRPCErr)
 			defer steerer.close()
-			if opts.Goal == nil {
+			if qs != nil {
+				qs.steer = steerer.steer
+			}
+			if opts.Goal == nil && opts.OnSteerReady != nil {
 				opts.OnSteerReady(func(text string) error {
 					q, err := ParseGoalCommand(text)
 					if err != nil {
@@ -724,7 +728,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				shutdown()
 				return
 			}
-			result := runCodexGoal(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send)
+			result := runCodexGoal(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, qs)
 			if ctx.Err() != nil {
 				shutdown()
 				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)
@@ -767,6 +771,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			respondServerRequest,
 			b.logger.With("agent", agent.ID, "sessionKey", opts.SessionKey),
 			send,
+			qs,
 		)
 		if steerer != nil {
 			// The turn is over (or the stream broke) — refuse further
@@ -846,6 +851,8 @@ func buildCodexResumeParams(threadParams map[string]any, threadID string) map[st
 
 // codexStreamResult holds the accumulated state from parsing a Codex stream.
 type codexStreamResult struct {
+	questions     *codexQuestionState
+	questionText  string // fallback for a run ending immediately after an async question
 	fullText      strings.Builder
 	thinking      strings.Builder
 	toolUses      []ToolUse
@@ -886,6 +893,7 @@ func runCodexTurns(
 	respondServerRequest codexServerRequestResponder,
 	logger *slog.Logger,
 	send func(ChatEvent) bool,
+	questions ...*codexQuestionState,
 ) *codexStreamResult {
 	combined := &codexStreamResult{}
 	input := initialInput
@@ -905,7 +913,7 @@ func runCodexTurns(
 			return combined
 		}
 
-		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send)
+		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send, questions...)
 		combined.absorb(result)
 
 		// Only a clean, successful completion with no final answer is
@@ -936,6 +944,9 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 	}
 	r.fullText.WriteString(next.fullText.String())
 	r.thinking.WriteString(next.thinking.String())
+	if next.questionText != "" {
+		r.questionText = strings.TrimSpace(r.questionText + "\n\n" + next.questionText)
+	}
 	r.toolUses = append(r.toolUses, next.toolUses...)
 	if next.usage != nil {
 		if r.usage == nil {
@@ -959,17 +970,21 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 // tool calls and reasoning prove work happened, but they are not a response to
 // the user. Whitespace-only model output is likewise not a usable completion.
 func (r *codexStreamResult) hasFinalResponse() bool {
-	return strings.TrimSpace(r.fullText.String()) != ""
+	return strings.TrimSpace(r.fullText.String()) != "" || strings.TrimSpace(r.questionText) != ""
 }
 
 // buildMessage creates a Message from accumulated stream data.
 func (r *codexStreamResult) buildMessage() *Message {
-	return assembleAssistantMessage(r.fullText.String(), r.thinking.String(), r.toolUses, r.usage)
+	text := r.fullText.String()
+	if strings.TrimSpace(text) == "" {
+		text = r.questionText
+	}
+	return assembleAssistantMessage(text, r.thinking.String(), r.toolUses, r.usage)
 }
 
 // hasOutput returns true if the stream produced any text or tool uses.
 func (r *codexStreamResult) hasOutput() bool {
-	return r.fullText.Len() > 0 || len(r.toolUses) > 0
+	return r.fullText.Len() > 0 || r.questionText != "" || len(r.toolUses) > 0
 }
 
 // parseCodexStream reads Codex app-server JSON-RPC notifications from a scanner
@@ -978,8 +993,11 @@ func (r *codexStreamResult) hasOutput() bool {
 // steer may be nil; when set, the active turn id from the turn/start
 // response (or the turn/started notification) is forwarded to it so
 // mid-turn turn/steer requests can be issued.
-func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codexSteerer, respondServerRequest codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codexSteerer, respondServerRequest codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool, questions ...*codexQuestionState) *codexStreamResult {
 	res := &codexStreamResult{}
+	if len(questions) > 0 {
+		res.questions = questions[0]
+	}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 
 	for scanner.Scan() {
@@ -1272,6 +1290,8 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 	}
 	var params struct {
 		Item struct {
+			Delivery         string          `json:"delivery"`
+			Questions        json.RawMessage `json:"questions"`
 			ID               string          `json:"id"`
 			Type             string          `json:"type"`
 			Text             string          `json:"text"`
@@ -1324,6 +1344,18 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 			return true
 		}
 	case "agentMessage":
+		// Message-delivered questions have no server RPC awaiting a reply.
+		// Do not mix their text into the later final answer (or post it twice).
+		if res.questions != nil && params.Item.Delivery == "async" && len(params.Item.Questions) > 0 && string(params.Item.Questions) != "null" && string(params.Item.Questions) != "[]" {
+			seen := res.questions.asyncSeen[params.Item.ID]
+			if err := res.questions.registerAsync(msg); err == nil {
+				if !seen {
+					res.questionText = strings.TrimSpace(res.questionText + "\n\n" + params.Item.Text)
+				}
+				return false
+			}
+			// An unsupported form remains readable as ordinary text.
+		}
 		// app-server normally streams agentMessage deltas, but the completed
 		// item is the authoritative snapshot. If no delta arrived at all, use
 		// its text as a fallback so a valid final answer is not mistaken for an

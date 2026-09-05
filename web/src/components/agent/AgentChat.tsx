@@ -645,7 +645,7 @@ export function AgentChat() {
   // Shares refetchSeqRef with the holder-status refetch effect above so
   // the two paths can't overwrite each other with stale out-of-order
   // responses — only the globally latest refetch's response commits.
-  const onConnected = useCallback(() => {
+  const refreshTranscript = useCallback(() => {
     if (!id) return;
     const seq = ++refetchSeqRef.current;
     agentApi.messages(id, PAGE_SIZE).then((r) => {
@@ -682,7 +682,7 @@ export function AgentChat() {
   const { connected, sendMessage, abort } = useAgentWebSocket({
     agentId: id!,
     onEvent,
-    onConnected,
+    onConnected: refreshTranscript,
     onDisconnect,
   });
 
@@ -1365,8 +1365,18 @@ export function AgentChat() {
             pending={pq}
             onSubmit={async (answers) => {
               if (!id) return;
-              await agentApi.answerAgentQuestion(id, pq.requestId, answers);
-              setPendingQuestions((prev) => prev.filter((p) => p.requestId !== pq.requestId));
+              const answeredForId = id;
+              try {
+                await agentApi.answerAgentQuestion(id, pq.requestId, answers);
+                if (idRef.current === answeredForId) {
+                  setPendingQuestions((prev) => prev.filter((p) => p.requestId !== pq.requestId));
+                }
+              } finally {
+                // A turn can end before the answer RPC's ACK (or lost-ACK
+                // error) returns. Its message event may miss the closed
+                // stream, so reconcile the persisted row after settlement.
+                if (idRef.current === answeredForId) refreshTranscript();
+              }
             }}
           />
         ))}

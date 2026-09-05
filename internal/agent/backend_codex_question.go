@@ -42,7 +42,6 @@ func (q *codexQuestionState) register(msg *rpcMessage, automated bool) (string, 
 	}
 	var p struct {
 		Questions []UserQuestion `json:"questions"`
-		Blocking  *bool          `json:"isBlocking"`
 	}
 	if err := json.Unmarshal(*msg.Params, &p); err != nil {
 		return "", err
@@ -72,16 +71,19 @@ func (q *codexQuestionState) register(msg *rpcMessage, automated bool) (string, 
 	q.pending[id] = entry
 	q.mu.Unlock()
 	raw, _ := json.Marshal(p.Questions)
-	if !q.emit(ChatEvent{Type: "user_question", RequestID: id, Questions: raw, QuestionBlocking: p.Blocking}) {
+	// The request_user_input tool awaits this JSON-RPC answer even when
+	// Default mode reports isBlocking=false (a native UI policy hint).
+	// Unlike message-delivered async questions, Kojo holds this request open.
+	blocking := true
+	if !q.emit(ChatEvent{Type: "user_question", RequestID: id, Questions: raw, QuestionBlocking: &blocking}) {
 		_ = q.answer(id, nil, true, "")
 		return "", nil
 	}
 	timeout := time.Duration(0)
-	// isBlocking=false is an async prompt: the model continues working.
 	// autoResolutionMs is deprecated; app-server owns native expiration and
 	// announces it through serverRequest/resolved. Only Kojo's automated-turn
 	// safety timeout can send an empty answer to an unwatched blocking prompt.
-	if automated && (p.Blocking == nil || *p.Blocking) {
+	if automated {
 		timeout = automatedQuestionTimeout
 	}
 	q.mu.Lock()

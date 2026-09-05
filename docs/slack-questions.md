@@ -40,9 +40,11 @@ The shared `UserQuestion` contract has an optional `id`: Codex answers use that
 ID, while Claude answers retain the original question-text key. Codex JSON-RPC
 IDs remain opaque (both strings and numbers are echoed exactly); the UI sees a
 fresh prompt UUID, preventing collisions after a CLI restart. Codex server-side
-resolution notifications invalidate prompts. Nonblocking Codex questions remain
-answerable while work continues, without marking the agent as blocked. Kojo only
-adds a fallback timer for unwatched, automated blocking turns.
+resolution notifications invalidate prompts. RPC questions wait for their answer,
+including Default-mode requests carrying `isBlocking=false`: on user-initiated
+turns Kojo does not auto-answer those UI-optional requests. Message-delivered async questions remain
+answerable while work continues. Kojo only adds a fallback timer for unwatched,
+automated RPC questions.
 
 External answers share the existing holder-fenced, no-automatic-replay input
 transport (`external-chat/steer`), with an exclusive `question` envelope instead
@@ -74,3 +76,13 @@ References:
 通常処理の終了、goal の終了、停止、再起動でカードは失効する。
 失効後は通常のスレッド返信で回答する（カードの回答から勝手に実行を再開しない）。
 回答の到達が不明な場合も自動再送しない。
+
+### Codex の同期質問と Default mode
+
+回答経路のある呼び出しでは、Kojo が app-server 起動時に
+`features.default_mode_request_user_input=true` を指定する。
+この設定がないと同期 `request_user_input` は Default mode で拒否され、
+質問カード用の RPC に到達しない。通常の作業を続けられるよう Plan mode には切り替えない。
+同期質問は回答フォームからの入力を元の RPC に返すまで待機する。
+通常のスレッド追記は同期質問への回答ではないため、カードの「回答する」を使う。
+非対話呼び出しにはこの設定を追加しない。

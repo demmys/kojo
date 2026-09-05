@@ -119,7 +119,7 @@ const (
 	// token is intentional: backends such as Codex treat an empty successful
 	// completion as a recoverable failure and automatically ask the model to
 	// produce a real answer.
-	noReplyToken = "[[NO_REPLY]]"
+	noReplyToken = agent.SlackNoReplyToken
 
 	// finalizeShortTimeout caps the single-call finalize ops
 	// (StopStream, chat.update, clearAssistantStatus) that share finCtx.

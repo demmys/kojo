@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/loppo-llc/kojo/internal/chathistory"
 )
@@ -361,6 +362,132 @@ func TestParseCodexStream_CommandExecution(t *testing.T) {
 	}
 	if !foundToolResult {
 		t.Error("expected tool_result event")
+	}
+}
+
+func TestParseCodexStream_FileChange(t *testing.T) {
+	// Captured from codex app-server 0.153.3: apply_patch surfaces as a
+	// fileChange item, not a commandExecution.
+	events, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{
+				"id": "exec-1", "type": "fileChange", "status": "inProgress",
+				"changes": []map[string]any{
+					{"path": "/w/a.txt", "kind": map[string]any{"type": "add"}, "diff": "hello\n"},
+					{"path": "/w/b.go", "kind": map[string]any{"type": "update", "move_path": "/w/c.go"}, "diff": "@@ -1 +1 @@\n-x\n+y\n"},
+					{"path": "/w/d.txt", "kind": map[string]any{"type": "delete"}},
+				},
+			},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{
+				"id": "exec-1", "type": "fileChange", "status": "completed",
+				"changes": []map[string]any{
+					{"path": "/w/a.txt", "kind": map[string]any{"type": "add"}, "diff": "hello\n"},
+				},
+			},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+
+	if len(result.toolUses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d", len(result.toolUses))
+	}
+	tu := result.toolUses[0]
+	if tu.Name != "apply_patch" {
+		t.Errorf("tool name = %q, want %q", tu.Name, "apply_patch")
+	}
+	wantInput := "add /w/a.txt\nhello\n\nupdate /w/b.go -> /w/c.go\n@@ -1 +1 @@\n-x\n+y\n\ndelete /w/d.txt"
+	if tu.Input != wantInput {
+		t.Errorf("tool input = %q, want %q", tu.Input, wantInput)
+	}
+	if tu.Output != "completed" {
+		t.Errorf("tool output = %q, want %q", tu.Output, "completed")
+	}
+
+	var got []ChatEvent
+	for _, e := range events {
+		if e.Type == "tool_use" || e.Type == "tool_result" {
+			got = append(got, e)
+		}
+	}
+	want := []ChatEvent{
+		{Type: "tool_use", ToolUseID: "exec-1", ToolName: "apply_patch", ToolInput: wantInput},
+		{Type: "tool_result", ToolUseID: "exec-1", ToolName: "apply_patch", ToolOutput: "completed"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tool events = %+v, want %+v", got, want)
+	}
+}
+
+func TestCodexFileChangeInput_TruncatesOnRuneBoundary(t *testing.T) {
+	// A 3-byte rune straddling the limit must be dropped whole.
+	diff := strings.Repeat("x", codexFileChangeDiffLimit-1) + "あ" + "yy"
+	got := codexFileChangeInput([]codexFileChange{{Path: "/w/u", Diff: diff}})
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated input is not valid UTF-8")
+	}
+	want := "update /w/u\n" + strings.Repeat("x", codexFileChangeDiffLimit-1) + "\n[...truncated 5 bytes...]"
+	if got != want {
+		t.Errorf("tail=%q", got[len(got)-40:])
+	}
+}
+
+func TestCodexFileChangeInput_TruncatesLargeDiff(t *testing.T) {
+	big := strings.Repeat("x", codexFileChangeDiffLimit+100)
+	got := codexFileChangeInput([]codexFileChange{{Path: "/w/big", Diff: big + "\n"}})
+	want := "update /w/big\n" + big[:codexFileChangeDiffLimit] + "\n[...truncated 100 bytes...]"
+	if got != want {
+		t.Errorf("len(got)=%d want %d; tail=%q", len(got), len(want), got[len(got)-40:])
+	}
+}
+
+func TestParseCodexStream_FileChangeBackfillsInputFromCompleted(t *testing.T) {
+	// With apply_patch streaming events the started item may carry no
+	// changes yet; the completed item must fill the stored input.
+	_, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "exec-3", "type": "fileChange", "changes": []map[string]any{}},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "exec-3", "type": "fileChange", "status": "completed",
+				"changes": []map[string]any{{"path": "/w/a.txt", "kind": map[string]any{"type": "add"}, "diff": "hi\n"}}},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+	if len(result.toolUses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d", len(result.toolUses))
+	}
+	if got := result.toolUses[0].Input; got != "add /w/a.txt\nhi" {
+		t.Errorf("input = %q", got)
+	}
+	if got := result.toolUses[0].Output; got != "completed" {
+		t.Errorf("output = %q", got)
+	}
+}
+
+func TestParseCodexStream_FileChangeFailed(t *testing.T) {
+	_, result := collectCodexEvents(t, 1,
+		rpcLine("item/started", map[string]any{
+			"item": map[string]any{"id": "exec-2", "type": "fileChange",
+				"changes": []map[string]any{{"path": "/w/a.txt", "kind": map[string]any{"type": "add"}, "diff": "x"}}},
+		}),
+		rpcLine("item/completed", map[string]any{
+			"item": map[string]any{"id": "exec-2", "type": "fileChange", "status": "failed"},
+		}),
+		rpcLine("turn/completed", map[string]any{
+			"turn": map[string]any{"status": "completed"},
+		}),
+	)
+	if len(result.toolUses) != 1 {
+		t.Fatalf("expected 1 tool use, got %d", len(result.toolUses))
+	}
+	if got := result.toolUses[0].Output; got != "failed" {
+		t.Errorf("output = %q, want %q", got, "failed")
 	}
 }
 

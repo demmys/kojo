@@ -451,10 +451,10 @@ func (s *Server) peerDisplayName(ctx context.Context, peerID string) string {
 func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerID string, payload handoffArrivalRequest) (bool, error) {
 	if s.peerID != nil && originPeerID == s.peerID.DeviceID {
 		err := s.activateLocalHandoffCapability(ctx, payload)
-		// A missing in-memory capability after restart is ambiguous: the
-		// adapter may have admitted the arrival immediately before the crash.
-		// Fail closed instead of launching a duplicate legacy fallback.
-		return errors.Is(err, errHandoffCapabilityInvalid), err
+		// Missing capability means this process did not admit this attempt.
+		// Finalize persists intent before dispatch, so a crash retry cannot
+		// replay an admission from a previous process as a fresh fallback.
+		return false, err
 	}
 	if s.agents == nil || s.agents.Store() == nil {
 		return false, errors.New("peer registry is unavailable")
@@ -488,17 +488,10 @@ func (s *Server) postHandoffArrivalContinuation(ctx context.Context, originPeerI
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		var errorBody struct {
-			Error struct {
-				Code string `json:"code"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(body, &errorBody)
-		// invalid_capability cannot distinguish "never admitted" from
-		// "admitted, then the origin restarted before finalize committed".
-		// Treat it like a lost response and suppress fallback (at-most-once).
-		uncertain := errorBody.Error.Code == "invalid_capability"
-		return uncertain, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		// An explicit rejection did not admit this attempt. Earlier transport
+		// uncertainty remains sticky in dispatch; durable finalize intent
+		// prevents fallback after a target crash loses that in-memory state.
+		return false, fmt.Errorf("origin Hub returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	return false, nil
 }

@@ -163,6 +163,19 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"signer peer device_id does not match source_device_id")
 		return
 	}
+	allowedProxy, err := s.resolveAllowedProxyPeer(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"continuation.origin_peer_id is not a paired peer")
+			return
+		}
+		s.logger.Error("peer agent-sync finalize: origin peer validation failed",
+			"agent", req.AgentID, "origin_peer", req.Continuation.OriginPeerID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"validate continuation origin peer: "+err.Error())
+		return
+	}
 	// Serialize the entire consume → arrival decision → commit sequence for
 	// this operation. In particular, only one retry may decide between origin
 	// admission and legacy fallback; later retries observe the committed 404.
@@ -242,7 +255,7 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		err := s.agents.Store().UpdateAgentLockAllowedProxy(
 			r.Context(), req.AgentID,
 			s.peerID.DeviceID, // expected holder
-			allowedProxyPeer(req),
+			allowedProxy,
 		)
 		switch {
 		case err == nil:
@@ -327,18 +340,24 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			fallback := func() {
 				s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
 			}
+			// Write intent BEFORE the external side effect. A target crash after
+			// origin admission but before persisting the outcome must not replay
+			// an invalid capability after the origin also restarts.
+			entry.ArrivalUncertain = true
+			if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+				writeError(w, http.StatusInternalServerError, "internal",
+					"persist arrival intent: "+err.Error())
+				return
+			}
 			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
-				if errors.Is(err, errHandoffArrivalUncertain) {
-					entry.ArrivalUncertain = true
-					if persistErr := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); persistErr != nil {
-						err = fmt.Errorf("%w; persist uncertain state: %v", err, persistErr)
-					}
-				}
+				// Keep the durable intent on failure: cancellation may bypass
+				// dispatch's final uncertain classification after an earlier send.
 				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
 					"agent", req.AgentID, "op_id", req.OpID, "err", err)
 				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())
 				return
 			}
+			entry.ArrivalUncertain = false
 			entry.ArrivalHandled = true
 			if err := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); err != nil {
 				s.logger.Error("peer agent-sync finalize: arrival decision persistence failed; pending retained",
@@ -381,11 +400,27 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
 }
 
-func allowedProxyPeer(req peerAgentSyncFinalizeRequest) string {
-	if req.Continuation != nil && req.Continuation.OriginPeerID != "" {
-		return req.Continuation.OriginPeerID
+func (s *Server) resolveAllowedProxyPeer(ctx context.Context, req peerAgentSyncFinalizeRequest) (string, error) {
+	if req.Continuation == nil || req.Continuation.OriginPeerID == "" ||
+		req.Continuation.OriginPeerID == req.SourceDeviceID {
+		return req.SourceDeviceID, nil
 	}
-	return req.SourceDeviceID
+	// A return migration may target the response-surface Hub itself. Our own
+	// identity is trusted without a self-entry in peer_registry.
+	if s != nil && s.peerID != nil && req.Continuation.OriginPeerID == s.peerID.DeviceID {
+		return s.peerID.DeviceID, nil
+	}
+	// SourceDeviceID is bound to the authenticated signer above. A distinct
+	// response-surface Hub is safe only when it is already in peer_registry;
+	// otherwise a paired source could nominate an arbitrary third device for
+	// agent_locks.allowed_proxy_peer.
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return "", errors.New("peer registry is unavailable")
+	}
+	if _, err := s.agents.Store().GetPeer(ctx, req.Continuation.OriginPeerID); err != nil {
+		return "", err
+	}
+	return req.Continuation.OriginPeerID, nil
 }
 
 // errTailLockNotSelf signals that the tail apply could not proceed

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -360,19 +361,19 @@ func TestDispatchHandoffArrivalSuppressesFallbackAfterLostResponse(t *testing.T)
 	}
 }
 
-func TestPostHandoffArrivalTreatsMissingCapabilityAsUncertain(t *testing.T) {
+func TestPostHandoffArrivalTreatsMissingCapabilityAsDefiniteFailure(t *testing.T) {
 	srv, _, group, _ := newGroupDMHandlerTestServer(t)
 	srv.peerID = &peer.Identity{DeviceID: "origin"}
 	uncertain, err := srv.postHandoffArrivalContinuation(context.Background(), "origin", handoffArrivalRequest{
 		HolderDeviceID: "origin", AgentID: group.Members[0].AgentID, OpID: "op",
 		SessionKey: "slack:C:T", SourceDeviceID: "source", Capability: "missing",
 	})
-	if err == nil || !uncertain {
-		t.Fatalf("err = %v, uncertain = %v; want ambiguous restart-safe failure", err, uncertain)
+	if err == nil || uncertain {
+		t.Fatalf("err = %v, uncertain = %v; want definite failure", err, uncertain)
 	}
 }
 
-func TestPostRemoteHandoffArrivalTreatsMissingCapabilityAsUncertain(t *testing.T) {
+func TestPostRemoteHandoffArrivalTreatsMissingCapabilityAsDefiniteFailure(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusForbidden, "invalid_capability", "missing")
 	}))
@@ -388,8 +389,63 @@ func TestPostRemoteHandoffArrivalTreatsMissingCapabilityAsUncertain(t *testing.T
 		HolderDeviceID: "holder", AgentID: group.Members[0].AgentID, OpID: "op",
 		SessionKey: "slack:C:T", SourceDeviceID: "source", Capability: "missing",
 	})
-	if err == nil || !uncertain {
-		t.Fatalf("err = %v, uncertain = %v; want ambiguous restart-safe failure", err, uncertain)
+	if err == nil || uncertain {
+		t.Fatalf("err = %v, uncertain = %v; want definite failure", err, uncertain)
+	}
+}
+
+func TestDispatchHandoffArrivalFallsBackAfterInvalidCapability(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusForbidden, "invalid_capability", "missing")
+	}))
+	t.Cleanup(origin.Close)
+	srv, _, group, _ := newGroupDMHandlerTestServer(t)
+	agentID := group.Members[0].AgentID
+	srv.peerID = &peer.Identity{DeviceID: "holder"}
+	if _, err := srv.agents.Store().AcquireAgentLock(context.Background(), agentID, "holder", 0, 60_000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.agents.Store().UpsertPeer(context.Background(), &store.PeerRecord{
+		DeviceID: "origin", Name: "Origin", URL: origin.URL, Status: store.PeerStatusOnline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fellBack := false
+	err := srv.dispatchHandoffArrivalContinuation(context.Background(), "origin", handoffArrivalRequest{
+		HolderDeviceID: "holder", AgentID: agentID, OpID: "op", SessionKey: "slack:C:T", Capability: "missing",
+	}, func() { fellBack = true })
+	if err != nil || !fellBack {
+		t.Fatalf("err = %v, fellBack = %v; want legacy fallback", err, fellBack)
+	}
+}
+
+func TestResolveAllowedProxyPeerRequiresPairedOrigin(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	req := peerAgentSyncFinalizeRequest{
+		SourceDeviceID: "source",
+		Continuation: &handoffContinuation{
+			OriginPeerID: "origin", SessionKey: "slack:C:T", Capability: "cap",
+		},
+	}
+	if _, err := srv.resolveAllowedProxyPeer(context.Background(), req); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown origin err = %v, want store.ErrNotFound", err)
+	}
+	srv.peerID = &peer.Identity{DeviceID: "origin"}
+	if got, err := srv.resolveAllowedProxyPeer(context.Background(), req); err != nil || got != "origin" {
+		t.Fatalf("local origin = (%q, %v), want origin without a self peer record", got, err)
+	}
+	srv.peerID = &peer.Identity{DeviceID: "holder"}
+	if _, err := srv.agents.Store().UpsertPeer(context.Background(), &store.PeerRecord{
+		DeviceID: "origin", Name: "Origin", Status: store.PeerStatusOffline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := srv.resolveAllowedProxyPeer(context.Background(), req); err != nil || got != "origin" {
+		t.Fatalf("paired origin = (%q, %v), want origin", got, err)
+	}
+	req.Continuation.OriginPeerID = req.SourceDeviceID
+	if got, err := srv.resolveAllowedProxyPeer(context.Background(), req); err != nil || got != "source" {
+		t.Fatalf("signer origin = (%q, %v), want source", got, err)
 	}
 }
 
@@ -415,5 +471,87 @@ func TestDispatchHandoffArrivalFallsBackAfterDefiniteDialFailure(t *testing.T) {
 	}, func() { fellBack = true })
 	if err != nil || !fellBack {
 		t.Fatalf("err = %v, fellBack = %v; want definite failure fallback", err, fellBack)
+	}
+}
+
+func TestFinalizeArrivalPersistsIntentBeforeDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		priorIntent, failWrite bool
+	}{
+		{name: "successful admission"},
+		{name: "crash retry", priorIntent: true},
+		{name: "intent persistence failure", failWrite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, group, _ := newGroupDMHandlerTestServer(t)
+			pending, db := newPendingSyncTestServer(t)
+			srv.pendingSyncDB, srv.pendingSyncKEK = db, pending.pendingSyncKEK
+			srv.peerID = &peer.Identity{DeviceID: "holder"}
+			agentID, opID := group.Members[0].AgentID, "op-intent"
+			ctx := context.Background()
+			if _, err := srv.agents.Store().AcquireAgentLock(ctx, agentID, "holder", 0, 60_000); err != nil {
+				t.Fatal(err)
+			}
+			var calls int
+			var callMu sync.Mutex
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				callMu.Lock()
+				calls++
+				callMu.Unlock()
+				// Read only the durable row, without the live server's cache.
+				fresh := &Server{pendingSyncDB: db, pendingSyncKEK: pending.pendingSyncKEK}
+				entry, ok, err := fresh.consumePendingAgentSync(ctx, agentID, opID)
+				if err != nil || !ok || !entry.ArrivalUncertain || entry.ArrivalHandled {
+					t.Errorf("dispatch preceded durable intent: entry=%+v ok=%v err=%v", entry, ok, err)
+				}
+				writeJSONResponse(w, http.StatusOK, handoffArrivalResponse{Accepted: true})
+			}))
+			t.Cleanup(origin.Close)
+			if _, err := srv.agents.Store().UpsertPeer(ctx, &store.PeerRecord{
+				DeviceID: "origin", Name: "Origin", URL: origin.URL, Status: store.PeerStatusOnline,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{ArrivalUncertain: tc.priorIntent}); err != nil {
+				t.Fatal(err)
+			}
+			// Simulate process restart by discarding the in-memory pending cache.
+			if tc.priorIntent {
+				srv.pendingAgentSyncs = nil
+			}
+			if tc.failWrite {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body, _ := json.Marshal(peerAgentSyncFinalizeRequest{
+				AgentID: agentID, OpID: opID, SourceDeviceID: "source",
+				Continuation: &handoffContinuation{OriginPeerID: "origin", SessionKey: "slack:C:T", Capability: "cap"},
+			})
+			req := authedRequest(httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync/finalize", bytes.NewReader(body)),
+				auth.Principal{Role: auth.RolePeer, PeerID: "source"})
+			rr := httptest.NewRecorder()
+			srv.handlePeerAgentSyncFinalize(rr, req)
+			wantStatus, wantCalls := http.StatusOK, 1
+			if tc.priorIntent {
+				wantStatus, wantCalls = http.StatusServiceUnavailable, 0
+			}
+			if tc.failWrite {
+				wantStatus, wantCalls = http.StatusInternalServerError, 0
+			}
+			callMu.Lock()
+			gotCalls := calls
+			callMu.Unlock()
+			if rr.Code != wantStatus || gotCalls != wantCalls {
+				t.Fatalf("status=%d body=%s calls=%d, want status=%d calls=%d", rr.Code, rr.Body.String(), gotCalls, wantStatus, wantCalls)
+			}
+			if tc.failWrite && !bytes.Contains(rr.Body.Bytes(), []byte("persist arrival intent")) {
+				t.Fatalf("expected intent write failure, got %s", rr.Body.String())
+			}
+			if tc.priorIntent && !bytes.Contains(rr.Body.Bytes(), []byte("fallback remains suppressed")) {
+				t.Fatalf("expected crash-replay guard, got %s", rr.Body.String())
+			}
+		})
 	}
 }

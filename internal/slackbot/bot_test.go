@@ -911,7 +911,7 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 
 	sourceReservation, arrivalReservation := bot.reserveThreadPair("C1", "thread.1")
 	_, sourceCancel := context.WithCancel(context.Background())
-	source := bot.registerActiveTurn("C1", "thread.1", sourceCancel)
+	source := bot.registerActiveTurnForUser("C1", "thread.1", "U123", sourceCancel)
 	arrival := &slackHandoffReservation{
 		bot: bot, channel: "C1", threadTS: "thread.1",
 		reservation: arrivalReservation, source: source,
@@ -924,8 +924,8 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 	bot.unregisterActiveTurn("C1", "thread.1", source)
 	// Recreate the gap after the source stop transaction has completed but
 	// before the discarded arrival wakes for its reserved FIFO slot.
-	arrivalActive, started := bot.cancelActiveTurnForCommand("C1", "thread.1")
-	if arrivalActive == nil || !started {
+	arrivalActive, started, denied := bot.cancelActiveTurnForCommand("C1", "thread.1", "U123")
+	if arrivalActive == nil || !started || denied {
 		t.Fatal("handoff arrival was not stoppable while awaiting source release")
 	}
 	arrivalActive.completeStopAck()
@@ -952,10 +952,10 @@ func TestStoppedSourceDiscardsActivatedHandoffArrival(t *testing.T) {
 	}
 	_, nextCancel := context.WithCancel(context.Background())
 	defer nextCancel()
-	next := bot.registerActiveTurn("C1", "thread.1", nextCancel)
+	next := bot.registerActiveTurnForUser("C1", "thread.1", "U123", nextCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.1", next)
-	got, started := bot.cancelActiveTurnForCommand("C1", "thread.1")
-	if got != next || !started {
+	got, started, denied := bot.cancelActiveTurnForCommand("C1", "thread.1", "U123")
+	if got != next || !started || denied {
 		t.Fatal("discarded handoff left a stale stop transaction for the thread")
 	}
 }
@@ -1134,7 +1134,7 @@ func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
 		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
 	}
 	turnCtx, turnCancel := context.WithCancel(context.Background())
-	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
 	defer turnCancel()
 
@@ -1152,6 +1152,57 @@ func TestHandleMessageEventStopCommandBypassesAutoReply(t *testing.T) {
 	if postCalls.Load() != 1 || gotThread != "thread.123" || gotMarkdown != stopCommandAck {
 		t.Fatalf("stop ack calls=%d thread=%q markdown=%q", postCalls.Load(), gotThread, gotMarkdown)
 	}
+}
+
+// Ownership checks must share the stop registry lock and must not bypass the
+// acknowledgement barrier or accidentally target a successor during finalization.
+func TestStopCommandOwnershipAcrossFinalization(t *testing.T) {
+	for _, tc := range []struct {
+		name, owner, requester string
+	}{
+		{"other user", "UOWNER", "UOTHER"},
+		{"missing requester", "UOWNER", ""},
+		{"internal turn", "", "UOTHER"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bot := &Bot{}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			turn := bot.registerActiveTurnForUser("C1", "T1", tc.owner, cancel)
+			got, started, denied := bot.cancelActiveTurnForCommand("C1", "T1", tc.requester)
+			if got != turn || started || !denied || ctx.Err() != nil || turn.stopRequested() {
+				t.Fatalf("unauthorized stop: got=%p started=%v denied=%v cancelled=%v", got, started, denied, ctx.Err())
+			}
+			if len(bot.stoppingTurns) != 0 {
+				t.Fatal("unauthorized command created a stop transaction")
+			}
+		})
+	}
+	bot := &Bot{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	turn := bot.registerActiveTurnForUser("C1", "T1", "UOWNER", cancel)
+	got, started, denied := bot.cancelActiveTurnForCommand("C1", "T1", "UOWNER")
+	if got != turn || !started || denied || ctx.Err() == nil {
+		t.Fatal("owner could not stop own turn")
+	}
+	defer turn.completeStopAck()
+	bot.unregisterActiveTurn("C1", "T1", turn)
+	nextCtx, nextCancel := context.WithCancel(context.Background())
+	defer nextCancel()
+	next := bot.registerActiveTurnForUser("C1", "T1", "UNEXT", nextCancel)
+	for _, user := range []string{"UOTHER", "UNEXT", "", "UOWNER"} {
+		got, started, denied = bot.cancelActiveTurnForCommand("C1", "T1", user)
+		if got != turn || started || denied != (user != "UOWNER") || nextCtx.Err() != nil {
+			t.Fatalf("finalizing stop for %q: got=%p started=%v denied=%v nextCancelled=%v", user, got, started, denied, nextCtx.Err())
+		}
+	}
+	bot.finishStopTransaction("C1", "T1", turn)
+	got, started, denied = bot.cancelActiveTurnForCommand("C1", "T1", "UNEXT")
+	if got != next || !started || denied || nextCtx.Err() == nil {
+		t.Fatal("successor was not stoppable after finalization")
+	}
+	next.completeStopAck()
 }
 
 func TestStopCompletionWaitsForCommandAck(t *testing.T) {
@@ -1192,11 +1243,11 @@ func TestStopCompletionWaitsForCommandAck(t *testing.T) {
 		activeTurns: make(map[string][]*activeTurn),
 	}
 	turnCtx, turnCancel := context.WithCancel(context.Background())
-	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
 	nextCtx, nextCancel := context.WithCancel(context.Background())
 	defer nextCancel()
-	next := bot.registerActiveTurn("C1", "thread.123", nextCancel)
+	next := bot.registerActiveTurnForUser("C1", "thread.123", "U123", nextCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.123", next)
 
 	completionAttempted := make(chan struct{})
@@ -1213,7 +1264,7 @@ func TestStopCompletionWaitsForCommandAck(t *testing.T) {
 	}()
 	commandDone := make(chan struct{})
 	go func() {
-		bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "!stop")
+		bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "U123", "!stop")
 		close(commandDone)
 	}()
 
@@ -1261,7 +1312,7 @@ func TestStopCompletionWaitsForCommandAck(t *testing.T) {
 	}
 	// The original turn is now absent from activeTurns and the next queued turn
 	// is the FIFO head, but the stop transaction remains until Stopped finishes.
-	if !bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.457", "!stop") {
+	if !bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.457", "U123", "!stop") {
 		t.Fatal("duplicate stop command was not consumed")
 	}
 	select {
@@ -1306,7 +1357,7 @@ func TestStopCompletionContinuesAfterAckFailure(t *testing.T) {
 		activeTurns: make(map[string][]*activeTurn),
 	}
 	turnCtx, turnCancel := context.WithCancel(context.Background())
-	turn := bot.registerActiveTurn("C1", "thread.123", turnCancel)
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
 	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
 
 	completionDone := make(chan struct{})
@@ -1315,7 +1366,7 @@ func TestStopCompletionContinuesAfterAckFailure(t *testing.T) {
 		bot.postStopNotice("C1", "thread.123", turn)
 		close(completionDone)
 	}()
-	bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "!stop")
+	bot.handleSlackCommand(context.Background(), "C1", "thread.123", "msg.456", "U123", "!stop")
 	select {
 	case <-completionDone:
 	case <-time.After(time.Second):
@@ -1330,6 +1381,87 @@ func TestStopCompletionContinuesAfterAckFailure(t *testing.T) {
 		default:
 			t.Fatalf("notice %d was not posted", i)
 		}
+	}
+}
+
+func TestHandleMessageEventStopCommandHonorsThreadGate(t *testing.T) {
+	var postCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	respondThread := false
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID: "test-agent", agentDataDir: t.TempDir(),
+		config: agent.SlackBotConfig{Enabled: true, RespondThread: &respondThread},
+		api:    slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), mgr: &mockMgr{}, logger: testLogger,
+		botUserID: "UBOTTEST", ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		threadLocks: make(map[string]*threadLock), activeTurns: make(map[string][]*activeTurn),
+		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "U123", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "U123", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.123", TimeStamp: "msg.456", Text: "!stop",
+	})
+	select {
+	case <-turnCtx.Done():
+		t.Fatal("disabled thread surface accepted stop command")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if postCalls.Load() != 0 {
+		t.Fatalf("disabled thread surface posted %d command responses", postCalls.Load())
+	}
+}
+
+func TestHandleMessageEventStopCommandRequiresTurnOwner(t *testing.T) {
+	var postCalls atomic.Int32
+	var gotMarkdown string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat.postMessage" {
+			postCalls.Add(1)
+			_ = r.ParseForm()
+			gotMarkdown = r.FormValue("markdown_text")
+		}
+		fmt.Fprint(w, `{"ok":true,"channel":"C1","ts":"post.1"}`)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot := &Bot{
+		agentID: "test-agent", agentDataDir: t.TempDir(), config: agent.SlackBotConfig{Enabled: true},
+		api: slack.New("xoxb-test", slack.OptionAPIURL(srv.URL+"/")), mgr: &mockMgr{}, logger: testLogger,
+		botUserID: "UBOTTEST", ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		threadLocks: make(map[string]*threadLock), activeTurns: make(map[string][]*activeTurn),
+		userCache: make(map[string]string), sem: make(chan struct{}, maxConcurrentChats),
+	}
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	turn := bot.registerActiveTurnForUser("C1", "thread.123", "UOWNER", turnCancel)
+	defer bot.unregisterActiveTurn("C1", "thread.123", turn)
+	defer turnCancel()
+
+	bot.handleMessageEvent(context.Background(), &slackevents.MessageEvent{
+		User: "UOTHER", Channel: "C1", ChannelType: "channel",
+		ThreadTimeStamp: "thread.123", TimeStamp: "msg.456", Text: "!stop",
+	})
+	select {
+	case <-turnCtx.Done():
+		t.Fatal("unrelated Slack user cancelled the active turn")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if postCalls.Load() != 1 || gotMarkdown != stopCommandNotOwner {
+		t.Fatalf("unauthorized stop response calls=%d markdown=%q", postCalls.Load(), gotMarkdown)
 	}
 }
 

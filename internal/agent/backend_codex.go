@@ -78,7 +78,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, errors.New("native goals require a persistent conversation")
 	}
 	goalKey := codexThreadRefPath(agent.ID, opts.SessionKey)
-	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, userID: opts.GoalUserID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
 	if !opts.OneShot {
 		if old, loaded := codexGoalRuntimes.LoadOrStore(goalKey, runtime); loaded {
 			if opts.Goal == nil {
@@ -445,7 +445,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			old := decodeGoal(msg.Result)
-			if opts.ResumeGoalOnReply && opts.Goal == nil && old != nil && old.Status != "complete" {
+			if opts.ResumeGoalOnReply && opts.Goal == nil && goalResumesOnReply(refBefore.Goal, old) {
 				opts.Goal = &GoalRequest{Action: "resume"}
 				runtime.mu.Lock()
 				runtime.isGoal = true

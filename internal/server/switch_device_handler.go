@@ -383,7 +383,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// produces a torn turn at the SIGTERM point.
 	selfCall := p.IsAgent() && p.AgentID == agentID
 	if selfCall && agent.NativeGoalRunning(agentID, strings.TrimSpace(r.Header.Get("X-Kojo-Session-Key"))) {
-		writeError(w, http.StatusConflict, "goal_requires_operator_handoff", "An active native goal cannot migrate itself safely. Use the WebUI device switch (which drains the runner), or pause the goal, move, then resume it on the target.")
+		writeError(w, http.StatusConflict, "goal_requires_operator_handoff", "An active native goal cannot migrate itself safely. Pause the goal with !goal pause, then request the move; resume it with !goal resume after arrival. If goal controls fail on an older peer, request a normal move from a new conversation without !goal. Do not use force-reclaim for a normal move.")
 		return
 	}
 	var callerOneShot agent.OneShotOrigin

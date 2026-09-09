@@ -78,6 +78,7 @@ type externalChatTextRequest struct {
 }
 
 type externalChatSteerRequest struct {
+	GoalUserID string                `json:"goalUserId,omitempty"`
 	SessionKey string                `json:"sessionKey"`
 	Content    string                `json:"content,omitempty"`
 	Question   *agent.QuestionAnswer `json:"question,omitempty"`
@@ -428,6 +429,10 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content})
 }
 
+func (r *externalChatRouter) SteerOneShotAsUser(ctx context.Context, agentID, sessionKey, content, userID string) error {
+	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content, GoalUserID: userID})
+}
+
 func (r *externalChatRouter) AnswerOneShotQuestion(ctx context.Context, agentID, sessionKey string, answer agent.QuestionAnswer) error {
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Question: &answer})
 }
@@ -464,7 +469,7 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 					q := input.Question
 					return r.server.agents.AnswerOneShotQuestion(agentID, input.SessionKey, r.selfPeerID(), q.RequestID, q.Answers, q.Deny, q.DenyMessage)
 				}
-				return r.server.agents.SteerOneShotForAgent(agentID, input.SessionKey, input.Content)
+				return r.server.agents.SteerOneShotAsUser(agentID, input.SessionKey, "", input.Content, input.GoalUserID)
 			})
 		}
 
@@ -506,6 +511,8 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 			msg = resp.Status
 		}
 		switch body.Error.Code {
+		case "goal_owner_forbidden":
+			return agent.ErrGoalOwnerForbidden
 		case "question_not_found":
 			return agent.ErrQuestionNotFound
 		case "invalid_answers":
@@ -967,7 +974,14 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid external chat request: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Message) == "" {
+	if err := req.Goal.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	// Goal commands carry their intent separately from chat text. Only a
+	// validated goal request may omit the message; empty ordinary turns stay
+	// invalid. Do this before any backend or attachment work.
+	if strings.TrimSpace(req.Message) == "" && req.Goal == nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "message is required")
 		return
 	}
@@ -1018,6 +1032,8 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrGoalOwnerForbidden):
+			writeError(w, http.StatusForbidden, "goal_owner_forbidden", err.Error())
 		case errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID):
 			writeError(w, http.StatusConflict, "switching", err.Error())
 		case errors.Is(err, agent.ErrAgentNotFound):
@@ -1217,12 +1233,14 @@ func (s *Server) handleExternalChatSteer(w http.ResponseWriter, r *http.Request)
 		q := req.Question
 		err = s.agents.AnswerOneShotQuestion(agentID, req.SessionKey, origin, q.RequestID, q.Answers, q.Deny, q.DenyMessage)
 	} else if s.unsafePeer && p.IsOwner() {
-		err = s.agents.SteerOneShotForAgent(agentID, req.SessionKey, req.Content)
+		err = s.agents.SteerOneShotAsUser(agentID, req.SessionKey, "", req.Content, req.GoalUserID)
 	} else {
-		err = s.agents.SteerOneShotFromOrigin(agentID, req.SessionKey, p.PeerID, req.Content)
+		err = s.agents.SteerOneShotAsUser(agentID, req.SessionKey, p.PeerID, req.Content, req.GoalUserID)
 	}
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrGoalOwnerForbidden):
+			writeError(w, http.StatusForbidden, "goal_owner_forbidden", err.Error())
 		case errors.Is(err, agent.ErrQuestionNotFound):
 			writeError(w, http.StatusNotFound, "question_not_found", err.Error())
 		case errors.Is(err, agent.ErrInvalidQuestionAnswer):

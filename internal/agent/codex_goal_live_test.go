@@ -109,7 +109,7 @@ func TestCodexGoalLivePauseResume(t *testing.T) {
 	if err != nil || binding == nil || !binding.DesiredPaused {
 		t.Fatalf("pause not persisted: %+v %v", binding, err)
 	}
-	// Original process is gone; resume must use its persisted native thread.
+	// Original process is gone; explicit resume uses the persisted native thread.
 	events, err = b.Chat(ctx, a, "", "Smoke test; no external tools.", ChatOptions{Goal: &GoalRequest{Action: "resume"}})
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestCodexGoalLiveCancellationReasons(t *testing.T) {
 	}
 }
 
-func TestCodexGoalLiveReplyResume(t *testing.T) {
+func TestCodexGoalLivePausedReplyStaysPaused(t *testing.T) {
 	if os.Getenv("KOJO_TEST_CODEX_GOAL") != "1" {
 		t.Skip("authenticated native smoke")
 	}
@@ -247,8 +247,8 @@ func TestCodexGoalLiveReplyResume(t *testing.T) {
 	if err != nil || binding == nil || !binding.DesiredPaused {
 		t.Fatalf("pause not persisted: %+v %v", binding, err)
 	}
-	// Original process is gone; resume must use its persisted native thread.
-	events, err = b.Chat(ctx, a, "The answer has changed: respond with REPLY_DELIVERED_739 instead of 2, then mark the goal complete.", "Smoke test; no external tools.", ChatOptions{ResumeGoalOnReply: true})
+	// Original process is gone; an ordinary reply must keep the goal paused.
+	events, err = b.Chat(ctx, a, "Respond with REPLY_DELIVERED_739. Do not change or resume the paused goal.", "Smoke test; no external tools.", ChatOptions{ResumeGoalOnReply: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,8 +266,12 @@ func TestCodexGoalLiveReplyResume(t *testing.T) {
 			complete = ev.Goal.Status == "complete"
 		}
 	}
-	if !complete || !receivedReply {
-		t.Fatalf("resume complete=%v receivedReply=%v", complete, receivedReply)
+	if complete || !receivedReply {
+		t.Fatalf("paused reply complete=%v receivedReply=%v", complete, receivedReply)
+	}
+	binding, err = goalBindingFor(a.ID, "")
+	if err != nil || binding == nil || !binding.DesiredPaused {
+		t.Fatalf("ordinary reply lost pause intent: %+v %v", binding, err)
 	}
 	events, err = b.Chat(ctx, a, "", "", ChatOptions{Goal: &GoalRequest{Action: "clear"}})
 	if err != nil {

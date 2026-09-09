@@ -2624,6 +2624,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 	}
 
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex {
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return nil, err
+		}
+	}
+
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -2992,6 +2998,33 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 		return ErrSteerUnsupported
 	}
 	return fn(text)
+}
+
+// SteerOneShotAsUser checks Slack goal ownership on the holder before capturing
+// the live turn callback. Admission serialization prevents a replacement run
+// from being authorized with the previous run's owner.
+func (m *Manager) SteerOneShotAsUser(agentID, sessionKey, originPeerID, text, userID string) error {
+	unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, sessionKey))
+	defer unlock()
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex && strings.HasPrefix(sessionKey, agentID+":slack:") {
+		opts := OneShotOpts{SessionKey: sessionKey, GoalUserID: userID}
+		if userID == "" {
+			binding, err := goalBindingFor(agentID, sessionKey)
+			if err != nil {
+				return err
+			}
+			if NativeGoalRunning(agentID, sessionKey) || (binding != nil && binding.State != nil && binding.State.Status != "complete") {
+				return errors.New("Slack goal steering requires the initiating user; upgrade the Hub if it omitted the user")
+			}
+		}
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return err
+		}
+	}
+	if originPeerID != "" {
+		return m.SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text)
+	}
+	return m.SteerOneShotForAgent(agentID, sessionKey, text)
 }
 
 // processOneShotEvents is like processChatEvents but does not persist

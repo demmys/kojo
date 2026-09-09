@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"sync"
@@ -85,9 +86,10 @@ type peerAgentSyncFinalizeRequest struct {
 }
 
 type handoffContinuation struct {
-	SessionKey   string `json:"session_key"`
-	OriginPeerID string `json:"origin_peer_id"`
-	Capability   string `json:"capability"`
+	GoalHandoffID string `json:"goal_handoff_id,omitempty"`
+	SessionKey    string `json:"session_key"`
+	OriginPeerID  string `json:"origin_peer_id"`
+	Capability    string `json:"capability"`
 }
 
 type peerAgentSyncFinalizeResponse struct {
@@ -153,7 +155,13 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"source_device_id, agent_id, and op_id required")
 		return
 	}
-	if req.Continuation != nil && (req.Continuation.SessionKey == "" || req.Continuation.OriginPeerID == "" || req.Continuation.Capability == "") {
+	if c := req.Continuation; c != nil && c.GoalHandoffID != "" {
+		if _, err := uuid.Parse(c.GoalHandoffID); err != nil || c.GoalHandoffID != req.OpID || c.Capability != "" || c.OriginPeerID == "" {
+			writeError(w, 400, "bad_request", "invalid goal handoff continuation")
+			return
+		}
+	}
+	if req.Continuation != nil && req.Continuation.GoalHandoffID == "" && (req.Continuation.SessionKey == "" || req.Continuation.OriginPeerID == "" || req.Continuation.Capability == "") {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"continuation.session_key, continuation.origin_peer_id, and continuation.capability required")
 		return
@@ -320,7 +328,49 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	// capability+op_id, and Manager deduplicates the fallback by op_id, so a kv
 	// delete failure can safely retry the whole finalize.
 	if s.agents != nil {
-		if req.Continuation == nil {
+		if req.Continuation != nil && req.Continuation.GoalHandoffID != "" {
+			if !entry.ArrivalHandled {
+				if entry.ArrivalUncertain {
+					writeError(w, 503, "goal_resume_uncertain", "Goal handoff resume delivery is uncertain; inspect destination state before explicitly resuming")
+					return
+				}
+				binding, err := s.agents.AcceptGoalHandoff(req.AgentID, req.Continuation.SessionKey, req.OpID, req.SourceDeviceID, s.peerID.DeviceID)
+				if err != nil {
+					writeError(w, 409, "goal_changed", err.Error())
+					return
+				}
+				entry.ArrivalUncertain = true
+				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
+					return
+				}
+				origin := binding.OriginPeerID
+				if origin == "" {
+					origin = req.SourceDeviceID
+				}
+				if err := s.callGoalHandoffOrigin(r.Context(), origin, goalHandoffOriginRequest{Action: "check", OpID: req.OpID, AgentID: req.AgentID}); err != nil {
+					writeError(w, 409, "goal_handoff_stopped", err.Error())
+					return
+				}
+				recovery := goalRecoveryRequest{AgentID: req.AgentID, SessionKey: binding.SessionKey, ThreadID: binding.State.ThreadID, Generation: binding.Generation, UserID: binding.UserID, RunID: binding.RunID, HolderID: s.peerID.DeviceID, HandoffID: req.OpID}
+				// Main WebUI follows the agent; Slack retains the original Hub.
+				if binding.SessionKey != "" && binding.OriginPeerID != "" && binding.OriginPeerID != s.peerID.DeviceID {
+					err = s.requestGoalRecovery(r.Context(), binding.OriginPeerID, recovery)
+				} else {
+					err = s.resumeGoalSurface(r.Context(), recovery)
+				}
+				if err != nil {
+					writeError(w, 503, "goal_resume_uncertain", err.Error())
+					return
+				}
+				entry.ArrivalUncertain = false
+				entry.ArrivalHandled = true
+				if err := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
+					return
+				}
+			}
+		} else if req.Continuation == nil {
 			s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
 		} else if entry.ArrivalUncertain {
 			writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted",

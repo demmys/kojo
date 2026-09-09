@@ -585,6 +585,8 @@ func SyncCodexDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logge
 }
 
 func codexDeviceSwitchSkillBody(body string) string {
+	body = strings.ReplaceAll(body, "On 2xx, the response JSON's", "If HTTP 202 returns outcome=queued, the Goal move is only reserved, not completed. Save needed notes, then END THIS TURN immediately. Do not poll, sleep, call switch again, or continue other work: migration waits for your turn to finish. Kojo will pause and checkpoint the native process before transferring and resuming the same Goal. Use !goal status from a later user turn for state, or !goal pause to cancel. Never force-reclaim or retry a move whose ownership is uncertain. This queued case takes precedence over the non-completed cases below.\n\nOn 2xx, the response JSON's")
+
 	repl := strings.NewReplacer(
 		"grok --resume", "Codex app-server thread/resume",
 		"grok session state", "Codex thread state",

@@ -238,6 +238,11 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	if r == nil || r.server == nil || r.server.agents == nil {
 		return nil, errors.New("external chat router is unavailable")
 	}
+	if opts.Goal != nil && (opts.Goal.Action == "pause" || opts.Goal.Action == "clear") {
+		if handled, stopErr := r.StopIdleGoal(ctx, agentID, opts.SessionKey, opts.GoalUserID); handled && stopErr != nil {
+			r.server.logger.Warn("handoff stop not confirmed at origin; continuing normal authorized goal control", "agent", agentID, "err", stopErr)
+		}
+	}
 	freshContext, resumeContext := opts.FreshSessionContext, opts.ResumeSessionContext
 	if freshContext == "" && resumeContext == "" {
 		freshContext, resumeContext = agent.FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
@@ -610,6 +615,11 @@ func (r *externalChatRouter) selfPeerID() string {
 
 func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID, holder string, local bool, req externalChatTextRequest) externalChatDispatchResult {
 	s := r.server
+	if req.Goal != nil && req.Goal.ExpectedHandoffID != "" {
+		if err := s.checkGoalStop(routeCtx, agentID, req.Goal.ExpectedHandoffID); err != nil {
+			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
+		}
+	}
 	if req.Goal != nil && req.Goal.ExpectedRunID != "" {
 		if err := s.checkGoalStop(routeCtx, agentID, req.Goal.ExpectedRunID); err != nil {
 			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}

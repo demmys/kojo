@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
 )
 
 type goalStopRequest struct {
+	HandoffID  string `json:"handoffId,omitempty"`
 	SessionKey string `json:"sessionKey"`
 	RunID      string `json:"runId"`
 }
@@ -27,11 +29,33 @@ func (s *Server) handleExternalGoalStop(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var q goalStopRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&q); err != nil || len(q.RunID) != 64 || q.SessionKey == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&q); err != nil || (q.HandoffID == "" && (len(q.RunID) != 64 || q.SessionKey == "")) {
 		writeError(w, 400, "bad_request", "sessionKey and goal run nonce required")
 		return
 	}
 	p := auth.FromContext(r.Context())
+	if q.HandoffID != "" {
+		lock, err := s.agents.Store().GetAgentLock(r.Context(), r.PathValue("id"))
+		if err != nil || s.peerID == nil || lock.HolderPeer != s.peerID.DeviceID {
+			writeError(w, 409, "wrong_holder", "handoff stop reached a stale holder")
+			return
+		}
+		b, err := agent.GoalHandoffBinding(r.PathValue("id"), q.SessionKey)
+		if err != nil || b == nil || (b.OriginPeerID != "" && b.OriginPeerID != p.PeerID) || (b.OriginPeerID == "" && (b.Handoff == nil || b.Handoff.SourcePeerID != p.PeerID)) {
+			writeError(w, 403, "forbidden", "handoff origin mismatch")
+			return
+		}
+		if err := s.agents.CancelGoalHandoff(r.PathValue("id"), q.SessionKey, q.HandoffID); err != nil {
+			writeError(w, 409, "goal_changed", err.Error())
+			return
+		}
+		if err := s.agents.Store().CheckFencing(r.Context(), r.PathValue("id"), s.peerID.DeviceID, lock.FencingToken); err != nil {
+			writeError(w, 409, "wrong_holder", "handoff moved during stop; resume remains fenced at origin")
+			return
+		}
+		writeJSONResponse(w, 200, map[string]bool{"paused": true})
+		return
+	}
 	if err := s.agents.FenceGoalRun(r.PathValue("id"), q.SessionKey, q.RunID, p.PeerID); err != nil {
 		writeError(w, 409, "goal_changed", err.Error())
 		return

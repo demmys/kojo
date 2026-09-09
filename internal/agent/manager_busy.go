@@ -132,6 +132,10 @@ const (
 )
 
 func (m *Manager) Steer(ctx context.Context, agentID, text string) (string, error) {
+	q, _ := ParseGoalCommand(text)
+	if err := checkGoalHandoffAdmission(agentID, "", q); err != nil {
+		return "", err
+	}
 	// Refuse a steer during a restart drain BEFORE persisting anything
 	// (mirrors acquirePreparing). A steer accepted mid-quiesce would reserve a
 	// row against a turn about to be aborted and never processed — surface the
@@ -156,7 +160,14 @@ func (m *Manager) Steer(ctx context.Context, agentID, text string) (string, erro
 		return "", err
 	}
 
-	injectErr := m.injectSteer(agentID, entry, text)
+	injectErr := func() error {
+		unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, ""))
+		defer unlock()
+		if err := checkGoalHandoffAdmission(agentID, "", q); err != nil {
+			return err
+		}
+		return m.injectSteer(agentID, entry, text)
+	}()
 	if injectErr == nil {
 		return SteerModeInjected, nil
 	}

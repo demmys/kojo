@@ -50,7 +50,14 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 	if replyStart != nil {
 		replyID, err = replyStart()
 	} else {
+		r.mu.Lock()
+		if r.stopRequested {
+			r.mu.Unlock()
+			combined.processError = "goal stopped before activation"
+			return combined
+		}
 		startID, err = r.write(method, params)
+		r.mu.Unlock()
 	}
 	if err != nil {
 		combined.processError = err.Error()
@@ -64,7 +71,24 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 	inTurn := false
 	currentTurnID := ""
 	var checkID int64
+	var handoffPauseID int64
+	handoffPaused := false
+	canFinish := func() bool {
+		if !activated || inTurn || checkID != 0 || goal != nil && goal.Status == "active" {
+			return false
+		}
+		if r.wantsHandoff() && goal != nil && goal.Status == "paused" {
+			if !handoffPaused || handoffPauseID != 0 {
+				return false
+			}
+			r.checkpointHandoff()
+		}
+		return true
+	}
 	publish := func(g *CodexGoal) bool {
+		if r.wantsHandoff() && g != nil && g.Status != "active" && g.Status != "paused" {
+			_ = updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) { cancelGoalHandoff(b, "native goal ended or became blocked before handoff") })
+		}
 		goal = g
 		if err := updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) { b.State = g }); err != nil {
 			combined.processError = "persist goal checkpoint: " + err.Error()
@@ -84,6 +108,27 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 			continue
 		}
 		if id, ok := msg.numericID(); ok {
+			if handoffPauseID != 0 && id == handoffPauseID {
+				handoffPauseID = 0
+				if msg.Error != nil {
+					combined.processError = "handoff pause: " + msg.Error.Message
+					return combined
+				}
+				handoffPaused = true
+				if !publish(decodeGoal(msg.Result)) {
+					return combined
+				}
+				if inTurn && currentTurnID != "" {
+					_, _ = r.write("turn/interrupt", map[string]any{"threadId": r.threadID, "turnId": currentTurnID})
+				} else {
+					checkID, err = r.write("thread/goal/get", map[string]any{"threadId": r.threadID})
+					if err != nil {
+						combined.processError = err.Error()
+						return combined
+					}
+				}
+				continue
+			}
 			handled := r.resolve(&msg)
 			if !handled && steer != nil {
 				steer.resolve(id, msg.Error)
@@ -120,6 +165,9 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				if id == startID {
 					if err := updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) {
 						b.ActivationPending = false
+						if q.ExpectedHandoffID != "" && b.Handoff != nil && b.Handoff.ID == q.ExpectedHandoffID && b.Handoff.Phase == "resuming" {
+							b.Handoff.Phase = "resumed"
+						}
 						b.RecoveryAttempts = 0
 						rememberGoalOperation(b, q.OperationID)
 					}); err != nil {
@@ -132,8 +180,20 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				}
 				if id == startID {
 					activated = true
+					if q.ExpectedHandoffID != "" {
+						notice := "Goal resumed after device transfer. Operation: " + q.ExpectedHandoffID + "\n\n"
+						combined.fullText.WriteString(notice)
+						send(ChatEvent{Type: "text", Delta: notice})
+					}
 				}
-				if activated && !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
+				if r.handoffReadyToPark() && !handoffPaused && handoffPauseID == 0 && goal != nil && goal.Status == "active" {
+					handoffPauseID, err = r.write("thread/goal/set", map[string]any{"threadId": r.threadID, "status": "paused"})
+					if err != nil {
+						combined.processError = err.Error()
+						return combined
+					}
+				}
+				if canFinish() {
 					combined.turnCompleted = true
 					return combined
 				}
@@ -154,7 +214,7 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 			}
 			// A goal may complete during a turn. Drain the final response before
 			// releasing the runner, attachment ownership, and Slack stream.
-			if activated && !inTurn && checkID == 0 && (goal == nil || goal.Status != "active") {
+			if canFinish() {
 				combined.turnCompleted = true
 				return combined
 			}
@@ -171,8 +231,12 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				return combined
 			}
 		case "turn/started":
+			r.nativeTurnStarted()
 			inTurn = true
 			currentTurnID = decodeCodexTurnID(msg.Params)
+			if handoffPaused && currentTurnID != "" {
+				_, _ = r.write("turn/interrupt", map[string]any{"threadId": r.threadID, "turnId": currentTurnID})
+			}
 			if steer != nil {
 				steer.setTurnID(decodeCodexTurnID(msg.Params))
 			}
@@ -199,7 +263,9 @@ func runCodexGoalWithReply(scanner *jsonlLineScanner, q *GoalRequest, r *codexGo
 				return combined
 			}
 
-			// Account for state notifications ordered after turn/completed.
+			// The curl requesting a move has now finished inside a completed
+			// native turn. Only here may parking interrupt autonomous work.
+			r.nativeTurnCompleted()
 			checkID, err = r.write("thread/goal/get", map[string]any{"threadId": r.threadID})
 			if err != nil {
 				combined.processError = err.Error()

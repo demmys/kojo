@@ -52,6 +52,7 @@ const peerAgentSyncStateMaxBody = 4 << 10 // 4 KiB; body is two short strings.
 
 func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Kojo-Native-Goal", "v1")
+	w.Header().Set("X-Kojo-Goal-Handoff", "v1")
 	p, ok := requirePeerOrOwner(w, r)
 	if !ok {
 		return

@@ -2274,6 +2274,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			}
 		}
 	}
+	if err := checkGoalHandoffAdmission(agentID, "", goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing checks switching AND increments the
 	// preparing counter under one busyMu lock — Step -1's
 	// WaitChatIdle observes the counter so a race between
@@ -2630,6 +2633,9 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 	}
 
+	if err := checkGoalHandoffAdmission(agentID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -2649,7 +2655,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			if err != nil {
 				return nil, err
 			}
-			return goalControlEvents(g), nil
+			return goalControlEvents(g, agentID, opts.SessionKey), nil
 		}
 	}
 
@@ -3006,6 +3012,10 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 func (m *Manager) SteerOneShotAsUser(agentID, sessionKey, originPeerID, text, userID string) error {
 	unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, sessionKey))
 	defer unlock()
+	q, _ := ParseGoalCommand(text)
+	if err := checkGoalHandoffAdmission(agentID, sessionKey, q); err != nil {
+		return err
+	}
 	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex && strings.HasPrefix(sessionKey, agentID+":slack:") {
 		opts := OneShotOpts{SessionKey: sessionKey, GoalUserID: userID}
 		if userID == "" {

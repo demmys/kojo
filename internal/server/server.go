@@ -91,12 +91,13 @@ func httpServerErrorLog(logger *slog.Logger) *log.Logger {
 var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
 
 type Server struct {
-	goalStopFences sync.Map // emergency in-memory stop fence when durable storage is unavailable
-	sessions       *session.Manager
-	agents         *agent.Manager
-	groupdms       *agent.GroupDMManager
-	slackHub       *slackbot.Hub
-	externalChat   *externalChatRouter
+	goalHandoffBarriers sync.Map // op -> passive source adapter completion barrier
+	goalStopFences      sync.Map // emergency in-memory stop fence when durable storage is unavailable
+	sessions            *session.Manager
+	agents              *agent.Manager
+	groupdms            *agent.GroupDMManager
+	slackHub            *slackbot.Hub
+	externalChat        *externalChatRouter
 	// extensions is the kojo extension-package registry (packages
 	// installed from a git URL). Nil on PeerOnly daemons and when
 	// the registry directory could not be opened; every handler
@@ -950,6 +951,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// Owner OR self-agent; the policy layer enforces the
 		// caller-matches-{id} invariant for non-owner principals.
 		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/switch", s.handleAgentHandoffSwitch)
+		mux.HandleFunc("POST /api/v1/peers/goals/handoff", s.handleGoalHandoffOrigin)
+		mux.HandleFunc("GET /api/v1/goal-handoffs/{op}", s.handleGoalHandoffStatus)
 		// Target-side pull endpoint that the orchestrator dials.
 		// Owner OR RolePeer (the orchestrator signs as its own
 		// peer identity); the source-side blob serve at

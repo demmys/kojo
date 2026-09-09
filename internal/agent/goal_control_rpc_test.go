@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -55,6 +56,16 @@ func TestGoalRPCProcess(t *testing.T) {
 				status = next
 				_ = os.WriteFile(statePath, []byte(status), 0600)
 			}
+			if _, err := os.Stat(statePath + ".handoff"); err == nil {
+				db, e := sql.Open("sqlite", filepath.Join(os.Getenv("CODEX_HOME"), "goals_1.sqlite"))
+				if e != nil {
+					os.Exit(4)
+				}
+				if _, e = db.Exec("UPDATE thread_goals SET status=?, tokens_used=451", status); e != nil {
+					os.Exit(5)
+				}
+				db.Close()
+			}
 			result = goal(status)
 		case "thread/resume", "thread/start":
 			result = map[string]any{"thread": map[string]any{"id": tid}}
@@ -65,7 +76,20 @@ func TestGoalRPCProcess(t *testing.T) {
 		if q.Method == "turn/start" || (q.Method == "thread/goal/set" && status == "active") {
 			emit("turn/started", map[string]any{"turn": map[string]any{"id": "turn"}})
 			emit("item/agentMessage/delta", map[string]any{"delta": "ordinary reply"})
-			if status == "active" {
+			_, handoffErr := os.Stat(statePath + ".handoff")
+			if handoffErr == nil {
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					if _, err := os.Stat(statePath + ".queued"); err == nil {
+						break
+					}
+					if time.Now().After(deadline) {
+						os.Exit(6)
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}
+			if status == "active" && handoffErr != nil {
 				_ = os.WriteFile(statePath, []byte("complete"), 0600)
 				emit("thread/goal/updated", goal("complete"))
 			}

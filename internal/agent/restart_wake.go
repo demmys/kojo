@@ -258,13 +258,7 @@ func (m *Manager) WakeChat(agentID, message string) error {
 	}
 	go func() {
 		defer cancel()
-		for range events {
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			m.logger.Warn("wake chat timed out", "agent", agentID, "timeout", timeout)
-		} else {
-			m.logger.Info("wake chat completed", "agent", agentID)
-		}
+		drainBackgroundChat(ctx, events, m.logger, "wake chat", agentID, timeout)
 	}()
 	return nil
 }

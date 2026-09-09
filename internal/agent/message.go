@@ -105,6 +105,8 @@ type ChatEvent struct {
 	attachmentClaim *attachmentOwnership
 	Usage           *Usage `json:"usage,omitempty"`
 	ErrorMessage    string `json:"errorMessage,omitempty"`
+	// ErrorCode preserves the backend classification separately from human-readable text.
+	ErrorCode string `json:"errorCode,omitempty"`
 	// ParentToolUseID is set when this event originates from a subagent
 	// spawned by a Task tool call rather than the main assistant turn.
 	// Its value is the tool_use ID of the parent Task invocation (or, for

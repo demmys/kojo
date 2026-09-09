@@ -2390,6 +2390,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system" && goal == nil,
+		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
 		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
@@ -2454,6 +2455,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer m.clearBusy(agentID)
 		defer cancel()
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		// Background callers keep draining after Abort cancels only chatCtx.
+		// processChatEvents deliberately stops forwarding on cancellation, so
+		// preserve that outcome for them before the broadcaster closes.
+		if src == BusySourceCron && chatCtx.Err() != nil && ctx.Err() == nil {
+			outCh <- ChatEvent{Type: "done", ErrorMessage: ErrMsgCancelled}
+		}
 
 		m.updatePostChatIndex(agentID)
 		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
@@ -3754,13 +3761,7 @@ func (m *Manager) Checkin(agentID string) error {
 
 	go func() {
 		defer cancel()
-		for range events {
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			m.logger.Warn("manual checkin timed out", "agent", agentID, "timeout", timeout)
-		} else {
-			m.logger.Info("manual checkin completed", "agent", agentID)
-		}
+		drainBackgroundChat(ctx, events, m.logger, "manual checkin", agentID, timeout)
 	}()
 	return nil
 }

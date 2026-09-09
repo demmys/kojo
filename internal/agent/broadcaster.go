@@ -21,7 +21,7 @@ const (
 func eventSize(ev ChatEvent) int {
 	n := len(ev.Type) + len(ev.Status) + len(ev.Delta) +
 		len(ev.ToolUseID) + len(ev.ToolName) + len(ev.ToolInput) +
-		len(ev.ToolOutput) + len(ev.ErrorMessage)
+		len(ev.ToolOutput) + len(ev.ErrorMessage) + len(ev.ErrorCode)
 	for i := range ev.Attachments {
 		a := &ev.Attachments[i]
 		n += len(a.Path) + len(a.Name) + len(a.Mime)

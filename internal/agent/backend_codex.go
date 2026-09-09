@@ -71,6 +71,9 @@ func (b *CodexBackend) Available() bool {
 }
 
 func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	if err := checkGoalHandoffAdmission(agent.ID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
 	if err := opts.Goal.Validate(); err != nil {
 		return nil, err
 	}
@@ -79,6 +82,9 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	}
 	goalKey := codexThreadRefPath(agent.ID, opts.SessionKey)
 	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, userID: opts.GoalUserID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	if opts.Goal != nil {
+		runtime.resumeHandoffID = opts.Goal.ExpectedHandoffID
+	}
 	if !opts.OneShot {
 		if old, loaded := codexGoalRuntimes.LoadOrStore(goalKey, runtime); loaded {
 			if opts.Goal == nil {
@@ -88,7 +94,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			if err != nil {
 				return nil, err
 			}
-			return goalControlEvents(g), nil
+			return goalControlEvents(g, agent.ID, opts.SessionKey), nil
 		}
 	}
 	launched := false
@@ -177,6 +183,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
 				if b.State != nil && b.State.Status != "complete" {
 					if stopped || !preserve {
+						cancelGoalHandoff(b, "goal execution cancelled")
 						b.DesiredPaused = true
 						b.Generation++
 					}
@@ -376,14 +383,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 		if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil {
-			if refBefore == nil || refBefore.Goal == nil || refBefore.Goal.DesiredPaused || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
+			if opts.Goal.ExpectedHandoffID != "" && !goalHandoffResumeAllowed(refBefore, opts.Goal) {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal handoff changed or was cancelled before resume"})
+				shutdown()
+				return
+			}
+			if refBefore == nil || refBefore.Goal == nil || (refBefore.Goal.DesiredPaused && opts.Goal.ExpectedHandoffID == "") || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
 				send(ChatEvent{Type: "error", ErrorMessage: "goal changed or paused since recovery was scheduled"})
 				shutdown()
 				return
 			}
 		}
 		if opts.Goal != nil && refBefore != nil && goalOperationSeen(refBefore.Goal, opts.Goal.OperationID) {
-			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State), "", nil, nil)})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
 			shutdown()
 			return
 		}
@@ -395,7 +407,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			if opts.Goal.Action == "pause" || opts.Goal.Action == "clear" {
-				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.DesiredPaused = true; b.Generation++ }); err != nil {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+					b.DesiredPaused = true
+					b.Generation++
+					cancelGoalHandoff(b, "goal explicitly paused or cleared")
+				}); err != nil {
 					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
 					shutdown()
 					return
@@ -425,7 +441,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			send(ChatEvent{Type: "goal", Goal: goal})
-			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal), "", nil, nil)})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
 			shutdown()
 			return
 		}
@@ -451,7 +467,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				runtime.isGoal = true
 				runtime.mu.Unlock()
 			}
-			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && refBefore.Goal.ActivationPending))) {
+			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && (refBefore.Goal.ActivationPending || goalHandoffResumeAllowed(refBefore, opts.Goal))))) {
 				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) { g.State = old }); err != nil {
 					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
 				} else {
@@ -689,6 +705,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				shutdown()
 				return
 			}
+			activationAdmitted := false
 			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) {
 				if ctx.Err() != nil {
 					g.DesiredPaused = true
@@ -697,6 +714,14 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				if opts.Goal.Action == "start" {
 					g.SetupContext = userMessage
 					g.State = &CodexGoal{ThreadID: threadID, Objective: opts.Goal.Objective, Status: "active", TokenBudget: opts.Goal.TokenBudget}
+				}
+				if opts.Goal.ExpectedHandoffID != "" {
+					if g.Handoff == nil || g.Handoff.ID != opts.Goal.ExpectedHandoffID || g.Handoff.Phase != "resume_pending" || g.Generation != *opts.Goal.ExpectedGeneration || g.RunID != opts.Goal.ExpectedRunID {
+						return
+					}
+					g.Handoff.Phase = "resuming"
+				} else if opts.Goal.ExpectedGeneration == nil {
+					g.Handoff = nil // old operation must not stop this explicit replacement
 				}
 				g.Generation++
 				g.DesiredPaused = false
@@ -713,6 +738,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				if opts.OriginPeerID != "" {
 					g.OriginPeerID = opts.OriginPeerID
 				}
+				activationAdmitted = true
 				// Pending activation is fenced before RPC; success is recorded on ACK.
 			}); err != nil {
 				runtime.mu.Unlock()
@@ -721,6 +747,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			runtime.mu.Unlock()
+			if !activationAdmitted {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal activation was cancelled"})
+				shutdown()
+				return
+			}
 			if opts.OnSteerReady != nil {
 				opts.OnSteerReady(func(text string) error {
 					q, err := ParseGoalCommand(text)
@@ -746,6 +777,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				replyStart = func() (int64, error) { return startTurn(userMessage) }
 			}
 			result := runCodexGoalWithReply(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, replyStart, qs)
+			if runtime.wantsHandoff() {
+				shutdownErr := shutdown()
+				if result.processError != "" {
+					shutdownErr = errors.New(result.processError)
+				}
+				runtime.finishHandoff(shutdownErr)
+				if shutdownErr != nil && result.processError == "" {
+					result.processError = "Goal handoff failed: " + shutdownErr.Error()
+				}
+				result.fullText.WriteString(goalHandoffSummary(agent.ID, opts.SessionKey))
+				send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+				return
+			}
 			if ctx.Err() != nil {
 				shutdown()
 				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)

@@ -714,6 +714,21 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 	} else if denied {
 		b.postMessage(ctx, channel, replyTS, stopCommandNotOwner)
 	} else if active == nil {
+		if stopper, ok := b.mgr.(interface {
+			StopIdleGoal(context.Context, string, string, string) (bool, error)
+		}); ok {
+			stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			handled, err := stopper.StopIdleGoal(stopCtx, b.agentID, b.agentID+":slack:"+channel+":"+replyTS, userID)
+			cancel()
+			if handled {
+				if err != nil {
+					b.postMessage(ctx, channel, replyTS, "Goal handoff stop: "+err.Error())
+				} else {
+					b.postMessage(ctx, channel, replyTS, "Goal handoff cancelled. Automatic resume is fenced.")
+				}
+				return true
+			}
+		}
 		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
 	}
 	// A duplicate command against the same already-stopping FIFO head is
@@ -1076,8 +1091,9 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
 	if arrival != nil {
 		arrivalReservation = &slackHandoffReservation{
-			userID: userID,
-			bot:    b, channel: channel, threadTS: threadTS,
+			sourceCompleteErr: errors.New("Slack source did not finalize successfully"),
+			userID:            userID,
+			bot:               b, channel: channel, threadTS: threadTS,
 			reservation: arrival, history: arrivalHistory, source: active,
 		}
 	}
@@ -1733,6 +1749,7 @@ streamLoop:
 		runAsync(cleanup)
 	}
 
+	var sourceHistoryErr error
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
 	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
@@ -1749,10 +1766,17 @@ streamLoop:
 		}
 		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
 		if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{botMsg}); err != nil {
+			sourceHistoryErr = err
 			b.logger.Warn("failed to save bot response to thread history", "err", err)
 		}
 	}
-
+	if arrivalReservation != nil {
+		arrivalReservation.mu.Lock()
+		if sourceHistoryErr == nil && !hasError && !stopped && finalDelivered {
+			arrivalReservation.sourceCompleteErr = nil
+		}
+		arrivalReservation.mu.Unlock()
+	}
 }
 
 // slackSessionKey computes the deterministic SessionKey for a Slack
@@ -2686,7 +2710,8 @@ type threadReservation struct {
 func (r *threadReservation) Wait() { <-r.ready }
 
 type slackHandoffReservation struct {
-	userID string // human who owns question forms across handoff
+	sourceCompleteErr error  // guarded by mu; observed only after source FIFO releases
+	userID            string // human who owns question forms across handoff
 
 	mu          sync.Mutex
 	bot         *Bot
@@ -2894,4 +2919,17 @@ func (b *Bot) resolveUserNameContext(ctx context.Context, userID string) string 
 	b.userCacheMu.Unlock()
 
 	return name
+}
+
+// WaitSourceComplete is a passive checkpoint barrier, not an arrival admission.
+// source FIFO release happens after delivery, history writes and cleanup defers.
+func (r *slackHandoffReservation) WaitSourceComplete(ctx context.Context) error {
+	select {
+	case <-r.reservation.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sourceCompleteErr
 }

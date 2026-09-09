@@ -14,6 +14,8 @@ import (
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
+var ErrGoalOwnerForbidden = errors.New("only the user who started this goal can control or reply to it")
+
 // GoalRequest is explicit user intent, never extracted from model output or
 // historical context. Controls use the same authenticated conversation route.
 type GoalRequest struct {
@@ -189,6 +191,7 @@ var codexGoalRuntimes sync.Map // ref path -> *codexGoalRuntime
 type codexGoalRuntime struct {
 	isGoal        bool
 	runID, origin string
+	userID        string // immutable authenticated Slack user for pre-persistence controls
 	stopRequested bool
 	mu            sync.Mutex
 	controlMu     sync.Mutex
@@ -412,4 +415,45 @@ func NativeGoalRunning(id, key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.isGoal && !r.closed
+}
+
+// Explicit pause/stop survives ordinary conversation, including a stale native
+// "active" update after cancellation. Blocked is different: a human answer can
+// unblock that goal. Native paused state also requires explicit resume.
+func goalResumesOnReply(binding *GoalBinding, native *CodexGoal) bool {
+	return binding != nil && !binding.DesiredPaused && native != nil &&
+		native.Status != "paused" && native.Status != "complete"
+}
+
+// Slack commands have an authenticated user even when their message is empty.
+// Validate before both the live-control fast path and idle runner creation.
+// WebUI uses its own authenticated owner path and has no Slack user ID.
+func authorizeSlackGoal(agentID string, opts OneShotOpts) error {
+	if !strings.HasPrefix(opts.SessionKey, agentID+":slack:") {
+		return nil
+	}
+	if opts.Goal != nil && opts.GoalUserID == "" {
+		return errors.New("Slack goal control requires the initiating user; upgrade the Hub if it omitted the user")
+	}
+	if opts.Goal == nil && opts.GoalUserID == "" {
+		return nil // system handoff continuation, not a user command
+	}
+	if raw, ok := codexGoalRuntimes.Load(codexThreadRefPath(agentID, opts.SessionKey)); ok {
+		runtime := raw.(*codexGoalRuntime)
+		runtime.mu.Lock()
+		forbidden := runtime.isGoal && runtime.userID != "" && runtime.userID != opts.GoalUserID
+		runtime.mu.Unlock()
+		if forbidden {
+			return ErrGoalOwnerForbidden
+		}
+	}
+	binding, err := goalBindingFor(agentID, opts.SessionKey)
+	if err != nil {
+		return err
+	}
+	if binding != nil && binding.State != nil && binding.State.Status != "complete" &&
+		binding.UserID != "" && binding.UserID != opts.GoalUserID {
+		return ErrGoalOwnerForbidden
+	}
+	return nil
 }

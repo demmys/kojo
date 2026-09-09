@@ -31,6 +31,11 @@ type oneShotSteerer interface {
 	SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error
 }
 
+// Slack steering retains the authenticated sender, just like ordinary turns.
+type oneShotUserSteerer interface {
+	SteerOneShotAsUser(ctx context.Context, agentID, sessionKey, content, userID string) error
+}
+
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
 	questionsMu sync.Mutex
@@ -636,7 +641,7 @@ func contextUntilTurnStop(parent context.Context, active *activeTurn) (context.C
 
 const (
 	stopCommandAck         = "_Stopping current turn…_"
-	stopCommandNoActive    = "_No active turn in this thread._"
+	stopCommandNoActive    = "_No active turn in this thread. A saved goal may still exist: use !goal status to check, or !goal pause to keep it paused._"
 	stopCommandNotOwner    = "_Only the person who started the current turn can stop it._"
 	stopCommandDone        = "_Stopped current turn._"
 	steerDeliveryUncertain = "_I couldn't confirm whether that interruption was delivered, so I didn't retry it to avoid sending it twice._"
@@ -668,7 +673,7 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 		go func() {
 			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
-			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q})
+			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q, GoalUserID: userID})
 			if err != nil {
 				b.postChatError(channel, replyTS, err.Error())
 				return
@@ -830,18 +835,30 @@ func (b *Bot) admitIncoming(ctx context.Context, channel, origThreadTS, replyTS,
 				}
 				close(stopWatchDone)
 			}()
-			err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS),
-				func() string {
-					if q, _ := agent.ParseGoalCommand(text); q != nil {
-						return text
-					}
-					return buildSlackUserMessage(channel, replyTS, text, displayName)
-				}())
+			content := func() string {
+				if q, _ := agent.ParseGoalCommand(text); q != nil {
+					return text
+				}
+				return buildSlackUserMessage(channel, replyTS, text, displayName)
+			}()
+			if userSteerer, ok := b.mgr.(oneShotUserSteerer); ok {
+				err = userSteerer.SteerOneShotAsUser(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content, userID)
+			} else {
+				err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content)
+			}
 			steerCancel()
 			<-stopWatchDone
 		}
 	} else {
 		err = agent.ErrSteerUnsupported
+	}
+
+	// Authorization rejection is final, not a delivery race. In particular it
+	// must not close steering or enqueue an unauthorized follow-up ahead of
+	// the owner's next correction.
+	if errors.Is(err, agent.ErrGoalOwnerForbidden) {
+		b.postChatError(channel, replyTS, err.Error())
+		return
 	}
 
 	if maySteer && (err == nil || errors.Is(err, agent.ErrSteerDeliveryUncertain)) {

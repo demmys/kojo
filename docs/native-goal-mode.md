@@ -67,8 +67,11 @@ state. Staging has compensating rollback.
 **Initial safety restriction:** an active goal cannot migrate itself from a
 `kojo-switch-device` tool call. The legacy self-call protocol snapshots the
 native rollout before its own tool result and final accounting, and cannot
-safely hand that live goal to a second runner. Use the WebUI device switch, or
-pause the goal, move the agent, then resume. Supporting autonomous mid-goal
+safely hand that live goal to a second runner. Pause the goal with `!goal pause`, request a normal move, then explicitly
+resume it on the destination. There is currently no normal device-switch UI.
+On older peers where goal controls fail, request a normal move in a new Slack
+thread without `!goal`. Force-reclaim is not a substitute: it does not fetch
+the holder's latest state. Supporting autonomous mid-goal
 self-migration requires a post-turn native-tail handoff protocol.
 
 ## Verification
@@ -89,4 +92,16 @@ self-migration requires a post-turn native-tail handoff protocol.
 
 ### Replies in Slack goal threads
 
-A normal human reply in a Slack thread with an unfinished goal resumes that goal automatically, including blocked or paused goals. The reply (including attachment context) is delivered as a user turn before autonomous continuation is reactivated. Replies during a running turn keep the existing steer behavior. Completed or cleared goals remain ordinary conversations. Explicit `!goal` commands retain their meaning; `!goal <objective>` still starts a new goal, while `!goal clear` removes the old goal.
+A normal human reply in a Slack thread with an unfinished goal resumes that goal automatically, including blocked goals, but not explicitly paused/stopped goals or native paused goals. Use `!goal resume` to reactivate those; ordinary replies remain ordinary turns and can request a device move. The reply (including attachment context) is delivered as a user turn before autonomous continuation is reactivated. Replies during a running turn keep the existing steer behavior. Completed or cleared goals remain ordinary conversations. Explicit `!goal` commands retain their meaning; `!goal <objective>` still starts a new goal, while `!goal clear` removes the old goal.
+
+
+### Remote controls and stop semantics
+
+Goal controls carry a validated structured request; their chat message can be
+empty. Both local and peer routes preserve the Slack user and operation ID.
+Only the initiating user can control or continue an unfinished Slack goal when
+its owner is known; an older Hub that omits the user must be upgraded.
+
+`!stop` cancels the currently tracked turn. If there is no active turn it does
+not clear or pause a stored goal: the response points to `!goal status` and
+`!goal pause`. A blocked goal is waiting for an answer, not completed.

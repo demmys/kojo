@@ -92,7 +92,11 @@ func (b *Bot) showQuestion(ctx context.Context, channel, thread, user, session s
 	b.questionsMu.Unlock()
 	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	_, ts, err := b.api.PostMessageContext(callCtx, channel, slack.MsgOptionTS(thread), slack.MsgOptionText("エージェントからの質問（回答待ち）", false), slack.MsgOptionBlocks(blocks...))
+	postOpts := []slack.MsgOption{slack.MsgOptionText("エージェントからの質問（回答待ち）", false), slack.MsgOptionBlocks(blocks...)}
+	if thread != "" {
+		postOpts = append(postOpts, slack.MsgOptionTS(thread))
+	}
+	_, ts, err := b.api.PostMessageContext(callCtx, channel, postOpts...)
 	b.questionsMu.Lock()
 	q.messageTS = ts
 	if err != nil {

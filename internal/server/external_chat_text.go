@@ -820,9 +820,13 @@ func (r *externalChatRouter) postRemote(ctx context.Context, agentID, holder str
 	if payload.HandoffCapability != "" {
 		req.Header.Set("X-Kojo-Handoff-Capability", payload.HandoffCapability)
 	}
+	var wroteRequest atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) },
+	}))
 	resp, err := peer.NoKeepAliveHTTPClient(0).Do(req)
 	if err != nil {
-		return nil, true, fmt.Errorf("dispatch Slack turn to holder: %w", err)
+		return nil, wroteRequest.Load(), fmt.Errorf("dispatch Slack turn to holder: %w", err)
 	}
 	return resp, true, nil
 }

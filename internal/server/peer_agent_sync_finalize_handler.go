@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -399,8 +400,22 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 				return
 			}
 			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
-				// Keep the durable intent on failure: cancellation may bypass
-				// dispatch's final uncertain classification after an earlier send.
+				// Only a delivery that may have reached the Hub keeps the durable
+				// intent; a definite failure (holder changed, verify error, no send
+				// began) must not poison every later finalize with 503.
+				if !errors.Is(err, errHandoffArrivalUncertain) {
+					entry.ArrivalUncertain = false
+					// The definite failure may itself be the request context being
+					// cancelled; the clear must still persist or every later
+					// finalize keeps returning 503.
+					clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+					perr := s.updatePendingAgentSyncAfterSideEffect(clearCtx, req.AgentID, req.OpID, entry)
+					clearCancel()
+					if perr != nil {
+						s.logger.Error("peer agent-sync finalize: clearing arrival intent failed; pending retained",
+							"agent", req.AgentID, "op_id", req.OpID, "err", perr)
+					}
+				}
 				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
 					"agent", req.AgentID, "op_id", req.OpID, "err", err)
 				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())

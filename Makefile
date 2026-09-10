@@ -38,7 +38,7 @@ watch:
 	air
 
 dev-web:
-	cd web && npm run dev
+	cd web && $(NPM) run dev
 
 clean:
 	rm -f kojo kojo.exe

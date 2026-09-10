@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -60,8 +61,14 @@ type handoffArrivalBindRequest struct {
 	Capability     string `json:"capability"`
 }
 
+// Adapters use pointer receivers. A nil pointer inside the interface is not an
+// executable reservation and must never be advertised as a capability.
+func missingHandoffArrivalReservation(reservation agent.HandoffArrivalReservation) bool {
+	return reservation == nil || (reflect.ValueOf(reservation).Kind() == reflect.Pointer && reflect.ValueOf(reservation).IsNil())
+}
+
 func (s *Server) mintHandoffArrivalCapability(agentID, sessionKey string, reservation agent.HandoffArrivalReservation) string {
-	if s == nil || agentID == "" || sessionKey == "" || reservation == nil {
+	if s == nil || agentID == "" || sessionKey == "" || missingHandoffArrivalReservation(reservation) {
 		return ""
 	}
 	raw := make([]byte, 32)
@@ -173,7 +180,7 @@ func (s *Server) activateHandoffArrivalCapability(ctx context.Context, req hando
 				continue
 			}
 		}
-		if entry.Reservation == nil {
+		if missingHandoffArrivalReservation(entry.Reservation) {
 			s.handoffArrivalMu.Unlock()
 			return errHandoffCapabilityInvalid
 		}

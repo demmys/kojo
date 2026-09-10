@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/loppo-llc/kojo/internal/chathistory"
 )
@@ -1286,13 +1287,14 @@ func (res *codexStreamResult) handleItemStarted(msg *rpcMessage, itemPhases map[
 	}
 	var params struct {
 		Item struct {
-			ID        string          `json:"id"`
-			Type      string          `json:"type"`
-			Phase     string          `json:"phase"`
-			Command   string          `json:"command"`
-			Tool      string          `json:"tool"`
-			Server    string          `json:"server"`
-			Arguments json.RawMessage `json:"arguments"`
+			ID        string            `json:"id"`
+			Type      string            `json:"type"`
+			Phase     string            `json:"phase"`
+			Command   string            `json:"command"`
+			Tool      string            `json:"tool"`
+			Server    string            `json:"server"`
+			Arguments json.RawMessage   `json:"arguments"`
+			Changes   []codexFileChange `json:"changes"`
 		} `json:"item"`
 	}
 	json.Unmarshal(*msg.Params, &params)
@@ -1328,8 +1330,78 @@ func (res *codexStreamResult) handleItemStarted(msg *rpcMessage, itemPhases map[
 			res.cancelled = true
 			return true
 		}
+	case "fileChange":
+		// apply_patch. Codex has no separate read/write tools: reads are
+		// shell commands (commandExecution) and writes are patches, which
+		// app-server reports as a fileChange item rather than a command.
+		input := codexFileChangeInput(params.Item.Changes)
+		res.toolUses = append(res.toolUses, ToolUse{
+			ID:    params.Item.ID,
+			Name:  codexApplyPatchTool,
+			Input: input,
+		})
+		if !send(ChatEvent{Type: "tool_use", ToolUseID: params.Item.ID, ToolName: codexApplyPatchTool, ToolInput: input}) {
+			res.cancelled = true
+			return true
+		}
 	}
 	return false
+}
+
+// codexApplyPatchTool is the tool name shown for a fileChange item. It is the
+// name of the built-in Codex tool that produces one.
+const codexApplyPatchTool = "apply_patch"
+
+// codexFileChange is one entry of a fileChange item's `changes` array.
+type codexFileChange struct {
+	Path string `json:"path"`
+	Kind struct {
+		Type     string `json:"type"` // add | delete | update
+		MovePath string `json:"move_path"`
+	} `json:"kind"`
+	Diff string `json:"diff"`
+}
+
+// codexFileChangeDiffLimit caps the diff kept per file in the tool input. The
+// input is streamed, stored on the message and replayed on every history
+// fetch, so a multi-megabyte patch is trimmed to a preview.
+const codexFileChangeDiffLimit = 16 * 1024
+
+// codexFileChangeInput renders a fileChange item's changes as the tool input:
+// one "<kind> <path>" header per file followed by its diff (the full content
+// for an add, truncated past codexFileChangeDiffLimit), files separated by a
+// blank line.
+func codexFileChangeInput(changes []codexFileChange) string {
+	var b strings.Builder
+	for i, c := range changes {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		kind := c.Kind.Type
+		if kind == "" {
+			kind = "update"
+		}
+		b.WriteString(kind)
+		b.WriteString(" ")
+		b.WriteString(c.Path)
+		if c.Kind.MovePath != "" {
+			b.WriteString(" -> ")
+			b.WriteString(c.Kind.MovePath)
+		}
+		diff := strings.TrimRight(c.Diff, "\n")
+		if len(diff) > codexFileChangeDiffLimit {
+			cut := codexFileChangeDiffLimit
+			for cut > 0 && !utf8.RuneStart(diff[cut]) {
+				cut--
+			}
+			diff = diff[:cut] + fmt.Sprintf("\n[...truncated %d bytes...]", len(diff)-cut)
+		}
+		if diff != "" {
+			b.WriteString("\n")
+			b.WriteString(diff)
+		}
+	}
+	return b.String()
 }
 
 func (res *codexStreamResult) handleAgentMessageDelta(msg *rpcMessage, itemPhases map[string]string, send func(ChatEvent) bool) bool {
@@ -1415,6 +1487,7 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 			Success      *bool             `json:"success"`
 			Summary      []json.RawMessage `json:"summary"`
 			Content      []json.RawMessage `json:"content"`
+			Changes      []codexFileChange `json:"changes"`
 		} `json:"item"`
 	}
 	json.Unmarshal(*msg.Params, &params)
@@ -1511,6 +1584,32 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 			return true
 		}
 		matchToolOutput(res.toolUses, params.Item.ID, toolName, output)
+	case "fileChange":
+		// status is completed | failed | declined. The v2 FileChange item
+		// carries no error or per-file outcome, so the status is the whole
+		// result. Record it before sending so a cancel that lands on this
+		// event still leaves the stored tool use with its output.
+		output := params.Item.Status
+		// item/started normally carries the full change set, but with the
+		// apply_patch_streaming_events feature the patch can still be
+		// streaming at that point (item/fileChange/patchUpdated follows).
+		// The completed item is authoritative, so backfill an input that
+		// started out empty rather than storing a blank apply_patch.
+		if input := codexFileChangeInput(params.Item.Changes); input != "" {
+			for i := len(res.toolUses) - 1; i >= 0; i-- {
+				if res.toolUses[i].ID == params.Item.ID {
+					if res.toolUses[i].Input == "" {
+						res.toolUses[i].Input = input
+					}
+					break
+				}
+			}
+		}
+		matchToolOutput(res.toolUses, params.Item.ID, codexApplyPatchTool, output)
+		if !send(ChatEvent{Type: "tool_result", ToolUseID: params.Item.ID, ToolName: codexApplyPatchTool, ToolOutput: output}) {
+			res.cancelled = true
+			return true
+		}
 	case "dynamicToolCall":
 		var output string
 		if len(params.Item.ContentItems) > 0 && string(params.Item.ContentItems) != "null" {

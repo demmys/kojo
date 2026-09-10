@@ -717,6 +717,15 @@ func main() {
 				context.Background(), 30*time.Second)
 			agentMgr.EvictNonLocalAgentsAtStartup(
 				evictCtx, peerIdentity.DeviceID)
+			incomplete, ierr := st.IncompleteIncomingHandoffs(evictCtx)
+			if ierr != nil {
+				logger.Error("cannot read incoming handoff fences; refusing unsafe startup", "err", ierr)
+				os.Exit(1)
+			}
+			for id := range incomplete {
+				agentMgr.TeardownAgentRuntime(id)
+			}
+
 			evictCancel()
 			// --peer 限定の追加 prune: released marker が無い orphan 行
 			// (未finalize / 過去 incarnation の残骸) も schedulers 起動前
@@ -819,6 +828,13 @@ func main() {
 						ids = append(ids, id)
 					}
 				}
+				filtered := ids[:0]
+				for _, id := range ids {
+					if !incomplete[id] {
+						filtered = append(filtered, id)
+					}
+				}
+				ids = filtered
 				// --peer prune が失敗していたら ids は部分集合 (内部の
 				// kv 読取も同じ store を使うので同じく degraded のはず)。
 				// 部分 seed で Start すると stale ID を AcquireAgentLock し
@@ -1098,32 +1114,15 @@ func main() {
 		// rows present but not actively claimed by this peer.
 		srv.SetOnAgentSyncFinalized(func(hookCtx context.Context, agentID, rawToken, sourceDeviceID, opID string) (bool, error) {
 			tokenReissued := false
-			// Step order is durability-first: write the durable
-			// arrived marker BEFORE touching token / lock-guard
-			// state, THEN best-effort clear any prior released
-			// marker. Source releases regardless of finalizeErr
-			// (lock + blobs have already moved by complete), so
-			// any later-step failure must leave target with at
-			// least a durable seed for AgentLockGuard on the
-			// next restart. A stale older released/<id> row that
-			// fails to delete here is harmless — latest-wins
-			// arbitration in latestHandoffMarkers picks the new
-			// arrival because its timestamp is later. Token-
-			// adopt failure after the marker is recoverable via
-			// ReissueAgentToken / operator re-handoff; an
-			// arrived-marker-missing state would leave the agent
-			// unreachable from any future boot because
-			// ReleaseAgentLockByPeer on graceful shutdown wipes
-			// the agent_locks row.
+			// The handler has already accepted the source/op/ownership receipt
+			// and atomically set holder + proxy. Persist arrival credentials and
+			// markers before runtime registration. Until the hook succeeds,
+			// the durable incoming receipt blocks startup and turn admission;
+			// a failed hook is retried through finalize, never bypassed by Guard.
 			if agentMgr != nil {
-				// sourceDeviceID becomes the allowed_proxy_peer that
-				// finalize stamps below via UpdateAgentLockAllowedProxy
-				// (peer_agent_sync_finalize_handler.go). Persist it now
-				// so a graceful-shutdown wipe of agent_locks doesn't
-				// strand the agent on the next boot — the fresh
-				// AcquireAgentLock would otherwise default allowed_proxy
-				// _peer back to self and the Hub→target chat proxy
-				// would 403 in agentHolderAdmitMiddleware.
+				// sourceDeviceID here is the resolved response-surface Hub, not
+				// necessarily the immediate source on a multi-hop handoff. Keep
+				// its proxy authorization across graceful lock-row removal.
 				if err := agentMgr.MarkAgentArrivedHere(hookCtx, agentID, sourceDeviceID); err != nil {
 					return tokenReissued, fmt.Errorf("mark agent arrived: %w", err)
 				}
@@ -1172,17 +1171,8 @@ func main() {
 			if capturedGuard != nil {
 				capturedGuard.AddAgent(hookCtx, agentID)
 			}
-			// Verify the lock actually transferred to this host
-			// before activating runtime side channels. AddAgent
-			// internally calls AcquireAgentLock; ErrLockHeld
-			// (stale source row still alive) leaves holder ≠
-			// self. Activating cron / notify / arrival chat
-			// against an agent we don't actually hold would let
-			// the runtime mutate state the source still owns,
-			// then surfacing 5xx at finalize would leave a
-			// half-active target. Return an error so the
-			// finalize handler keeps pending and the orchestrator
-			// can retry.
+			// Guard adopts the accepted token. Fail closed if ownership no
+			// longer belongs here rather than activating side channels.
 			if agentMgr != nil && agentMgr.Store() != nil && peerIdentity != nil {
 				lock, lerr := agentMgr.Store().GetAgentLock(hookCtx, agentID)
 				if lerr != nil {
@@ -1225,7 +1215,7 @@ func main() {
 			// passes). Firing here would build the arrival prompt
 			// against a transcript missing the agent's own
 			// commitment text. See peer_agent_sync_finalize_handler.go
-			// for the new ordering: hook → UpdateAgentLockAllowedProxy
+			// for the ordering: accept → hook → activation receipt
 			// → applyFinalizeTailMessage → origin-aware arrival admission
 			// (or legacy main arrival) → commitPendingAgentSync.
 			if agentMgr != nil {

@@ -191,6 +191,10 @@ DELETE FROM kv
 		return nil, fmt.Errorf("store.ForceReclaimAgentToLocal: kv handoff: %w", err)
 	}
 
+	if _, err := tx.ExecContext(ctx, `UPDATE incoming_handoffs SET phase='aborted' WHERE agent_id=? AND phase!='done'`, agentID); err != nil {
+		return nil, err
+	}
+
 	rec, err := scanAgentLockTx(ctx, tx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("store.ForceReclaimAgentToLocal: post-read: %w", err)

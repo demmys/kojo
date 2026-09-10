@@ -37,6 +37,13 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Readiness is a read of THIS peer's DB route, including its outgoing
+		// shadow. Proxying it (notably Owner+PeerID callers on a Hub) would
+		// hide the delegation evidence and can create routing loops.
+		if sub == "/external-chat/ready" && r.Method == http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		// Local agent → normal handler.
 		if _, local := s.agents.Get(id); local {

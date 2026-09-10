@@ -50,6 +50,8 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, "bad_request", "missing agent id")
 		return
 	}
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: id})
+	defer unlock()
 	// Confirm the agent exists in the store so an operator typo
 	// surfaces as 404 instead of silently creating an orphan lock
 	// row for a nonexistent agent.

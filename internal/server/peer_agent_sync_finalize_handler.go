@@ -63,9 +63,8 @@ type peerAgentSyncFinalizeRequest struct {
 	// the source-release guard would otherwise drop this turn.
 	//
 	// Handler ordering (see handlePeerAgentSyncFinalize):
-	//   1. onAgentSyncFinalized hook (AddAgent + lock verify +
-	//      ActivateAgentRuntime)
-	//   2. UpdateAgentLockAllowedProxy (proxy stamp)
+	//   1. AcceptIncomingHandoff (atomic holder/token/proxy)
+	//   2. onAgentSyncFinalized hook, then activated receipt
 	//   3. applyFinalizeTailMessage — UPSERTs the row by id under
 	//      a FencingPredicate keyed on the post-hook lock token,
 	//      so a force-reclaim race aborts the apply with
@@ -185,9 +184,9 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// Serialize the entire consume → arrival decision → commit sequence for
-	// this operation. In particular, only one retry may decide between origin
+	// this agent, including force-reclaim. Only one retry may decide between origin
 	// admission and legacy fallback; later retries observe the committed 404.
-	unlockFinalize := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID, OpID: req.OpID})
+	unlockFinalize := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID})
 	defer unlockFinalize()
 
 	entry, ok, err := s.consumePendingAgentSync(r.Context(), req.AgentID, req.OpID)
@@ -204,16 +203,51 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		//     this op_id (forged or wrong-host finalize)
 		//   - a prior finalize already committed and removed
 		//     the entry (idempotent re-call)
-		// Both are surfaced as 404; the orchestrator treats
-		// 404 as "nothing to do" so a retry after a successful
-		// finalize is a no-op.
+		// Both are surfaced as 404; the orchestrator conservatively reports
+		// failure because this alone cannot prove that runtime activation ran.
 		writeError(w, http.StatusNotFound, "not_found",
 			"no pending agent-sync for the given (agent_id, op_id); finalize already committed or sync never landed")
 		return
 	}
+	if entry.SourceDeviceID != "" && entry.SourceDeviceID != req.SourceDeviceID {
+		writeError(w, 403, "forbidden", "finalize source differs from phase-1 source")
+		return
+	}
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		if !entry.IncomingFenced {
+			writeError(w, 409, "legacy_handoff_pending", "pending operation predates ownership fencing; start a new handoff")
+			return
+		}
+		accepted, err := s.agents.Store().AcceptIncomingHandoff(r.Context(), req.AgentID, req.OpID, req.SourceDeviceID, s.peerID.DeviceID, allowedProxy, store.NowMillis(), forceReclaimLeaseDuration.Milliseconds())
+		if err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) || errors.Is(err, store.ErrNotFound) {
+				writeError(w, 409, "stale_handoff", err.Error())
+			} else {
+				writeError(w, 503, "handoff_accept_failed", err.Error())
+			}
+			return
+		}
+		if accepted.Phase == "done" {
+			if err := s.commitPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
+				writeError(w, 500, "internal", err.Error())
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
+			return
+		}
+		// Startup deliberately evicts incomplete incoming snapshots. A retry
+		// must reload only after validating its durable receipt, before the
+		// activation hook registers schedulers or admits an arrival.
+		if _, exists := s.agents.Get(req.AgentID); !exists {
+			if err := s.agents.ReloadAgentFromStore(req.AgentID); err != nil {
+				writeError(w, 503, "handoff_reload_failed", err.Error())
+				return
+			}
+		}
+	}
 	tokenReissued := false
 	if s.onAgentSyncFinalized != nil {
-		reissued, err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID, req.OpID)
+		reissued, err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, allowedProxy, req.OpID)
 		tokenReissued = reissued
 		if err != nil {
 			// Lock-race surface: cmd/kojo's hook wraps a
@@ -244,52 +278,17 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	// Single-statement verify + stamp: UpdateAgentLockAllowedProxy
-	// only fires when holder_peer == self at the moment of the
-	// UPDATE. A concurrent steal between the hook and this call
-	// returns ErrFencingMismatch; the pending entry stays so the
-	// orchestrator can retry. ErrNotFound means the lock row
-	// vanished entirely — same retry semantics.
-	//
-	// agentHolderAdmitMiddleware gates agents/* on
-	// `holder_peer == self AND allowed_proxy_peer == signer`.
-	// AcquireAgentLock fresh-row insert lands allowed_proxy_peer
-	// = self; we rewrite it to the response-surface Hub (or the
-	// legacy source peer) so Hub→target proxying admits. Scoped to a single agent — no
-	// peer_registry.trusted flip, so a paired-but-untrusted
-	// source can NOT use this as a stepping-stone to
-	// sessions/files/git.
-	if s.agents != nil && s.agents.Store() != nil && s.peerID != nil {
-		err := s.agents.Store().UpdateAgentLockAllowedProxy(
-			r.Context(), req.AgentID,
-			s.peerID.DeviceID, // expected holder
-			allowedProxy,
-		)
-		switch {
-		case err == nil:
-		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrFencingMismatch):
-			s.logger.Error("peer agent-sync finalize: holder did not transfer / lock missing; pending retained",
-				"agent", req.AgentID, "op_id", req.OpID, "err", err)
-			writeError(w, http.StatusServiceUnavailable, "lock_not_self",
-				"agent_locks.holder_peer is not the local peer; finalize aborted, orchestrator may retry")
-			return
-		default:
-			s.logger.Error("peer agent-sync finalize: allowed-proxy stamp failed; pending retained",
-				"agent", req.AgentID, "source", req.SourceDeviceID, "err", err)
-			writeError(w, http.StatusInternalServerError, "internal",
-				"allowed-proxy stamp: "+err.Error())
+	// Accept committed holder+proxy together. Only mark admission-ready once
+	// the runtime hook succeeded, without a second holder-only proxy rewrite.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
 			return
 		}
 	}
-	// Apply the optional Plan A TailMessage AFTER the hook + admit
-	// gate have BOTH confirmed the lock is at us. Applying earlier
-	// would 503 forever on the first /handoff/finalize attempt —
-	// the lock isn't acquired until the hook runs AddAgent, so
-	// applyFinalizeTailMessage's holder check would refuse every
-	// pre-hook attempt. The fencing predicate on AppendMessage
-	// still re-verifies the lock is at us at apply-tx time (covers
-	// a force-reclaim race in the gap between
-	// UpdateAgentLockAllowedProxy and AppendMessage).
+	// Apply the optional tail after acceptance and runtime activation, but
+	// before building the arrival prompt. AppendMessage independently verifies
+	// the current local fencing token in its transaction.
 	if req.TailMessage != nil && s.agents != nil && s.agents.Store() != nil {
 		if err := s.applyFinalizeTailMessage(r.Context(), req.AgentID, req.TailMessage); err != nil {
 			if errors.Is(err, errTailLockNotSelf) {
@@ -426,6 +425,12 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	// orchestrator the op completed would let a later boot consume
 	// the same (agent_id, op_id) and replay every hook side
 	// effect. All hook steps are idempotent on retry.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().FinishIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
+			return
+		}
+	}
 	if err := s.commitPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
 		s.logger.Error("peer agent-sync finalize: commit kv delete failed; surface 500 for retry",
 			"agent", req.AgentID, "op_id", req.OpID, "err", err)
@@ -543,13 +548,13 @@ func (s *Server) applyFinalizeTailMessage(ctx context.Context, agentID string, r
 
 	// Build the fencing predicate from the current lock row. By
 	// the time this helper runs, the finalize handler has already
-	// driven the hook + UpdateAgentLockAllowedProxy so the lock
+	// accepted ownership and completed the runtime hook, so the lock
 	// SHOULD be at us; the checks below catch the post-hook race
 	// window:
 	//
 	//   - ErrNotFound: the agent_locks row vanished between
-	//     UpdateAgentLockAllowedProxy and here (force-reclaim
-	//     wiped it, or a manual operator delete fired). Surface
+	//     acceptance and here (for example, shutdown or an explicit
+	//     operator delete). Surface
 	//     errTailLockNotSelf so the orchestrator retries once the
 	//     row is re-acquired.
 	//
@@ -644,6 +649,30 @@ func (s *Server) handlePeerAgentSyncDrop(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return
+	}
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID})
+	defer unlock()
+	entry, found, err := s.consumePendingAgentSync(r.Context(), req.AgentID, req.OpID)
+	if err != nil {
+		writeError(w, 500, "internal", err.Error())
+		return
+	}
+	if found && entry.SourceDeviceID != "" && entry.SourceDeviceID != req.SourceDeviceID {
+		writeError(w, 403, "forbidden", "drop source differs from phase-1")
+		return
+	}
+	if s.peerID != nil {
+		// The snapshot transaction can commit before pending credentials are
+		// sealed, and drop can overtake phase-1. Fence both cases durably,
+		// independent of whether the pending KV entry exists.
+		if err := s.agents.Store().AbortIncomingHandoff(r.Context(), req.AgentID, req.OpID, req.SourceDeviceID); err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) {
+				writeError(w, 409, "stale_handoff", "cannot drop an accepted handoff or another source's operation")
+			} else {
+				writeError(w, 500, "internal", err.Error())
+			}
+			return
+		}
 	}
 	if err := s.dropPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
 		s.logger.Error("peer agent-sync drop: kv delete failed",

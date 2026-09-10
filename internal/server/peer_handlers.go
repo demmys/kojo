@@ -56,11 +56,15 @@ func requirePeerOrOwner(w http.ResponseWriter, r *http.Request) (auth.Principal,
 }
 
 // verifySignerIsSource reports whether principal p is authorized to
-// act on behalf of sourceDeviceID. Owner principals always pass; a
-// peer principal must be the named source device. Callers write their
+// act on behalf of sourceDeviceID. A device-authenticated principal must
+// match even when that trusted device has owner role. Local owners without
+// a PeerID may act out-of-band. Callers write their
 // own 403 so per-site wording and any lock cleanup stay local.
 func verifySignerIsSource(p auth.Principal, sourceDeviceID string) bool {
-	return !p.IsPeer() || p.PeerID == sourceDeviceID
+	if p.PeerID != "" {
+		return p.PeerID == sourceDeviceID
+	}
+	return p.IsOwner()
 }
 
 // peerResponse is the wire shape for one peer_registry row.

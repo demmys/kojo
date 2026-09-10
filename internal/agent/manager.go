@@ -1973,6 +1973,15 @@ func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
 func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool, opts prepareChatOptions) (*chatPrep, error) {
+	if st := m.Store(); st != nil {
+		blocked, err := st.IsIncomingHandoffIncomplete(ctx, agentID)
+		if err != nil {
+			return nil, fmt.Errorf("incoming handoff fence: %w", err)
+		}
+		if blocked {
+			return nil, ErrAgentBusy
+		}
+	}
 	// Cheap pre-check: refuse archived agents (and unknown ones) before any
 	// disk I/O like syncPersona, so dormant agents don't leak side effects
 	// into persona files / publicProfile regeneration.

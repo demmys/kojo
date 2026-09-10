@@ -74,6 +74,8 @@ type AgentLockGuard struct {
 	id     *Identity
 	logger *slog.Logger
 
+	opsMu    sync.Mutex
+	ops      map[string]*sync.Mutex
 	mu       sync.Mutex
 	desired  map[string]struct{} // agent_ids we want a lock for
 	tokens   map[string]int64    // agent_id -> fencing_token of the row we hold
@@ -126,20 +128,37 @@ func (g *AgentLockGuard) Start(ctx context.Context, agentIDs []string) {
 	go g.refreshLoop()
 }
 
-// AddAgent acquires the lock for an agent that was created after
-// Start. Idempotent — calling on an already-held id is a no-op.
+// Serialize DB operations as well as in-memory membership. A snapshot from
+// the refresh loop must not acquire an agent after RemoveAgent finished.
+func (g *AgentLockGuard) lockOperation(agentID string) func() {
+	g.opsMu.Lock()
+	if g.ops == nil {
+		g.ops = make(map[string]*sync.Mutex)
+	}
+	mu := g.ops[agentID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		g.ops[agentID] = mu
+	}
+	g.opsMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// AddAgent registers an agent and refreshes its cached ownership token, even
+// when already present (force-reclaim may have minted a new generation).
 func (g *AgentLockGuard) AddAgent(ctx context.Context, agentID string) {
 	if g == nil || agentID == "" {
 		return
 	}
+	unlock := g.lockOperation(agentID)
+	defer unlock()
 	g.mu.Lock()
 	g.desired[agentID] = struct{}{}
-	_, already := g.tokens[agentID]
 	g.mu.Unlock()
-	if already {
-		return
-	}
-	g.acquire(ctx, agentID)
+	// Re-read even if already held: an explicit reclaim may have issued a
+	// newer token while the guard still remembers the previous generation.
+	g.acquireLocked(ctx, agentID)
 }
 
 // RemoveAgent releases the lock for an agent that was deleted or
@@ -148,6 +167,8 @@ func (g *AgentLockGuard) RemoveAgent(ctx context.Context, agentID string) {
 	if g == nil || agentID == "" {
 		return
 	}
+	unlock := g.lockOperation(agentID)
+	defer unlock()
 	g.mu.Lock()
 	delete(g.desired, agentID)
 	token, held := g.tokens[agentID]
@@ -197,6 +218,18 @@ func (g *AgentLockGuard) Stop() {
 // fencing token. The caller decides whether to log + continue or
 // retry; this helper just centralises the bookkeeping.
 func (g *AgentLockGuard) acquire(ctx context.Context, agentID string) {
+	unlock := g.lockOperation(agentID)
+	defer unlock()
+	g.acquireLocked(ctx, agentID)
+}
+
+func (g *AgentLockGuard) acquireLocked(ctx context.Context, agentID string) {
+	g.mu.Lock()
+	_, desired := g.desired[agentID]
+	g.mu.Unlock()
+	if !desired {
+		return
+	}
 	opCtx, cancel := context.WithTimeout(ctx, agentLockOpTimeout)
 	defer cancel()
 	rec, err := g.st.AcquireAgentLock(opCtx, agentID, g.id.DeviceID,
@@ -295,6 +328,14 @@ func (g *AgentLockGuard) refreshAll() {
 }
 
 func (g *AgentLockGuard) refreshOne(agentID string, token int64) {
+	unlock := g.lockOperation(agentID)
+	defer unlock()
+	g.mu.Lock()
+	current, held := g.tokens[agentID]
+	g.mu.Unlock()
+	if !held || current != token {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), agentLockOpTimeout)
 	defer cancel()
 	if _, err := g.st.RefreshAgentLock(ctx, agentID, g.id.DeviceID, token,

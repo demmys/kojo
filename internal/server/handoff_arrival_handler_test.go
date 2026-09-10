@@ -490,7 +490,7 @@ func TestFinalizeArrivalPersistsIntentBeforeDispatch(t *testing.T) {
 			srv.peerID = &peer.Identity{DeviceID: "holder"}
 			agentID, opID := group.Members[0].AgentID, "op-intent"
 			ctx := context.Background()
-			if _, err := srv.agents.Store().AcquireAgentLock(ctx, agentID, "holder", 0, 60_000); err != nil {
+			if _, err := srv.agents.Store().AcquireAgentLock(ctx, agentID, "source", 0, 60_000); err != nil {
 				t.Fatal(err)
 			}
 			var calls int
@@ -513,7 +513,8 @@ func TestFinalizeArrivalPersistsIntentBeforeDispatch(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{ArrivalUncertain: tc.priorIntent}); err != nil {
+			prepareFencedIncomingForTest(t, srv, agentID, opID, "source")
+			if err := srv.recordPendingAgentSync(ctx, agentID, opID, pendingSyncEntry{SourceDeviceID: "source", IncomingFenced: true, ArrivalUncertain: tc.priorIntent}); err != nil {
 				t.Fatal(err)
 			}
 			// Simulate process restart by discarding the in-memory pending cache.

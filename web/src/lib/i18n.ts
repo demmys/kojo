@@ -282,6 +282,8 @@ const messages = {
   },
   "dash.enable": { ja: "有効化", en: "Enable" },
   "dash.agents": { ja: "エージェント", en: "Agents" },
+  "dash.effortDefault": { ja: "既定", en: "default" },
+  "dash.configuredEffort": { ja: "設定 Effort: {level}", en: "Configured effort: {level}" },
   "dash.noAgents": { ja: "エージェントがまだない", en: "No agents yet" },
   "dash.threads": { ja: "スレッド", en: "Threads" },
   "dash.groupDms": { ja: "グループ DM", en: "Group DMs" },

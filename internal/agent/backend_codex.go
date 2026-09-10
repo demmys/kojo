@@ -807,7 +807,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					}
 				})
 			}
-			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
 			shutdown()
 			return
 		}
@@ -826,7 +826,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			ctx,
 			scanner,
 			userMessage,
-			codexEmptyCompletionMaxRetries,
+			codexRetryPolicy(opts),
 			startTurn,
 			steerer,
 			respondServerRequest,
@@ -848,7 +848,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 		if result.turnCompleted {
-			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
 			shutdown()
 			return
 		}
@@ -912,16 +912,18 @@ func buildCodexResumeParams(threadParams map[string]any, threadID string) map[st
 
 // codexStreamResult holds the accumulated state from parsing a Codex stream.
 type codexStreamResult struct {
-	questions     *codexQuestionState
-	questionText  string // fallback for a run ending immediately after an async question
-	fullText      strings.Builder
-	thinking      strings.Builder
-	toolUses      []ToolUse
-	usage         *Usage
-	processError  string // non-empty if turn/completed reported an error
-	turnStatus    string // status reported by the newest turn/completed
-	turnCompleted bool   // true if turn/completed was received
-	cancelled     bool   // true if send returned false (context cancelled)
+	questions        *codexQuestionState
+	questionText     string // fallback for a run ending immediately after an async question
+	fullText         strings.Builder
+	thinking         strings.Builder
+	toolUses         []ToolUse
+	usage            *Usage
+	processError     string // non-empty if turn/completed reported an error
+	processErrorCode string // app-server codexErrorInfo classification
+	activity         bool   // any model item, delta, or server request; fail closed for overload replay
+	turnStatus       string // status reported by the newest turn/completed
+	turnCompleted    bool   // true if turn/completed was received
+	cancelled        bool   // true if send returned false (context cancelled)
 
 	// streamedReasoning records the reasoning item ids that already arrived
 	// as item/reasoning/*Delta notifications, so the completed item for the
@@ -940,15 +942,15 @@ type codexStreamResult struct {
 type codexTurnStarter func(input string) (int64, error)
 
 // runCodexTurns processes one logical user request, automatically continuing
-// the same Codex thread when app-server reports a successful completion but
-// supplies no final assistant response. Tool/thinking state from each attempt
+// the same Codex thread after empty successful completions, and (for check-ins)
+// explicit overload failures before work starts. Tool/thinking state from each attempt
 // is retained in the terminal Message; live events are already emitted by
 // parseCodexStream as each attempt runs.
 func runCodexTurns(
 	ctx context.Context,
 	scanner *jsonlLineScanner,
 	initialInput string,
-	maxEmptyRetries int,
+	policy codexTurnRetryPolicy,
 	startTurn codexTurnStarter,
 	steerer *codexSteerer,
 	respondServerRequest codexServerRequestResponder,
@@ -959,7 +961,8 @@ func runCodexTurns(
 	combined := &codexStreamResult{}
 	input := initialInput
 
-	for attempt := 0; ; attempt++ {
+	emptyRetries, overloadRetries := 0, 0
+	for {
 		if ctx.Err() != nil {
 			combined.cancelled = true
 			combined.turnCompleted = false
@@ -977,21 +980,42 @@ func runCodexTurns(
 		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send, questions...)
 		combined.absorb(result)
 
+		// Retry only explicit overload failures before any work across the whole
+		// logical request. Never replay tools, partial output, or unknown failures.
+		if ctx.Err() == nil && !result.cancelled && result.turnCompleted &&
+			result.turnStatus == "failed" && result.processErrorCode == "serverOverloaded" &&
+			!combined.activity && overloadRetries < len(policy.overloadDelays) &&
+			steerer.prepareOverloadRetry(policy.overloadDelays[overloadRetries]) {
+			delay := policy.overloadDelays[overloadRetries]
+			overloadRetries++
+			logger.Warn("codex overloaded before work; waiting to retry",
+				"retry", overloadRetries, "maxRetries", len(policy.overloadDelays),
+				"delay", delay, "errorCode", result.processErrorCode, "err", result.processError)
+			if !waitCodexRetry(ctx, delay) {
+				combined.cancelled = true
+				combined.turnCompleted = false
+				return combined
+			}
+			input = codexOverloadRetryPrompt
+			continue
+		}
+
 		// Only a clean, successful completion with no final answer is
 		// recoverable here. Failed/interrupted turns, cancellation, and broken
 		// streams keep their existing error paths.
 		if result.cancelled || !result.turnCompleted || result.turnStatus != "completed" || result.processError != "" || result.hasFinalResponse() {
 			return combined
 		}
-		if attempt >= maxEmptyRetries {
+		if emptyRetries >= policy.maxEmptyRetries {
 			combined.processError = codexEmptyCompletionError
 			logger.Warn("codex turn completed without final response; automatic retries exhausted",
-				"retries", maxEmptyRetries)
+				"retries", policy.maxEmptyRetries)
 			return combined
 		}
 
 		logger.Warn("codex turn completed without final response; starting automatic continuation",
-			"retry", attempt+1, "maxRetries", maxEmptyRetries)
+			"retry", emptyRetries+1, "maxRetries", policy.maxEmptyRetries)
+		emptyRetries++
 		input = codexEmptyCompletionRetryPrompt
 	}
 }
@@ -1021,6 +1045,8 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 			r.usage.CostUSD += next.usage.CostUSD
 		}
 	}
+	r.activity = r.activity || next.activity
+	r.processErrorCode = next.processErrorCode
 	r.processError = next.processError
 	r.turnStatus = next.turnStatus
 	r.turnCompleted = next.turnCompleted
@@ -1070,6 +1096,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 		var msg rpcMessage
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			logger.Debug("codex rpc parse error", "line", line, "err", err)
+			res.activity = true // Unreadable notifications cannot prove that no work ran.
 			continue
 		}
 
@@ -1084,6 +1111,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 			return res
 		}
 		if handled {
+			res.activity = true
 			continue
 		}
 
@@ -1156,6 +1184,20 @@ func decodeCodexTurnID(result *json.RawMessage) string {
 // handleNotification processes a single JSON-RPC notification.
 // Returns true if the stream should stop (turn completed or cancelled).
 func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map[string]string, logger *slog.Logger, send func(ChatEvent) bool) bool {
+	// Include unrendered/unknown item kinds (file changes, collab tools, etc.)
+	// in the safety guard, not just the subset the UI knows how to display.
+	if msg.Method == "item/started" || msg.Method == "item/completed" {
+		var params struct {
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if msg.Params == nil || json.Unmarshal(*msg.Params, &params) != nil || params.Item.Type != "userMessage" {
+			res.activity = true
+		}
+	} else if strings.HasPrefix(msg.Method, "item/") {
+		res.activity = true
+	}
 	switch msg.Method {
 	case "item/started":
 		return res.handleItemStarted(msg, itemPhases, send)
@@ -1217,8 +1259,8 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 		if msg.Params != nil {
 			var params struct {
 				Turn struct {
-					Status string    `json:"status"`
-					Error  *rpcError `json:"error"`
+					Status string          `json:"status"`
+					Error  *codexTurnError `json:"error"`
 				} `json:"turn"`
 			}
 			json.Unmarshal(*msg.Params, &params)
@@ -1226,7 +1268,10 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 			if params.Turn.Status == "failed" || params.Turn.Status == "interrupted" {
 				res.processError = "codex turn " + params.Turn.Status
 				if params.Turn.Error != nil {
-					res.processError = params.Turn.Error.Message
+					if params.Turn.Error.Message != "" {
+						res.processError = params.Turn.Error.Message
+					}
+					res.processErrorCode = codexErrorCode(params.Turn.Error.CodexErrorInfo)
 				}
 			}
 		}

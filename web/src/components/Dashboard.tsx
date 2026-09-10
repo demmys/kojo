@@ -9,6 +9,7 @@ import { TransferSkipsNotice } from "./agent/TransferSkipsNotice";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { useCollapsedSet } from "../hooks/useCollapsedSet";
 import { errMsg } from "../lib/utils";
+import { supportsEffort } from "../lib/toolModels";
 import { useT } from "../lib/i18n";
 import { Header } from "./ui/Header";
 import { Lamp, type LampState } from "./ui/Lamp";
@@ -761,7 +762,19 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                               <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
                               <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
                                 <Chip className="shrink-0">{agent.tool}</Chip>
-                                {agent.model && <Chip className="min-w-0 max-w-[45%]">{agent.model}</Chip>}
+                                {agent.model && <Chip className="min-w-0 max-w-[45%]" title={agent.model}>{agent.model}</Chip>}
+                                {supportsEffort(agent.tool) && (
+                                  <Chip
+                                    className="shrink-0"
+                                    title={t("dash.configuredEffort", { level: agent.effort || t("field.effortCliDefault") }) + (
+                                      (agent.tool === "claude" || agent.tool === "grok") && agent.autoEffort !== false
+                                        ? ` — ${t("settings.autoEffortDesc")}`
+                                        : ""
+                                    )}
+                                  >
+                                    {agent.effort || t("dash.effortDefault")}
+                                  </Chip>
+                                )}
                                 {agent.workDir && (
                                   <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-ink-faint">{agent.workDir}</span>
                                 )}

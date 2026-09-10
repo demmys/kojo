@@ -172,11 +172,42 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 			remainingSkips--
 			continue
 		}
+		if a.kind == "codex" && codexArtifactHasUnfinishedGoal(a.codex) {
+			return 0, 0, fmt.Errorf("handoff would omit an unfinished native goal; clear it or increase transfer capacity")
+		}
 		rejected = append(rejected, a.artifact)
 		req.TransferSkips = append(req.TransferSkips, a.skip)
 	}
 	apply(selected)
 	return len(selected), len(rejected), nil
+}
+
+// codexArtifactHasUnfinishedGoal protects both Kojo's portable binding and
+// Codex's durable goal row. Read-side limits already reject omitted goals, but
+// the later JSON-envelope budget can reject an artifact that was read
+// successfully. An incomplete or malformed goal is non-droppable: silently
+// omitting it would make the target's authoritative snapshot lose resumable
+// state.
+func codexArtifactHasUnfinishedGoal(v codexThreadWire) bool {
+	if v.Goal != nil && (v.Goal.State == nil || v.Goal.State.Status != "complete") {
+		return true
+	}
+	if v.NativeGoal == nil {
+		return false
+	}
+	if v.NativeGoal.Row == nil {
+		return true
+	}
+	for i, column := range v.NativeGoal.Row.Columns {
+		if column != "status" || i >= len(v.NativeGoal.Row.Values) {
+			continue
+		}
+		value := v.NativeGoal.Row.Values[i]
+		return value.Type != "text" || value.Text != "complete"
+	}
+	// A native goal row without a status is malformed and must not be treated
+	// as a droppable ordinary session.
+	return true
 }
 
 // exactAgentSyncNonSessionJSONSize returns the exact encoding/json byte length

@@ -49,7 +49,7 @@ type externalChatRouter struct {
 	server *Server
 
 	mu     sync.RWMutex
-	routes map[string]string // agent ID -> most recently confirmed holder
+	routes map[string]externalChatRouteHint // agent ID -> holder within a local ownership generation
 
 	handoffWait   time.Duration
 	pollInterval  time.Duration
@@ -78,6 +78,7 @@ type externalChatTextRequest struct {
 }
 
 type externalChatSteerRequest struct {
+	GoalUserID string                `json:"goalUserId,omitempty"`
 	SessionKey string                `json:"sessionKey"`
 	Content    string                `json:"content,omitempty"`
 	Question   *agent.QuestionAnswer `json:"question,omitempty"`
@@ -198,7 +199,7 @@ type externalChatDispatchResult struct {
 func newExternalChatRouter(s *Server) *externalChatRouter {
 	return &externalChatRouter{
 		server:        s,
-		routes:        make(map[string]string),
+		routes:        make(map[string]externalChatRouteHint),
 		handoffWait:   defaultExternalChatHandoffWait,
 		pollInterval:  defaultExternalChatPoll,
 		probeTimeout:  defaultExternalChatProbe,
@@ -207,26 +208,26 @@ func newExternalChatRouter(s *Server) *externalChatRouter {
 }
 
 func (r *externalChatRouter) routeHint(agentID string) string {
+	v, err := r.currentRouteVersion(context.Background(), agentID)
+	if err != nil {
+		return ""
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.routes[agentID]
+	hint := r.routes[agentID]
+	if hint.Version != v {
+		return ""
+	}
+	return hint.Holder
 }
 
+// rememberRoute is for synchronous authoritative hints. Asynchronous routes
+// must use rememberRouteFrom with the generation captured BEFORE their I/O.
 func (r *externalChatRouter) rememberRoute(agentID, holder string) {
-	if agentID == "" || holder == "" {
-		return
+	ctx, err := r.withRouteVersion(context.Background(), agentID)
+	if err == nil {
+		r.rememberRouteFrom(ctx, agentID, holder)
 	}
-	r.mu.Lock()
-	r.routes[agentID] = holder
-	r.mu.Unlock()
-}
-
-func (r *externalChatRouter) forgetRoute(agentID, holder string) {
-	r.mu.Lock()
-	if r.routes[agentID] == holder {
-		delete(r.routes, agentID)
-	}
-	r.mu.Unlock()
 }
 
 // ChatOneShot implements slackbot.ChatManager. A remote transport request is
@@ -236,6 +237,15 @@ func (r *externalChatRouter) forgetRoute(agentID, holder string) {
 func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (events <-chan agent.ChatEvent, err error) {
 	if r == nil || r.server == nil || r.server.agents == nil {
 		return nil, errors.New("external chat router is unavailable")
+	}
+	if opts.Goal != nil && (opts.Goal.Action == "pause" || opts.Goal.Action == "clear") {
+		if handled, stopErr := r.StopIdleGoal(ctx, agentID, opts.SessionKey, opts.GoalUserID); handled && stopErr != nil {
+			r.server.logger.Warn("handoff stop not confirmed at origin; continuing normal authorized goal control", "agent", agentID, "err", stopErr)
+		}
+	}
+	ctx, err = r.withRouteVersion(ctx, agentID)
+	if err != nil {
+		return nil, err
 	}
 	freshContext, resumeContext := opts.FreshSessionContext, opts.ResumeSessionContext
 	if freshContext == "" && resumeContext == "" {
@@ -298,7 +308,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	}
 
 	if result.nextHolder != "" {
-		r.rememberRoute(agentID, result.nextHolder)
+		r.rememberRouteFrom(ctx, agentID, result.nextHolder)
 		result = r.dispatch(ctx, ctx, agentID, result.nextHolder,
 			result.nextHolder == r.selfPeerID(), req)
 		if result.events != nil || (result.err != nil && result.state == externalChatDispatchDone) {
@@ -315,6 +325,10 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
+	waitCtx, err = r.refreshRouteVersion(waitCtx, agentID)
+	if err != nil {
+		return nil, err
+	}
 	found, switching, discoverErr := r.discoverReadyHolder(waitCtx, agentID)
 	if discoverErr == nil && found != "" {
 		result = r.dispatch(waitCtx, ctx, agentID, found, found == r.selfPeerID(), req)
@@ -351,6 +365,10 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 			}
 			return nil, waitCtx.Err()
 		case <-ticker.C:
+			waitCtx, err = r.refreshRouteVersion(waitCtx, agentID)
+			if err != nil {
+				return nil, err
+			}
 			found, _, err := r.discoverReadyHolder(waitCtx, agentID)
 			if err != nil || found == "" {
 				continue
@@ -428,6 +446,10 @@ func (r *externalChatRouter) SteerOneShot(ctx context.Context, agentID, sessionK
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content})
 }
 
+func (r *externalChatRouter) SteerOneShotAsUser(ctx context.Context, agentID, sessionKey, content, userID string) error {
+	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content, GoalUserID: userID})
+}
+
 func (r *externalChatRouter) AnswerOneShotQuestion(ctx context.Context, agentID, sessionKey string, answer agent.QuestionAnswer) error {
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Question: &answer})
 }
@@ -437,6 +459,11 @@ func (r *externalChatRouter) AnswerOneShotQuestion(ctx context.Context, agentID,
 func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID string, input externalChatSteerRequest) error {
 	if r == nil || r.server == nil || r.server.agents == nil {
 		return errors.New("external chat router is unavailable")
+	}
+	var versionErr error
+	ctx, versionErr = r.withRouteVersion(ctx, agentID)
+	if versionErr != nil {
+		return versionErr
 	}
 	holder, local, err := r.initialRoute(ctx, agentID)
 	if err != nil {
@@ -451,7 +478,7 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 		if local || holder == "" {
 			ready := r.server.externalChatReadiness(ctx, agentID)
 			if ready.HolderPeer != "" && ready.HolderPeer != r.selfPeerID() {
-				r.forgetRoute(agentID, holder)
+				r.forgetRouteFrom(ctx, agentID, holder)
 				holder = ready.HolderPeer
 				local = false
 				continue
@@ -464,7 +491,7 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 					q := input.Question
 					return r.server.agents.AnswerOneShotQuestion(agentID, input.SessionKey, r.selfPeerID(), q.RequestID, q.Answers, q.Deny, q.DenyMessage)
 				}
-				return r.server.agents.SteerOneShotForAgent(agentID, input.SessionKey, input.Content)
+				return r.server.agents.SteerOneShotAsUser(agentID, input.SessionKey, "", input.Content, input.GoalUserID)
 			})
 		}
 
@@ -473,14 +500,17 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 			return fmt.Errorf("probe thread holder before steer: %w", err)
 		}
 		if ready.HolderPeer != "" && ready.HolderPeer != holder {
-			r.forgetRoute(agentID, holder)
+			r.forgetRouteFrom(ctx, agentID, holder)
 			holder = ready.HolderPeer
 			local = holder == r.selfPeerID()
 			continue
 		}
 		if !ready.Ready {
-			r.forgetRoute(agentID, holder)
+			r.forgetRouteFrom(ctx, agentID, holder)
 			return fmt.Errorf("thread holder %s is not ready: %s", holder, ready.Unavailable)
+		}
+		if err := r.checkRouteVersion(ctx, agentID); err != nil {
+			return err
 		}
 		resp, attempted, err := r.postRemoteSteer(ctx, agentID, holder, input)
 		if err != nil {
@@ -491,7 +521,7 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			r.rememberRoute(agentID, holder)
+			r.rememberRouteFrom(ctx, agentID, holder)
 			return nil
 		}
 		var body struct {
@@ -506,6 +536,8 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 			msg = resp.Status
 		}
 		switch body.Error.Code {
+		case "goal_owner_forbidden":
+			return agent.ErrGoalOwnerForbidden
 		case "question_not_found":
 			return agent.ErrQuestionNotFound
 		case "invalid_answers":
@@ -517,7 +549,7 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 		case "delivery_uncertain":
 			return fmt.Errorf("%w: %s", agent.ErrSteerDeliveryUncertain, msg)
 		case "wrong_holder", "runtime_not_ready", "switching":
-			r.forgetRoute(agentID, holder)
+			r.forgetRouteFrom(ctx, agentID, holder)
 			return fmt.Errorf("thread holder changed before steer admission: %s", msg)
 		default:
 			return fmt.Errorf("holder rejected thread steer (%s): %s", resp.Status, msg)
@@ -603,6 +635,19 @@ func (r *externalChatRouter) selfPeerID() string {
 
 func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID, holder string, local bool, req externalChatTextRequest) externalChatDispatchResult {
 	s := r.server
+	var versionErr error
+	routeCtx, versionErr = r.withRouteVersion(routeCtx, agentID)
+	if versionErr != nil {
+		return externalChatVersionFailure(versionErr)
+	}
+	if versionErr = r.checkRouteVersion(routeCtx, agentID); versionErr != nil {
+		return externalChatVersionFailure(versionErr)
+	}
+	if req.Goal != nil && req.Goal.ExpectedHandoffID != "" {
+		if err := s.checkGoalStop(routeCtx, agentID, req.Goal.ExpectedHandoffID); err != nil {
+			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
+		}
+	}
 	if req.Goal != nil && req.Goal.ExpectedRunID != "" {
 		if err := s.checkGoalStop(routeCtx, agentID, req.Goal.ExpectedRunID); err != nil {
 			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
@@ -644,17 +689,17 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			}
 			return externalChatDispatchResult{state: externalChatDispatchDone, err: err}
 		}
-		r.rememberRoute(agentID, r.selfPeerID())
+		r.rememberRouteFrom(routeCtx, agentID, r.selfPeerID())
 		return externalChatDispatchResult{events: events, state: externalChatDispatchDone}
 	}
 
 	ready, probeErr := r.probeHolder(routeCtx, agentID, holder)
 	if probeErr != nil {
-		r.forgetRoute(agentID, holder)
+		r.forgetRouteFrom(routeCtx, agentID, holder)
 		return externalChatDispatchResult{state: externalChatDispatchStale, err: probeErr}
 	}
 	if !ready.Ready {
-		r.forgetRoute(agentID, holder)
+		r.forgetRouteFrom(routeCtx, agentID, holder)
 		state := externalChatDispatchStale
 		if ready.Switching || ready.HolderPeer == holder {
 			// The lock can reach the target just before finalize activates
@@ -681,6 +726,9 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 				s.logger.Warn("native goal stop not acknowledged; origin recovery remains fenced", "agent", agentID, "err", err)
 			}
 		}
+	}
+	if err := r.checkRouteVersion(routeCtx, agentID); err != nil {
+		return externalChatVersionFailure(err)
 	}
 	resp, attempted, err := r.postRemote(turnCtx, agentID, holder, req)
 	if err != nil {
@@ -710,11 +758,11 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 		switch body.Error.Code {
 		case "switching", "runtime_not_ready":
-			r.forgetRoute(agentID, holder)
+			r.forgetRouteFrom(routeCtx, agentID, holder)
 			return externalChatDispatchResult{state: externalChatDispatchSwitching,
 				nextHolder: resp.Header.Get("X-Kojo-Holder-Peer"), err: errors.New(msg)}
 		case "wrong_holder":
-			r.forgetRoute(agentID, holder)
+			r.forgetRouteFrom(routeCtx, agentID, holder)
 			return externalChatDispatchResult{state: externalChatDispatchStale,
 				nextHolder: resp.Header.Get("X-Kojo-Holder-Peer"), err: errors.New(msg)}
 		default:
@@ -723,7 +771,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 	}
 
-	r.rememberRoute(agentID, holder)
+	r.rememberRouteFrom(routeCtx, agentID, holder)
 	out := make(chan agent.ChatEvent, 64)
 	go r.decodeExternalChatTextStream(turnCtx, agentID, holder, resp.Body, out, stopGoal)
 	return externalChatDispatchResult{events: out, state: externalChatDispatchDone}
@@ -851,8 +899,15 @@ func (r *externalChatRouter) probeHolder(ctx context.Context, agentID, holder st
 }
 
 func (r *externalChatRouter) discoverReadyHolder(ctx context.Context, agentID string) (holder string, switching bool, err error) {
+	ctx, err = r.withRouteVersion(ctx, agentID)
+	if err != nil {
+		return "", false, err
+	}
+	if err = r.checkRouteVersion(ctx, agentID); err != nil {
+		return "", false, err
+	}
 	if ready := r.localReadiness(ctx, agentID); ready.Ready {
-		r.rememberRoute(agentID, r.selfPeerID())
+		r.rememberRouteFrom(ctx, agentID, r.selfPeerID())
 		return r.selfPeerID(), false, nil
 	} else if ready.Switching {
 		switching = true
@@ -871,7 +926,7 @@ func (r *externalChatRouter) discoverReadyHolder(ctx context.Context, agentID st
 			continue
 		}
 		if ready.Ready {
-			r.rememberRoute(agentID, rec.DeviceID)
+			r.rememberRouteFrom(ctx, agentID, rec.DeviceID)
 			return rec.DeviceID, false, nil
 		}
 		if ready.Switching || ready.HolderPeer == rec.DeviceID {
@@ -907,6 +962,18 @@ func (s *Server) externalChatReadiness(ctx context.Context, agentID string) exte
 			return result
 		}
 	}
+	if s.agents.Store() != nil {
+		incomplete, err := s.agents.Store().IsIncomingHandoffIncomplete(ctx, agentID)
+		if err != nil {
+			result.Unavailable = "incoming handoff fence lookup failed"
+			return result
+		}
+		if incomplete {
+			result.Switching = true
+			result.Unavailable = "incoming handoff is not finalized"
+			return result
+		}
+	}
 	if s.agents.IsSwitching(agentID) {
 		result.Switching = true
 		result.Unavailable = "device switch in progress"
@@ -929,7 +996,11 @@ func (s *Server) externalChatReadiness(ctx context.Context, agentID string) exte
 }
 
 func (s *Server) handleExternalChatReady(w http.ResponseWriter, r *http.Request) {
-	if !s.externalChatPeerAllowed(w, r) {
+	// Hub authentication stamps paired devices as Owner+PeerID. Permit
+	// those identities for this read-only route probe, not generic chat POSTs.
+	p := auth.FromContext(r.Context())
+	if !p.IsPeer() && !(p.IsOwner() && (p.PeerID != "" || s.unsafePeer)) {
+		writeError(w, http.StatusForbidden, "forbidden", "external chat readiness is peer-only")
 		return
 	}
 	ready := s.externalChatReadiness(r.Context(), r.PathValue("id"))
@@ -967,7 +1038,14 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid external chat request: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Message) == "" {
+	if err := req.Goal.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	// Goal commands carry their intent separately from chat text. Only a
+	// validated goal request may omit the message; empty ordinary turns stay
+	// invalid. Do this before any backend or attachment work.
+	if strings.TrimSpace(req.Message) == "" && req.Goal == nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "message is required")
 		return
 	}
@@ -1018,6 +1096,8 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrGoalOwnerForbidden):
+			writeError(w, http.StatusForbidden, "goal_owner_forbidden", err.Error())
 		case errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID):
 			writeError(w, http.StatusConflict, "switching", err.Error())
 		case errors.Is(err, agent.ErrAgentNotFound):
@@ -1217,12 +1297,14 @@ func (s *Server) handleExternalChatSteer(w http.ResponseWriter, r *http.Request)
 		q := req.Question
 		err = s.agents.AnswerOneShotQuestion(agentID, req.SessionKey, origin, q.RequestID, q.Answers, q.Deny, q.DenyMessage)
 	} else if s.unsafePeer && p.IsOwner() {
-		err = s.agents.SteerOneShotForAgent(agentID, req.SessionKey, req.Content)
+		err = s.agents.SteerOneShotAsUser(agentID, req.SessionKey, "", req.Content, req.GoalUserID)
 	} else {
-		err = s.agents.SteerOneShotFromOrigin(agentID, req.SessionKey, p.PeerID, req.Content)
+		err = s.agents.SteerOneShotAsUser(agentID, req.SessionKey, p.PeerID, req.Content, req.GoalUserID)
 	}
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrGoalOwnerForbidden):
+			writeError(w, http.StatusForbidden, "goal_owner_forbidden", err.Error())
 		case errors.Is(err, agent.ErrQuestionNotFound):
 			writeError(w, http.StatusNotFound, "question_not_found", err.Error())
 		case errors.Is(err, agent.ErrInvalidQuestionAnswer):

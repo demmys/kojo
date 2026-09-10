@@ -31,6 +31,11 @@ type oneShotSteerer interface {
 	SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error
 }
 
+// Slack steering retains the authenticated sender, just like ordinary turns.
+type oneShotUserSteerer interface {
+	SteerOneShotAsUser(ctx context.Context, agentID, sessionKey, content, userID string) error
+}
+
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
 	questionsMu sync.Mutex
@@ -636,7 +641,7 @@ func contextUntilTurnStop(parent context.Context, active *activeTurn) (context.C
 
 const (
 	stopCommandAck         = "_Stopping current turn…_"
-	stopCommandNoActive    = "_No active turn in this thread._"
+	stopCommandNoActive    = "_No active turn in this thread. A saved goal may still exist: use !goal status to check, or !goal pause to keep it paused._"
 	stopCommandNotOwner    = "_Only the person who started the current turn can stop it._"
 	stopCommandDone        = "_Stopped current turn._"
 	steerDeliveryUncertain = "_I couldn't confirm whether that interruption was delivered, so I didn't retry it to avoid sending it twice._"
@@ -668,7 +673,7 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 		go func() {
 			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
-			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q})
+			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q, GoalUserID: userID})
 			if err != nil {
 				b.postChatError(channel, replyTS, err.Error())
 				return
@@ -709,6 +714,21 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 	} else if denied {
 		b.postMessage(ctx, channel, replyTS, stopCommandNotOwner)
 	} else if active == nil {
+		if stopper, ok := b.mgr.(interface {
+			StopIdleGoal(context.Context, string, string, string) (bool, error)
+		}); ok {
+			stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			handled, err := stopper.StopIdleGoal(stopCtx, b.agentID, b.agentID+":slack:"+channel+":"+replyTS, userID)
+			cancel()
+			if handled {
+				if err != nil {
+					b.postMessage(ctx, channel, replyTS, "Goal handoff stop: "+err.Error())
+				} else {
+					b.postMessage(ctx, channel, replyTS, "Goal handoff cancelled. Automatic resume is fenced.")
+				}
+				return true
+			}
+		}
 		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
 	}
 	// A duplicate command against the same already-stopping FIFO head is
@@ -830,18 +850,30 @@ func (b *Bot) admitIncoming(ctx context.Context, channel, origThreadTS, replyTS,
 				}
 				close(stopWatchDone)
 			}()
-			err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS),
-				func() string {
-					if q, _ := agent.ParseGoalCommand(text); q != nil {
-						return text
-					}
-					return buildSlackUserMessage(channel, replyTS, text, displayName)
-				}())
+			content := func() string {
+				if q, _ := agent.ParseGoalCommand(text); q != nil {
+					return text
+				}
+				return buildSlackUserMessage(channel, replyTS, text, displayName)
+			}()
+			if userSteerer, ok := b.mgr.(oneShotUserSteerer); ok {
+				err = userSteerer.SteerOneShotAsUser(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content, userID)
+			} else {
+				err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content)
+			}
 			steerCancel()
 			<-stopWatchDone
 		}
 	} else {
 		err = agent.ErrSteerUnsupported
+	}
+
+	// Authorization rejection is final, not a delivery race. In particular it
+	// must not close steering or enqueue an unauthorized follow-up ahead of
+	// the owner's next correction.
+	if errors.Is(err, agent.ErrGoalOwnerForbidden) {
+		b.postChatError(channel, replyTS, err.Error())
+		return
 	}
 
 	if maySteer && (err == nil || errors.Is(err, agent.ErrSteerDeliveryUncertain)) {
@@ -964,8 +996,21 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		b.releaseThreadReservation(channel, replyTS, reservation)
 		if arrivalReservation != nil {
 			arrivalReservation.Release()
+		} else if arrival != nil {
+			b.releaseThreadReservation(channel, replyTS, arrival)
 		}
 	}()
+	// A synthetic arrival owns one FIFO ticket rather than a source/arrival
+	// pair. Split that ticket before exposing the turn to ChatOneShot: its next
+	// handoff must stay ahead of human turns already waiting on this thread.
+	if arrival == nil {
+		var err error
+		arrival, err = b.reserveThreadSuccessor(channel, replyTS, reservation)
+		if err != nil {
+			b.postChatError(channel, replyTS, err.Error())
+			return
+		}
+	}
 	currentUserMsg := chathistory.HistoryMessage{
 		Platform: platformSlack, ChannelID: channel, ThreadID: replyTS, MessageID: messageTS,
 		UserID: userID, UserName: displayName, Text: text, Timestamp: time.Now().Format(time.RFC3339),
@@ -1057,12 +1102,11 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 	// system prompt — not the user message — keeps it out of the cacheable
 	// prefix's transcript while still teaching the agent where it is.
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
-	if arrival != nil {
-		arrivalReservation = &slackHandoffReservation{
-			userID: userID,
-			bot:    b, channel: channel, threadTS: threadTS,
-			reservation: arrival, history: arrivalHistory, source: active,
-		}
+	arrivalReservation = &slackHandoffReservation{
+		sourceCompleteErr: errors.New("Slack source did not finalize successfully"),
+		userID:            userID,
+		bot:               b, channel: channel, threadTS: threadTS,
+		reservation: arrival, history: arrivalHistory, source: active,
 	}
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
@@ -1716,6 +1760,7 @@ streamLoop:
 		runAsync(cleanup)
 	}
 
+	var sourceHistoryErr error
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
 	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
@@ -1732,10 +1777,17 @@ streamLoop:
 		}
 		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
 		if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{botMsg}); err != nil {
+			sourceHistoryErr = err
 			b.logger.Warn("failed to save bot response to thread history", "err", err)
 		}
 	}
-
+	if arrivalReservation != nil {
+		arrivalReservation.mu.Lock()
+		if sourceHistoryErr == nil && !hasError && !stopped && finalDelivered {
+			arrivalReservation.sourceCompleteErr = nil
+		}
+		arrivalReservation.mu.Unlock()
+	}
 }
 
 // slackSessionKey computes the deterministic SessionKey for a Slack
@@ -2660,16 +2712,17 @@ func slackHistoryAtTurnStart(history []chathistory.HistoryMessage, cutoff, selfU
 }
 
 type threadReservation struct {
-	ready <-chan struct{}
-	done  chan struct{}
-	tl    *threadLock
-	once  sync.Once
+	ready    <-chan struct{}
+	done     chan struct{} // guarded by Bot.threadLocksMu; transferable to a successor
+	tl       *threadLock
+	released bool // guarded by Bot.threadLocksMu
 }
 
 func (r *threadReservation) Wait() { <-r.ready }
 
 type slackHandoffReservation struct {
-	userID string // human who owns question forms across handoff
+	sourceCompleteErr error  // guarded by mu; observed only after source FIFO releases
+	userID            string // human who owns question forms across handoff
 
 	mu          sync.Mutex
 	bot         *Bot
@@ -2683,6 +2736,9 @@ type slackHandoffReservation struct {
 }
 
 func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expectedHolder string) error {
+	if r == nil {
+		return errors.New("Slack arrival reservation is missing")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.released {
@@ -2783,6 +2839,9 @@ func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expected
 }
 
 func (r *slackHandoffReservation) Release() {
+	if r == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.released || r.activated {
@@ -2792,9 +2851,8 @@ func (r *slackHandoffReservation) Release() {
 	r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
 }
 
-// acquireThreadLock returns the threadLock for the given channel+thread,
-// creating one if needed, and increments its reference count.
-// Must be paired with releaseThreadLock after tl.mu.Unlock().
+// reserveThread appends one FIFO ticket. Every ticket must be released once
+// it finishes or is discarded; releasing it again is harmless.
 func (b *Bot) reserveThread(channel, threadTS string) *threadReservation {
 	turn, _ := b.reserveThreadN(channel, threadTS, 1)
 	return turn
@@ -2829,13 +2887,34 @@ func (b *Bot) reserveThreadN(channel, threadTS string, count int) (*threadReserv
 	return first, reserve()
 }
 
-// releaseThreadLock decrements the reference count and removes the map entry
-// when no goroutines are waiting or holding the lock.
+// reserveThreadSuccessor splits an unreleased ticket into current→successor.
+// Existing waiters still wait on the old done channel, now owned by successor;
+// current releases only a new intermediate gate. No waiter can observe a gap,
+// and neither the tail nor any already-published ready channel needs changing.
+func (b *Bot) reserveThreadSuccessor(channel, threadTS string, current *threadReservation) (*threadReservation, error) {
+	b.threadLocksMu.Lock()
+	defer b.threadLocksMu.Unlock()
+	if current == nil || current.released || current.tl != b.threadLocks[channel+":"+threadTS] {
+		return nil, errors.New("Slack source FIFO reservation is no longer active")
+	}
+	gate := make(chan struct{})
+	next := &threadReservation{ready: gate, done: current.done, tl: current.tl}
+	current.done = gate
+	current.tl.waiters++
+	return next, nil
+}
+
+// releaseThreadReservation closes this ticket's gate and drops its reference
+// atomically with successor insertion and new ordinary reservations.
 func (b *Bot) releaseThreadReservation(channel, threadTS string, reservation *threadReservation) {
-	reservation.once.Do(func() { close(reservation.done) })
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
+	if reservation.released {
+		return
+	}
+	reservation.released = true
+	close(reservation.done)
 	tl := reservation.tl
 	tl.waiters--
 	if tl.waiters == 0 {
@@ -2877,4 +2956,20 @@ func (b *Bot) resolveUserNameContext(ctx context.Context, userID string) string 
 	b.userCacheMu.Unlock()
 
 	return name
+}
+
+// WaitSourceComplete is a passive checkpoint barrier, not an arrival admission.
+// source FIFO release happens after delivery, history writes and cleanup defers.
+func (r *slackHandoffReservation) WaitSourceComplete(ctx context.Context) error {
+	if r == nil {
+		return errors.New("Slack arrival reservation is missing")
+	}
+	select {
+	case <-r.reservation.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sourceCompleteErr
 }

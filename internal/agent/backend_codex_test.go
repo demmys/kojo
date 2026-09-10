@@ -741,7 +741,7 @@ func TestRunCodexTurns_RetriesEmptyCompletionAndPreservesWork(t *testing.T) {
 		context.Background(),
 		newCodexLineScanner(strings.NewReader(input)),
 		"original request",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		startTurn,
 		nil,
 		nil,
@@ -800,7 +800,7 @@ func TestRunCodexTurns_StopsAfterBoundedEmptyCompletionRetries(t *testing.T) {
 		context.Background(),
 		newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n")+"\n")),
 		"original request",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		func(string) (int64, error) {
 			starts++
 			return int64(starts), nil
@@ -867,7 +867,7 @@ func TestRunCodexTurns_DoesNotRetryFailedOrAnsweredTurn(t *testing.T) {
 				context.Background(),
 				newCodexLineScanner(strings.NewReader(strings.Join(tt.lines, "\n")+"\n")),
 				"original",
-				codexEmptyCompletionMaxRetries,
+				codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 				func(string) (int64, error) { starts++; return 1, nil },
 				nil,
 				nil,
@@ -895,7 +895,7 @@ func TestRunCodexTurns_ContextCancelledBeforeRetryStart(t *testing.T) {
 		ctx,
 		newCodexLineScanner(strings.NewReader("")),
 		"original",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		func(string) (int64, error) { starts++; return 1, nil },
 		nil,
 		nil,

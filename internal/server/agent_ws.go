@@ -357,6 +357,9 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 
 			case "abort":
 				s.agents.Abort(agentID)
+				if err := s.stopMainGoalHandoff(ctx, agentID); err != nil {
+					_ = writeJSON(ctx, conn, map[string]string{"type": "error", "errorMessage": "Goal handoff stop could not be confirmed: " + err.Error()})
+				}
 				if bgEvents != nil {
 					terminal := drainAfterAbort(ctx, bgEvents)
 					bgEvents = nil
@@ -421,6 +424,9 @@ func (s *Server) streamAgentEvents(
 			switch msg.Type {
 			case "abort":
 				s.agents.Abort(agentID)
+				if err := s.stopMainGoalHandoff(ctx, agentID); err != nil {
+					_ = writeJSON(ctx, conn, map[string]string{"type": "error", "errorMessage": "Goal handoff stop could not be confirmed: " + err.Error()})
+				}
 				terminal := drainAfterAbort(ctx, events)
 				if terminal != nil {
 					_ = writeJSON(ctx, conn, *terminal)

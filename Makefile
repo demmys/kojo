@@ -2,6 +2,14 @@
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
+ifeq ($(OS),Windows_NT)
+BINARY := kojo.exe
+NPM := npm.cmd
+else
+BINARY := kojo
+NPM := npm
+endif
+
 # Without this, a failed npm ci can leave a fresh-mtime stamp file
 # behind and the next make would skip the install.
 .DELETE_ON_ERROR:
@@ -13,14 +21,14 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 # are out of sync), untouched otherwise (make skips the step).
 # --include=dev keeps tsc/vite installed even under NODE_ENV=production.
 web/node_modules/.package-lock.json: web/package.json web/package-lock.json
-	cd web && npm ci --include=dev
+	cd web && $(NPM) ci --include=dev
 
 build: web/node_modules/.package-lock.json
-	cd web && KOJO_VERSION="$(VERSION)" npm run build
-	go build -ldflags "-X main.version=$(VERSION)" -o kojo ./cmd/kojo
+	cd web && KOJO_VERSION="$(VERSION)" $(NPM) run build
+	go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) ./cmd/kojo
 
 build-windows: web/node_modules/.package-lock.json
-	cd web && KOJO_VERSION="$(VERSION)" npm run build
+	cd web && KOJO_VERSION="$(VERSION)" $(NPM) run build
 	GOOS=windows GOARCH=amd64 go build -ldflags "-X main.version=$(VERSION)" -o kojo.exe ./cmd/kojo
 
 dev-server:
@@ -30,7 +38,7 @@ watch:
 	air
 
 dev-web:
-	cd web && npm run dev
+	cd web && $(NPM) run dev
 
 clean:
 	rm -f kojo kojo.exe

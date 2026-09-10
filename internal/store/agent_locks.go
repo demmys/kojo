@@ -152,6 +152,11 @@ func (s *Store) AcquireAgentLock(ctx context.Context, agentID, peer string, now,
 		return nil, fmt.Errorf("store.AcquireAgentLock: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if blocked, err := incomingHandoffBlocksAcquireTx(ctx, tx, agentID); err != nil {
+		return nil, err
+	} else if blocked {
+		return nil, ErrIncomingHandoffPending
+	}
 
 	const sel = `
 SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer
@@ -165,17 +170,24 @@ SELECT agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allo
 		// First acquisition for this agent (or first since the prior
 		// holder Released). Pull a fresh token from the per-agent
 		// counter — never reuse 1 across a release-reacquire cycle.
+		previous, err := agentLockVersionTx(ctx, tx, agentID)
+		if err != nil {
+			return nil, err
+		}
 		token, err := nextFencingToken(ctx, tx, agentID)
 		if err != nil {
 			return nil, err
 		}
-		// allowed_proxy_peer = holder for a fresh local acquire:
-		// the host that owns the lock IS the orchestrator until a
-		// device-switch transfers the role elsewhere.
+		proxy, err := resumeActivatedIncomingTx(ctx, tx, agentID, peer, previous.Token, token)
+		if err != nil {
+			return nil, err
+		}
+		// A fresh local acquire uses proxy=self, except an activated
+		// handoff receipt resumed across graceful shutdown.
 		const ins = `
 INSERT INTO agent_locks (agent_id, holder_peer, fencing_token, lease_expires_at, acquired_at, allowed_proxy_peer)
 VALUES (?, ?, ?, ?, ?, ?)`
-		if _, err := tx.ExecContext(ctx, ins, agentID, peer, token, now+leaseDuration, now, peer); err != nil {
+		if _, err := tx.ExecContext(ctx, ins, agentID, peer, token, now+leaseDuration, now, proxy); err != nil {
 			return nil, fmt.Errorf("store.AcquireAgentLock: insert: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -187,7 +199,7 @@ VALUES (?, ?, ?, ?, ?, ?)`
 			FencingToken:     token,
 			LeaseExpiresAt:   now + leaseDuration,
 			AcquiredAt:       now,
-			AllowedProxyPeer: peer,
+			AllowedProxyPeer: proxy,
 		}, nil
 
 	case err != nil:

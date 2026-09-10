@@ -71,11 +71,11 @@ const room = (over: Record<string, unknown>) => ({
   ...over,
 });
 
-function renderDashboard(initialPath = "/") {
+function renderDashboard(initialPath = "/", variant: "page" | "sidebar" = "page") {
   const router = createMemoryRouter(
     [
-      { path: "/", element: <Dashboard /> },
-      { path: "/agents/:id", element: <Dashboard /> },
+      { path: "/", element: <Dashboard variant={variant} /> },
+      { path: "/agents/:id", element: <Dashboard variant={variant} /> },
       { path: "/groupdms/:id", element: <div>room page</div> },
     ],
     { initialEntries: [initialPath] },
@@ -126,6 +126,65 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   localStorage.clear();
+});
+
+describe("Dashboard agent effort", () => {
+  function setAgent(over: Record<string, unknown> = {}) {
+    mocks.agentList.mockResolvedValue([{
+      id: "ag_a",
+      name: "Alice",
+      tool: "codex",
+      model: "gpt-6-astra",
+      effort: "xhigh",
+      createdAt: "2026-06-15T00:00:00Z",
+      updatedAt: "2026-06-15T00:00:00Z",
+      ...over,
+    }]);
+  }
+
+  it.each(["page", "sidebar"] as const)("shows model and configured effort in the %s list", async (variant) => {
+    setAgent();
+    renderDashboard("/", variant);
+    expect(await screen.findByText("gpt-6-astra")).toBeInTheDocument();
+    const effort = screen.getByTitle("Configured effort: xhigh");
+    expect(effort).toHaveTextContent("xhigh");
+    expect(effort).toHaveClass("shrink-0");
+    expect(screen.getByTitle("gpt-6-astra").parentElement).toBe(effort.parentElement);
+  });
+
+  it.each(["", undefined])("labels unset effort (%s) as default without inventing a level", async (effort) => {
+    setAgent({ effort });
+    renderDashboard();
+    expect(await screen.findByTitle("Configured effort: default (CLI config)")).toHaveTextContent("default");
+    expect(screen.queryByText("medium")).not.toBeInTheDocument();
+  });
+
+  it("shows explicit effort even when the model is left to the CLI", async () => {
+    setAgent({ model: "", effort: "high" });
+    renderDashboard();
+    expect(await screen.findByTitle("Configured effort: high")).toHaveTextContent("high");
+    expect(screen.queryByText("gpt-6-astra")).not.toBeInTheDocument();
+  });
+
+  it.each(["claude", "grok"])("explains the configured ceiling/fallback for automatic %s effort", async (tool) => {
+    setAgent({ tool, model: tool === "claude" ? "opus" : "grok-4.6", effort: "high" });
+    renderDashboard();
+    expect(await screen.findByTitle(/Configured effort: high — Pick per-turn effort automatically/)).toHaveTextContent("high");
+  });
+
+  it("does not describe fixed effort as automatic", async () => {
+    setAgent({ tool: "claude", model: "opus", effort: "max", autoEffort: false });
+    renderDashboard();
+    expect(await screen.findByTitle("Configured effort: max")).toHaveTextContent("max");
+  });
+
+  it.each(["custom-claude", "custom-codex", "custom-bare"])("does not show unused effort for %s", async (tool) => {
+    setAgent({ tool, model: "custom-model", effort: "high" });
+    renderDashboard();
+    expect(await screen.findByText("custom-model")).toBeInTheDocument();
+    expect(screen.queryByTitle(/Configured effort:/)).not.toBeInTheDocument();
+    expect(screen.queryByText("high")).not.toBeInTheDocument();
+  });
 });
 
 describe("Dashboard room list", () => {

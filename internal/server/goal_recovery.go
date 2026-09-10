@@ -13,9 +13,11 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 type goalRecoveryRequest struct {
+	HandoffID  string `json:"handoffId,omitempty"`
 	UserID     string `json:"userId,omitempty"`
 	RunID      string `json:"runId,omitempty"`
 	AgentID    string `json:"agentId"`
@@ -126,11 +128,13 @@ func (s *Server) handlePeerGoalResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "unavailable", "no external chat router")
 		return
 	}
-	holder, local, err := s.externalChat.initialRoute(r.Context(), req.AgentID)
-	if err != nil || local || holder != req.HolderID {
+	lock, err := s.agents.Store().GetAgentLock(r.Context(), req.AgentID)
+	if err != nil || s.peerID == nil || lock.HolderPeer == s.peerID.DeviceID || lock.HolderPeer != req.HolderID {
 		writeError(w, 409, "wrong_holder", "goal recovery must come from the current remote holder")
 		return
 	}
+	routeCtx := context.WithValue(r.Context(), externalChatRouteVersionKey{}, externalChatRouteVersion{AgentID: req.AgentID, Version: store.AgentLockVersion{Token: lock.FencingToken, Holder: lock.HolderPeer}})
+	s.externalChat.rememberRouteFrom(routeCtx, req.AgentID, lock.HolderPeer)
 	if err = s.resumeGoalSurface(r.Context(), req); err != nil {
 		writeError(w, 409, "recovery_unavailable", err.Error())
 		return
@@ -141,12 +145,21 @@ func (s *Server) resumeGoalSurface(ctx context.Context, req goalRecoveryRequest)
 	if len(req.UserID) > 64 || strings.Trim(req.UserID, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != "" {
 		return errors.New("invalid recovery user identity")
 	}
+	if err := s.checkGoalStop(ctx, req.AgentID, req.HandoffID); err != nil {
+		return err
+	}
 	if err := s.checkGoalStop(ctx, req.AgentID, req.RunID); err != nil {
 		return err
 	}
 	command := fmt.Sprintf("!goal resume-if %s %d", req.ThreadID, req.Generation)
 	if req.RunID != "" {
 		command += " " + req.RunID
+	}
+	if req.HandoffID != "" {
+		if req.RunID == "" {
+			command += " -"
+		}
+		command += " " + req.HandoffID
 	}
 	q, err := agent.ParseGoalCommand(command)
 	if err != nil || q == nil {

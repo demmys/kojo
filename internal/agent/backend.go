@@ -54,6 +54,10 @@ type ChatOptions struct {
 	// preserve, so token conservation wins over continuity.
 	AutomatedTrigger bool
 
+	// RetryOverload allows bounded Codex overload recovery before any work starts.
+	// Set only for check-in/wake turns; the existing busy lock and timeout stay held.
+	RetryOverload bool
+
 	// SessionKey overrides the default agent-ID-based session identifier.
 	// The key is hashed into a deterministic UUID so callers can pass any
 	// stable string (e.g. "<agentID>:slack:<channel>:<thread>") to get an independent

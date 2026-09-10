@@ -1973,6 +1973,15 @@ func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
 func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool, opts prepareChatOptions) (*chatPrep, error) {
+	if st := m.Store(); st != nil {
+		blocked, err := st.IsIncomingHandoffIncomplete(ctx, agentID)
+		if err != nil {
+			return nil, fmt.Errorf("incoming handoff fence: %w", err)
+		}
+		if blocked {
+			return nil, ErrAgentBusy
+		}
+	}
 	// Cheap pre-check: refuse archived agents (and unknown ones) before any
 	// disk I/O like syncPersona, so dormant agents don't leak side effects
 	// into persona files / publicProfile regeneration.
@@ -2274,6 +2283,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 			}
 		}
 	}
+	if err := checkGoalHandoffAdmission(agentID, "", goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing checks switching AND increments the
 	// preparing counter under one busyMu lock — Step -1's
 	// WaitChatIdle observes the counter so a race between
@@ -2390,6 +2402,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system" && goal == nil,
+		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
 		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
@@ -2454,6 +2467,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer m.clearBusy(agentID)
 		defer cancel()
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		// Background callers keep draining after Abort cancels only chatCtx.
+		// processChatEvents deliberately stops forwarding on cancellation, so
+		// preserve that outcome for them before the broadcaster closes.
+		if src == BusySourceCron && chatCtx.Err() != nil && ctx.Err() == nil {
+			outCh <- ChatEvent{Type: "done", ErrorMessage: ErrMsgCancelled}
+		}
 
 		m.updatePostChatIndex(agentID)
 		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
@@ -2624,6 +2643,15 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 	}
 
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex {
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := checkGoalHandoffAdmission(agentID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -2643,7 +2671,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			if err != nil {
 				return nil, err
 			}
-			return goalControlEvents(g), nil
+			return goalControlEvents(g, agentID, opts.SessionKey), nil
 		}
 	}
 
@@ -2992,6 +3020,37 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 		return ErrSteerUnsupported
 	}
 	return fn(text)
+}
+
+// SteerOneShotAsUser checks Slack goal ownership on the holder before capturing
+// the live turn callback. Admission serialization prevents a replacement run
+// from being authorized with the previous run's owner.
+func (m *Manager) SteerOneShotAsUser(agentID, sessionKey, originPeerID, text, userID string) error {
+	unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, sessionKey))
+	defer unlock()
+	q, _ := ParseGoalCommand(text)
+	if err := checkGoalHandoffAdmission(agentID, sessionKey, q); err != nil {
+		return err
+	}
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex && strings.HasPrefix(sessionKey, agentID+":slack:") {
+		opts := OneShotOpts{SessionKey: sessionKey, GoalUserID: userID}
+		if userID == "" {
+			binding, err := goalBindingFor(agentID, sessionKey)
+			if err != nil {
+				return err
+			}
+			if NativeGoalRunning(agentID, sessionKey) || (binding != nil && binding.State != nil && binding.State.Status != "complete") {
+				return errors.New("Slack goal steering requires the initiating user; upgrade the Hub if it omitted the user")
+			}
+		}
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return err
+		}
+	}
+	if originPeerID != "" {
+		return m.SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text)
+	}
+	return m.SteerOneShotForAgent(agentID, sessionKey, text)
 }
 
 // processOneShotEvents is like processChatEvents but does not persist
@@ -3754,13 +3813,7 @@ func (m *Manager) Checkin(agentID string) error {
 
 	go func() {
 		defer cancel()
-		for range events {
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			m.logger.Warn("manual checkin timed out", "agent", agentID, "timeout", timeout)
-		} else {
-			m.logger.Info("manual checkin completed", "agent", agentID)
-		}
+		drainBackgroundChat(ctx, events, m.logger, "manual checkin", agentID, timeout)
 	}()
 	return nil
 }

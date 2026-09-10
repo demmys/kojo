@@ -72,6 +72,9 @@ func (b *CodexBackend) Available() bool {
 }
 
 func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	if err := checkGoalHandoffAdmission(agent.ID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
 	if err := opts.Goal.Validate(); err != nil {
 		return nil, err
 	}
@@ -79,7 +82,10 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, errors.New("native goals require a persistent conversation")
 	}
 	goalKey := codexThreadRefPath(agent.ID, opts.SessionKey)
-	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, userID: opts.GoalUserID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	if opts.Goal != nil {
+		runtime.resumeHandoffID = opts.Goal.ExpectedHandoffID
+	}
 	if !opts.OneShot {
 		if old, loaded := codexGoalRuntimes.LoadOrStore(goalKey, runtime); loaded {
 			if opts.Goal == nil {
@@ -89,7 +95,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			if err != nil {
 				return nil, err
 			}
-			return goalControlEvents(g), nil
+			return goalControlEvents(g, agent.ID, opts.SessionKey), nil
 		}
 	}
 	launched := false
@@ -178,6 +184,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
 				if b.State != nil && b.State.Status != "complete" {
 					if stopped || !preserve {
+						cancelGoalHandoff(b, "goal execution cancelled")
 						b.DesiredPaused = true
 						b.Generation++
 					}
@@ -377,14 +384,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 		if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil {
-			if refBefore == nil || refBefore.Goal == nil || refBefore.Goal.DesiredPaused || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
+			if opts.Goal.ExpectedHandoffID != "" && !goalHandoffResumeAllowed(refBefore, opts.Goal) {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal handoff changed or was cancelled before resume"})
+				shutdown()
+				return
+			}
+			if refBefore == nil || refBefore.Goal == nil || (refBefore.Goal.DesiredPaused && opts.Goal.ExpectedHandoffID == "") || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
 				send(ChatEvent{Type: "error", ErrorMessage: "goal changed or paused since recovery was scheduled"})
 				shutdown()
 				return
 			}
 		}
 		if opts.Goal != nil && refBefore != nil && goalOperationSeen(refBefore.Goal, opts.Goal.OperationID) {
-			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State), "", nil, nil)})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
 			shutdown()
 			return
 		}
@@ -396,7 +408,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			if opts.Goal.Action == "pause" || opts.Goal.Action == "clear" {
-				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.DesiredPaused = true; b.Generation++ }); err != nil {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+					b.DesiredPaused = true
+					b.Generation++
+					cancelGoalHandoff(b, "goal explicitly paused or cleared")
+				}); err != nil {
 					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
 					shutdown()
 					return
@@ -426,7 +442,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			send(ChatEvent{Type: "goal", Goal: goal})
-			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal), "", nil, nil)})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
 			shutdown()
 			return
 		}
@@ -446,13 +462,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			old := decodeGoal(msg.Result)
-			if opts.ResumeGoalOnReply && opts.Goal == nil && old != nil && old.Status != "complete" {
+			if opts.ResumeGoalOnReply && opts.Goal == nil && goalResumesOnReply(refBefore.Goal, old) {
 				opts.Goal = &GoalRequest{Action: "resume"}
 				runtime.mu.Lock()
 				runtime.isGoal = true
 				runtime.mu.Unlock()
 			}
-			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && refBefore.Goal.ActivationPending))) {
+			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && (refBefore.Goal.ActivationPending || goalHandoffResumeAllowed(refBefore, opts.Goal))))) {
 				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) { g.State = old }); err != nil {
 					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
 				} else {
@@ -690,6 +706,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				shutdown()
 				return
 			}
+			activationAdmitted := false
 			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) {
 				if ctx.Err() != nil {
 					g.DesiredPaused = true
@@ -698,6 +715,14 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				if opts.Goal.Action == "start" {
 					g.SetupContext = userMessage
 					g.State = &CodexGoal{ThreadID: threadID, Objective: opts.Goal.Objective, Status: "active", TokenBudget: opts.Goal.TokenBudget}
+				}
+				if opts.Goal.ExpectedHandoffID != "" {
+					if g.Handoff == nil || g.Handoff.ID != opts.Goal.ExpectedHandoffID || g.Handoff.Phase != "resume_pending" || g.Generation != *opts.Goal.ExpectedGeneration || g.RunID != opts.Goal.ExpectedRunID {
+						return
+					}
+					g.Handoff.Phase = "resuming"
+				} else if opts.Goal.ExpectedGeneration == nil {
+					g.Handoff = nil // old operation must not stop this explicit replacement
 				}
 				g.Generation++
 				g.DesiredPaused = false
@@ -714,6 +739,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				if opts.OriginPeerID != "" {
 					g.OriginPeerID = opts.OriginPeerID
 				}
+				activationAdmitted = true
 				// Pending activation is fenced before RPC; success is recorded on ACK.
 			}); err != nil {
 				runtime.mu.Unlock()
@@ -722,6 +748,11 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				return
 			}
 			runtime.mu.Unlock()
+			if !activationAdmitted {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal activation was cancelled"})
+				shutdown()
+				return
+			}
 			if opts.OnSteerReady != nil {
 				opts.OnSteerReady(func(text string) error {
 					q, err := ParseGoalCommand(text)
@@ -747,6 +778,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 				replyStart = func() (int64, error) { return startTurn(userMessage) }
 			}
 			result := runCodexGoalWithReply(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, replyStart, qs)
+			if runtime.wantsHandoff() {
+				shutdownErr := shutdown()
+				if result.processError != "" {
+					shutdownErr = errors.New(result.processError)
+				}
+				runtime.finishHandoff(shutdownErr)
+				if shutdownErr != nil && result.processError == "" {
+					result.processError = "Goal handoff failed: " + shutdownErr.Error()
+				}
+				result.fullText.WriteString(goalHandoffSummary(agent.ID, opts.SessionKey))
+				send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+				return
+			}
 			if ctx.Err() != nil {
 				shutdown()
 				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)
@@ -764,7 +808,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					}
 				})
 			}
-			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
 			shutdown()
 			return
 		}
@@ -783,7 +827,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			ctx,
 			scanner,
 			userMessage,
-			codexEmptyCompletionMaxRetries,
+			codexRetryPolicy(opts),
 			startTurn,
 			steerer,
 			respondServerRequest,
@@ -805,7 +849,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 		if result.turnCompleted {
-			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
 			shutdown()
 			return
 		}
@@ -869,16 +913,18 @@ func buildCodexResumeParams(threadParams map[string]any, threadID string) map[st
 
 // codexStreamResult holds the accumulated state from parsing a Codex stream.
 type codexStreamResult struct {
-	questions     *codexQuestionState
-	questionText  string // fallback for a run ending immediately after an async question
-	fullText      strings.Builder
-	thinking      strings.Builder
-	toolUses      []ToolUse
-	usage         *Usage
-	processError  string // non-empty if turn/completed reported an error
-	turnStatus    string // status reported by the newest turn/completed
-	turnCompleted bool   // true if turn/completed was received
-	cancelled     bool   // true if send returned false (context cancelled)
+	questions        *codexQuestionState
+	questionText     string // fallback for a run ending immediately after an async question
+	fullText         strings.Builder
+	thinking         strings.Builder
+	toolUses         []ToolUse
+	usage            *Usage
+	processError     string // non-empty if turn/completed reported an error
+	processErrorCode string // app-server codexErrorInfo classification
+	activity         bool   // any model item, delta, or server request; fail closed for overload replay
+	turnStatus       string // status reported by the newest turn/completed
+	turnCompleted    bool   // true if turn/completed was received
+	cancelled        bool   // true if send returned false (context cancelled)
 
 	// streamedReasoning records the reasoning item ids that already arrived
 	// as item/reasoning/*Delta notifications, so the completed item for the
@@ -897,15 +943,15 @@ type codexStreamResult struct {
 type codexTurnStarter func(input string) (int64, error)
 
 // runCodexTurns processes one logical user request, automatically continuing
-// the same Codex thread when app-server reports a successful completion but
-// supplies no final assistant response. Tool/thinking state from each attempt
+// the same Codex thread after empty successful completions, and (for check-ins)
+// explicit overload failures before work starts. Tool/thinking state from each attempt
 // is retained in the terminal Message; live events are already emitted by
 // parseCodexStream as each attempt runs.
 func runCodexTurns(
 	ctx context.Context,
 	scanner *jsonlLineScanner,
 	initialInput string,
-	maxEmptyRetries int,
+	policy codexTurnRetryPolicy,
 	startTurn codexTurnStarter,
 	steerer *codexSteerer,
 	respondServerRequest codexServerRequestResponder,
@@ -916,7 +962,8 @@ func runCodexTurns(
 	combined := &codexStreamResult{}
 	input := initialInput
 
-	for attempt := 0; ; attempt++ {
+	emptyRetries, overloadRetries := 0, 0
+	for {
 		if ctx.Err() != nil {
 			combined.cancelled = true
 			combined.turnCompleted = false
@@ -934,21 +981,42 @@ func runCodexTurns(
 		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send, questions...)
 		combined.absorb(result)
 
+		// Retry only explicit overload failures before any work across the whole
+		// logical request. Never replay tools, partial output, or unknown failures.
+		if ctx.Err() == nil && !result.cancelled && result.turnCompleted &&
+			result.turnStatus == "failed" && result.processErrorCode == "serverOverloaded" &&
+			!combined.activity && overloadRetries < len(policy.overloadDelays) &&
+			steerer.prepareOverloadRetry(policy.overloadDelays[overloadRetries]) {
+			delay := policy.overloadDelays[overloadRetries]
+			overloadRetries++
+			logger.Warn("codex overloaded before work; waiting to retry",
+				"retry", overloadRetries, "maxRetries", len(policy.overloadDelays),
+				"delay", delay, "errorCode", result.processErrorCode, "err", result.processError)
+			if !waitCodexRetry(ctx, delay) {
+				combined.cancelled = true
+				combined.turnCompleted = false
+				return combined
+			}
+			input = codexOverloadRetryPrompt
+			continue
+		}
+
 		// Only a clean, successful completion with no final answer is
 		// recoverable here. Failed/interrupted turns, cancellation, and broken
 		// streams keep their existing error paths.
 		if result.cancelled || !result.turnCompleted || result.turnStatus != "completed" || result.processError != "" || result.hasFinalResponse() {
 			return combined
 		}
-		if attempt >= maxEmptyRetries {
+		if emptyRetries >= policy.maxEmptyRetries {
 			combined.processError = codexEmptyCompletionError
 			logger.Warn("codex turn completed without final response; automatic retries exhausted",
-				"retries", maxEmptyRetries)
+				"retries", policy.maxEmptyRetries)
 			return combined
 		}
 
 		logger.Warn("codex turn completed without final response; starting automatic continuation",
-			"retry", attempt+1, "maxRetries", maxEmptyRetries)
+			"retry", emptyRetries+1, "maxRetries", policy.maxEmptyRetries)
+		emptyRetries++
 		input = codexEmptyCompletionRetryPrompt
 	}
 }
@@ -978,6 +1046,8 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 			r.usage.CostUSD += next.usage.CostUSD
 		}
 	}
+	r.activity = r.activity || next.activity
+	r.processErrorCode = next.processErrorCode
 	r.processError = next.processError
 	r.turnStatus = next.turnStatus
 	r.turnCompleted = next.turnCompleted
@@ -1027,6 +1097,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 		var msg rpcMessage
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			logger.Debug("codex rpc parse error", "line", line, "err", err)
+			res.activity = true // Unreadable notifications cannot prove that no work ran.
 			continue
 		}
 
@@ -1041,6 +1112,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 			return res
 		}
 		if handled {
+			res.activity = true
 			continue
 		}
 
@@ -1113,6 +1185,20 @@ func decodeCodexTurnID(result *json.RawMessage) string {
 // handleNotification processes a single JSON-RPC notification.
 // Returns true if the stream should stop (turn completed or cancelled).
 func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map[string]string, logger *slog.Logger, send func(ChatEvent) bool) bool {
+	// Include unrendered/unknown item kinds (file changes, collab tools, etc.)
+	// in the safety guard, not just the subset the UI knows how to display.
+	if msg.Method == "item/started" || msg.Method == "item/completed" {
+		var params struct {
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if msg.Params == nil || json.Unmarshal(*msg.Params, &params) != nil || params.Item.Type != "userMessage" {
+			res.activity = true
+		}
+	} else if strings.HasPrefix(msg.Method, "item/") {
+		res.activity = true
+	}
 	switch msg.Method {
 	case "item/started":
 		return res.handleItemStarted(msg, itemPhases, send)
@@ -1174,8 +1260,8 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 		if msg.Params != nil {
 			var params struct {
 				Turn struct {
-					Status string    `json:"status"`
-					Error  *rpcError `json:"error"`
+					Status string          `json:"status"`
+					Error  *codexTurnError `json:"error"`
 				} `json:"turn"`
 			}
 			json.Unmarshal(*msg.Params, &params)
@@ -1183,7 +1269,10 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 			if params.Turn.Status == "failed" || params.Turn.Status == "interrupted" {
 				res.processError = "codex turn " + params.Turn.Status
 				if params.Turn.Error != nil {
-					res.processError = params.Turn.Error.Message
+					if params.Turn.Error.Message != "" {
+						res.processError = params.Turn.Error.Message
+					}
+					res.processErrorCode = codexErrorCode(params.Turn.Error.CodexErrorInfo)
 				}
 			}
 		}

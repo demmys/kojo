@@ -14,9 +14,12 @@ import (
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 )
 
+var ErrGoalOwnerForbidden = errors.New("only the user who started this goal can control or reply to it")
+
 // GoalRequest is explicit user intent, never extracted from model output or
 // historical context. Controls use the same authenticated conversation route.
 type GoalRequest struct {
+	ExpectedHandoffID  string `json:"expectedHandoffId,omitempty"`
 	ExpectedRunID      string `json:"expectedRunId,omitempty"`
 	OperationID        string `json:"operationId,omitempty"`
 	ExpectedGeneration *int64 `json:"expectedGeneration,omitempty"`
@@ -39,19 +42,20 @@ type CodexGoal struct {
 // GoalBinding travels with the native thread pointer. DesiredPaused fences
 // cancellation even when the CLI cannot acknowledge pause before being killed.
 type GoalBinding struct {
-	UserID            string     `json:"userId,omitempty"`
-	RuntimeFailures   int        `json:"runtimeFailures,omitempty"`
-	ActivationPending bool       `json:"activationPending,omitempty"`
-	RunID             string     `json:"runId,omitempty"`
-	RecoveryPending   bool       `json:"recoveryPending,omitempty"`
-	RecoveryAttempts  int        `json:"recoveryAttempts,omitempty"`
-	SeenOperations    []string   `json:"seenOperations,omitempty"`
-	SetupContext      string     `json:"setupContext,omitempty"`
-	Generation        int64      `json:"generation"`
-	OriginPeerID      string     `json:"originPeerId,omitempty"`
-	SessionKey        string     `json:"sessionKey"`
-	DesiredPaused     bool       `json:"desiredPaused"`
-	State             *CodexGoal `json:"state,omitempty"`
+	Handoff           *GoalHandoff `json:"handoff,omitempty"`
+	UserID            string       `json:"userId,omitempty"`
+	RuntimeFailures   int          `json:"runtimeFailures,omitempty"`
+	ActivationPending bool         `json:"activationPending,omitempty"`
+	RunID             string       `json:"runId,omitempty"`
+	RecoveryPending   bool         `json:"recoveryPending,omitempty"`
+	RecoveryAttempts  int          `json:"recoveryAttempts,omitempty"`
+	SeenOperations    []string     `json:"seenOperations,omitempty"`
+	SetupContext      string       `json:"setupContext,omitempty"`
+	Generation        int64        `json:"generation"`
+	OriginPeerID      string       `json:"originPeerId,omitempty"`
+	SessionKey        string       `json:"sessionKey"`
+	DesiredPaused     bool         `json:"desiredPaused"`
+	State             *CodexGoal   `json:"state,omitempty"`
 }
 
 func ParseGoalCommand(text string) (*GoalRequest, error) {
@@ -96,7 +100,7 @@ func ParseGoalCommand(text string) (*GoalRequest, error) {
 	}
 	if strings.HasPrefix(rest, "resume-if ") {
 		fields := strings.Fields(rest)
-		if len(fields) != 3 && len(fields) != 4 {
+		if len(fields) != 3 && len(fields) != 4 && len(fields) != 5 {
 			return nil, errors.New("invalid recovery command")
 		}
 		tid := fields[1]
@@ -108,8 +112,11 @@ func ParseGoalCommand(text string) (*GoalRequest, error) {
 		r.Objective = ""
 		r.ExpectedThreadID = tid
 		r.ExpectedGeneration = &gen
-		if len(fields) == 4 {
+		if len(fields) >= 4 && fields[3] != "-" {
 			r.ExpectedRunID = fields[3]
+		}
+		if len(fields) == 5 {
+			r.ExpectedHandoffID = fields[4]
 		}
 	}
 	return r, r.Validate()
@@ -117,6 +124,9 @@ func ParseGoalCommand(text string) (*GoalRequest, error) {
 func (r *GoalRequest) Validate() error {
 	if r == nil {
 		return nil
+	}
+	if r.ExpectedHandoffID != "" && (r.ExpectedGeneration == nil || !isCodexThreadID(r.ExpectedHandoffID)) {
+		return errors.New("invalid goal handoff identity")
 	}
 	if len(r.OperationID) > 256 {
 		return errors.New("goal operation id too long")
@@ -187,17 +197,22 @@ func updateGoalBinding(agentID, key string, f func(*GoalBinding)) error {
 var codexGoalRuntimes sync.Map // ref path -> *codexGoalRuntime
 
 type codexGoalRuntime struct {
-	isGoal        bool
-	runID, origin string
-	stopRequested bool
-	mu            sync.Mutex
-	controlMu     sync.Mutex
-	pending       map[int64]chan *rpcMessage
-	write         func(string, any) (int64, error)
-	threadID      string
-	closed        bool
-	ready         bool
-	agentID, key  string
+	resumeHandoffID string // immutable operation for a finalized resume
+	turnSequence    uint64 // protected by mu
+	inNativeTurn    bool   // protected by mu
+	handoff         *nativeGoalHandoff
+	isGoal          bool
+	runID, origin   string
+	userID          string // immutable authenticated Slack user for pre-persistence controls
+	stopRequested   bool
+	mu              sync.Mutex
+	controlMu       sync.Mutex
+	pending         map[int64]chan *rpcMessage
+	write           func(string, any) (int64, error)
+	threadID        string
+	closed          bool
+	ready           bool
+	agentID, key    string
 }
 
 func (r *codexGoalRuntime) rpc(ctx context.Context, method string, params any) (*rpcMessage, error) {
@@ -248,6 +263,12 @@ func (r *codexGoalRuntime) resolve(msg *rpcMessage) bool {
 }
 func (r *codexGoalRuntime) close() {
 	r.mu.Lock()
+	h := r.handoff
+	r.mu.Unlock()
+	if h != nil {
+		h.finish(errors.New("goal runner exited without a clean handoff"))
+	}
+	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
 	for id, ch := range r.pending {
@@ -279,7 +300,12 @@ func (r *codexGoalRuntime) control(ctx context.Context, q *GoalRequest) (*CodexG
 		return nil, errors.New("goal is already running; pause it before starting or resuming")
 	}
 	if q.Action == "pause" || q.Action == "clear" {
-		if err := updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) { b.DesiredPaused = true; b.Generation++ }); err != nil {
+		r.cancelHandoffRuntime("goal explicitly paused or cleared")
+		if err := updateGoalBinding(r.agentID, r.key, func(b *GoalBinding) {
+			b.DesiredPaused = true
+			b.Generation++
+			cancelGoalHandoff(b, "goal explicitly paused or cleared")
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -332,10 +358,14 @@ func decodeGoal(raw *json.RawMessage) *CodexGoal {
 	}
 	return v.Goal
 }
-func goalControlEvents(g *CodexGoal) <-chan ChatEvent {
+func goalControlEvents(g *CodexGoal, identity ...string) <-chan ChatEvent {
+	summary := goalSummary(g)
+	if len(identity) == 2 {
+		summary += goalHandoffSummary(identity[0], identity[1])
+	}
 	ch := make(chan ChatEvent, 2)
 	ch <- ChatEvent{Type: "goal", Goal: g}
-	ch <- ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(g), "", nil, nil)}
+	ch <- ChatEvent{Type: "done", Message: assembleAssistantMessage(summary, "", nil, nil)}
 	close(ch)
 	return ch
 }
@@ -412,4 +442,45 @@ func NativeGoalRunning(id, key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.isGoal && !r.closed
+}
+
+// Explicit pause/stop survives ordinary conversation, including a stale native
+// "active" update after cancellation. Blocked is different: a human answer can
+// unblock that goal. Native paused state also requires explicit resume.
+func goalResumesOnReply(binding *GoalBinding, native *CodexGoal) bool {
+	return binding != nil && !binding.Handoff.Pending() && !binding.DesiredPaused && native != nil &&
+		native.Status != "paused" && native.Status != "complete"
+}
+
+// Slack commands have an authenticated user even when their message is empty.
+// Validate before both the live-control fast path and idle runner creation.
+// WebUI uses its own authenticated owner path and has no Slack user ID.
+func authorizeSlackGoal(agentID string, opts OneShotOpts) error {
+	if !strings.HasPrefix(opts.SessionKey, agentID+":slack:") {
+		return nil
+	}
+	if opts.Goal != nil && opts.GoalUserID == "" {
+		return errors.New("Slack goal control requires the initiating user; upgrade the Hub if it omitted the user")
+	}
+	if opts.Goal == nil && opts.GoalUserID == "" {
+		return nil // system handoff continuation, not a user command
+	}
+	if raw, ok := codexGoalRuntimes.Load(codexThreadRefPath(agentID, opts.SessionKey)); ok {
+		runtime := raw.(*codexGoalRuntime)
+		runtime.mu.Lock()
+		forbidden := runtime.isGoal && runtime.userID != "" && runtime.userID != opts.GoalUserID
+		runtime.mu.Unlock()
+		if forbidden {
+			return ErrGoalOwnerForbidden
+		}
+	}
+	binding, err := goalBindingFor(agentID, opts.SessionKey)
+	if err != nil {
+		return err
+	}
+	if binding != nil && binding.State != nil && binding.State.Status != "complete" &&
+		binding.UserID != "" && binding.UserID != opts.GoalUserID {
+		return ErrGoalOwnerForbidden
+	}
+	return nil
 }

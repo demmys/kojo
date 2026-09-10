@@ -41,12 +41,14 @@ type codexSteerer struct {
 	// the app-server stdin. Returns the id and any write error.
 	writeRPC func(method string, params any) (int64, error)
 
-	mu        sync.Mutex
-	turnID    string
-	closed    bool
-	ready     chan struct{}        // closed once the current turnID is set or the steerer is closed
-	readyDone bool                 // guards close(ready); reset for an automatic continuation turn
-	pending   map[int64]chan error // in-flight turn/steer request id -> response slot
+	mu             sync.Mutex
+	turnID         string
+	retryUntil     time.Time // intentional overload backoff; extends only the turn-readiness wait
+	steerUncertain bool      // sticky: a steer may have arrived without an acknowledgement
+	closed         bool
+	ready          chan struct{}        // closed once the current turnID is set or the steerer is closed
+	readyDone      bool                 // guards close(ready); reset for an automatic continuation turn
+	pending        map[int64]chan error // in-flight turn/steer request id -> response slot
 }
 
 func newCodexSteerer(threadID string, writeRPC func(method string, params any) (int64, error)) *codexSteerer {
@@ -144,7 +146,12 @@ func (s *codexSteerer) resolve(id int64, rpcErr *rpcError) bool {
 
 // steer implements SteerFunc for the codex backend.
 func (s *codexSteerer) steer(text string) error {
-	deadline := time.NewTimer(codexSteerTurnWait)
+	return s.steerWithTimeouts(text, codexSteerTurnWait, codexSteerRespWait)
+}
+
+func (s *codexSteerer) steerWithTimeouts(text string, turnWait, responseWait time.Duration) error {
+	waitUntil := time.Now().Add(turnWait)
+	deadline := time.NewTimer(turnWait)
 	defer deadline.Stop()
 
 	for {
@@ -157,13 +164,25 @@ func (s *codexSteerer) steer(text string) error {
 			return ErrAgentNotBusy
 		}
 		if s.turnID == "" {
+			// A deliberate overload wait is not a wedged turn/start. Extend
+			// existing waiters too, then retain the normal RPC-start allowance.
+			if until := s.retryUntil.Add(turnWait); until.After(waitUntil) {
+				waitUntil = until
+				deadline.Reset(time.Until(waitUntil))
+			}
 			ready := s.ready
 			s.mu.Unlock()
 			select {
 			case <-ready:
 				continue
 			case <-deadline.C:
-				return fmt.Errorf("codex: turn did not start within %s", codexSteerTurnWait)
+				s.mu.Lock()
+				extended := s.retryUntil.Add(turnWait).After(waitUntil)
+				s.mu.Unlock()
+				if extended {
+					continue
+				}
+				return fmt.Errorf("codex: turn did not start within %s", turnWait)
 			}
 		}
 
@@ -178,11 +197,13 @@ func (s *codexSteerer) steer(text string) error {
 			},
 		})
 		if err != nil {
-			s.mu.Unlock()
 			var writeErr *codexRPCWriteError
 			if errors.As(err, &writeErr) && writeErr.Written == 0 {
+				s.mu.Unlock()
 				return fmt.Errorf("%w: codex turn/steer write: %v", ErrAgentNotBusy, err)
 			}
+			s.steerUncertain = true
+			s.mu.Unlock()
 			// The app-server may have received the full JSON-RPC frame before
 			// the pipe surfaced a write error; do not let canonical history
 			// roll back input whose delivery cannot be disproved.
@@ -195,11 +216,34 @@ func (s *codexSteerer) steer(text string) error {
 		select {
 		case err := <-respCh:
 			return err
-		case <-time.After(codexSteerRespWait):
+		case <-time.After(responseWait):
 			s.mu.Lock()
 			delete(s.pending, id)
+			s.steerUncertain = true
 			s.mu.Unlock()
-			return fmt.Errorf("%w: codex turn/steer was not acknowledged within %s", ErrSteerDeliveryUncertain, codexSteerRespWait)
+			return fmt.Errorf("%w: codex turn/steer was not acknowledged within %s", ErrSteerDeliveryUncertain, responseWait)
 		}
 	}
+}
+
+// prepareOverloadRetry extends readiness deadlines before sleeping. Do not wait
+// with an unacknowledged steer: its response timer is already running and its
+// delivery is uncertain. A nil steerer is the ordinary noninteractive case.
+func (s *codexSteerer) prepareOverloadRetry(delay time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.turnID != "" || len(s.pending) != 0 || s.steerUncertain {
+		return false
+	}
+	s.retryUntil = time.Now().Add(delay)
+	// Wake already-waiting steers so they see the extended deadline.
+	if !s.readyDone {
+		close(s.ready)
+	}
+	s.ready = make(chan struct{})
+	s.readyDone = false
+	return true
 }

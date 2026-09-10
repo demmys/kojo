@@ -28,7 +28,7 @@ func (m *Manager) RecoverableGoals() map[string][]GoalBinding {
 				continue
 			}
 			ref, err := readCodexThreadRefFile(filepath.Join(codexThreadRefDir(a.ID), entry.Name()))
-			if err != nil || ref.Goal == nil || ref.Goal.DesiredPaused || ref.Goal.State == nil || ref.Goal.State.Status != "active" {
+			if err != nil || ref.Goal == nil || ref.Goal.DesiredPaused || ref.Goal.Handoff.Pending() || ref.Goal.State == nil || ref.Goal.State.Status != "active" {
 				continue
 			}
 			if codexThreadRefName(ref.Goal.SessionKey) != entry.Name() {
@@ -90,6 +90,7 @@ func (m *Manager) FenceGoalRun(id, key, runID, origin string) error {
 	return updateGoalBinding(id, key, func(b *GoalBinding) {
 		if b.RunID == runID {
 			b.DesiredPaused = true
+			cancelGoalHandoff(b, "goal explicitly stopped")
 			b.RecoveryPending = false
 			b.Generation++
 		}
@@ -104,6 +105,7 @@ func (m *Manager) ClaimGoalRecovery(id, key string, generation int64) bool {
 		}
 		if b.RecoveryAttempts >= 3 {
 			b.DesiredPaused = true
+			cancelGoalHandoff(b, "goal explicitly stopped")
 			b.RecoveryPending = false
 			return
 		}

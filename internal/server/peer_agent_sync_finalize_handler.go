@@ -279,17 +279,12 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	// Accept committed holder+proxy together. Only mark admission-ready once
-	// the runtime hook succeeded, without a second holder-only proxy rewrite.
-	if entry.IncomingFenced {
-		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
-			writeError(w, 409, "stale_handoff", err.Error())
-			return
-		}
-	}
-	// Apply the optional tail after acceptance and runtime activation, but
-	// before building the arrival prompt. AppendMessage independently verifies
-	// the current local fencing token in its transaction.
+	// Apply the optional tail after the runtime hook but BEFORE activation:
+	// activation opens local turn admission, and a turn admitted in that gap
+	// would read history without the source's final message. AppendMessage
+	// independently verifies the current local fencing token in its
+	// transaction, and a lock_not_self here leaves the fence un-activated so
+	// the orchestrator's retry re-runs the whole tail+activate sequence.
 	if req.TailMessage != nil && s.agents != nil && s.agents.Store() != nil {
 		if err := s.applyFinalizeTailMessage(r.Context(), req.AgentID, req.TailMessage); err != nil {
 			if errors.Is(err, errTailLockNotSelf) {
@@ -306,8 +301,17 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	// Accept committed holder+proxy together. Only mark admission-ready once
+	// the runtime hook and the tail apply succeeded, without a second
+	// holder-only proxy rewrite.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
+			return
+		}
+	}
 
-	// Build the arrival only AFTER the tail apply. The external continuation
+	// Build the arrival only AFTER the tail apply and activation. The external continuation
 	// carries this exact prompt to the Hub; the legacy path below asks Manager
 	// to build the same prompt for main WebUI delivery.
 	sourceName := req.SourceDeviceID

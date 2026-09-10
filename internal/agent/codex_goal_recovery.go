@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // PreserveNativeGoalsOnShutdown distinguishes daemon shutdown from user stop.
@@ -41,6 +42,84 @@ func (m *Manager) RecoverableGoals() map[string][]GoalBinding {
 		}
 	}
 	return out
+}
+
+// maxGoalHandoffResumeAttempts bounds destination-side re-dispatch of a
+// handoff resume whose asynchronous surface delivery never reached admission.
+const maxGoalHandoffResumeAttempts = 3
+
+// StalledGoalHandoffResumes enumerates accepted handoffs on this destination
+// (target == local peer) whose resume has not been admitted for at least
+// minAge since the last dispatch and that have no live runtime. It carries
+// the portable identity only; the caller must re-run the origin stop check
+// before re-dispatching `!goal resume-if`.
+func (m *Manager) StalledGoalHandoffResumes(target string, minAge time.Duration) map[string][]GoalBinding {
+	out := map[string][]GoalBinding{}
+	if target == "" {
+		return out
+	}
+	cutoff := time.Now().Add(-minAge).UnixMilli()
+	for _, a := range m.List() {
+		if a.Archived || a.Tool != ToolCodex {
+			continue
+		}
+		entries, err := os.ReadDir(codexThreadRefDir(a.ID))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !validCodexThreadRefName(entry.Name()) {
+				continue
+			}
+			ref, err := readCodexThreadRefFile(filepath.Join(codexThreadRefDir(a.ID), entry.Name()))
+			if err != nil || ref.Goal == nil || ref.Goal.State == nil || ref.Goal.State.Status != "paused" {
+				continue
+			}
+			h := ref.Goal.Handoff
+			if h == nil || h.Phase != "resume_pending" || h.TargetPeerID != target || h.AcceptedAt > cutoff {
+				continue
+			}
+			if codexThreadRefName(ref.Goal.SessionKey) != entry.Name() {
+				continue
+			}
+			if _, running := codexGoalRuntimes.Load(codexThreadRefPath(a.ID, ref.Goal.SessionKey)); running {
+				continue
+			}
+			out[a.ID] = append(out[a.ID], *ref.Goal)
+		}
+	}
+	return out
+}
+
+// ClaimGoalHandoffResume consumes one automatic resume attempt for the exact
+// handoff identity. Once the bound is exhausted the handoff fails closed so the
+// operator sees the stall instead of a silently parked goal; explicit
+// `!goal pause` + `!goal resume` remains available.
+func (m *Manager) ClaimGoalHandoffResume(id, key, op string) bool {
+	unlock := goalAdmissions.Lock(codexThreadRefPath(id, key))
+	defer unlock()
+	if _, running := codexGoalRuntimes.Load(codexThreadRefPath(id, key)); running {
+		return false
+	}
+	claimed := false
+	err := updateGoalBinding(id, key, func(b *GoalBinding) {
+		h := b.Handoff
+		if h == nil || h.ID != op || h.Phase != "resume_pending" || b.State == nil || b.State.Status != "paused" {
+			return
+		}
+		if h.ResumeAttempts >= maxGoalHandoffResumeAttempts {
+			h.Phase = "failed"
+			h.Error = "automatic resume was not admitted after device transfer; use !goal pause then !goal resume"
+			b.DesiredPaused = true
+			b.RecoveryPending = false
+			b.Generation++
+			return
+		}
+		h.ResumeAttempts++
+		h.AcceptedAt = time.Now().UnixMilli()
+		claimed = true
+	})
+	return claimed && err == nil
 }
 
 func (m *Manager) SetGoalRecoveryPaused(id, key string) error {

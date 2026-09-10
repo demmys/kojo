@@ -132,25 +132,17 @@ type Server struct {
 	// complete (see handleAgentHandoffFinalize), so an aborted
 	// switch doesn't leave target peer with stale runtime state.
 	onAgentSynced func(ctx context.Context, agentID string) error
-	// onAgentSyncFinalized runs after a successful complete on
-	// the source side, when the orchestrator notifies target via
-	// POST /api/v1/peers/agent-sync/finalize. Adopts the raw
-	// $KOJO_AGENT_TOKEN into the local TokenStore, registers
-	// the agent with AgentLockGuard so the lock acquired during
-	// complete doesn't expire from this peer, and fires a
-	// system-message chat so the agent can resume immediately.
-	// sourceDeviceID identifies the originating peer (for the
-	// arrival notification prompt).
-	// opID is the orchestrator-minted UUID for this particular
-	// switch attempt; carried through so the arrival-chat dedup
-	// can key on (agentID, opID) instead of agentID alone — without
-	// that, the in-memory dedup map never clears and subsequent
-	// switches back to this peer silently skip their auto-continue.
+	// onAgentSyncFinalized runs after the source's complete/drain and the
+	// target's durable acceptance. It adopts the agent token, registers Guard
+	// with the accepted lock token, and activates runtime side channels.
+	// allowedProxy is the resolved response-surface Hub (not necessarily the
+	// immediate source). Arrival dispatch happens in the HTTP handler after
+	// this hook and optional transcript tail application. opID binds retries.
 	// Returns tokenReissued=true when rawToken was empty and the
 	// hook auto-re-issued a fresh agent token on this peer (Task A
 	// auto-repair) — surfaced in the arrival prompt so the agent
 	// knows no manual re-issue is needed.
-	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (tokenReissued bool, err error)
+	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, allowedProxy, opID string) (tokenReissued bool, err error)
 	// onAgentReleasedAsSource fires after the orchestrator's
 	// successful complete + finalize. Source peer drops the
 	// agent from its local AgentLockGuard so a target lease
@@ -1464,7 +1456,9 @@ type pendingSyncKey struct {
 // delivery-decision, and degraded-transfer metadata survive target restarts
 // without separate partially-updated rows.
 type pendingSyncEntry struct {
-	RawToken string `json:"raw_token"`
+	SourceDeviceID string `json:"source_device_id,omitempty"`
+	IncomingFenced bool   `json:"incoming_fenced,omitempty"`
+	RawToken       string `json:"raw_token"`
 	// ArrivalHandled records that origin continuation admission or its legacy
 	// fallback already succeeded. ArrivalUncertain records an attempted origin
 	// delivery whose outcome cannot be distinguished after a transport loss.
@@ -1771,7 +1765,7 @@ func (s *Server) currentSelfNodeKey() string {
 // SetOnAgentSyncFinalized installs the post-complete hook that
 // the orchestrator's /api/v1/peers/agent-sync/finalize endpoint
 // invokes. See onAgentSyncFinalized for the contract.
-func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (bool, error)) {
+func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, allowedProxy, opID string) (bool, error)) {
 	s.onAgentSyncFinalized = fn
 }
 

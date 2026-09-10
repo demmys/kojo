@@ -13,6 +13,7 @@ import (
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 type goalRecoveryRequest struct {
@@ -132,7 +133,8 @@ func (s *Server) handlePeerGoalResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "wrong_holder", "goal recovery must come from the current remote holder")
 		return
 	}
-	s.externalChat.rememberRoute(req.AgentID, lock.HolderPeer)
+	routeCtx := context.WithValue(r.Context(), externalChatRouteVersionKey{}, externalChatRouteVersion{AgentID: req.AgentID, Version: store.AgentLockVersion{Token: lock.FencingToken, Holder: lock.HolderPeer}})
+	s.externalChat.rememberRouteFrom(routeCtx, req.AgentID, lock.HolderPeer)
 	if err = s.resumeGoalSurface(r.Context(), req); err != nil {
 		writeError(w, 409, "recovery_unavailable", err.Error())
 		return

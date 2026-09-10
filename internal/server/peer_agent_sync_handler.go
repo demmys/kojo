@@ -495,20 +495,17 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 			"source_device_id must not equal the local peer")
 		return false
 	}
-	// Holder verification: if target already has an agent_locks
-	// row for this agentID, the signer MUST be the recorded
-	// holder. This blocks a stray/malicious authenticated peer
-	// from clobbering target's view of an agent it didn't
-	// originate, even within the v1 trust realm. First-time
-	// syncs (no lock row yet) are allowed because there's
-	// nothing on target to protect.
+	// Never accept a remote snapshot over a local ownership claim. A
+	// different remote shadow needs delegation evidence; applyPeerAgentSync
+	// resolves and fences it before any snapshot/filesystem writes. Chunked
+	// staging may proceed, but commit uses that same authoritative gate.
 	existingLock, lerr := s.agents.Store().GetAgentLock(r.Context(), req.Agent.ID)
 	if lerr != nil && !errors.Is(lerr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"lookup agent lock: "+lerr.Error())
 		return false
 	}
-	if existingLock != nil && existingLock.HolderPeer != req.SourceDeviceID {
+	if existingLock != nil && existingLock.HolderPeer != req.SourceDeviceID && (s.peerID == nil || existingLock.HolderPeer == s.peerID.DeviceID) {
 		writeError(w, http.StatusConflict, "wrong_holder",
 			"agent_locks.holder_peer does not match source_device_id; refusing sync")
 		return false
@@ -521,6 +518,43 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 // handlePeerAgentSyncChunkedCommit (chunked). The caller is responsible
 // for validating req via validatePeerAgentSyncRequest first.
 func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req *peerAgentSyncRequest) {
+	// Serialize receiver lifecycle changes, including force-reclaim, across
+	// validation and all phase-1 side effects (single-shot AND chunked paths).
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: req.Agent.ID})
+	defer unlock()
+	if !s.validatePeerAgentSyncRequest(w, r, req, auth.FromContext(r.Context())) {
+		return
+	}
+	var incoming *store.IncomingHandoff
+	if s.peerID != nil {
+		prior, err := s.agents.Store().GetIncomingHandoff(r.Context(), req.Agent.ID, req.OpID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeError(w, 500, "internal", err.Error())
+			return
+		}
+		if prior != nil && (prior.Phase != "prepared" || prior.SourcePeer != req.SourceDeviceID) {
+			writeError(w, 409, "stale_handoff", "operation already accepted or retired; use a new handoff")
+			return
+		}
+		version, delegatedBy, err := s.authorizeIncomingSource(r.Context(), req.Agent.ID, req.SourceDeviceID)
+		if err != nil {
+			writeError(w, 409, "wrong_holder", err.Error())
+			return
+		}
+		incoming = &store.IncomingHandoff{AgentID: req.Agent.ID, OpID: req.OpID, SourcePeer: req.SourceDeviceID, TargetPeer: s.peerID.DeviceID, Expected: version, DelegatedBy: delegatedBy}
+		if prior != nil && prior.Expected != version {
+			writeError(w, 409, "stale_handoff", "ownership changed since phase-1")
+			return
+		}
+		if err := s.agents.Store().ValidateIncomingHandoff(r.Context(), incoming); err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) {
+				writeError(w, 409, "stale_handoff", "operation cancelled, superseded, or another handoff is pending")
+			} else {
+				writeError(w, 500, "internal", err.Error())
+			}
+			return
+		}
+	}
 	// Cross-platform workDir: the user-facing Settings.workDir
 	// (peer-local per docs §3.8) is rewritten to a portable
 	// default so a /Users/alice/... path from a macOS source
@@ -748,11 +782,12 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	}
 
 	if err := s.agents.Store().SyncAgentFromPeer(r.Context(), store.AgentSyncPayload{
-		Agent:         req.Agent,
-		Persona:       req.Persona,
-		Memory:        req.Memory,
-		Messages:      req.Messages,
-		MemoryEntries: req.MemoryEntries,
+		IncomingHandoff: incoming,
+		Agent:           req.Agent,
+		Persona:         req.Persona,
+		Memory:          req.Memory,
+		Messages:        req.Messages,
+		MemoryEntries:   req.MemoryEntries,
 		// Workspace files: always full-replace. See the
 		// peerAgentSyncRequest doc-comment for the rationale.
 		WorkspaceFiles:           req.WorkspaceFiles,
@@ -926,6 +961,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// so a stale drop from a previous attempt can't erase the
 	// fresh retry's entry.
 	if err := s.recordPendingAgentSync(r.Context(), req.Agent.ID, req.OpID, pendingSyncEntry{
+		SourceDeviceID: req.SourceDeviceID, IncomingFenced: incoming != nil,
 		RawToken:        req.AgentToken,
 		DegradedFlushes: req.DegradedFlushes,
 		TransferSkips:   req.TransferSkips,

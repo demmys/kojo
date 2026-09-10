@@ -344,6 +344,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if cur, lerr := s.agents.Store().GetAgentLock(ctx, agentID); lerr == nil {
+		ctx = context.WithValue(ctx, sourceHandoffVersionKey{}, store.AgentLockVersion{Token: cur.FencingToken, Holder: cur.HolderPeer})
 		if cur.HolderPeer != s.peerID.DeviceID {
 			writeError(w, http.StatusConflict, "wrong_source",
 				fmt.Sprintf("agent_lock holder is %s, not the local peer; orchestrate the switch from that peer",
@@ -1007,7 +1008,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 						s.agents.DetachOneShot(agentID, callerOneShot.ID)
 					}
 					releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-					s.onAgentReleasedAsSource(releaseCtx, agentID)
+					s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, lock.FencingToken)
 					releaseCancel()
 				}
 				resp.Outcome = "complete_errored_lock_at_target"
@@ -1029,6 +1030,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		resp.Reason = "complete: agent_lock did not transfer; restored source ownership to avoid a blob-only migration"
 		if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 			reclaimCtx, reclaimCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			unlockRestore := s.lockPendingFinalize(pendingSyncKey{AgentID: agentID})
 			rec, rerr := s.agents.Store().ForceReclaimAgentToLocal(
 				reclaimCtx, agentID, s.peerID.DeviceID,
 				store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
@@ -1046,6 +1048,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 					"agent", agentID, "target", req.TargetPeerID,
 					"op_id", syncReq.OpID, "fencing_token", rec.FencingToken)
 			}
+			unlockRestore()
 			reclaimCancel()
 		}
 		if resp.AgentSynced && targetAddr != "" && req.TargetPeerID != "" && syncReq.OpID != "" {
@@ -1088,7 +1091,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 					s.agents.DetachOneShot(agentID, callerOneShot.ID)
 				}
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-				s.onAgentReleasedAsSource(releaseCtx, agentID)
+				s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 				releaseCancel()
 			}
 			writeJSONResponse(w, http.StatusOK, resp)
@@ -1155,7 +1158,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				s.agents.DetachOneShot(agentID, callerOneShot.ID)
 			}
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-			s.onAgentReleasedAsSource(releaseCtx, agentID)
+			s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 			releaseCancel()
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
@@ -1191,13 +1194,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// SKILL.md tells claude to stay silent on completed so a
 		// missing finalize_error surface here doesn't leak to the
 		// user.
-		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
+		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, completeResp.LockFencing)
 	} else if selfCall && continuation == nil && callerOneShot.ID != 0 {
 		// The response adapter identified this as a one-shot, but the target
 		// could not negotiate origin-aware continuation (old target or failed
 		// capability bind). Preserve legacy main-chat arrival without letting it
 		// overlap the source turn that is still blocked inside this curl.
-		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID)
+		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
 	} else {
 		// Uses a fresh background ctx so a wedged target doesn't
 		// stall past switchDeviceOpTimeout — the switch is already
@@ -1215,7 +1218,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		const finalizeRetryBackoff = 500 * time.Millisecond
 		for attempt := 0; attempt < finalizeAttempts; attempt++ {
 			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, continuation)
+			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, continuation, completeResp.LockFencing)
 			finalizeCancel()
 			if finalizeErr == nil {
 				break
@@ -1226,7 +1229,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				// source turn that is still waiting for this HTTP response.
 				continuation = nil
 				if selfCall && callerOneShot.ID != 0 {
-					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID)
+					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
 					finalizeErr = nil
 					break
 				}
@@ -1234,7 +1237,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				// finalize immediately rather than consuming another loop attempt:
 				// the capability downgrade can be discovered on the final attempt.
 				legacyCtx, legacyCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-				finalizeErr = s.dispatchPeerAgentSyncFinalize(legacyCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, nil)
+				finalizeErr = s.dispatchPeerAgentSyncFinalize(legacyCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, nil, completeResp.LockFencing)
 				legacyCancel()
 				if finalizeErr == nil {
 					break
@@ -1283,7 +1286,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			s.agents.DetachOneShot(agentID, callerOneShot.ID)
 		}
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		s.onAgentReleasedAsSource(releaseCtx, agentID)
+		s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 		releaseCancel()
 	}
 
@@ -1377,7 +1380,7 @@ const deferredFinalizeTailWaitBudget = 30 * time.Second
 // Runs under context.Background so a parent-handler cancellation
 // (e.g. switchDeviceOpTimeout firing right after writeJSONResponse)
 // doesn't cut us off mid-wait.
-func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID string) {
+func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID string, expectedToken ...int64) {
 	defer func() {
 		// Goroutine-level recover: a panic here would have no
 		// supervisor to catch it (the parent handler already
@@ -1409,7 +1412,7 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	var finalizeErr error
 	for attempt := 0; attempt < finalizeAttempts; attempt++ {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail, nil)
+		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail, nil, expectedToken...)
 		finalizeCancel()
 		if finalizeErr == nil {
 			break
@@ -1427,7 +1430,7 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	}
 }
 
-func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64) {
+func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64, expectedToken ...int64) {
 	waitCtx, cancel := context.WithTimeout(context.Background(), deferredFinalizeTailWaitBudget)
 	err := s.agents.WaitOneShotDone(waitCtx, agentID, oneShotID)
 	cancel()
@@ -1439,7 +1442,7 @@ func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID,
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil)
+		finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil, expectedToken...)
 		finalizeCancel()
 		if finalizeErr == nil {
 			return
@@ -1489,7 +1492,17 @@ var errFinalizeContinuationDowngrade = errors.New("target rejected origin-aware 
 // cap (oversized tail is silently dropped + finalize still proceeds,
 // preferring "target runtime activates without the commitment text"
 // over "target never activates because finalize itself 413'd").
-func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation) error {
+func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation, expectedToken ...int64) error {
+	if len(expectedToken) > 0 {
+		current, err := s.agents.Store().GetAgentLockVersion(ctx, agentID)
+		if err != nil {
+			return err
+		}
+		if current != (store.AgentLockVersion{Holder: targetDeviceID, Token: expectedToken[0]}) {
+			return store.ErrStaleHandoff
+		}
+	}
+
 	body := peerAgentSyncFinalizeRequest{
 		SourceDeviceID: s.peerID.DeviceID,
 		AgentID:        agentID,
@@ -1631,11 +1644,13 @@ func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targ
 	// those to learn the switch died.
 	s.noteSwitchFailure(agentID, reason)
 	s.abortAfterFailure(ctx, agentID, resp, reason)
-	if resp.AgentSynced && targetAddr != "" && targetDeviceID != "" && opID != "" {
+	// A failed/timed-out sync may still have committed at the target. Send
+	// cancellation even without a success response; it can precede phase-1.
+	if targetAddr != "" && targetDeviceID != "" && opID != "" {
 		dropCtx, cancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 		defer cancel()
 		if derr := s.dispatchPeerAgentSyncDrop(dropCtx, targetAddr, targetDeviceID, agentID, opID); derr != nil {
-			s.logger.Warn("switch-device: agent-sync drop failed (target may hold stale pending entry until next sync)",
+			s.logger.Warn("switch-device: agent-sync drop failed (target may require explicit cancellation before another sync)",
 				"agent", agentID, "target", targetDeviceID, "err", derr)
 		}
 	}
@@ -1658,11 +1673,10 @@ func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targ
 func (s *Server) abortAfterFailure(ctx context.Context, agentID string, resp *switchDeviceResponse, reason string) {
 	s.logger.Warn("switch-device: aborting after failure",
 		"agent", agentID, "target", resp.TargetPeerID, "reason", reason)
-	// Abort uses a fresh context bounded to the handoff timeout so
+	// Abort ignores cancellation but retains the source ownership fence so
 	// a caller-cancelled ctx (e.g. client hung up) still lets us
-	// clear handoff_pending — leaving the flag set would block
-	// future writes against the agent's blobs.
-	abortCtx, cancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+	// clear this generation's handoff_pending, never a later operation's.
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handoffOpTimeout)
 	defer cancel()
 	abortResp, aerr := s.runHandoffOp(abortCtx, agentID, "abort", "")
 	resp.Abort = abortResp

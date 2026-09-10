@@ -339,17 +339,20 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 					writeError(w, 409, "goal_changed", err.Error())
 					return
 				}
-				entry.ArrivalUncertain = true
-				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
-					writeError(w, 500, "internal", err.Error())
-					return
-				}
 				origin := binding.OriginPeerID
 				if origin == "" {
 					origin = req.SourceDeviceID
 				}
 				if err := s.callGoalHandoffOrigin(r.Context(), origin, goalHandoffOriginRequest{Action: "check", OpID: req.OpID, AgentID: req.AgentID}); err != nil {
 					writeError(w, 409, "goal_handoff_stopped", err.Error())
+					return
+				}
+				// Persist the uncertain intent only after the side-effect-free
+				// origin check, immediately before the resume side effect; a
+				// failed check must stay retryable rather than 503 forever.
+				entry.ArrivalUncertain = true
+				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
 					return
 				}
 				recovery := goalRecoveryRequest{AgentID: req.AgentID, SessionKey: binding.SessionKey, ThreadID: binding.State.ThreadID, Generation: binding.Generation, UserID: binding.UserID, RunID: binding.RunID, HolderID: s.peerID.DeviceID, HandoffID: req.OpID}

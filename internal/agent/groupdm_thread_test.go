@@ -21,6 +21,7 @@ import (
 type threadStub struct {
 	mu            sync.Mutex
 	calls         []OneShotOpts
+	messages      []string
 	reply         string
 	active        int32
 	maxConcurrent int32
@@ -34,6 +35,11 @@ func (s *threadStub) lastOpts() OneShotOpts {
 	defer s.mu.Unlock()
 	return s.calls[len(s.calls)-1]
 }
+func (s *threadStub) lastMessage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.messages[len(s.messages)-1]
+}
 
 func (s *threadStub) fn(ctx context.Context, agentID, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
 	n := atomic.AddInt32(&s.active, 1)
@@ -45,6 +51,7 @@ func (s *threadStub) fn(ctx context.Context, agentID, userMessage string, opts O
 	}
 	s.mu.Lock()
 	s.calls = append(s.calls, opts)
+	s.messages = append(s.messages, userMessage)
 	reply := s.reply
 	s.mu.Unlock()
 
@@ -90,6 +97,10 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior answer", nil)
+	if err := appendGroupMessage(g.ID, prior, 0, false); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "ping", nil, true); err != nil {
 		t.Fatal(err)
 	}
@@ -102,12 +113,154 @@ func TestThreadPost_RunsOneShotNotNotify(t *testing.T) {
 	if got := stub.lastOpts().SessionKey; got != "groupdm:"+g.ID {
 		t.Errorf("SessionKey = %q, want %q", got, "groupdm:"+g.ID)
 	}
+	if got := stub.lastOpts().History; len(got) != 1 || got[0].Text != "prior answer" || !got[0].IsBot {
+		t.Errorf("History = %+v, want prior agent answer only", got)
+	}
 	// notify path must not have fired for the thread room.
 	gdm.notifyMu.Lock()
 	_, exists := gdm.notify[g.ID+":ag_alice"]
 	gdm.notifyMu.Unlock()
 	if exists {
 		t.Errorf("thread post should not create notify state")
+	}
+}
+
+func TestThreadPost_ForwardsInputAttachmentsToOneShot(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	stub := &threadStub{reply: "received"}
+	gdm.oneShot = stub.fn
+
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(t.TempDir(), "report.pdf")
+	if err := os.WriteFile(sourcePath, []byte("report contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attachments := []MessageAttachment{{
+		Path: sourcePath, Name: "report.pdf", Mime: "application/pdf", Size: 15, PeerID: "hub",
+	}}
+	if _, err := gdm.PostUserMessage(context.Background(), g.ID, "inspect this", attachments, true); err != nil {
+		t.Fatal(err)
+	}
+	waitForMessage(t, gdm, g.ID, "received")
+
+	got := stub.lastOpts().Attachments
+	if len(got) != 1 || got[0] != attachments[0] {
+		t.Fatalf("one-shot attachments = %+v, want %+v", got, attachments)
+	}
+	if strings.Contains(stub.lastMessage(), sourcePath) {
+		t.Fatalf("live payload leaked Hub-local attachment path: %q", stub.lastMessage())
+	}
+}
+
+func TestThreadConversationHistory_KeepsAttachmentOnlyMessage(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := newGroupMessage(UserSenderID, "User", "", []MessageAttachment{{
+		Path: "kojo://global/groupdms/" + g.ID + "/input/design.png",
+		Name: "design.png", Mime: "image/png", Size: 123,
+	}})
+	if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	gdm.latestMsgID[g.ID] = msg.ID
+
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, msg.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].MessageID != msg.ID ||
+		!strings.Contains(history[0].Text, "design.png") || !strings.Contains(history[0].Text, "image/png") {
+		t.Fatalf("attachment-only history = %+v", history)
+	}
+}
+
+func TestThreadConversationHistory_PreservesContentWhitespace(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, err := gdm.CreateThread("ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "    indented code  \nnext line  "
+	msg := newGroupMessage(UserSenderID, "User", content, nil)
+	if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	gdm.latestMsgID[g.ID] = msg.ID
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, msg.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Text != content {
+		t.Fatalf("history text = %q, want exact %q", history[0].Text, content)
+	}
+}
+
+func TestThreadConversationHistory_StopsBeforeTriggeringMessage(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior", nil)
+	current := newGroupMessage(UserSenderID, "User", "current", nil)
+	future := newGroupMessage(UserSenderID, "User", "future", nil)
+	for _, msg := range []*GroupMessage{prior, current, future} {
+		if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gdm.latestMsgID[g.ID] = future.ID
+	gdm.registerThreadQueued(g.ID, current.ID)
+	gdm.registerThreadQueued(g.ID, future.ID)
+
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, current.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered := history[:0]
+	for _, msg := range history {
+		if msg.MessageID != current.ID {
+			filtered = append(filtered, msg)
+		}
+	}
+	history = filtered
+	if len(history) != 1 || history[0].MessageID != prior.ID || history[0].Text != "prior" {
+		t.Fatalf("history = %+v, want only the message before the trigger", history)
+	}
+}
+
+func TestThreadConversationHistory_StopsThroughArrivalTrigger(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := newGroupMessage("ag_alice", "Alice", "prior", nil)
+	current := newGroupMessage(UserSenderID, "User", "current", nil)
+	future := newGroupMessage(UserSenderID, "User", "future", nil)
+	steer := newGroupMessage(UserSenderID, "User", "steer current turn", nil)
+	latePriorReply := newGroupMessage("ag_alice", "Alice", "reply to prior", nil)
+	for _, msg := range []*GroupMessage{prior, current, future, steer, latePriorReply} {
+		if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gdm.latestMsgID[g.ID] = latePriorReply.ID
+	gdm.registerThreadQueued(g.ID, current.ID)
+	gdm.registerThreadQueued(g.ID, future.ID)
+
+	history, err := gdm.threadConversationSnapshot(context.Background(), g.ID, current.ID, "ag_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 4 || history[0].MessageID != prior.ID || history[1].MessageID != current.ID || history[2].MessageID != steer.ID || history[3].MessageID != latePriorReply.ID {
+		t.Fatalf("history = %+v, want prior, trigger, steer, and preceding-turn reply but not future queued post", history)
 	}
 }
 

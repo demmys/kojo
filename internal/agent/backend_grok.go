@@ -232,6 +232,17 @@ func writeGrokSessionIDFor(agentDirPath, sessionKey, sessionID string, logger *s
 	}
 }
 
+// deleteGrokThreadRefStrict makes the next keyed turn start a fresh grok
+// session. The old session directory may still be referenced by another key,
+// so only the key-to-session ref is removed here.
+func deleteGrokThreadRefStrict(agentID, sessionKey string) error {
+	err := os.Remove(grokSessionRefPath(agentDir(agentID), sessionKey))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
 func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string) []string {
 	args := []string{
 		"--prompt-file", promptPath,
@@ -307,6 +318,8 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		}
 	}
 
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumeID != "")
+
 	// A fresh session has no history of its own, so bootstrap it with a
 	// bounded transcript excerpt (including the recent tool calls) the
 	// same way ClaudeBackend does. Without this, a session that was
@@ -314,7 +327,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 	// it just did — re-running commands it already ran. Resumed sessions
 	// skip it: their context is already on disk. OneShot turns skip it
 	// too — Slack / Discord / Group DM carry their own context.
-	if !opts.OneShot && resumeID == "" && opts.RecentMessagesContext != "" {
+	if !opts.OneShot && resumeID == "" && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
 
@@ -351,6 +364,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 
 	cmd := exec.CommandContext(ctx, grokPath, args...)
 	cmd.Env = grokCommandEnv(agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	cmd.Dir = dir
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)

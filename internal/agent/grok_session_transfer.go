@@ -67,10 +67,10 @@ type GrokSessionTransfer struct {
 
 // grokSessionFileMaxBytes caps an individual file the transfer
 // accepts. grok session files are normally small (a few KB) but
-// terminal/ logs can balloon for tool-heavy turns; 32 MiB per file
-// matches the claude ceiling and keeps the agent-sync wire payload
-// bounded.
-const grokSessionFileMaxBytes = 32 << 20
+// terminal/ logs can balloon for tool-heavy turns. The device-switch
+// orchestrator applies the exact aggregate JSON-envelope budget; this larger
+// reader-side ceiling only blocks a single pathological file early.
+var grokSessionFileMaxBytes int64 = 128 << 20
 
 // grokSessionTransferMaxFiles caps the file count to bound the
 // per-message overhead of the JSON envelope (each file is a
@@ -215,7 +215,7 @@ func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []SkippedSessio
 		// blow past the wire cap BEFORE we copy every file
 		// into RAM — otherwise a buggy / hostile source could
 		// allocate up to grokSessionTransferMaxFiles ×
-		// grokSessionFileMaxBytes (32 GiB) before the wire cap
+		// grokSessionFileMaxBytes before the wire cap
 		// rejects the request.
 		totalBytes += fi.Size()
 		if totalBytes > grokSessionTransferMaxTotalBytes {
@@ -269,9 +269,9 @@ func ReadGrokSessionFiles(agentID string) (*GrokSessionTransfer, []SkippedSessio
 
 // StageGrokSessionCleanup purges any pre-existing primary grok
 // session state from target's agentDir. Used by the agent-sync
-// handler when the inbound payload says the agent IS a grok agent
-// but carries NO GrokSession block — i.e. source either has no
-// session yet OR cleared it via ResetSession. Without this purge,
+// handler when the authoritative inbound snapshot carries no GrokSession
+// block — either the source uses another backend, has no session yet, or
+// cleared it via ResetSession. Without this purge,
 // target would keep the stale `.grok/session_id` file it inherited
 // from a previous switch (or wrote during a local turn while it
 // hosted the agent earlier) and the next chat would `--resume`

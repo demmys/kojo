@@ -1,5 +1,6 @@
 import type { EmbeddingModelHook } from "./useEmbeddingModel";
 import type { GeminiApiKeyHook } from "./useGeminiApiKey";
+import type { OpenAIApiKeyHook } from "./useOpenAIApiKey";
 import type { XAIApiKeyHook } from "./useXAIApiKey";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -11,11 +12,12 @@ import { useT } from "../../lib/i18n";
 interface Props {
   gemini: GeminiApiKeyHook;
   embedding: EmbeddingModelHook;
+  openai: OpenAIApiKeyHook;
   xai: XAIApiKeyHook;
 }
 
-/** API Keys section — Gemini API key + embedding model selector. */
-export function ApiKeysSection({ gemini, embedding, xai }: Props) {
+/** API Keys section — image, embedding, and voice service credentials. */
+export function ApiKeysSection({ gemini, embedding, openai, xai }: Props) {
   const t = useT();
   return (
     <SectionCard
@@ -27,7 +29,9 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
           <div className="min-w-0">
             <div className="text-[13px] font-medium text-ink">Gemini API</div>
             <div className="mt-0.5 text-[12px]">
-              {gemini.configured ? (
+              {gemini.loadError ? (
+                <span className="text-lamp-err">{t("gs.keyStatusError")}</span>
+              ) : gemini.configured ? (
                 <span className="text-lamp-run">{t("gs.configured")}</span>
               ) : gemini.hasFallback ? (
                 <span className="text-lamp-warn">{t("gs.usingFallback")}</span>
@@ -94,11 +98,67 @@ export function ApiKeysSection({ gemini, embedding, xai }: Props) {
               </Select>
             ) : (
               <div className="text-[12px] text-ink-faint">
-                {gemini.configured ? t("gs.loadModelsFailed") : t("gs.configureKeyForModels")}
+                {gemini.configured || gemini.hasFallback
+                  ? t("gs.loadModelsFailed")
+                  : t("gs.configureKeyForModels")}
               </div>
             )}
           </Field>
         </div>
+      </div>
+
+      <div className="mt-3 rounded-[10px] border border-hairline bg-raised p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">OpenAI API</div>
+            <div className="mt-0.5 text-[12px]">
+              {openai.loadError ? (
+                <span className="text-lamp-err">{t("gs.keyStatusError")}</span>
+              ) : openai.configured ? (
+                <span className="text-lamp-run">{t("gs.configured")}</span>
+              ) : openai.hasFallback ? (
+                <span className="text-lamp-warn">{t("gs.usingFallback")}</span>
+              ) : (
+                <span className="text-ink-faint">{t("gs.notConfigured")}</span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[11px] text-ink-faint">{t("gs.openaiImageHelp")}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button onClick={openai.toggleEditing}>
+              {openai.editing ? t("common.cancel") : openai.configured ? t("gs.update") : t("gs.configure")}
+            </Button>
+            {openai.configured && (
+              <button
+                onClick={openai.remove}
+                aria-label={t("gs.removeOpenaiKey")}
+                className="rounded-md px-1.5 text-ink-faint transition-colors hover:text-lamp-err"
+              >
+                &times;
+              </button>
+            )}
+          </div>
+        </div>
+
+        {openai.editing && (
+          <div className="mt-3 space-y-2 border-t border-hairline pt-3">
+            <Input
+              mono
+              type="password"
+              value={openai.input}
+              onChange={(e) => openai.setInput(e.target.value)}
+              placeholder="sk-..."
+            />
+            <Button
+              variant="primary"
+              onClick={openai.save}
+              disabled={openai.saving || !openai.input.trim()}
+              className="w-full"
+            >
+              {openai.saving ? t("settings.saving") : t("gs.save")}
+            </Button>
+          </div>
+        )}
       </div>
 
       <div className="mt-3 rounded-[10px] border border-hairline bg-raised p-3">

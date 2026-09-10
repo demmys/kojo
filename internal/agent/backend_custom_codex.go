@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/customapi"
 )
 
 // customCodexProviderID is the `model_providers.<id>` key kojo synthesizes
@@ -30,16 +32,17 @@ const customCodexProviderID = "kojo_custom"
 // threads) — the difference from custom-bare, where kojo posts a single
 // stateless completion itself.
 //
-// Unlike custom-bare, the base URL is NOT restricted to loopback: the
-// request is issued by the codex CLI subprocess, exactly like custom-claude
-// issues its own through the claude CLI, so kojo's process is not the one
-// being pointed at an arbitrary host.
+// Like the other custom backends, the endpoint is restricted to loopback or
+// the Tailscale network. Codex talks through a short-lived loopback relay so
+// the endpoint is DNS-pinned and the real API key never enters the subprocess
+// environment.
 type CustomCodexBackend struct {
 	logger *slog.Logger
+	creds  *CredentialStore
 }
 
-func NewCustomCodexBackend(logger *slog.Logger) *CustomCodexBackend {
-	return &CustomCodexBackend{logger: logger}
+func NewCustomCodexBackend(logger *slog.Logger, creds *CredentialStore) *CustomCodexBackend {
+	return &CustomCodexBackend{logger: logger, creds: creds}
 }
 
 func (b *CustomCodexBackend) Name() string { return ToolCustomCodex }
@@ -71,19 +74,48 @@ func (b *CustomCodexBackend) Chat(ctx context.Context, agent *Agent, userMessage
 	if agent.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for the custom-codex backend")
 	}
-	base := customCodexBaseURL(agent.CustomBaseURL)
+	apiKey, err := LoadCustomAPIKey(b.creds, agent.ID, agent.CustomBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("load custom API key: %w", err)
+	}
+	// The relay targets the server root. Agent.CustomBaseURL may already end
+	// in /v1 for Codex, but /props lives beside /v1 rather than below it.
+	targetBase := strings.TrimSuffix(strings.TrimRight(agent.CustomBaseURL, "/"), "/v1")
+	relay, err := customapi.StartLocalRelay(ctx, targetBase, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("customBaseURL: %w", err)
+	}
+	base := customCodexBaseURL(relay.URL)
 	if base == "" {
+		relay.Close()
 		return nil, fmt.Errorf("customBaseURL is required for the custom-codex backend")
 	}
 
 	overrides := customCodexOverrides(base)
-	if n := probeCustomContextWindow(ctx, agent.CustomBaseURL, b.logger); n > 0 {
+	if n := probeCustomContextWindowAt(ctx, agent.CustomBaseURL, relay.URL, b.logger); n > 0 {
 		overrides = append(overrides, customCodexContextOverrides(n)...)
 	}
 
 	cb := NewCodexBackend(b.logger)
 	cb.SetConfigOverrides(overrides)
-	return cb.Chat(ctx, agent, userMessage, systemPrompt, opts)
+	events, err := cb.Chat(ctx, agent, userMessage, systemPrompt, opts)
+	if err != nil {
+		relay.Close()
+		return nil, err
+	}
+	out := make(chan ChatEvent, 64)
+	go func() {
+		defer close(out)
+		defer relay.Close()
+		for event := range events {
+			select {
+			case out <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
 }
 
 // The share of the endpoint's context that may be filled before codex
@@ -148,11 +180,19 @@ var (
 // exists in the OpenAI API itself, so anything else simply goes unconfigured
 // rather than being configured wrongly.
 func probeCustomContextWindow(ctx context.Context, rawBase string, logger *slog.Logger) int {
-	root := strings.TrimRight(strings.TrimSpace(rawBase), "/")
+	return probeCustomContextWindowAt(ctx, rawBase, rawBase, logger)
+}
+
+// probeCustomContextWindowAt keeps the cache keyed by the stable configured
+// endpoint while allowing production callers to issue the request through a
+// loopback relay that pins DNS, rejects redirects, and injects authentication.
+func probeCustomContextWindowAt(ctx context.Context, cacheBase, requestBase string, logger *slog.Logger) int {
+	root := strings.TrimRight(strings.TrimSpace(cacheBase), "/")
 	if root == "" {
 		return 0
 	}
 	root = strings.TrimSuffix(root, "/v1")
+	requestRoot := strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(requestBase), "/"), "/v1")
 
 	customContextWindowMu.Lock()
 	entry, ok := customContextWindowCache[root]
@@ -161,7 +201,7 @@ func probeCustomContextWindow(ctx context.Context, rawBase string, logger *slog.
 		return entry.window
 	}
 
-	window := fetchLlamaCppContextWindow(ctx, root)
+	window := fetchLlamaCppContextWindow(ctx, requestRoot)
 	if window == 0 {
 		if logger != nil {
 			logger.Debug("custom-codex: context window probe found nothing, codex will use its default window",

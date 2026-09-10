@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -61,16 +64,14 @@ type peerAgentSyncFinalizeRequest struct {
 	// the source-release guard would otherwise drop this turn.
 	//
 	// Handler ordering (see handlePeerAgentSyncFinalize):
-	//   1. onAgentSyncFinalized hook (AddAgent + lock verify +
-	//      ActivateAgentRuntime)
-	//   2. UpdateAgentLockAllowedProxy (proxy stamp)
+	//   1. AcceptIncomingHandoff (atomic holder/token/proxy)
+	//   2. onAgentSyncFinalized hook, then activated receipt
 	//   3. applyFinalizeTailMessage — UPSERTs the row by id under
 	//      a FencingPredicate keyed on the post-hook lock token,
 	//      so a force-reclaim race aborts the apply with
 	//      errTailLockNotSelf (caller 503s, source retries).
-	//   4. NotifyDeviceSwitchArrival — arrival prompt's transcript
-	//      scan now sees the agent's own "I'll do X on arrival"
-	//      commitment alongside the user's last instruction.
+	//   4. admit the arrival either to the initiating Slack/WebUI
+	//      thread or, for legacy/main turns, to main WebUI
 	//   5. commitPendingAgentSync
 	//
 	// Nil/empty on non-self-call paths and on self-call paths where
@@ -78,10 +79,51 @@ type peerAgentSyncFinalizeRequest struct {
 	// budget — the finalize still proceeds; target's arrival just
 	// lacks the tail (degraded but functional).
 	TailMessage *store.MessageRecord `json:"tail_message,omitempty"`
+	// Continuation routes the arrival system turn back through the Hub-owned
+	// response adapter that initiated the switch. Nil preserves the legacy main
+	// WebUI arrival chat.
+	Continuation *handoffContinuation `json:"continuation,omitempty"`
+}
+
+type handoffContinuation struct {
+	GoalHandoffID string `json:"goal_handoff_id,omitempty"`
+	SessionKey    string `json:"session_key"`
+	OriginPeerID  string `json:"origin_peer_id"`
+	Capability    string `json:"capability"`
 }
 
 type peerAgentSyncFinalizeResponse struct {
 	AgentID string `json:"agent_id"`
+}
+
+type pendingFinalizeLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (s *Server) lockPendingFinalize(key pendingSyncKey) func() {
+	s.pendingFinalizeMu.Lock()
+	if s.pendingFinalizeLocks == nil {
+		s.pendingFinalizeLocks = make(map[pendingSyncKey]*pendingFinalizeLock)
+	}
+	entry := s.pendingFinalizeLocks[key]
+	if entry == nil {
+		entry = &pendingFinalizeLock{}
+		s.pendingFinalizeLocks[key] = entry
+	}
+	entry.refs++
+	s.pendingFinalizeMu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		s.pendingFinalizeMu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(s.pendingFinalizeLocks, key)
+		}
+		s.pendingFinalizeMu.Unlock()
+	}
 }
 
 func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Request) {
@@ -113,11 +155,40 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			"source_device_id, agent_id, and op_id required")
 		return
 	}
+	if c := req.Continuation; c != nil && c.GoalHandoffID != "" {
+		if _, err := uuid.Parse(c.GoalHandoffID); err != nil || c.GoalHandoffID != req.OpID || c.Capability != "" || c.OriginPeerID == "" {
+			writeError(w, 400, "bad_request", "invalid goal handoff continuation")
+			return
+		}
+	}
+	if req.Continuation != nil && req.Continuation.GoalHandoffID == "" && (req.Continuation.SessionKey == "" || req.Continuation.OriginPeerID == "" || req.Continuation.Capability == "") {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"continuation.session_key, continuation.origin_peer_id, and continuation.capability required")
+		return
+	}
 	if !verifySignerIsSource(p, req.SourceDeviceID) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return
 	}
+	allowedProxy, err := s.resolveAllowedProxyPeer(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"continuation.origin_peer_id is not a paired peer")
+			return
+		}
+		s.logger.Error("peer agent-sync finalize: origin peer validation failed",
+			"agent", req.AgentID, "origin_peer", req.Continuation.OriginPeerID, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"validate continuation origin peer: "+err.Error())
+		return
+	}
+	// Serialize the entire consume → arrival decision → commit sequence for
+	// this agent, including force-reclaim. Only one retry may decide between origin
+	// admission and legacy fallback; later retries observe the committed 404.
+	unlockFinalize := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID})
+	defer unlockFinalize()
 
 	entry, ok, err := s.consumePendingAgentSync(r.Context(), req.AgentID, req.OpID)
 	if err != nil {
@@ -133,16 +204,51 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		//     this op_id (forged or wrong-host finalize)
 		//   - a prior finalize already committed and removed
 		//     the entry (idempotent re-call)
-		// Both are surfaced as 404; the orchestrator treats
-		// 404 as "nothing to do" so a retry after a successful
-		// finalize is a no-op.
+		// Both are surfaced as 404; the orchestrator conservatively reports
+		// failure because this alone cannot prove that runtime activation ran.
 		writeError(w, http.StatusNotFound, "not_found",
 			"no pending agent-sync for the given (agent_id, op_id); finalize already committed or sync never landed")
 		return
 	}
+	if entry.SourceDeviceID != "" && entry.SourceDeviceID != req.SourceDeviceID {
+		writeError(w, 403, "forbidden", "finalize source differs from phase-1 source")
+		return
+	}
+	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		if !entry.IncomingFenced {
+			writeError(w, 409, "legacy_handoff_pending", "pending operation predates ownership fencing; start a new handoff")
+			return
+		}
+		accepted, err := s.agents.Store().AcceptIncomingHandoff(r.Context(), req.AgentID, req.OpID, req.SourceDeviceID, s.peerID.DeviceID, allowedProxy, store.NowMillis(), forceReclaimLeaseDuration.Milliseconds())
+		if err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) || errors.Is(err, store.ErrNotFound) {
+				writeError(w, 409, "stale_handoff", err.Error())
+			} else {
+				writeError(w, 503, "handoff_accept_failed", err.Error())
+			}
+			return
+		}
+		if accepted.Phase == "done" {
+			if err := s.commitPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
+				writeError(w, 500, "internal", err.Error())
+				return
+			}
+			writeJSONResponse(w, http.StatusOK, peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
+			return
+		}
+		// Startup deliberately evicts incomplete incoming snapshots. A retry
+		// must reload only after validating its durable receipt, before the
+		// activation hook registers schedulers or admits an arrival.
+		if _, exists := s.agents.Get(req.AgentID); !exists {
+			if err := s.agents.ReloadAgentFromStore(req.AgentID); err != nil {
+				writeError(w, 503, "handoff_reload_failed", err.Error())
+				return
+			}
+		}
+	}
 	tokenReissued := false
 	if s.onAgentSyncFinalized != nil {
-		reissued, err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, req.SourceDeviceID, req.OpID)
+		reissued, err := s.onAgentSyncFinalized(r.Context(), req.AgentID, entry.RawToken, allowedProxy, req.OpID)
 		tokenReissued = reissued
 		if err != nil {
 			// Lock-race surface: cmd/kojo's hook wraps a
@@ -173,52 +279,17 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	// Single-statement verify + stamp: UpdateAgentLockAllowedProxy
-	// only fires when holder_peer == self at the moment of the
-	// UPDATE. A concurrent steal between the hook and this call
-	// returns ErrFencingMismatch; the pending entry stays so the
-	// orchestrator can retry. ErrNotFound means the lock row
-	// vanished entirely — same retry semantics.
-	//
-	// agentHolderAdmitMiddleware gates agents/* on
-	// `holder_peer == self AND allowed_proxy_peer == signer`.
-	// AcquireAgentLock fresh-row insert lands allowed_proxy_peer
-	// = self; we rewrite it to source here so the Hub→target
-	// proxy admits. Scoped to a single agent — no
-	// peer_registry.trusted flip, so a paired-but-untrusted
-	// source can NOT use this as a stepping-stone to
-	// sessions/files/git.
-	if s.agents != nil && s.agents.Store() != nil && s.peerID != nil {
-		err := s.agents.Store().UpdateAgentLockAllowedProxy(
-			r.Context(), req.AgentID,
-			s.peerID.DeviceID, // expected holder
-			req.SourceDeviceID,
-		)
-		switch {
-		case err == nil:
-		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrFencingMismatch):
-			s.logger.Error("peer agent-sync finalize: holder did not transfer / lock missing; pending retained",
-				"agent", req.AgentID, "op_id", req.OpID, "err", err)
-			writeError(w, http.StatusServiceUnavailable, "lock_not_self",
-				"agent_locks.holder_peer is not the local peer; finalize aborted, orchestrator may retry")
-			return
-		default:
-			s.logger.Error("peer agent-sync finalize: allowed-proxy stamp failed; pending retained",
-				"agent", req.AgentID, "source", req.SourceDeviceID, "err", err)
-			writeError(w, http.StatusInternalServerError, "internal",
-				"allowed-proxy stamp: "+err.Error())
+	// Accept committed holder+proxy together. Only mark admission-ready once
+	// the runtime hook succeeded, without a second holder-only proxy rewrite.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
 			return
 		}
 	}
-	// Apply the optional Plan A TailMessage AFTER the hook + admit
-	// gate have BOTH confirmed the lock is at us. Applying earlier
-	// would 503 forever on the first /handoff/finalize attempt —
-	// the lock isn't acquired until the hook runs AddAgent, so
-	// applyFinalizeTailMessage's holder check would refuse every
-	// pre-hook attempt. The fencing predicate on AppendMessage
-	// still re-verifies the lock is at us at apply-tx time (covers
-	// a force-reclaim race in the gap between
-	// UpdateAgentLockAllowedProxy and AppendMessage).
+	// Apply the optional tail after acceptance and runtime activation, but
+	// before building the arrival prompt. AppendMessage independently verifies
+	// the current local fencing token in its transaction.
 	if req.TailMessage != nil && s.agents != nil && s.agents.Store() != nil {
 		if err := s.applyFinalizeTailMessage(r.Context(), req.AgentID, req.TailMessage); err != nil {
 			if errors.Is(err, errTailLockNotSelf) {
@@ -236,34 +307,148 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Arrival prompt fire is deliberately AFTER the tail apply.
-	// NotifyDeviceSwitchArrival's buildArrivalPrompt reads
-	// agent_messages via ListMessages; firing it before the tail
-	// landed would build the prompt against an incomplete transcript
-	// and quote only the user instruction without the commitment
-	// text. Hook-side firing was removed for this reason
-	// (cmd/kojo/main.go SetOnAgentSyncFinalized).
+	// Build the arrival only AFTER the tail apply. The external continuation
+	// carries this exact prompt to the Hub; the legacy path below asks Manager
+	// to build the same prompt for main WebUI delivery.
+	sourceName := req.SourceDeviceID
+	notes := agent.ArrivalNotes{
+		TokenReissued: tokenReissued, DegradedFlushes: entry.DegradedFlushes, TransferSkips: entry.TransferSkips,
+	}
 	if s.agents != nil {
-		sourceName := req.SourceDeviceID
 		if req.SourceDeviceID != "" && s.agents.Store() != nil {
 			if rec, gerr := s.agents.Store().GetPeer(r.Context(), req.SourceDeviceID); gerr == nil && rec.Name != "" {
 				sourceName = rec.Name
 			}
 		}
-		s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, agent.ArrivalNotes{
-			TokenReissued:   tokenReissued,
-			DegradedFlushes: entry.DegradedFlushes,
-			TransferSkips:   entry.TransferSkips,
-		})
+	}
+	// Admit the arrival before consuming the pending finalize marker. This
+	// preserves the legacy crash-safety property: once finalize commits, either
+	// the response adapter owns an admitted in-process FIFO reservation or Manager
+	// has registered the main-WebUI arrival. Callback retries are idempotent by
+	// capability+op_id, and Manager deduplicates the fallback by op_id, so a kv
+	// delete failure can safely retry the whole finalize.
+	if s.agents != nil {
+		if req.Continuation != nil && req.Continuation.GoalHandoffID != "" {
+			if !entry.ArrivalHandled {
+				if entry.ArrivalUncertain {
+					writeError(w, 503, "goal_resume_uncertain", "Goal handoff resume delivery is uncertain; inspect destination state before explicitly resuming")
+					return
+				}
+				binding, err := s.agents.AcceptGoalHandoff(req.AgentID, req.Continuation.SessionKey, req.OpID, req.SourceDeviceID, s.peerID.DeviceID)
+				if err != nil {
+					writeError(w, 409, "goal_changed", err.Error())
+					return
+				}
+				origin := binding.OriginPeerID
+				if origin == "" {
+					origin = req.SourceDeviceID
+				}
+				if err := s.callGoalHandoffOrigin(r.Context(), origin, goalHandoffOriginRequest{Action: "check", OpID: req.OpID, AgentID: req.AgentID}); err != nil {
+					writeError(w, 409, "goal_handoff_stopped", err.Error())
+					return
+				}
+				// Persist the uncertain intent only after the side-effect-free
+				// origin check, immediately before the resume side effect; a
+				// failed check must stay retryable rather than 503 forever.
+				entry.ArrivalUncertain = true
+				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
+					return
+				}
+				recovery := goalRecoveryRequest{AgentID: req.AgentID, SessionKey: binding.SessionKey, ThreadID: binding.State.ThreadID, Generation: binding.Generation, UserID: binding.UserID, RunID: binding.RunID, HolderID: s.peerID.DeviceID, HandoffID: req.OpID}
+				// Main WebUI follows the agent; Slack retains the original Hub.
+				if binding.SessionKey != "" && binding.OriginPeerID != "" && binding.OriginPeerID != s.peerID.DeviceID {
+					err = s.requestGoalRecovery(r.Context(), binding.OriginPeerID, recovery)
+				} else {
+					err = s.resumeGoalSurface(r.Context(), recovery)
+				}
+				if err != nil {
+					writeError(w, 503, "goal_resume_uncertain", err.Error())
+					return
+				}
+				entry.ArrivalUncertain = false
+				entry.ArrivalHandled = true
+				if err := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
+					return
+				}
+			}
+		} else if req.Continuation == nil {
+			s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+		} else if entry.ArrivalUncertain {
+			writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted",
+				"a previous origin-conversation delivery was uncertain; fallback remains suppressed")
+			return
+		} else if entry.ArrivalHandled {
+			// A prior finalize admitted the origin turn (or its definite-failure
+			// fallback) but failed while committing the pending row. Do not replay
+			// the arrival; continue directly to the idempotent commit below.
+		} else {
+			arrivalReq := handoffArrivalRequest{
+				HolderDeviceID: s.peerID.DeviceID,
+				AgentID:        req.AgentID, OpID: req.OpID,
+				SessionKey: req.Continuation.SessionKey, SourceDeviceID: req.SourceDeviceID,
+				Notes: notes, Capability: req.Continuation.Capability,
+			}
+			fallback := func() {
+				s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+			}
+			// Write intent BEFORE the external side effect. A target crash after
+			// origin admission but before persisting the outcome must not replay
+			// an invalid capability after the origin also restarts.
+			entry.ArrivalUncertain = true
+			if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+				writeError(w, http.StatusInternalServerError, "internal",
+					"persist arrival intent: "+err.Error())
+				return
+			}
+			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
+				// Only a delivery that may have reached the Hub keeps the durable
+				// intent; a definite failure (holder changed, verify error, no send
+				// began) must not poison every later finalize with 503.
+				if !errors.Is(err, errHandoffArrivalUncertain) {
+					entry.ArrivalUncertain = false
+					// The definite failure may itself be the request context being
+					// cancelled; the clear must still persist or every later
+					// finalize keeps returning 503.
+					clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+					perr := s.updatePendingAgentSyncAfterSideEffect(clearCtx, req.AgentID, req.OpID, entry)
+					clearCancel()
+					if perr != nil {
+						s.logger.Error("peer agent-sync finalize: clearing arrival intent failed; pending retained",
+							"agent", req.AgentID, "op_id", req.OpID, "err", perr)
+					}
+				}
+				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
+					"agent", req.AgentID, "op_id", req.OpID, "err", err)
+				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())
+				return
+			}
+			entry.ArrivalUncertain = false
+			entry.ArrivalHandled = true
+			if err := s.updatePendingAgentSyncAfterSideEffect(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+				s.logger.Error("peer agent-sync finalize: arrival decision persistence failed; pending retained",
+					"agent", req.AgentID, "op_id", req.OpID, "err", err)
+				writeError(w, http.StatusInternalServerError, "internal",
+					"persist arrival decision: "+err.Error())
+				return
+			}
+		}
 	}
 
-	// Hook + admit gate + tail + arrival all succeeded — NOW remove
+	// Hook + admit gate + tail + arrival admission all succeeded — NOW remove
 	// the pending entry so a subsequent retry surfaces as the 404
 	// idempotent path. A kv delete failure still surfaces as 500:
 	// leaving the sealed token in place while telling the
 	// orchestrator the op completed would let a later boot consume
 	// the same (agent_id, op_id) and replay every hook side
 	// effect. All hook steps are idempotent on retry.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().FinishIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
+			return
+		}
+	}
 	if err := s.commitPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
 		s.logger.Error("peer agent-sync finalize: commit kv delete failed; surface 500 for retry",
 			"agent", req.AgentID, "op_id", req.OpID, "err", err)
@@ -277,8 +462,38 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 	// now instead of waiting out the drain's backoff timer; on a
 	// non-hub peer the queue table is empty and this is a no-op.
 	s.kickHandoffQueueDrain()
+	// The designated arrival owns one conversation; restore any other active
+	// goals transferred with the same agent through their original surfaces.
+	excludeGoalKey := ""
+	if req.Continuation != nil {
+		excludeGoalKey = req.Continuation.SessionKey
+	}
+	go s.recoverNativeGoals(req.AgentID, excludeGoalKey, false)
 	writeJSONResponse(w, http.StatusOK,
 		peerAgentSyncFinalizeResponse{AgentID: req.AgentID})
+}
+
+func (s *Server) resolveAllowedProxyPeer(ctx context.Context, req peerAgentSyncFinalizeRequest) (string, error) {
+	if req.Continuation == nil || req.Continuation.OriginPeerID == "" ||
+		req.Continuation.OriginPeerID == req.SourceDeviceID {
+		return req.SourceDeviceID, nil
+	}
+	// A return migration may target the response-surface Hub itself. Our own
+	// identity is trusted without a self-entry in peer_registry.
+	if s != nil && s.peerID != nil && req.Continuation.OriginPeerID == s.peerID.DeviceID {
+		return s.peerID.DeviceID, nil
+	}
+	// SourceDeviceID is bound to the authenticated signer above. A distinct
+	// response-surface Hub is safe only when it is already in peer_registry;
+	// otherwise a paired source could nominate an arbitrary third device for
+	// agent_locks.allowed_proxy_peer.
+	if s == nil || s.agents == nil || s.agents.Store() == nil {
+		return "", errors.New("peer registry is unavailable")
+	}
+	if _, err := s.agents.Store().GetPeer(ctx, req.Continuation.OriginPeerID); err != nil {
+		return "", err
+	}
+	return req.Continuation.OriginPeerID, nil
 }
 
 // errTailLockNotSelf signals that the tail apply could not proceed
@@ -351,13 +566,13 @@ func (s *Server) applyFinalizeTailMessage(ctx context.Context, agentID string, r
 
 	// Build the fencing predicate from the current lock row. By
 	// the time this helper runs, the finalize handler has already
-	// driven the hook + UpdateAgentLockAllowedProxy so the lock
+	// accepted ownership and completed the runtime hook, so the lock
 	// SHOULD be at us; the checks below catch the post-hook race
 	// window:
 	//
 	//   - ErrNotFound: the agent_locks row vanished between
-	//     UpdateAgentLockAllowedProxy and here (force-reclaim
-	//     wiped it, or a manual operator delete fired). Surface
+	//     acceptance and here (for example, shutdown or an explicit
+	//     operator delete). Surface
 	//     errTailLockNotSelf so the orchestrator retries once the
 	//     row is re-acquired.
 	//
@@ -452,6 +667,30 @@ func (s *Server) handlePeerAgentSyncDrop(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden",
 			"signer peer device_id does not match source_device_id")
 		return
+	}
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: req.AgentID})
+	defer unlock()
+	entry, found, err := s.consumePendingAgentSync(r.Context(), req.AgentID, req.OpID)
+	if err != nil {
+		writeError(w, 500, "internal", err.Error())
+		return
+	}
+	if found && entry.SourceDeviceID != "" && entry.SourceDeviceID != req.SourceDeviceID {
+		writeError(w, 403, "forbidden", "drop source differs from phase-1")
+		return
+	}
+	if s.peerID != nil {
+		// The snapshot transaction can commit before pending credentials are
+		// sealed, and drop can overtake phase-1. Fence both cases durably,
+		// independent of whether the pending KV entry exists.
+		if err := s.agents.Store().AbortIncomingHandoff(r.Context(), req.AgentID, req.OpID, req.SourceDeviceID); err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) {
+				writeError(w, 409, "stale_handoff", "cannot drop an accepted handoff or another source's operation")
+			} else {
+				writeError(w, 500, "internal", err.Error())
+			}
+			return
+		}
 	}
 	if err := s.dropPendingAgentSync(r.Context(), req.AgentID, req.OpID); err != nil {
 		s.logger.Error("peer agent-sync drop: kv delete failed",

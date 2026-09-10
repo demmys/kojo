@@ -41,6 +41,8 @@ import {
   type StreamingTool,
 } from "./chatEventReducer";
 
+import { GoalControls } from "../GoalControls";
+
 const PAGE_SIZE = 30;
 
 export function AgentChat() {
@@ -54,7 +56,10 @@ export function AgentChat() {
   // listing it as a dependency.
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
-  const [agent, setAgent] = useState<AgentInfo | null>(null);
+  const [goalMode,setGoalMode]=useState(false);
+ const [goalBudget,setGoalBudget]=useState("");
+ useEffect(() => {setGoalMode(false);setGoalBudget("");}, [id]);
+ const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const { input, setInput } = useDraftInput("agent-draft", id);
   // Live mirrors for async completions (queued offline send) that must
@@ -92,7 +97,7 @@ export function AgentChat() {
     fileInputRef,
     handleFileSelect,
     removePendingFile,
-  } = useFileUpload();
+  } = useFileUpload(agent?.holderPeer);
   const { textareaRef, resize: handleTextareaInput } = useAutoGrowTextarea(input);
   // Canonical auto-scroll + pagination shared with GroupDMChat. The suppress /
   // restore refs are owned by useChatScroll; the holder-peer refetch effect
@@ -520,6 +525,10 @@ export function AgentChat() {
           }
           break;
         }
+        case "question_resolved": {
+          setPendingQuestions((prev) => prev.filter((p) => p.requestId !== event.requestId));
+          break;
+        }
         case "user_question": {
           if (event.requestId && event.questions) {
             const q: UserQuestion[] = event.questions;
@@ -537,7 +546,9 @@ export function AgentChat() {
             const m = event.message;
             // An answered question comes back as a user message; drop its card.
             if (m.role === "user" && m.content.startsWith("answered:")) {
-              setPendingQuestions([]);
+              setPendingQuestions((prev) => event.requestId
+                ? prev.filter((p) => p.requestId !== event.requestId)
+                : []);
             }
             // A steered user message comes back over the WS with a real
             // server id; drop the optimistic "pending_" copy (same
@@ -634,7 +645,7 @@ export function AgentChat() {
   // Shares refetchSeqRef with the holder-status refetch effect above so
   // the two paths can't overwrite each other with stale out-of-order
   // responses — only the globally latest refetch's response commits.
-  const onConnected = useCallback(() => {
+  const refreshTranscript = useCallback(() => {
     if (!id) return;
     const seq = ++refetchSeqRef.current;
     agentApi.messages(id, PAGE_SIZE).then((r) => {
@@ -671,7 +682,7 @@ export function AgentChat() {
   const { connected, sendMessage, abort } = useAgentWebSocket({
     agentId: id!,
     onEvent,
-    onConnected,
+    onConnected: refreshTranscript,
     onDisconnect,
   });
 
@@ -716,7 +727,7 @@ export function AgentChat() {
   // backend "unsupported", a busy agent, quiescing, or a server error) — never
   // the common race — so the recovery just restores the text without the old
   // deferred WS-terminal fallback machinery.
-  const handleSteer = (text: string) => {
+  const handleSteer = (text: string, preserveDraft = false) => {
     if (!id) return;
     const pendingId = "pending_" + Date.now();
     setMessages((prev) => [...prev, {
@@ -725,7 +736,7 @@ export function AgentChat() {
       content: text,
       timestamp: localRFC3339(),
     }]);
-    setInput("");
+    if (!preserveDraft) setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     const sentForId = id;
@@ -744,7 +755,21 @@ export function AgentChat() {
       }
       // mode === "steer": injected into the running turn; nothing to do, the
       // turn keeps streaming and the bubble stays.
-    }).catch(() => {
+    }).catch((e) => {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      if (/^502:.*delivery_uncertain/.test(errorMessage)) {
+        if (sentForId !== idRef.current) return;
+        // The canonical row was retained and the backend may have consumed
+        // it. Keep the optimistic bubble (a live/refetch message will replace
+        // its pending id) and never restore the composer for a duplicate send.
+        setMessages((prev) => appendSystemErrorIfNew(
+          prev,
+          t("chat.steerDeliveryUncertain"),
+          Date.now,
+          localRFC3339,
+        ));
+        return;
+      }
       // Genuine refusal — never drop the text.
       if (sentForId !== idRef.current) {
         // The user navigated to a different agent: restoring the text into
@@ -758,14 +783,15 @@ export function AgentChat() {
       // newline-separated, when the user already typed something).
       setMessages((prev) => prev.filter((m) => m.id !== pendingId));
       const cur = textareaRef.current?.value ?? "";
-      setInput(cur ? cur + "\n" + text : text);
+      if (!preserveDraft) setInput(cur ? cur + "\n" + text : text);
     });
   };
 
-  const handleSend = () => {
-    const text = input.trim();
+  const handleSend = (command?: string) => {
+    const text = command ?? (goalMode && !streaming && input.trim() ? "!goal " + (goalBudget ? "--tokens " + goalBudget + " " : "") + input.trim() : input.trim());
+    const files = command === undefined ? pendingFiles : [];
     if (streaming) {
-      if (text) handleSteer(text);
+      if (text) handleSteer(text, command !== undefined);
       return;
     }
     // Holder peer offline → the WS frame would dead-end at the Hub
@@ -778,7 +804,7 @@ export function AgentChat() {
     if (holderOffline) {
       if (!id) return;
       if (queueSendTokenRef.current !== 0) return; // one POST at a time
-      if (pendingFiles.length > 0) {
+      if (files.length > 0) {
         // The queue endpoint is text-only. Files can be attached only
         // while online (AttachButton is disabled offline), so these
         // predate the outage — refuse rather than silently drop them.
@@ -791,7 +817,7 @@ export function AgentChat() {
       queueSendTokenRef.current = token;
       // Clear the draft up-front (same optimistic UX as the online
       // path) so a slow response can't wipe text typed in the interim.
-      setInput("");
+      if (command === undefined) setInput("");
       if (textareaRef.current) textareaRef.current.style.height = "auto";
       const sentForId = id;
       agentApi.postAgentMessage(id, text).then((r) => {
@@ -827,11 +853,11 @@ export function AgentChat() {
         );
         // The draft was cleared optimistically — put the failed text
         // back so the user can retry, unless they typed something new.
-        if (!inputRef.current.trim()) setInput(text);
+        if (command === undefined && !inputRef.current.trim()) setInput(text);
       });
       return;
     }
-    if ((!text && pendingFiles.length === 0) || !connected) return;
+    if ((!text && files.length === 0) || !connected) return;
     abortedIdRef.current = null; // Finalize any pending abort — synthetic message stays as-is
 
     // Add user message immediately
@@ -839,19 +865,20 @@ export function AgentChat() {
       id: "pending_" + Date.now(),
       role: "user",
       content: text,
-      attachments: pendingFiles.length > 0 ? pendingFiles : undefined,
+      attachments: files.length > 0 ? files : undefined,
       timestamp: localRFC3339(),
     };
     setMessages((prev) => [...prev, userMsg]);
-    setInput("");
+    if (command === undefined) setInput("");
     setStreaming(true);
     setStreamText("");
     setStreamThinking("");
     setStreamTools([]);
     setStreamStatus("thinking");
     setStreamStartTime(Date.now());
-    sendMessage(text, pendingFiles.length > 0 ? pendingFiles : undefined);
-    setPendingFiles([]);
+    sendMessage(text, files.length > 0 ? files : undefined);
+    if (command === undefined) setGoalMode(false);
+    if (command === undefined) setPendingFiles([]);
     setUploadError(null);
 
     // Reset textarea height
@@ -1338,8 +1365,18 @@ export function AgentChat() {
             pending={pq}
             onSubmit={async (answers) => {
               if (!id) return;
-              await agentApi.answerAgentQuestion(id, pq.requestId, answers);
-              setPendingQuestions((prev) => prev.filter((p) => p.requestId !== pq.requestId));
+              const answeredForId = id;
+              try {
+                await agentApi.answerAgentQuestion(id, pq.requestId, answers);
+                if (idRef.current === answeredForId) {
+                  setPendingQuestions((prev) => prev.filter((p) => p.requestId !== pq.requestId));
+                }
+              } finally {
+                // A turn can end before the answer RPC's ACK (or lost-ACK
+                // error) returns. Its message event may miss the closed
+                // stream, so reconcile the persisted row after settlement.
+                if (idRef.current === answeredForId) refreshTranscript();
+              }
             }}
           />
         ))}
@@ -1393,6 +1430,7 @@ export function AgentChat() {
             onDismiss={() => speech.stop()}
           />
         )}
+        {agent?.tool === "codex" && id && <GoalControls agentId={id} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={streaming} onCommand={handleSend} />}
         {/* Pending file attachments */}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb />
         <div className="flex items-end gap-2">
@@ -1443,14 +1481,14 @@ export function AgentChat() {
             <>
               <StopButton onClick={handleAbort} />
               <SendButton
-                onClick={handleSend}
+                onClick={() => handleSend()}
                 disabled={!input.trim()}
                 title={t("chat.steerTitle")}
               />
             </>
           ) : (
             <SendButton
-              onClick={handleSend}
+              onClick={() => handleSend()}
               disabled={
                 holderOffline
                   // Attachments-only stays clickable so handleSend can

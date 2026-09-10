@@ -282,6 +282,8 @@ const messages = {
   },
   "dash.enable": { ja: "有効化", en: "Enable" },
   "dash.agents": { ja: "エージェント", en: "Agents" },
+  "dash.effortDefault": { ja: "既定", en: "default" },
+  "dash.configuredEffort": { ja: "設定 Effort: {level}", en: "Configured effort: {level}" },
   "dash.noAgents": { ja: "エージェントがまだない", en: "No agents yet" },
   "dash.threads": { ja: "スレッド", en: "Threads" },
   "dash.groupDms": { ja: "グループ DM", en: "Group DMs" },
@@ -424,6 +426,10 @@ const messages = {
     ja: "実行中のターンに割り込む",
     en: "Steer the running turn",
   },
+  "chat.steerDeliveryUncertain": {
+    ja: "割り込みは届いた可能性があります。重複を避けるため再送しません。",
+    en: "The steer may have arrived. It was not retried to avoid a duplicate.",
+  },
   "chat.sendQueuedTitle": {
     ja: "ホストピアがオフライン — メッセージはキューに登録され @ {peer} の復帰時に配送する",
     en: "Holder peer is offline — message will be queued and delivered when @ {peer} reconnects",
@@ -558,6 +564,14 @@ const messages = {
   "settings.changeAvatar": { ja: "アバターを変更", en: "Change Avatar" },
   "settings.generate": { ja: "生成", en: "Generate" },
   "settings.generating": { ja: "生成中...", en: "Generating..." },
+  "settings.avatarGenerationFailed": {
+    ja: "AIアバター生成に失敗したため、現在のアバターを維持した。",
+    en: "AI avatar generation failed; the current avatar was kept.",
+  },
+  "settings.avatarKeptWarning": {
+    ja: "AI画像生成に失敗したため現在のアバターを維持: {error}",
+    en: "The current avatar was kept because AI image generation failed: {error}",
+  },
   "settings.name": { ja: "名前", en: "Name" },
   "settings.personaPromptPlaceholder": {
     ja: "例: もっと毒舌にして",
@@ -612,8 +626,46 @@ const messages = {
   },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
   "settings.customBaseUrlHelp": {
-    ja: "Anthropic Messages API 互換のエンドポイント",
-    en: "Anthropic Messages API compatible endpoint",
+    ja: "Anthropic/OpenAI互換API。localhostまたはTailscaleホストを指定",
+    en: "Anthropic/OpenAI-compatible API on localhost or a Tailscale host",
+  },
+  "settings.customApiKey": { ja: "カスタムAPIキー", en: "Custom API key" },
+  "settings.customApiKeyHelp": {
+    ja: "モデル取得時にこのURLへ送信し、設定保存時にエージェントごとに暗号化保存する",
+    en: "Sent to this URL for model discovery and stored encrypted per agent when settings are saved",
+  },
+  "settings.customApiKeyConfigured": {
+    ja: "設定済み（空欄なら維持）",
+    en: "Configured (leave blank to keep)",
+  },
+  "settings.customApiKeyRemove": { ja: "キーを削除", en: "Remove key" },
+  "settings.customModelPrerequisites": {
+    ja: "Base URLとAPIキーを入力してください（認証不要なら「APIキーなし」）",
+    en: "Enter the Base URL and API key (or choose no API key for an unauthenticated API)",
+  },
+  "settings.customModelURLPrerequisite": {
+    ja: "Base URLを入力するとモデル一覧を取得します",
+    en: "Enter the Base URL to load available models",
+  },
+  "settings.customModelLoading": {
+    ja: "モデル一覧を取得中…",
+    en: "Loading available models…",
+  },
+  "settings.customModelError": {
+    ja: "モデル一覧を取得できませんでした。モデル名は手動入力できます: {error}",
+    en: "Could not load the model list. You can enter a model name manually: {error}",
+  },
+  "settings.customModelNoModels": {
+    ja: "モデル一覧を取得できませんでした。APIがモデルを返していません。モデル名は手動入力できます",
+    en: "Could not load the model list because the API returned no models. You can enter a model name manually",
+  },
+  "settings.customNoAuth": {
+    ja: "APIキーなしで接続（認証不要のAPI）",
+    en: "Connect without an API key (unauthenticated API)",
+  },
+  "settings.customApiKeyRemoveConfirm": {
+    ja: "カスタムAPIキーを削除しますか？",
+    en: "Remove the custom API key?",
   },
   "settings.allowedTools": { ja: "許可ツール", en: "Allowed Tools" },
   "settings.allEmpty": { ja: "(空 = すべて)", en: "(empty = all)" },
@@ -865,6 +917,10 @@ const messages = {
   "skips.summary": {
     ja: "転移時にスキップされたファイル: {count}件",
     en: "Files skipped during transfer: {count}",
+  },
+  "skips.dismissFailed": {
+    ja: "警告を閉じられませんでした",
+    en: "Could not dismiss the warning",
   },
 
   // ── RateLimitBadge ──
@@ -1149,6 +1205,32 @@ const messages = {
     ja: "生成ヒント (任意)",
     en: "Generation hint (optional)",
   },
+  "create.avatarPromptLabel": { ja: "アバター生成プロンプト", en: "Avatar generation prompt" },
+  "create.avatarPromptHelp": {
+    ja: "名前・人格・アイコン向け制約に加える画風や外見の指示。",
+    en: "Art direction and appearance instructions added to the name, persona, and icon constraints.",
+  },
+  "create.avatarPromptPlaceholder": {
+    ja: "例: 水彩画風、青い髪、人物の周囲に光る粒子。文字やロゴは入れない",
+    en: "e.g. watercolor style, blue hair, glowing particles around the character",
+  },
+  "create.avatarProviderLabel": { ja: "画像生成モデル", en: "Image generation model" },
+  "create.avatarProviderAuto": {
+    ja: "画像生成: {provider}（設定済みのAPIキーから自動選択）",
+    en: "Image generation: {provider} (automatically selected from configured API keys)",
+  },
+  "create.avatarProviderMissing": {
+    ja: "画像生成APIキーが未設定。Global SettingsでGeminiまたはOpenAIを設定して。",
+    en: "No image-generation API key is configured. Configure Gemini or OpenAI in Global Settings.",
+  },
+  "create.avatarProviderStatusError": {
+    ja: "画像生成APIキーの状態を取得できなかったため、生成を無効化した。画面を再読み込みして再試行して。",
+    en: "Could not load image-generation API key status, so generation is disabled. Reload the page to retry.",
+  },
+  "create.avatarFallback": {
+    ja: "AI画像生成に失敗したため代替アバターを使用: {error}",
+    en: "Using a fallback avatar because AI image generation failed: {error}",
+  },
   "create.nameAndAvatar": { ja: "名前とアバター", en: "Name & Avatar" },
   "create.setNameFirst": { ja: "先に名前を設定して", en: "Set a name first" },
   "create.genAvatarOnly": {
@@ -1274,6 +1356,7 @@ const messages = {
   },
   "field.effort": { ja: "Effort", en: "Effort" },
   "field.effortDefault": { ja: "既定 ({level})", en: "default ({level})" },
+  "field.effortCliDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
   "field.modelDefault": { ja: "既定 (CLI 設定)", en: "default (CLI config)" },
   "field.tool": { ja: "ツール", en: "Tool" },
   "field.modelName": { ja: "モデル名", en: "model name" },
@@ -1305,12 +1388,14 @@ const messages = {
   "gs.configured": { ja: "設定済み", en: "Configured" },
   "gs.usingFallback": { ja: "フォールバックを使用中", en: "Using fallback" },
   "gs.notConfigured": { ja: "未設定", en: "Not configured" },
+  "gs.keyStatusError": { ja: "状態を取得できません", en: "Status unavailable" },
   "gs.update": { ja: "更新", en: "Update" },
   "gs.configure": { ja: "設定する", en: "Configure" },
   "gs.removeGeminiKey": {
     ja: "Gemini API キーを削除",
     en: "Remove Gemini API key",
   },
+  "gs.removeOpenaiKey": { ja: "OpenAI API キーを削除", en: "Remove OpenAI API key" },
   "gs.removeXaiKey": { ja: "xAI API キーを削除", en: "Remove xAI API key" },
   "gs.save": { ja: "保存", en: "Save" },
   "gs.embeddingModel": { ja: "埋め込みモデル", en: "Embedding Model" },
@@ -1330,6 +1415,10 @@ const messages = {
   "gs.voiceInputStt": {
     ja: "音声入力 (音声認識)",
     en: "Voice input (speech-to-text)",
+  },
+  "gs.openaiImageHelp": {
+    ja: "GPT Image 2によるエージェントのアバター生成",
+    en: "Agent avatar generation with GPT Image 2",
   },
   "gs.archivedAgents": {
     ja: "アーカイブ済みエージェント",
@@ -1799,6 +1888,10 @@ const messages = {
     en: "Message the group… ({key} to send)",
   },
   "gdm.steerFailed": { ja: "割り込みに失敗", en: "Failed to steer" },
+  "gdm.steerDeliveryUncertain": {
+    ja: "割り込みは届いた可能性があります。重複を避けるため再送しません。",
+    en: "The steer may have arrived. It was not retried to avoid a duplicate.",
+  },
   "gdm.sendFailed": { ja: "送信に失敗", en: "Failed to send" },
   "gdm.clearConfirmTitle": { ja: "履歴を消去する?", en: "Clear history?" },
   "gdm.clearConfirmBody": {

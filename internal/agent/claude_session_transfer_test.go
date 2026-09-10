@@ -3,8 +3,118 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestReadClaudeSessionFiles_NewestFirst(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+
+	const agentID = "ag_claude_newest_first"
+	absDir, err := filepath.Abs(AgentDir(agentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := claudeProjectDir(absDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(dir, "old.jsonl")
+	newPath := filepath.Join(dir, "new.jsonl")
+	for _, path := range []string{oldPath, newPath} {
+		if err := os.WriteFile(path, []byte(path), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	if err := os.Chtimes(oldPath, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(newPath, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	files, skipped, err := ReadClaudeSessionFiles(agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 || len(files) != 2 {
+		t.Fatalf("files=%+v skipped=%+v", files, skipped)
+	}
+	if files[0].SessionID != "new" || files[1].SessionID != "old" {
+		t.Fatalf("session order = %q, %q; want new, old", files[0].SessionID, files[1].SessionID)
+	}
+}
+
+func TestStageClaudeSessionSnapshot_RemovesOmittedAndRollsBack(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+
+	const agentID = "ag_claude_snapshot"
+	absDir, err := filepath.Abs(AgentDir(agentID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectDir := claudeProjectDir(absDir)
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(projectDir, "stale.jsonl")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	commit, rollback, err := StageClaudeSessionSnapshot(agentID, []ClaudeSessionFile{
+		{SessionID: "new", Content: []byte("new")},
+		{SessionID: "old", Content: []byte("old")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("omitted session remains staged: %v", err)
+	}
+	newInfo, err := os.Stat(filepath.Join(projectDir, "new.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldInfo, err := os.Stat(filepath.Join(projectDir, "old.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !newInfo.ModTime().After(oldInfo.ModTime()) {
+		t.Fatalf("activity order lost: new=%v old=%v", newInfo.ModTime(), oldInfo.ModTime())
+	}
+	rollback()
+	if got, err := os.ReadFile(stale); err != nil || string(got) != "stale" {
+		t.Fatalf("rollback stale = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "new.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("new session survived rollback: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "old.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("old session survived rollback: %v", err)
+	}
+	_ = commit
+
+	commit, rollback, err = StageClaudeSessionSnapshot(agentID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	_ = rollback
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("empty authoritative snapshot retained stale session: %v", err)
+	}
+}
 
 // Dangling symlink at the target path (the --migrate-external-cli
 // leftover after `--clean v0` removed the link target) must be
@@ -26,6 +136,9 @@ func TestMkdirAllReplacingDanglingSymlink_Dangling(t *testing.T) {
 	}
 	if !fi.IsDir() {
 		t.Fatalf("want real dir, got mode %v", fi.Mode())
+	}
+	if got := fi.Mode().Perm(); got != 0o755 {
+		t.Fatalf("replacement mode = %o, want 755", got)
 	}
 }
 
@@ -63,5 +176,71 @@ func TestMkdirAllReplacingDanglingSymlink_PlainPaths(t *testing.T) {
 	}
 	if err := mkdirAllReplacingDanglingSymlink(fresh); err != nil {
 		t.Fatalf("existing dir: %v", err)
+	}
+}
+
+func TestEnsureClaudeProjectDir_RepairsProjectPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, ".claude"))
+	agentDir := filepath.Join(root, "agent")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectDir, err := claudeProjectPath(agentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(projectDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "gone"), projectDir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ensureClaudeProjectDir(agentDir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(projectDir)
+	if err != nil {
+		t.Fatalf("project dir %s stat: %v", projectDir, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("project dir %s was not repaired: mode=%v", projectDir, info.Mode())
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("project dir %s mode = %o, want 700", projectDir, got)
+	}
+}
+
+func TestMkdirAllReplacingDanglingSymlink_Concurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "project")
+	if err := os.Symlink(filepath.Join(dir, "gone"), path); err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 16
+	errCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- mkdirAllReplacingDanglingSymlink(path)
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent repair: %v", err)
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("repaired path stat: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("repaired path mode=%v, want dir", info.Mode())
 	}
 }

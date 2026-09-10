@@ -30,6 +30,13 @@ const ErrMsgCancelled = "cancelled: process was terminated"
 
 // ChatOptions holds optional parameters for a chat invocation.
 type ChatOptions struct {
+	// ResumeGoalOnReply resumes unfinished native goals while delivering this human reply.
+	ResumeGoalOnReply    bool
+	Goal                 *GoalRequest
+	GoalRunID            string
+	GoalUserID           string
+	OriginPeerID         string
+	PreserveGoalOnCancel func() bool
 	// OneShot skips session resumption, running a fresh ephemeral session.
 	// Used for Slack and other external platform conversations that have
 	// their own conversation context.
@@ -47,9 +54,13 @@ type ChatOptions struct {
 	// preserve, so token conservation wins over continuity.
 	AutomatedTrigger bool
 
+	// RetryOverload allows bounded Codex overload recovery before any work starts.
+	// Set only for check-in/wake turns; the existing busy lock and timeout stay held.
+	RetryOverload bool
+
 	// SessionKey overrides the default agent-ID-based session identifier.
 	// The key is hashed into a deterministic UUID so callers can pass any
-	// stable string (e.g. "slack:<channel>:<thread>") to get an independent
+	// stable string (e.g. "<agentID>:slack:<channel>:<thread>") to get an independent
 	// Claude session JSONL. Used for per-Slack-thread session resumption
 	// where each conversation thread maintains its own context, isolated
 	// from the agent's WebUI session and from other threads.
@@ -61,11 +72,32 @@ type ChatOptions struct {
 	// the call site rather than silently leaking context across keys.
 	SessionKey string
 
+	// ConversationKey is the response-surface key for the current turn even
+	// when this backend does not support native SessionKey resumption. It is
+	// exported to the child process as KOJO_SESSION_KEY so a self-initiated
+	// device switch can bind the HTTP request to the exact Slack/WebUI thread.
+	// Backends must not use it for resume decisions.
+	ConversationKey string
+
+	// FreshSessionContext is a bounded transcript supplied by the response
+	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends
+	// it only when no native session can be resumed and a fresh session is
+	// started. Keeping that choice in the backend is important: only the
+	// backend knows whether thread/start, --session-id, or an equivalent
+	// fresh path was actually selected.
+	FreshSessionContext string
+
+	// ResumeSessionContext is a small bounded safety recap supplied by an
+	// external response surface. It is prepended after native resume to cover
+	// transport/session cursor gaps. WebUI main leaves it empty because its
+	// native session and canonical transcript advance together.
+	ResumeSessionContext string
+
 	// RecentMessagesContext is a short, bounded transcript excerpt the
 	// backend may prepend when it has to start a fresh persistent session
-	// instead of resuming an existing one. Claude uses this as a continuity
-	// fallback for missing/empty/reset JSONL sessions; when --resume works,
-	// it is intentionally ignored to avoid duplicating history.
+	// instead of resuming an existing one. It is used for ordinary WebUI
+	// turns; response surfaces with their own canonical history use the
+	// FreshSessionContext/ResumeSessionContext pair above instead.
 	RecentMessagesContext string
 
 	// History is a bounded replay of the prior conversation, oldest
@@ -126,8 +158,8 @@ type ChatOptions struct {
 }
 
 // AnswerFunc resolves a pending interactive AskUserQuestion by writing the
-// CLI control_response for requestID. When deny is true the tool call is
-// refused with denyMessage; otherwise answers maps each question string to
+// backend response for requestID. When deny is true the tool call is
+// refused with denyMessage; otherwise answers maps each question ID (Codex) or question string (Claude) to
 // the chosen answer (a label, a ", "-joined list of labels for multiSelect,
 // or a free-form string). Returns ErrQuestionNotFound if requestID is not
 // pending, or ErrAgentNotBusy if the turn already ended.
@@ -357,6 +389,13 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 		filtered = append(filtered, "KOJO_API_BASE="+kojoAPIBase)
 	}
 	return filtered
+}
+
+func appendKojoTurnEnv(env []string, opts ChatOptions) []string {
+	if opts.ConversationKey != "" {
+		env = append(env, "KOJO_SESSION_KEY="+opts.ConversationKey)
+	}
+	return env
 }
 
 // emitCancelDone sends a partial "done" event when the backend process is

@@ -69,7 +69,7 @@ import (
 //
 //	{
 //	  "agent_id": "...",
-//	  "outcome":  "completed" | "completed_with_lock_failure"
+//	  "outcome":  "completed" | "completed_finalize_failed"
 //	              | "aborted" | "abort_failed" | "complete_failed",
 //	  "target_peer_id": "...",
 //	  "begin":  { ... handoffResponse ... },
@@ -141,8 +141,8 @@ type switchDeviceResponse struct {
 	AbortFailureReason string `json:"abort_failure_reason,omitempty"`
 	// Reason carries the per-step failure detail for non-success
 	// outcomes (aborted / abort_failed / complete_failed /
-	// source_drain_failed / complete_errored_lock_at_target /
-	// completed_with_lock_failure). Without this the caller —
+	// source_drain_failed / complete_errored_lock_at_target).
+	// Without this the caller —
 	// typically the agent driving the kojo-switch-device skill —
 	// sees only "outcome=aborted" and has no diagnostic to report
 	// to the user. Best-effort prose, not a stable code.
@@ -209,6 +209,20 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Serialize switch transactions, including deferred Goal execution. This
+	// lock is not retained while the requesting native turn finishes.
+	unlockSwitch := s.lockPendingFinalize(pendingSyncKey{AgentID: agentID, OpID: "switch-transaction"})
+	defer unlockSwitch()
+	pending, pendingErr := agent.PendingGoalHandoff(agentID)
+	executionIdentity, _ := r.Context().Value(goalHandoffExecutionKey{}).(*goalHandoffOperation)
+	if pendingErr != nil {
+		writeError(w, 409, "checkpoint_unreadable", pendingErr.Error())
+		return
+	}
+	if pending != nil && (executionIdentity == nil || pending.Handoff.ID != executionIdentity.ID) {
+		writeError(w, 409, "goal_handoff_pending", "A Goal move is already reserved. Finish that turn, or pause the Goal to cancel. Do not force-reclaim.")
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<10))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",
@@ -308,12 +322,13 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//       not part of the switch payload and intentionally do not
 	//       gate the handoff.
 	//
-	//   (b) The agent_lock (if it exists) must be held by the
-	//       local peer. Without this check, an agent with zero
-	//       blobs could trigger a lock migration even when the
-	//       lock currently sits on a third peer. The lock-first
-	//       complete reorder relies on the orchestrator owning
-	//       the lock to begin with.
+	//   (b) The agent_lock must exist and be held by the local
+	//       peer. Without this check, an agent with zero blobs
+	//       could trigger a lock migration even when the lock
+	//       currently sits on a third peer — or, worse, complete
+	//       could switch blob_refs with no fencing authority to
+	//       transfer. The lock-first complete reorder relies on
+	//       the orchestrator owning the lock to begin with.
 	refs, err := s.listHandoffBlobRefs(ctx, agentID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -329,12 +344,17 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if cur, lerr := s.agents.Store().GetAgentLock(ctx, agentID); lerr == nil {
-		if cur.HolderPeer != "" && cur.HolderPeer != s.peerID.DeviceID {
+		ctx = context.WithValue(ctx, sourceHandoffVersionKey{}, store.AgentLockVersion{Token: cur.FencingToken, Holder: cur.HolderPeer})
+		if cur.HolderPeer != s.peerID.DeviceID {
 			writeError(w, http.StatusConflict, "wrong_source",
 				fmt.Sprintf("agent_lock holder is %s, not the local peer; orchestrate the switch from that peer",
 					cur.HolderPeer))
 			return
 		}
+	} else if errors.Is(lerr, store.ErrNotFound) {
+		writeError(w, http.StatusConflict, "lock_missing",
+			"agent_lock row is missing; local runtime is not fenced, so device-switch cannot safely transfer ownership")
+		return
 	} else if !errors.Is(lerr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"agent_lock read: "+lerr.Error())
@@ -367,19 +387,84 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// skip the busy-cancel while still cancelling one-shots and
 	// draining all other concurrent writers.
 	//
-	// Trust model (v1): selfCall is decided by the bearer
-	// identity alone — there is no per-chat run-id binding the
-	// HTTP call to a specific busy entry. The agent token lives
-	// in kv under namespace=auth and is readable only by the
-	// owner-trusted process, so possessing it is already owner-
-	// equivalent.
+	// External/thread self-calls additionally carry KOJO_SESSION_KEY, which
+	// resolves the exact tracked one-shot so only that caller survives the
+	// drain. Keyless main-WebUI self-calls retain the bearer-only legacy path.
 	//
 	// Caveat (claude session JSONL): on selfCall the snapshot
 	// captures the JSONL while a tool_use (this curl) is mid-
 	// flight; target's `claude --continue` may see a torn final
 	// turn. Pre-existing limitation — the non-selfCall path also
 	// produces a torn turn at the SIGTERM point.
-	selfCall := p.IsAgent() && p.AgentID == agentID
+	execution, _ := r.Context().Value(goalHandoffExecutionKey{}).(*goalHandoffOperation)
+	selfCall := p.IsAgent() && p.AgentID == agentID && execution == nil
+	if execution != nil {
+		if req.Degraded || execution.AgentID != agentID || execution.Target != req.TargetPeerID || execution.Source != s.peerID.DeviceID {
+			writeError(w, 409, "goal_changed", "handoff identity mismatch")
+			return
+		}
+		if err := s.agents.Store().CheckFencing(ctx, agentID, execution.Source, execution.FencingToken); err != nil {
+			writeError(w, 409, "wrong_source", err.Error())
+			return
+		}
+		if _, err := s.agents.GoalHandoffCheckpoint(agentID, execution.SessionKey, execution.ID); err != nil {
+			writeError(w, 409, "goal_changed", err.Error())
+			return
+		}
+		if !s.targetSupportsGoalHandoff(ctx, targetAddr, agentID) {
+			writeError(w, 409, "goal_handoff_unsupported", "target no longer supports goal handoff")
+			return
+		}
+	}
+	if selfCall && agent.NativeGoalRunning(agentID, strings.TrimSpace(r.Header.Get("X-Kojo-Session-Key"))) {
+		if req.Degraded {
+			writeError(w, 409, "degraded_goal_handoff", "Goal handoff requires a complete checkpoint")
+			return
+		}
+		s.queueGoalHandoff(w, r, agentID, req.TargetPeerID, targetAddr)
+		return
+	}
+	var callerOneShot agent.OneShotOrigin
+	var continuation *handoffContinuation
+	if execution != nil {
+		binding, err := s.agents.GoalHandoffCheckpoint(agentID, execution.SessionKey, execution.ID)
+		if err != nil {
+			writeError(w, 409, "goal_changed", err.Error())
+			return
+		}
+		origin := binding.OriginPeerID
+		if origin == "" {
+			origin = execution.Source
+		}
+		continuation = &handoffContinuation{SessionKey: execution.SessionKey, OriginPeerID: origin, GoalHandoffID: execution.ID}
+	}
+	if selfCall {
+		sessionKey := strings.TrimSpace(r.Header.Get("X-Kojo-Session-Key"))
+		if len(sessionKey) > 1024 {
+			writeError(w, http.StatusBadRequest, "bad_request", "X-Kojo-Session-Key is too long")
+			return
+		}
+		if sessionKey != "" {
+			var ok bool
+			callerOneShot, ok = s.agents.InFlightOneShotOrigin(agentID, sessionKey)
+			if !ok {
+				writeError(w, http.StatusConflict, "caller_not_active",
+					"the conversation that requested this switch is no longer the active one-shot turn")
+				return
+			}
+			if callerOneShot.OriginPeerID != "" && callerOneShot.HandoffCapability != "" {
+				continuation = &handoffContinuation{
+					SessionKey: callerOneShot.SessionKey, OriginPeerID: callerOneShot.OriginPeerID,
+					Capability: callerOneShot.HandoffCapability,
+				}
+			}
+		}
+	}
+	if continuation != nil && continuation.GoalHandoffID == "" && !s.targetSupportsOriginAwareArrival(r.Context(), targetAddr, agentID) {
+		s.logger.Warn("switch-device: target lacks origin-aware arrival capability; using legacy main WebUI arrival",
+			"agent", agentID, "target", req.TargetPeerID)
+		continuation = nil
+	}
 
 	// Step -1: quiesce the local PTY AND set the switching
 	// flag so no NEW Chat starts on this peer for the duration
@@ -409,14 +494,22 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 		defer s.agents.SetSwitching(agentID, false)
 		if selfCall {
-			s.agents.CancelOneShotsForAgent(agentID)
+			if callerOneShot.ID != 0 {
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+			} else {
+				s.agents.CancelOneShotsForAgent(agentID)
+			}
 		} else {
 			s.agents.Abort(agentID)
 		}
 		quiesceCtx, quiesceCancel := context.WithTimeout(ctx, 3*time.Second)
 		var err error
 		if selfCall {
-			err = s.agents.WaitChatIdleSelfCall(quiesceCtx, agentID)
+			if callerOneShot.ID != 0 {
+				err = s.agents.WaitChatIdleExceptOneShot(quiesceCtx, agentID, callerOneShot.ID)
+			} else {
+				err = s.agents.WaitChatIdleSelfCall(quiesceCtx, agentID)
+			}
 		} else {
 			err = s.agents.WaitChatIdle(quiesceCtx, agentID)
 		}
@@ -553,11 +646,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 
 	// Step 0: build the agent-sync payload BEFORE begin. When
 	// targetState is non-nil + Known, the builder filters
-	// messages / memory_entries by seq so only the delta target
-	// is missing rides the wire. Other surfaces (agent / persona
-	// / memory / tasks / claude_sessions / token) ship as
-	// before — they're small enough that incremental gates
-	// aren't worth the complexity.
+	// messages / memory_entries by seq so only the canonical-history
+	// delta missing on the target rides the wire. Native backend sessions
+	// are ordered newest-first and fitted to the transfer envelope below;
+	// the remaining agent state is sent as a complete snapshot.
 	//
 	// Failure here is a precondition error (source missing data
 	// we'd need to migrate); we bail BEFORE marking
@@ -576,7 +668,6 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	syncReq.DegradedFlushes = degradedFlushes
 	resp.DegradedFlushes = degradedFlushes
 	resp.Degraded = len(degradedFlushes) > 0
-	resp.TransferSkips = syncReq.TransferSkips
 	// Raw token unavailable on source (hash-only after a restart):
 	// target auto-repairs at finalize if it also lacks the raw.
 	// Surface the fact so the operator knows no raw rode the wire.
@@ -624,6 +715,63 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// a prior attempt can't collide with a fresh retry's
 	// pending-sync entry on target.
 	syncReq.OpID = uuid.NewString()
+	if execution != nil {
+		syncReq.OpID = execution.ID
+	}
+	if continuation != nil && continuation.GoalHandoffID == "" {
+		bindCtx, bindCancel := context.WithTimeout(ctx, 5*time.Second)
+		bindErr := s.bindHandoffArrivalAtOrigin(bindCtx, continuation.OriginPeerID, handoffArrivalBindRequest{
+			SourceDeviceID: s.peerID.DeviceID,
+			TargetDeviceID: req.TargetPeerID,
+			AgentID:        agentID,
+			OpID:           syncReq.OpID,
+			SessionKey:     continuation.SessionKey,
+			Capability:     continuation.Capability,
+		})
+		bindCancel()
+		if bindErr != nil {
+			s.logger.Warn("switch-device: origin conversation could not bind handoff; using legacy main arrival",
+				"agent", agentID, "target", req.TargetPeerID, "op_id", syncReq.OpID, "err", bindErr)
+			continuation = nil
+		}
+	}
+	keptSessions, capacitySkips, budgetErr := fitAgentSyncSessions(syncReq, int64(peerAgentSyncMaxBody))
+	if budgetErr != nil {
+		s.noteSwitchFailure(agentID, "fit session transfer budget: "+budgetErr.Error())
+		writeError(w, http.StatusInternalServerError, "internal",
+			"fit session transfer budget: "+budgetErr.Error())
+		return
+	}
+	if capacitySkips > 0 {
+		s.logger.Info("switch-device: session artifacts trimmed to transfer capacity",
+			"agent", agentID, "kept", keptSessions, "skipped", capacitySkips,
+			"single_shot_cap", peerAgentSyncMaxBody)
+	}
+	if execution != nil {
+		checkpoint, err := s.agents.GoalHandoffCheckpoint(agentID, execution.SessionKey, execution.ID)
+		if err != nil {
+			writeError(w, 409, "goal_changed", err.Error())
+			return
+		}
+		found := false
+		if syncReq.CodexSession != nil {
+			for _, t := range syncReq.CodexSession.Threads {
+				if t.Goal != nil && t.Goal.SessionKey == execution.SessionKey && t.Goal.Generation == checkpoint.Generation && t.ThreadID == checkpoint.State.ThreadID && t.Goal.State != nil && t.Goal.State.Status == "paused" && t.Goal.DesiredPaused && t.Goal.Handoff != nil && t.Goal.Handoff.ID == execution.ID && t.NativeGoal != nil && t.NativeGoal.Row != nil && t.ThreadRow != nil && t.RolloutContentB64 != "" {
+					found = true
+				}
+			}
+		}
+		if !found {
+			writeError(w, 409, "checkpoint_missing", "required native goal session was skipped; no transfer performed")
+			return
+		}
+		execution.Phase = "transferring"
+		if err := s.saveGoalHandoff(ctx, execution); err != nil {
+			writeError(w, 500, "internal", err.Error())
+			return
+		}
+	}
+	resp.TransferSkips = syncReq.TransferSkips
 	// Surface op_id in the response immediately so even early
 	// failures (begin / sync / pull / complete) carry the
 	// identifier the operator needs to correlate target-side
@@ -856,8 +1004,11 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				s.logger.Warn("switch-device: complete errored but lock observed at target; releasing source",
 					"agent", agentID, "target", req.TargetPeerID, "op_id", syncReq.OpID)
 				if s.onAgentReleasedAsSource != nil {
+					if selfCall {
+						s.agents.DetachOneShot(agentID, callerOneShot.ID)
+					}
 					releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-					s.onAgentReleasedAsSource(releaseCtx, agentID)
+					s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, lock.FencingToken)
 					releaseCancel()
 				}
 				resp.Outcome = "complete_errored_lock_at_target"
@@ -874,6 +1025,45 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		return
 	}
 	resp.Complete = completeResp
+	if !completeResp.LockTransferred {
+		resp.Outcome = "complete_failed"
+		resp.Reason = "complete: agent_lock did not transfer; restored source ownership to avoid a blob-only migration"
+		if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+			reclaimCtx, reclaimCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			unlockRestore := s.lockPendingFinalize(pendingSyncKey{AgentID: agentID})
+			rec, rerr := s.agents.Store().ForceReclaimAgentToLocal(
+				reclaimCtx, agentID, s.peerID.DeviceID,
+				store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
+			)
+			if rerr != nil {
+				resp.Reason += "; automatic source restore failed: " + rerr.Error()
+				s.logger.Error("switch-device: complete returned no lock transfer and source restore failed",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "err", rerr)
+			} else {
+				if s.onAgentForceReclaimed != nil {
+					s.onAgentForceReclaimed(reclaimCtx, agentID)
+				}
+				s.logger.Error("switch-device: complete returned no lock transfer; source ownership restored",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "fencing_token", rec.FencingToken)
+			}
+			unlockRestore()
+			reclaimCancel()
+		}
+		if resp.AgentSynced && targetAddr != "" && req.TargetPeerID != "" && syncReq.OpID != "" {
+			dropCtx, dropCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+			if derr := s.dispatchPeerAgentSyncDrop(dropCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID); derr != nil {
+				s.logger.Warn("switch-device: no-lock repair could not drop target pending sync",
+					"agent", agentID, "target", req.TargetPeerID,
+					"op_id", syncReq.OpID, "err", derr)
+				resp.Reason += "; target pending-sync drop failed: " + derr.Error()
+			}
+			dropCancel()
+		}
+		writeJSONResponse(w, http.StatusOK, resp)
+		return
+	}
 	// Per-blob failures inside a "successful" complete (lock
 	// moved, but some SwitchBlobRefHome rows errored): surface
 	// as complete_failed so the operator knows blobs are
@@ -897,8 +1087,11 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			resp.Reason = fmt.Sprintf("complete: blob %s left in %s state: %s",
 				b.URI, b.Status, b.Error)
 			if s.onAgentReleasedAsSource != nil {
+				if selfCall {
+					s.agents.DetachOneShot(agentID, callerOneShot.ID)
+				}
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-				s.onAgentReleasedAsSource(releaseCtx, agentID)
+				s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 				releaseCancel()
 			}
 			writeJSONResponse(w, http.StatusOK, resp)
@@ -926,13 +1119,21 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// entry that still holds the open response would kill
 		// the curl before writeJSONResponse reaches it.
 		if selfCall {
-			s.agents.CancelOneShotsForAgent(agentID)
+			if callerOneShot.ID != 0 {
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+			} else {
+				s.agents.CancelOneShotsForAgent(agentID)
+			}
 		} else {
 			s.agents.Abort(agentID)
 		}
 		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
 		if selfCall {
-			drainErr = s.agents.WaitChatIdleSelfCall(drainCtx, agentID)
+			if callerOneShot.ID != 0 {
+				drainErr = s.agents.WaitChatIdleExceptOneShot(drainCtx, agentID, callerOneShot.ID)
+			} else {
+				drainErr = s.agents.WaitChatIdleSelfCall(drainCtx, agentID)
+			}
 		} else {
 			drainErr = s.agents.WaitChatIdle(drainCtx, agentID)
 		}
@@ -953,8 +1154,11 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// activates) is the same as the finalize-failed path;
 		// operator drives a manual finalize retry.
 		if s.onAgentReleasedAsSource != nil {
+			if selfCall {
+				s.agents.DetachOneShot(agentID, callerOneShot.ID)
+			}
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-			s.onAgentReleasedAsSource(releaseCtx, agentID)
+			s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 			releaseCancel()
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
@@ -968,29 +1172,35 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// operator can drive a manual finalize retry. The drop
 	// counterpart fires only on the abort paths above.
 	//
-	// selfCall path defers finalize into a background goroutine
-	// that first waits for source's claude to emit its
+	// A legacy/main selfCall defers finalize into a background goroutine that
+	// first waits for source's claude to emit its
 	// post-tool-result `done` event. The captured assistant
 	// Message rides as the TailMessage payload of finalize so
-	// target appends it BEFORE NotifyDeviceSwitchArrival fires —
+	// target appends it BEFORE the arrival continuation fires —
 	// the LLM on target then sees its own commitment text in
 	// transcript (e.g. "到着したらセキュリティチェックを実施する"),
 	// which the pre-A architecture silently dropped because the
 	// §3.7 release guard skipped persistDoneEvent on source.
 	//
-	// Non-selfCall path runs the synchronous finalize loop as
-	// before — there's no in-flight chat turn to defer for.
+	// Origin-aware external selfCalls finalize synchronously while the adapter's
+	// FIFO reservation is still alive; non-selfCalls are synchronous as before.
 	var finalizeErr error
-	if selfCall {
+	if selfCall && continuation == nil && callerOneShot.SessionKey == "" {
 		// Defer finalize: response returns to claude immediately
 		// (curl unblocks → claude continues turn → done event
 		// fires → goroutine ships finalize with tail). Outcome is
-		// forced to "completed" (or completed_with_lock_failure)
-		// because the orchestrator no longer synchronously knows
-		// the finalize result; the SKILL.md tells claude to stay
-		// silent on completed so a missing finalize_error surface
-		// here doesn't leak to the user.
-		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID)
+		// forced to "completed" because the orchestrator no
+		// longer synchronously knows the finalize result; the
+		// SKILL.md tells claude to stay silent on completed so a
+		// missing finalize_error surface here doesn't leak to the
+		// user.
+		go s.runDeferredFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, completeResp.LockFencing)
+	} else if selfCall && continuation == nil && callerOneShot.ID != 0 {
+		// The response adapter identified this as a one-shot, but the target
+		// could not negotiate origin-aware continuation (old target or failed
+		// capability bind). Preserve legacy main-chat arrival without letting it
+		// overlap the source turn that is still blocked inside this curl.
+		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
 	} else {
 		// Uses a fresh background ctx so a wedged target doesn't
 		// stall past switchDeviceOpTimeout — the switch is already
@@ -1008,15 +1218,35 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		const finalizeRetryBackoff = 500 * time.Millisecond
 		for attempt := 0; attempt < finalizeAttempts; attempt++ {
 			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil)
+			finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, continuation, completeResp.LockFencing)
 			finalizeCancel()
 			if finalizeErr == nil {
 				break
 			}
+			if errors.Is(finalizeErr, errFinalizeContinuationDowngrade) {
+				// The target rolled back after its capability probe. For a
+				// one-shot self-call, legacy main arrival must remain behind the
+				// source turn that is still waiting for this HTTP response.
+				continuation = nil
+				if selfCall && callerOneShot.ID != 0 {
+					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
+					finalizeErr = nil
+					break
+				}
+				// No live response-surface turn needs a barrier. Send the legacy
+				// finalize immediately rather than consuming another loop attempt:
+				// the capability downgrade can be discovered on the final attempt.
+				legacyCtx, legacyCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+				finalizeErr = s.dispatchPeerAgentSyncFinalize(legacyCtx, targetAddr, req.TargetPeerID, agentID, syncReq.OpID, nil, nil, completeResp.LockFencing)
+				legacyCancel()
+				if finalizeErr == nil {
+					break
+				}
+			}
 			// Only retry the lock-not-self race; everything else is
 			// either fatal (4xx that won't fix itself) or fits the
 			// "operator manual retry / force-reclaim" path.
-			if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+			if !retryableFinalizeError(finalizeErr) {
 				break
 			}
 			if attempt+1 < finalizeAttempts {
@@ -1047,20 +1277,21 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	//
 	// SELFCALL ORDERING: release MUST happen AFTER the deferred-
 	// finalize goroutine is spawned (above) but the goroutine
-	// itself accesses the busy entry's accumulator, which
-	// releaseAgentLocallyCore does NOT touch (only m.agents and
-	// the cron/one-shot side channels), so the goroutine's
-	// WaitChatDone keeps working across the release. The chat
-	// goroutine that feeds the accumulator likewise survives —
-	// it exits via its own defer chain once backendCh closes.
+	// itself may need the caller to finish unwinding. Source release
+	// normally cancels one-shots, so DetachOneShot removes only this
+	// identified caller from lifecycle cancellation first. The caller
+	// then exits via its own defer chain once backendCh closes.
 	if s.onAgentReleasedAsSource != nil {
+		if selfCall {
+			s.agents.DetachOneShot(agentID, callerOneShot.ID)
+		}
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		s.onAgentReleasedAsSource(releaseCtx, agentID)
+		s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
 		releaseCancel()
 	}
 
 	switch {
-	case selfCall && completeResp.LockTransferred:
+	case selfCall && continuation == nil && completeResp.LockTransferred:
 		// Deferred finalize: we don't synchronously know whether
 		// finalize succeeded, so report "completed" optimistically.
 		// A failure surfaces in the server log; the SKILL.md tells
@@ -1078,18 +1309,42 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	case completeResp.LockTransferred:
 		resp.Outcome = "completed"
 	default:
-		// LockTransferred=false in handoff_handler.go is collapsed
-		// to true when Lock.HolderPeer already equals target, so
-		// reaching this default means there was NO agent_lock row
-		// to migrate. blob_refs flipped to target on this complete
-		// but no fencing authority follows.
-		resp.Outcome = "completed_with_lock_failure"
-		resp.Reason = "complete: blob_refs flipped to target but no agent_lock row existed to migrate. Inspect agent_locks on target — issue a manual Acquire if the agent should be locked."
+		// Defensive fallback: the post-complete guard above should
+		// have already caught LockTransferred=false, restored source
+		// ownership, and returned before source release / finalize.
+		resp.Outcome = "complete_failed"
+		resp.Reason = "complete: agent_lock did not transfer"
 	}
 
 	// (Source drain + finalize already happened above before
 	// the LockTransferred branch.)
 	writeJSONResponse(w, http.StatusOK, resp)
+}
+
+// targetSupportsOriginAwareArrival negotiates the optional continuation wire
+// extension before begin transfers any ownership. A missing route/field is an
+// expected old-target downgrade, not a switch failure.
+func (s *Server) targetSupportsOriginAwareArrival(ctx context.Context, targetAddr, agentID string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, defaultExternalChatProbe)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet,
+		targetAddr+"/api/v1/agents/"+agentID+"/external-chat/ready", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := peer.NoKeepAliveHTTPClient(defaultExternalChatProbe).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var ready externalChatReadyResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ready); err != nil {
+		return false
+	}
+	return ready.OriginAwareArrivalV1
 }
 
 // deferredFinalizeTailWaitBudget bounds how long the selfCall finalize
@@ -1106,15 +1361,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 // silently dropping finalize altogether).
 const deferredFinalizeTailWaitBudget = 30 * time.Second
 
-// runDeferredFinalize is the goroutine the selfCall switch path
-// spawns after /handoff/complete returns to claude. It waits for
-// source's claude to finish the in-flight turn (so the post-tool-
-// result assistant Message becomes available via the chat
-// accumulator), then POSTs /handoff/finalize to target with the
-// captured Message as the optional TailMessage payload. Target's
-// finalize handler upserts the row to agent_messages BEFORE firing
-// NotifyDeviceSwitchArrival so the LLM sees its own commitment text
-// in the arrival prompt's transcript scan.
+// runDeferredFinalize is the goroutine the legacy/main selfCall switch path
+// spawns after /handoff/complete. It waits for the post-tool-result done event
+// and ships it as TailMessage. Origin-aware Slack/thread callers finalize
+// synchronously instead, while their adapter reservation is still alive.
 //
 // Failure modes (all surfaced as Warn-level logs, never propagated
 // back to the agent — the agent's claude has already disconnected
@@ -1130,7 +1380,7 @@ const deferredFinalizeTailWaitBudget = 30 * time.Second
 // Runs under context.Background so a parent-handler cancellation
 // (e.g. switchDeviceOpTimeout firing right after writeJSONResponse)
 // doesn't cut us off mid-wait.
-func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID string) {
+func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID string, expectedToken ...int64) {
 	defer func() {
 		// Goroutine-level recover: a panic here would have no
 		// supervisor to catch it (the parent handler already
@@ -1162,12 +1412,12 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	var finalizeErr error
 	for attempt := 0; attempt < finalizeAttempts; attempt++ {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail)
+		finalizeErr = s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, tail, nil, expectedToken...)
 		finalizeCancel()
 		if finalizeErr == nil {
 			break
 		}
-		if !strings.Contains(finalizeErr.Error(), "lock_not_self") {
+		if !retryableFinalizeError(finalizeErr) {
 			break
 		}
 		if attempt+1 < finalizeAttempts {
@@ -1180,6 +1430,40 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	}
 }
 
+func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64, expectedToken ...int64) {
+	waitCtx, cancel := context.WithTimeout(context.Background(), deferredFinalizeTailWaitBudget)
+	err := s.agents.WaitOneShotDone(waitCtx, agentID, oneShotID)
+	cancel()
+	if err != nil {
+		s.logger.Warn("switch-device: downgraded source one-shot did not exit; leaving target finalize pending",
+			"agent", agentID, "op_id", opID, "err", err)
+		return
+	}
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+		finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil, expectedToken...)
+		finalizeCancel()
+		if finalizeErr == nil {
+			return
+		}
+		if !retryableFinalizeError(finalizeErr) || attempt+1 == attempts {
+			s.logger.Warn("switch-device: downgraded one-shot finalize failed",
+				"agent", agentID, "op_id", opID, "err", finalizeErr)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func retryableFinalizeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "lock_not_self") || strings.Contains(msg, "arrival_not_admitted")
+}
+
 // finalizeWireBodyCap mirrors the MaxBytesReader limit on target's
 // finalize handler. Source pre-checks the marshalled body against
 // this cap; an oversized tail payload (huge assistant output, deep
@@ -1188,6 +1472,8 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 // in sync with the receiver-side 16<<20 in
 // peer_agent_sync_finalize_handler.go.
 const finalizeWireBodyCap = 16 << 20
+
+var errFinalizeContinuationDowngrade = errors.New("target rejected origin-aware finalize continuation")
 
 // dispatchPeerAgentSyncFinalize tells target to commit the
 // runtime side effects (TokenStore adopt, AgentLockGuard
@@ -1206,12 +1492,23 @@ const finalizeWireBodyCap = 16 << 20
 // cap (oversized tail is silently dropped + finalize still proceeds,
 // preferring "target runtime activates without the commitment text"
 // over "target never activates because finalize itself 413'd").
-func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord) error {
+func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation, expectedToken ...int64) error {
+	if len(expectedToken) > 0 {
+		current, err := s.agents.Store().GetAgentLockVersion(ctx, agentID)
+		if err != nil {
+			return err
+		}
+		if current != (store.AgentLockVersion{Holder: targetDeviceID, Token: expectedToken[0]}) {
+			return store.ErrStaleHandoff
+		}
+	}
+
 	body := peerAgentSyncFinalizeRequest{
 		SourceDeviceID: s.peerID.DeviceID,
 		AgentID:        agentID,
 		OpID:           opID,
 		TailMessage:    tail,
+		Continuation:   continuation,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -1231,8 +1528,18 @@ func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, 
 			return fmt.Errorf("re-marshal finalize body (tail dropped): %w", err)
 		}
 	}
-	return s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
+	err = s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
 		"/api/v1/peers/agent-sync/finalize", raw)
+	if err == nil || continuation == nil || continuation.GoalHandoffID != "" ||
+		!strings.Contains(err.Error(), "phase-2 HTTP 400") || !strings.Contains(err.Error(), "continuation") {
+		return err
+	}
+	// The target may have restarted or rolled back after the capability probe.
+	// Return a distinct downgrade signal so the orchestrator can preserve the
+	// source one-shot barrier before it retries the still-pending legacy finalize.
+	s.logger.Warn("switch-device: target rejected continuation field; requesting legacy downgrade",
+		"agent", agentID, "op_id", opID, "target", targetDeviceID)
+	return fmt.Errorf("%w: %v", errFinalizeContinuationDowngrade, err)
 }
 
 // dispatchPeerAgentSyncDrop tells target to discard any pending
@@ -1337,11 +1644,13 @@ func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targ
 	// those to learn the switch died.
 	s.noteSwitchFailure(agentID, reason)
 	s.abortAfterFailure(ctx, agentID, resp, reason)
-	if resp.AgentSynced && targetAddr != "" && targetDeviceID != "" && opID != "" {
+	// A failed/timed-out sync may still have committed at the target. Send
+	// cancellation even without a success response; it can precede phase-1.
+	if targetAddr != "" && targetDeviceID != "" && opID != "" {
 		dropCtx, cancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 		defer cancel()
 		if derr := s.dispatchPeerAgentSyncDrop(dropCtx, targetAddr, targetDeviceID, agentID, opID); derr != nil {
-			s.logger.Warn("switch-device: agent-sync drop failed (target may hold stale pending entry until next sync)",
+			s.logger.Warn("switch-device: agent-sync drop failed (target may require explicit cancellation before another sync)",
 				"agent", agentID, "target", targetDeviceID, "err", derr)
 		}
 	}
@@ -1364,11 +1673,10 @@ func (s *Server) orchestrateAbort(ctx context.Context, agentID, targetAddr, targ
 func (s *Server) abortAfterFailure(ctx context.Context, agentID string, resp *switchDeviceResponse, reason string) {
 	s.logger.Warn("switch-device: aborting after failure",
 		"agent", agentID, "target", resp.TargetPeerID, "reason", reason)
-	// Abort uses a fresh context bounded to the handoff timeout so
+	// Abort ignores cancellation but retains the source ownership fence so
 	// a caller-cancelled ctx (e.g. client hung up) still lets us
-	// clear handoff_pending — leaving the flag set would block
-	// future writes against the agent's blobs.
-	abortCtx, cancel := context.WithTimeout(context.Background(), handoffOpTimeout)
+	// clear this generation's handoff_pending, never a later operation's.
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), handoffOpTimeout)
 	defer cancel()
 	abortResp, aerr := s.runHandoffOp(abortCtx, agentID, "abort", "")
 	resp.Abort = abortResp
@@ -1579,35 +1887,48 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// don't touch your rows" so a broken credentials.key / older binary
 	// can't silently wipe target's credentials. Mirrors how the
 	// best-effort LookupAgentToken below behaves on missing state.
+	tool := agentRecordTool(rec)
 	if s.agents != nil && s.agents.HasCredentials() {
 		creds, cerr := s.agents.Credentials().ExportCredentials(agentID)
 		if cerr != nil {
 			return nil, fmt.Errorf("export credentials: %w", cerr)
 		}
 		req.Credentials = &creds
+		customKey, kerr := agent.LoadCustomAPIKey(s.agents.Credentials(), agentID, agentRecordCustomBaseURL(rec))
+		if kerr != nil {
+			return nil, fmt.Errorf("export custom API key: %w", kerr)
+		}
+		// Non-nil even when empty: once the source credential store is
+		// authoritative, the target must clear any stale key retained from an
+		// earlier stay. Omitting the field for a keyless non-custom agent could
+		// resurrect a revoked key when that agent later selects custom again.
+		req.CustomAPIKey = &customKey
 	}
 
-	// claude session JSONLs — claude's cwd is AgentDir(agentID),
-	// NOT Settings.workDir (workDir is the user's project files
-	// surface, unrelated to claude's --resume session
-	// placement). Read from source's AgentDir, target writes
-	// into its own AgentDir.
-	files, skipped, ferr := agent.ReadClaudeSessionFiles(agentID)
-	if ferr != nil {
-		return nil, fmt.Errorf("read claude sessions: %w", ferr)
-	}
-	if len(skipped) > 0 {
-		s.logger.Warn("agent-sync: skipped oversized claude session files",
-			"agent", agentID, "files", skipped)
-		req.TransferSkips = append(req.TransferSkips, skipped...)
-	}
-	if len(files) > 0 {
-		req.ClaudeSessions = make([]claudeSessionWire, 0, len(files))
-		for _, f := range files {
-			req.ClaudeSessions = append(req.ClaudeSessions, claudeSessionWire{
-				SessionID:  f.SessionID,
-				ContentB64: base64.StdEncoding.EncodeToString(f.Content),
-			})
+	// Transfer only the configured backend's active native sessions. Stale
+	// artifacts left by a previous backend are not part of the running
+	// agent state and previously accounted for tens of MiB of duplicate
+	// history on codex agents.
+	if tool == agent.ToolClaude || tool == agent.ToolCustomClaude {
+		// Claude's cwd is AgentDir(agentID), NOT Settings.workDir. Read from
+		// source's AgentDir; target writes into its own AgentDir.
+		files, skipped, ferr := agent.ReadClaudeSessionFiles(agentID)
+		if ferr != nil {
+			return nil, fmt.Errorf("read claude sessions: %w", ferr)
+		}
+		if len(skipped) > 0 {
+			s.logger.Warn("agent-sync: skipped oversized claude session files",
+				"agent", agentID, "files", skipped)
+			req.TransferSkips = append(req.TransferSkips, skipped...)
+		}
+		if len(files) > 0 {
+			req.ClaudeSessions = make([]claudeSessionWire, 0, len(files))
+			for _, f := range files {
+				req.ClaudeSessions = append(req.ClaudeSessions, claudeSessionWire{
+					SessionID:  f.SessionID,
+					ContentB64: base64.StdEncoding.EncodeToString(f.Content),
+				})
+			}
 		}
 	}
 
@@ -1616,8 +1937,8 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// stale `.grok/session_id` (e.g. from a previous era when the
 	// operator briefly switched to grok and back) does NOT
 	// accidentally ship grok state target would then resume from.
-	// The wire's tombstone branch on the receiver does the same
-	// gate, so source + target stay in lockstep.
+	// The receiver treats an absent Grok snapshot as authoritative
+	// cleanup, so stale target state cannot survive a tool change.
 	//
 	// CAVEAT (torn-turn read): when the agent triggered the switch
 	// via the kojo-switch-device skill, this read happens WHILE
@@ -1631,19 +1952,27 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// never a partial. If a required core file is somehow absent
 	// (a half-deleted session left behind by a crashed `grok
 	// sessions delete --partial`, etc.), ReadGrokSessionFiles
-	// returns an error and buildAgentSyncRequest fails — the
-	// orchestrator reports this as a switch failure with the
-	// error attached, and the operator can retry. The in-flight
+	// returns an error and this optional native artifact is skipped;
+	// target starts fresh from canonical Kojo history. The in-flight
 	// message itself is captured separately via
 	// SnapshotAccumulatedMessageRecord (the same path claude
 	// uses), so target's UI transcript stays complete even when
 	// the file-level session lags a turn. The transcript is the
 	// authoritative carried-over state; ResetSession remains available
 	// for operators who want to discard a stale backend-local session.
-	if agentRecordTool(rec) == "grok" {
+	if tool == "grok" {
 		grokTransfer, grokSkipped, gerr := agent.ReadGrokSessionFiles(agentID)
 		if gerr != nil {
-			return nil, fmt.Errorf("read grok session: %w", gerr)
+			// Native session artifacts are an optimisation: canonical Kojo
+			// history remains authoritative and fresh-session bootstrap can
+			// recover continuity. A corrupt/oversized Grok directory must not
+			// block that non-droppable state from moving.
+			s.logger.Warn("agent-sync: grok session unavailable; using history fallback",
+				"agent", agentID, "err", gerr)
+			req.TransferSkips = append(req.TransferSkips, agent.SkippedSessionFile{
+				Path: "grok-session", Reason: "unreadable",
+			})
+			grokTransfer = nil
 		}
 		if len(grokSkipped) > 0 {
 			s.logger.Warn("agent-sync: skipped oversized grok session files",
@@ -1680,14 +2009,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 				Threads: make([]codexThreadWire, 0, len(codexTransfer.Threads)),
 			}
 			for _, th := range codexTransfer.Threads {
-				cw.Threads = append(cw.Threads, codexThreadWire{
-					RefName:           th.RefName,
-					ThreadID:          th.ThreadID,
-					RolloutRelPath:    th.RolloutRelPath,
-					RolloutContentB64: base64.StdEncoding.EncodeToString(th.RolloutContent),
-					ThreadRow:         th.ThreadRow,
-					DynamicToolRows:   th.DynamicToolRows,
-				})
+				cw.Threads = append(cw.Threads, codexThreadToWire(th))
 			}
 			req.CodexSession = cw
 		}
@@ -1749,6 +2071,9 @@ func (s *Server) dispatchPeerAgentSyncState(ctx context.Context, targetAddr, tar
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if agent.HasCodexGoals(agentID) && resp.Header.Get("X-Kojo-Native-Goal") != "v1" {
+		return nil, errors.New("target peer does not support native goal transfer; upgrade it before moving this agent")
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		// Backward compat: older target binary without the
 		// /state endpoint. Sentinel lets the caller downgrade

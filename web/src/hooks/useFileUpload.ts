@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AgentMessageAttachment } from "../lib/agentApi";
 import { api } from "../lib/api";
 
@@ -10,31 +10,45 @@ import { api } from "../lib/api";
  * any key change — callers that need per-conversation reset call the exposed
  * setters explicitly.
  */
-export function useFileUpload() {
+export function useFileUpload(peerId?: string) {
   const [pendingFiles, setPendingFiles] = useState<AgentMessageAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const targetRef = useRef(peerId);
+  const previousTargetRef = useRef(peerId);
+  targetRef.current = peerId;
+
+  useEffect(() => {
+    if (previousTargetRef.current === peerId) return;
+    previousTargetRef.current = peerId;
+    setPendingFiles([]);
+    setUploadError(null);
+  }, [peerId]);
 
   const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
+    const uploadTarget = peerId;
     setUploading(true);
     setUploadError(null);
     try {
       const results = await Promise.allSettled(
-        Array.from(files).map((file) => api.upload(file)),
+        Array.from(files).map((file) => api.upload(file, peerId)),
       );
       const uploaded: AgentMessageAttachment[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         const r = results[i];
         if (r.status === "fulfilled") {
-          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime });
+          uploaded.push({ path: r.value.path, name: r.value.name, size: r.value.size, mime: r.value.mime, peerId: r.value.peerId });
         } else {
           failed.push(Array.from(files)[i].name);
         }
       }
+      // A handoff can finish while uploads are in flight. Paths returned by
+      // the old holder must never be attached to a turn on the new holder.
+      if (targetRef.current !== uploadTarget) return;
       if (uploaded.length > 0) {
         setPendingFiles((prev) => [...prev, ...uploaded]);
       }
@@ -45,7 +59,7 @@ export function useFileUpload() {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
-  }, []);
+  }, [peerId]);
 
   const removePendingFile = useCallback((index: number) => {
     setPendingFiles((prev) => prev.filter((_, i) => i !== index));

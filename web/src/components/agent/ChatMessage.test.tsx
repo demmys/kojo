@@ -8,16 +8,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function imageAttachment(path: string, name: string): AgentMessageAttachment {
+function imageAttachment(path: string, name: string, peerId?: string): AgentMessageAttachment {
   return {
     path,
     name,
     size: 1234,
     mime: "image/png",
+    peerId,
   };
 }
 
 describe("AttachmentList image preview", () => {
+  it("routes remote-holder attachment reads through that peer", () => {
+    const remote = imageAttachment("/tmp/remote.png", "remote.png", "peer-a");
+    render(<AttachmentList attachments={[remote]} isUser={false} />);
+
+    expect(screen.getByAltText(remote.name)).toHaveAttribute("src", expect.stringContaining("peer=peer-a"));
+  });
+
   it("wraps the preview caption at the rendered media width", async () => {
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
       x: 0,

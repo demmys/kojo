@@ -12,6 +12,7 @@ import (
 
 	"github.com/slack-go/slack"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
@@ -116,6 +117,38 @@ func (b *Bot) downloadSlackFiles(ctx context.Context, files []slack.File) ([]dow
 	return result, errs
 }
 
+// appendDownloadedFileNames keeps a stable, path-free record of successful
+// attachments in Slack history. The structured attachment carries the live
+// local path for the current turn; only the sanitized original name belongs in
+// transcript text because that path may be on another peer or later cleaned.
+func appendDownloadedFileNames(text string, files []downloadedFile) string {
+	for _, f := range files {
+		name := uploadpath.SanitizeName(f.Name)
+		if name == "" {
+			name = "attachment"
+		}
+		if strings.TrimSpace(text) != "" {
+			text += "\n"
+		}
+		text += "[Attached file: " + name + "]"
+	}
+	return text
+}
+
+func appendSlackHistoryFileNames(text string, files []slack.File) string {
+	for _, f := range files {
+		name := uploadpath.SanitizeName(f.Name)
+		if name == "" {
+			name = "attachment"
+		}
+		if strings.TrimSpace(text) != "" {
+			text += "\n"
+		}
+		text += "[Attached file: " + name + "]"
+	}
+	return text
+}
+
 // downloadOneFile downloads a single Slack file and saves it locally.
 // The filename uses {unixnano}_{original_name} to match the WebUI upload convention.
 func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (string, error) {
@@ -174,8 +207,9 @@ func (b *Bot) downloadOneFile(ctx context.Context, dir string, f *slack.File) (s
 	return localPath, nil
 }
 
-// appendFileInfo appends downloaded file paths and any errors to the message
-// text so the agent knows about the files and can read them with its file tools.
+// appendFileInfo is retained for focused file-helper tests. The live Slack
+// path now passes successful files as structured MessageAttachments; only
+// download failures are appended to the user-visible text there.
 func appendFileInfo(text string, files []downloadedFile, errs []fileError) string {
 	if len(files) == 0 && len(errs) == 0 {
 		return text
@@ -198,4 +232,24 @@ func appendFileInfo(text string, files []downloadedFile, errs []fileError) strin
 		}
 	}
 	return sb.String()
+}
+
+func appendFileErrors(text string, errs []fileError) string {
+	return appendFileInfo(text, nil, errs)
+}
+
+func downloadedAttachments(files []downloadedFile) []agent.MessageAttachment {
+	if len(files) == 0 {
+		return nil
+	}
+	out := make([]agent.MessageAttachment, 0, len(files))
+	for _, f := range files {
+		out = append(out, agent.MessageAttachment{
+			Path: f.Path,
+			Name: f.Name,
+			Mime: f.Mime,
+			Size: int64(f.Size),
+		})
+	}
+	return out
 }

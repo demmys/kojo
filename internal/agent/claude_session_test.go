@@ -192,6 +192,46 @@ func TestSessionEmptyUnsolicitedDropped(t *testing.T) {
 	pw.Close()
 }
 
+func TestSessionTextlessUnsolicitedErrorSurfaced(t *testing.T) {
+	bgCh := make(chan (<-chan ChatEvent), 1)
+	_, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
+		bgCh <- events
+	})
+	io.WriteString(pw, `{"type":"result","subtype":"error_during_execution","origin":{"kind":"task-notification"}}`+"\n")
+
+	events := <-bgCh
+	for _, event := range collect(t, events, 3*time.Second) {
+		if event.Type == "error" && event.ErrorMessage != "" {
+			pw.Close()
+			return
+		}
+	}
+	t.Fatal("textless background failure was not surfaced")
+}
+
+func TestSessionTextlessNotificationErrorDuringSolicitedTurnSurfaced(t *testing.T) {
+	bgCh := make(chan (<-chan ChatEvent), 1)
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
+		bgCh <- events
+	})
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(pw, `{"type":"result","subtype":"error_during_execution","origin":{"kind":"task-notification"}}`+"\n")
+	io.WriteString(pw, `{"type":"result","subtype":"success","result":"user answer"}`+"\n")
+	collect(t, sink, 3*time.Second)
+
+	events := <-bgCh
+	for _, event := range collect(t, events, 3*time.Second) {
+		if event.Type == "error" && event.ErrorMessage != "" {
+			pw.Close()
+			return
+		}
+	}
+	t.Fatal("interleaved textless background failure was not surfaced")
+}
+
 func TestSessionEOFMidTurnErrors(t *testing.T) {
 	s, pw := newTestSession(t, nil)
 	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
@@ -218,6 +258,58 @@ func TestSessionEOFMidTurnErrors(t *testing.T) {
 	if !dead {
 		t.Fatal("session should be dead after EOF")
 	}
+}
+
+func TestSessionEOFMidTurnWithTextMarksDoneAsError(t *testing.T) {
+	s, pw := newTestSession(t, nil)
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
+	if err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	io.WriteString(pw, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`+"\n")
+	io.WriteString(pw, `{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}`+"\n")
+	pw.Close()
+
+	evs := collect(t, sink, 3*time.Second)
+	for _, event := range evs {
+		if event.Type != "done" {
+			continue
+		}
+		if event.Message == nil || event.Message.Content != "Prompt is too long" {
+			t.Fatalf("done message = %+v, want terminal assistant only", event.Message)
+		}
+		if event.ErrorMessage == "" {
+			t.Fatal("mid-turn EOF done event must carry ErrorMessage")
+		}
+		return
+	}
+	t.Fatalf("expected done event; got %+v", evs)
+}
+
+func TestSessionErrorResultUsesTerminalAssistant(t *testing.T) {
+	s, pw := newTestSession(t, nil)
+	defer pw.Close()
+	sink, err := s.startTurn(context.Background(), &Agent{ID: "test-agent"}, "hi", false, false)
+	if err != nil {
+		t.Fatalf("startTurn: %v", err)
+	}
+	io.WriteString(pw, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`+"\n")
+	io.WriteString(pw, `{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}`+"\n")
+	io.WriteString(pw, `{"type":"result","subtype":"error_during_execution","session_id":"sess-1"}`+"\n")
+
+	evs := collect(t, sink, 3*time.Second)
+	for _, event := range evs {
+		if event.Type == "done" {
+			if event.Message == nil || event.Message.Content != "Prompt is too long" {
+				t.Fatalf("done message = %+v, want terminal assistant only", event.Message)
+			}
+			if event.ErrorMessage == "" {
+				t.Fatal("error result must surface ErrorMessage")
+			}
+			return
+		}
+	}
+	t.Fatalf("expected done event; got %+v", evs)
 }
 
 func TestSessionBusyRejectsSecondTurn(t *testing.T) {
@@ -399,12 +491,10 @@ func TestSessionQueuedSteerReaperDisarmedBySolicitedTurn(t *testing.T) {
 // live, and must be a no-op once the turn ended (never hitting a successor).
 func TestSessionUnsolicitedAbortInterruptsCLI(t *testing.T) {
 	abortCh := make(chan func(), 2)
+	eventsCh := make(chan (<-chan ChatEvent), 1)
 	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, abort func()) {
 		abortCh <- abort
-		go func() {
-			for range events {
-			}
-		}()
+		eventsCh <- events
 	})
 	stdin := &syncBuffer{}
 	s.stdinW = &claudeStdinWriter{w: stdin}
@@ -420,6 +510,12 @@ func TestSessionUnsolicitedAbortInterruptsCLI(t *testing.T) {
 	if abort == nil {
 		t.Fatal("abort func is nil for a live unsolicited turn")
 	}
+	var events <-chan ChatEvent
+	select {
+	case events = <-eventsCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background event channel not delivered")
+	}
 
 	// abort is async (it must never block Manager.Abort behind a wedged
 	// stdin) — poll for the interrupt write.
@@ -433,7 +529,12 @@ func TestSessionUnsolicitedAbortInterruptsCLI(t *testing.T) {
 	}
 
 	// End the turn; a late abort must now be a no-op.
-	io.WriteString(pw, `{"type":"result","subtype":"success","result":"bg turn","origin":{"kind":"task-notification"}}`+"\n")
+	io.WriteString(pw, `{"type":"result","subtype":"error_during_execution","result":"bg turn","origin":{"kind":"task-notification"}}`+"\n")
+	for _, event := range collect(t, events, 3*time.Second) {
+		if event.Type == "done" && event.ErrorMessage != "" {
+			t.Fatalf("intentional abort surfaced as error: %q", event.ErrorMessage)
+		}
+	}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		s.mu.Lock()
@@ -456,4 +557,50 @@ func TestSessionUnsolicitedAbortInterruptsCLI(t *testing.T) {
 		t.Fatalf("stale abort wrote an interrupt (%d -> %d)", before, got)
 	}
 	pw.Close()
+}
+
+func TestSessionUnsolicitedAbortEOFDoesNotSurfaceError(t *testing.T) {
+	abortCh := make(chan func(), 1)
+	eventsCh := make(chan (<-chan ChatEvent), 1)
+	s, pw := newTestSession(t, func(agentID string, events <-chan ChatEvent, _ AnswerFunc, abort func()) {
+		abortCh <- abort
+		eventsCh <- events
+	})
+
+	io.WriteString(pw, `{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}`+"\n")
+	abort := <-abortCh
+	events := <-eventsCh
+	abort()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		s.mu.Lock()
+		aborted := s.turnAborted
+		s.mu.Unlock()
+		if aborted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("abort state was not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotDone bool
+	for _, event := range collect(t, events, 3*time.Second) {
+		if event.Type == "error" {
+			t.Fatalf("intentional abort EOF surfaced error event: %q", event.ErrorMessage)
+		}
+		if event.Type == "done" {
+			gotDone = true
+			if event.ErrorMessage != "" {
+				t.Fatalf("intentional abort EOF surfaced error: %q", event.ErrorMessage)
+			}
+		}
+	}
+	if !gotDone {
+		t.Fatal("partial aborted turn must retain its done event")
+	}
 }

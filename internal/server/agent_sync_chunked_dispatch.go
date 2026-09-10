@@ -245,6 +245,7 @@ func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (b
 		AgentToken:                payload.AgentToken,
 		GrokSession:               payload.GrokSession,
 		Credentials:               payload.Credentials,
+		CustomAPIKey:              payload.CustomAPIKey,
 		SinceMessageSeq:           payload.SinceMessageSeq,
 		SinceMemoryEntrySeq:       payload.SinceMemoryEntrySeq,
 		SinceMemoryEntryUpdatedAt: payload.SinceMemoryEntryUpdatedAt,
@@ -435,6 +436,7 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 		AgentToken                string
 		GrokSession               any
 		Credentials               any
+		CustomAPIKey              any
 		SinceMessageSeq           int64
 		SinceMemoryEntrySeq       int64
 		SinceMemoryEntryUpdatedAt int64
@@ -447,6 +449,7 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 		AgentToken:                payload.AgentToken,
 		GrokSession:               grokHeader,
 		Credentials:               payload.Credentials,
+		CustomAPIKey:              payload.CustomAPIKey,
 		SinceMessageSeq:           payload.SinceMessageSeq,
 		SinceMemoryEntrySeq:       payload.SinceMemoryEntrySeq,
 		SinceMemoryEntryUpdatedAt: payload.SinceMemoryEntryUpdatedAt,

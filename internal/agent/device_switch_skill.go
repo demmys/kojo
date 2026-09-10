@@ -112,6 +112,7 @@ single-binary ` + "`Bash(curl:*)`" + ` pre-approval matcher (mixing in
 ` + "```bash" + `
 curl -skS -X POST \
   -H "X-Kojo-Token: ${KOJO_AGENT_TOKEN}" \
+  -H "X-Kojo-Session-Key: ${KOJO_SESSION_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"target_peer_id":"<DEVICE_ID>"}' \
   -w '\nHTTP_STATUS:%{http_code}\n' \
@@ -165,12 +166,11 @@ Outcome catalog:
   with the full migrated state; that is where the conversation
   continues. Treat the curl response as the end of your turn:
   no acknowledgement, no farewell, no plan, no summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -229,7 +229,8 @@ Once the target device_id is selected, POST it to the handoff
 endpoint. Replace ` + "`<DEVICE_ID>`" + ` with the resolved value:
 
 ` + "```" + `
-curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
+if not defined KOJO_SESSION_KEY set "KOJO_SESSION_KEY="
+curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "X-Kojo-Session-Key: %KOJO_SESSION_KEY%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
 ` + "```" + `
 
 The last line of stdout is ` + "`HTTP_STATUS:<code>`" + `; everything
@@ -279,12 +280,11 @@ Outcome catalog:
   with the full migrated state; that is where the conversation
   continues. Treat the curl response as the end of your turn:
   no acknowledgement, no farewell, no plan, no summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -349,6 +349,7 @@ resolved value:
 ` + "```bash" + `
 curl -skS -X POST \
   -H "X-Kojo-Token: ${KOJO_AGENT_TOKEN}" \
+  -H "X-Kojo-Session-Key: ${KOJO_SESSION_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"target_peer_id":"<DEVICE_ID>"}' \
   -w '\nHTTP_STATUS:%{http_code}\n' \
@@ -403,12 +404,11 @@ Outcome catalog:
   where the conversation continues. Treat the curl response as the
   end of your turn: no acknowledgement, no farewell, no plan, no
   summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -456,7 +456,8 @@ Once the target device_id is selected, POST it to the handoff
 endpoint. Replace ` + "`<DEVICE_ID>`" + ` with the resolved value:
 
 ` + "```" + `
-curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
+if not defined KOJO_SESSION_KEY set "KOJO_SESSION_KEY="
+curl -skS -X POST -H "X-Kojo-Token: %KOJO_AGENT_TOKEN%" -H "X-Kojo-Session-Key: %KOJO_SESSION_KEY%" -H "Content-Type: application/json" -d "{\"target_peer_id\":\"<DEVICE_ID>\"}" -w "\nHTTP_STATUS:%{http_code}\n" "%KOJO_API_BASE%/api/v1/agents/%KOJO_AGENT_ID%/handoff/switch"
 ` + "```" + `
 
 The last line of stdout is ` + "`HTTP_STATUS:<code>`" + `; everything
@@ -507,12 +508,11 @@ Outcome catalog:
   where the conversation continues. Treat the curl response as the
   end of your turn: no acknowledgement, no farewell, no plan, no
   summary. Just stop.
-- ` + "`completed_with_lock_failure`" + ` — blob_refs migrated to
-  target but no agent_lock row existed to move. Source still owns
-  the chat session, so a normal text response IS persisted:
-  surface ` + "`reason`" + ` to the user; operator inspects ` + "`agent_locks`" + `
-  on target and may issue a manual Acquire if the agent should be
-  locked.
+- ` + "`complete_failed`" + ` with ` + "`lock_missing`" + ` / missing-lock
+  wording — the source had no transferable agent_lock, so the
+  switch refused or restored source ownership instead of producing
+  a blob-only migration. Surface ` + "`reason`" + ` to the user and
+  let the operator retry after the local lock exists.
 - ` + "`aborted` / `abort_failed` / `complete_failed` / `source_drain_failed` / `complete_errored_lock_at_target`" + ` —
   switch did not happen (or completed only partially). Source is
   still the holder so your reply IS persisted normally: tell the
@@ -585,6 +585,8 @@ func SyncCodexDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logge
 }
 
 func codexDeviceSwitchSkillBody(body string) string {
+	body = strings.ReplaceAll(body, "On 2xx, the response JSON's", "If HTTP 202 returns outcome=queued, the Goal move is only reserved, not completed. Save needed notes, then END THIS TURN immediately. Do not poll, sleep, call switch again, or continue other work: migration waits for your turn to finish. Kojo will pause and checkpoint the native process before transferring and resuming the same Goal. Use !goal status from a later user turn for state, or !goal pause to cancel. Never force-reclaim or retry a move whose ownership is uncertain. This queued case takes precedence over the non-completed cases below.\n\nOn 2xx, the response JSON's")
+
 	repl := strings.NewReplacer(
 		"grok --resume", "Codex app-server thread/resume",
 		"grok session state", "Codex thread state",

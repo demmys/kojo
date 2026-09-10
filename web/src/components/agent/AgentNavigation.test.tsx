@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { BrowserRouter, createMemoryRouter, Route, RouterProvider, Routes, useNavigate } from "react-router";
 import { AgentChat } from "./AgentChat";
 import { AgentCredentials } from "./AgentCredentials";
 import { AgentSettings } from "./AgentSettings";
 
 const mocks = vi.hoisted(() => ({
+  answer: vi.fn(),
+  onEvent: undefined as undefined | ((ev: import("../../lib/agentApi").ChatEvent) => void),
   agentGet: vi.fn(),
   agentMessages: vi.fn(),
   checkinFile: vi.fn(),
@@ -16,11 +18,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../hooks/useAgentWebSocket", () => ({
-  useAgentWebSocket: () => ({
-    connected: true,
-    sendMessage: vi.fn(),
-    abort: vi.fn(),
-  }),
+  useAgentWebSocket: (opts: {onEvent: (ev: import("../../lib/agentApi").ChatEvent) => void}) => {
+    mocks.onEvent = opts.onEvent;
+    return { connected: true, sendMessage: vi.fn(), abort: vi.fn() };
+  },
 }));
 
 vi.mock("../../hooks/useTTS", () => ({
@@ -47,6 +48,7 @@ vi.mock("../../lib/agentApi", async (importOriginal) => {
     ...actual,
     agentApi: {
       ...actual.agentApi,
+      answerAgentQuestion: mocks.answer,
       get: mocks.agentGet,
       messages: mocks.agentMessages,
       getCheckinFile: mocks.checkinFile,
@@ -272,5 +274,26 @@ describe("agent route navigation", () => {
     // accumulating dead "/" entries.
     fireEvent.click(screen.getByRole("button", { name: "Back" }));
     expect(await screen.findByText("Open demo")).toBeInTheDocument();
+  });
+});
+
+describe("answer settlement transcript refresh", () => {
+  it.each([false, true])("refreshes after turn completion, uncertain=%s", async (uncertain) => {
+    const router = createMemoryRouter([{path:"/agents/:id",element:<AgentChat />}], {initialEntries:["/agents/demo"]});
+    let settle!: () => void;
+    mocks.answer.mockImplementation(() => new Promise<void>((resolve,reject) => {
+      settle = () => uncertain ? reject(new Error("502: delivery_uncertain")) : resolve();
+    }));
+    render(<RouterProvider router={router} />);
+    await screen.findByLabelText("Credentials");
+    act(() => mocks.onEvent?.({type:"user_question",requestId:"q",questions:[{id:"color",question:"Color?",options:[{label:"Blue"}]}]}));
+    fireEvent.click(await screen.findByRole("button",{name:"Blue"}));
+    fireEvent.click(screen.getByRole("button",{name:"Answer"}));
+    await waitFor(() => expect(mocks.answer).toHaveBeenCalledTimes(1));
+    act(() => mocks.onEvent?.({type:"done"})); // no later live message event
+    mocks.agentMessages.mockResolvedValue({messages:[{id:"answer-row",role:"user",content:"answered: color → Blue",timestamp:"2026-09-05T08:00:00Z"}],hasMore:false});
+    await act(async () => settle());
+    await screen.findByText("answered: color → Blue");
+    expect(mocks.agentMessages.mock.calls.length).toBeGreaterThan(1);
   });
 });

@@ -24,6 +24,7 @@ import { ModelPicker } from "./fields/ModelPicker";
 import { EffortPicker } from "./fields/EffortPicker";
 import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
+import { useAvatarImageProviders } from "./useAvatarImageProviders";
 import { buildAgentSavePayload, needsCustomURLFor } from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
@@ -116,6 +117,14 @@ export function AgentSettings() {
   const location = useLocation();
   const navigateRef = useRef(navigate);
   navigateRef.current = navigate;
+  const agentIDRef = useRef(id);
+  agentIDRef.current = id;
+  const customKeyLastAgentIDRef = useRef(id);
+  const customKeyOperationRef = useRef(0);
+  if (customKeyLastAgentIDRef.current !== id) {
+    customKeyLastAgentIDRef.current = id;
+    customKeyOperationRef.current += 1;
+  }
   const [agent, setAgent] = useState<AgentInfo | null>(null);
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
@@ -128,6 +137,12 @@ export function AgentSettings() {
   const [autoEffort, setAutoEffort] = useState(true);
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
+  const [customAPIKey, setCustomAPIKey] = useState("");
+  const [customAPIKeyConfigured, setCustomAPIKeyConfigured] = useState(false);
+  const [customAPIKeyStatusKnown, setCustomAPIKeyStatusKnown] = useState(false);
+  const [customNoAuth, setCustomNoAuth] = useState(false);
+  const [customAPIKeySaving, setCustomAPIKeySaving] = useState(false);
+  const [customAPIKeyVersion, setCustomAPIKeyVersion] = useState(0);
   const [thinkingMode, setThinkingMode] = useState("");
   const [workDir, setWorkDir] = useState("");
   const [cronExpr, setCronExpr] = useState("");
@@ -209,6 +224,9 @@ export function AgentSettings() {
   const [checkinNotice, setCheckinNotice] = useState("");
   const [avatarToken, setAvatarToken] = useState(() => Date.now());
   const [generatingAvatar, setGeneratingAvatar] = useState(false);
+  const [avatarPrompt, setAvatarPrompt] = useState("");
+  const [avatarWarning, setAvatarWarning] = useState("");
+  const avatarProviders = useAvatarImageProviders();
   const [personaPrompt, setPersonaPrompt] = useState("");
   const [generatingPersona, setGeneratingPersona] = useState(false);
   const [allowedTools, setAllowedTools] = useState<string[]>([]);
@@ -353,6 +371,14 @@ export function AgentSettings() {
 
   useEffect(() => {
     if (!id) return;
+    let cancelled = false;
+    // Secret state must never survive route reuse for another agent while the
+    // replacement requests are still in flight.
+    setCustomAPIKey("");
+    setCustomAPIKeyConfigured(false);
+    setCustomAPIKeyStatusKnown(false);
+    setCustomNoAuth(false);
+    setCustomAPIKeySaving(false);
     // Run agent + workspace-file fetches in parallel via allSettled so a
     // 404 on one endpoint (e.g. /user-context against a server that
     // hasn't been rebuilt) doesn't blank out the rest of the form. The
@@ -365,7 +391,9 @@ export function AgentSettings() {
       agentApi.getUserContext(id),
       agentApi.getAgentStatus(id),
       agentApi.getAgentAnchor(id),
-    ]).then(([agentRes, checkinRes, userCtxRes, statusRes, anchorRes]) => {
+      agentApi.customApiKey.get(id),
+    ]).then(([agentRes, checkinRes, userCtxRes, statusRes, anchorRes, customKeyRes]) => {
+      if (cancelled) return;
       if (agentRes.status !== "fulfilled") {
         navigateRef.current("/");
         return;
@@ -433,8 +461,22 @@ export function AgentSettings() {
         setLoadedAnchor("");
         setAnchorEtag("");
       }
+      const customKeyStatusKnown = customKeyRes.status === "fulfilled";
+      const customKeyConfigured =
+        customKeyStatusKnown && customKeyRes.value.configured;
+      setCustomAPIKeyStatusKnown(customKeyStatusKnown);
+      setCustomAPIKeyConfigured(customKeyConfigured);
+      // A persisted custom endpoint with no stored credential is an existing
+      // keyless configuration, not an unfinished form. Reconstruct that
+      // choice on every load so model discovery works immediately and the
+      // operator is not forced to re-confirm "no API key" on every visit.
+      setCustomNoAuth(
+        customKeyStatusKnown && (a.tool === "custom-claude" || a.tool === "custom") &&
+          !!a.customBaseURL?.trim() && !customKeyConfigured,
+      );
       setStatusLoadGen((g) => g + 1);
     });
+    return () => { cancelled = true; };
   }, [id]);
 
   // Keep nextCronAt fresh. The initial GET captures a snapshot; without
@@ -515,13 +557,83 @@ export function AgentSettings() {
     };
   }, [id, agent?.nextCronAt]);
 
-  const { needsCustomURL, customModels } = useCustomModels(tool, customBaseURL, setModel);
+  const isCustomClaude = tool === "custom-claude" || tool === "custom";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
+  useEffect(() => {
+    if (!isCustomClaude) setCustomNoAuth(false);
+  }, [isCustomClaude]);
+
+  const customAPIKeyURLSaved =
+    !!agent && customBaseURL.trim() === (agent.customBaseURL ?? "").trim();
+  useEffect(() => {
+    if (customAPIKeyConfigured && customAPIKeyURLSaved) setCustomNoAuth(false);
+  }, [customAPIKeyConfigured, customAPIKeyURLSaved]);
+  const customNoAuthEnabled = isCustomClaude && customNoAuth;
+  const customKeyStatusUnknownForSavedURL =
+    isCustomClaude && !!agent && customAPIKeyURLSaved && !customAPIKeyStatusKnown;
+  const customModelDiscoveryReady =
+    !!customBaseURL.trim() &&
+    (isKeyOptionalCustom || !!customAPIKey.trim() ||
+      (customAPIKeyConfigured && customAPIKeyURLSaved) || customNoAuthEnabled ||
+      customKeyStatusUnknownForSavedURL);
+  const {
+    needsCustomURL,
+    customModels,
+    status: customModelsStatus,
+    error: customModelsError,
+    errorCode: customModelsErrorCode,
+  } = useCustomModels(tool, customBaseURL, setModel, {
+    agentId: id,
+    ...(customAPIKey ? { apiKey: customAPIKey } : customNoAuthEnabled ? { apiKey: "" } : {}),
+    credentialVersion: customAPIKeyVersion,
+    enabled: customModelDiscoveryReady,
+  });
+  const customConnectionNeedsCompletion =
+    needsCustomURL && customModelsStatus === "idle" && !!agent &&
+    (tool !== agent.tool ||
+      customBaseURL.trim() !== (agent.customBaseURL ?? "").trim() ||
+      model.trim() !== agent.model);
+
+  const handleDeleteCustomAPIKey = async () => {
+    if (!id || !confirm(t("settings.customApiKeyRemoveConfirm"))) return;
+    const requestID = id;
+    const operation = ++customKeyOperationRef.current;
+    setCustomAPIKeySaving(true);
+    setError("");
+    try {
+      await agentApi.customApiKey.delete(id);
+      if (agentIDRef.current !== requestID || customKeyOperationRef.current !== operation) return;
+      setCustomAPIKey("");
+      setCustomAPIKeyConfigured(false);
+      setCustomAPIKeyStatusKnown(true);
+      setCustomNoAuth(isCustomClaude);
+      setCustomAPIKeyVersion((v) => v + 1);
+    } catch (err) {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setError(errMsg(err));
+      }
+    } finally {
+      if (agentIDRef.current === requestID && customKeyOperationRef.current === operation) {
+        setCustomAPIKeySaving(false);
+      }
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
     setError("");
     setSuccess(false);
+    const requestID = id!;
+    const saveOperation = ++customKeyOperationRef.current;
+    const saveIsCurrent = () =>
+      agentIDRef.current === requestID &&
+      customKeyOperationRef.current === saveOperation;
     try {
+      // Keep the write-only secret in local state until the ordinary agent
+      // PATCH has persisted its Base URL. The credential endpoint binds the
+      // key to that saved URL, but this sequencing remains one user-visible
+      // Save operation rather than leaking the storage split into the UI.
+      const pendingCustomAPIKey = needsCustomURL ? customAPIKey.trim() : "";
       // cronMessage and userContext live in separate workspace files
       // (checkin.md, user.md) — they're persisted via dedicated
       // endpoints, NOT the agents PATCH. Dirty detection compares the
@@ -542,9 +654,33 @@ export function AgentSettings() {
       // key spacing), so also skip when it still parses to the template.
       const statusDirty = statusContent !== loadedStatus && !statusIsDefault;
       const anchorDirty = anchorContent !== loadedAnchor;
+      const customURLChanged =
+        needsCustomURLFor(tool) &&
+        customBaseURL.trim() !== (agent?.customBaseURL ?? "").trim();
+
+      // A key replacement against an unchanged endpoint is a credential-only
+      // operation. Do not issue the broad agent PATCH in that case: a stale
+      // settings form must not overwrite a concurrent edit merely because the
+      // operator rotated an API key.
+      if (pendingCustomAPIKey && !nonSecretDirty) {
+        await agentApi.customApiKey.set(
+          requestID,
+          (agent?.customBaseURL ?? customBaseURL).trim(),
+          pendingCustomAPIKey,
+        );
+        if (!saveIsCurrent()) return;
+        setCustomAPIKey("");
+        setCustomAPIKeyConfigured(true);
+        setCustomAPIKeyStatusKnown(true);
+        setCustomNoAuth(false);
+        setCustomAPIKeyVersion((v) => v + 1);
+        setSuccess(true);
+        setTimeout(() => setSuccess(false), 2000);
+        return;
+      }
 
       const updated = await agentApi.update(
-        id!,
+        requestID,
         buildAgentSavePayload({
           name,
           persona,
@@ -585,6 +721,7 @@ export function AgentSettings() {
         // "someone else changed this" message below.
         agent?.etag,
       );
+      if (!saveIsCurrent()) return;
 
       // Commit the PATCH result to local state BEFORE the workspace-file
       // PUTs. If a PUT below throws (e.g. status validation 400), the
@@ -598,6 +735,28 @@ export function AgentSettings() {
       // TTS model/stylePrompt); without this the dirty diff would compare
       // raw local state against the normalized row and stay true forever.
       hydrateFromAgent(updated);
+      if (customURLChanged) {
+        // Manager.Update has already invalidated the old URL-bound secret.
+        // Reflect that immediately even if the replacement credential write
+        // below fails, so the UI never claims a deleted key is configured.
+        setCustomAPIKeyConfigured(false);
+        setCustomAPIKeyStatusKnown(true);
+      }
+      if (pendingCustomAPIKey) {
+        await agentApi.customApiKey.set(
+          requestID,
+          (updated.customBaseURL ?? customBaseURL).trim(),
+          pendingCustomAPIKey,
+        );
+        if (!saveIsCurrent()) return;
+        setCustomAPIKey("");
+        setCustomAPIKeyConfigured(true);
+        setCustomAPIKeyStatusKnown(true);
+        setCustomNoAuth(false);
+        setCustomAPIKeyVersion((v) => v + 1);
+      } else if (customURLChanged) {
+        setCustomAPIKeyVersion((v) => v + 1);
+      }
 
       if (checkinDirty) {
         // Thread the etag captured at load time as If-Match. Empty
@@ -605,10 +764,11 @@ export function AgentSettings() {
         // header. After the write the response carries the freshly
         // computed etag, which we re-pin for the next save.
         const wrapped = await agentApi.putCheckinFile(
-          id!,
+          requestID,
           cronMessage,
           checkinEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setCheckinIsDefault(res.isDefault);
         setCronMessage(res.content);
@@ -621,10 +781,11 @@ export function AgentSettings() {
       }
       if (userDirty) {
         const wrapped = await agentApi.setUserContext(
-          id!,
+          requestID,
           userContext,
           userContextEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setUserContextIsDefault(res.isDefault);
         setUserContext(res.content);
@@ -633,10 +794,11 @@ export function AgentSettings() {
       }
       if (statusDirty) {
         const wrapped = await agentApi.putAgentStatus(
-          id!,
+          requestID,
           statusContent,
           statusEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setStatusIsDefault(res.isDefault);
         setStatusContent(res.content);
@@ -648,10 +810,11 @@ export function AgentSettings() {
       }
       if (anchorDirty) {
         const wrapped = await agentApi.putAgentAnchor(
-          id!,
+          requestID,
           anchorContent,
           anchorEtag || undefined,
         );
+        if (!saveIsCurrent()) return;
         const res = wrapped.value;
         setAnchorIsDefault(res.isDefault);
         setAnchorContent(res.content);
@@ -662,6 +825,7 @@ export function AgentSettings() {
       setSuccess(true);
       setTimeout(() => setSuccess(false), 2000);
     } catch (err) {
+      if (!saveIsCurrent()) return;
       // PreconditionFailedError is the etag-mismatch 412. Re-fetch the
       // agent so the form rebases onto the server's current row before
       // the user re-applies their edit (otherwise the next Save would
@@ -669,7 +833,8 @@ export function AgentSettings() {
       if (err instanceof Error && err.name === "PreconditionFailedError") {
         setError(t("settings.saveConflict"));
         try {
-          const fresh = await agentApi.get(id!);
+          const fresh = await agentApi.get(requestID);
+          if (!saveIsCurrent()) return;
           setAgent(fresh);
           // Don't blow away the user's in-progress edits — only refresh
           // the etag-bearing record. Form fields stay as-is so the user
@@ -688,11 +853,12 @@ export function AgentSettings() {
         // stay as the user left them.
         try {
           const [ck, uc, st, an] = await Promise.allSettled([
-            agentApi.getCheckinFile(id!),
-            agentApi.getUserContext(id!),
-            agentApi.getAgentStatus(id!),
-            agentApi.getAgentAnchor(id!),
+            agentApi.getCheckinFile(requestID),
+            agentApi.getUserContext(requestID),
+            agentApi.getAgentStatus(requestID),
+            agentApi.getAgentAnchor(requestID),
           ]);
+          if (!saveIsCurrent()) return;
           // For each file: re-pin etag + snapshot, and if the user hadn't
           // edited it (field still equals the old snapshot) fast-forward the
           // field too. Otherwise an untouched textarea would read as dirty
@@ -1008,6 +1174,7 @@ export function AgentSettings() {
       await agentApi.uploadAvatar(id, file);
       setAvatarToken(Date.now());
       setAgent((a) => (a ? { ...a, hasAvatar: true } : a));
+      setAvatarWarning("");
     } catch (err) {
       setError(errMsg(err));
     }
@@ -1032,14 +1199,36 @@ export function AgentSettings() {
     if (!id || !persona.trim()) return;
     setGeneratingAvatar(true);
     setError("");
+    let generatedPath = "";
     try {
-      const result = await agentApi.generateAvatar(persona.trim(), name.trim());
+      const result = await agentApi.generateAvatar(
+        persona.trim(),
+        name.trim(),
+        avatarPrompt.trim(),
+        undefined,
+        avatarProviders.providerForRequest,
+        false,
+      );
+      generatedPath = result.avatarPath;
+      // Older servers ignore allowFallback; never replace a published avatar
+      // with the initials SVG if such a server returns one.
+      if (result.fallback) {
+        setAvatarWarning(result.warning ?? t("settings.avatarGenerationFailed"));
+        return;
+      }
       await agentApi.uploadGeneratedAvatar(id, result.avatarPath);
+      // The publish handler owns and removes the temp directory after it has
+      // validated the path, regardless of SaveAvatar success.
+      generatedPath = "";
       setAvatarToken(Date.now());
       setAgent((a) => (a ? { ...a, hasAvatar: true } : a));
+      setAvatarWarning("");
     } catch (err) {
       setError(errMsg(err));
     } finally {
+      if (generatedPath) {
+        await agentApi.discardAvatarPreview(generatedPath).catch(() => {});
+      }
       setGeneratingAvatar(false);
     }
   };
@@ -1070,7 +1259,7 @@ export function AgentSettings() {
   // thinkingMode, allowedTools, allowProtectedPaths, publicProfile body,
   // gemini-only TTS fields) are skipped so hidden inputs can't leave the
   // form un-clearably dirty.
-  const dirty =
+  const nonSecretDirty =
     !!agent &&
     (name.trim() !== agent.name ||
       persona.trim() !== agent.persona ||
@@ -1103,12 +1292,19 @@ export function AgentSettings() {
       userContext !== loadedUser ||
       (statusContent !== loadedStatus && !statusIsDefault) ||
       anchorContent !== loadedAnchor);
+  const dirty =
+    nonSecretDirty || (!!agent && needsCustomURLFor(tool) && !!customAPIKey.trim());
 
   // Rehydrate every form field from the persisted agent row / loaded
   // workspace-file snapshots, dropping unsaved edits.
   const handleDiscard = () => {
     if (!agent) return;
     hydrateFromAgent(agent);
+    setCustomAPIKey("");
+    setCustomNoAuth(
+      customAPIKeyStatusKnown && (agent.tool === "custom-claude" || agent.tool === "custom") &&
+        !!agent.customBaseURL?.trim() && !customAPIKeyConfigured,
+    );
     setCronMessage(loadedCheckin);
     setUserContext(loadedUser);
     setStatusContent(loadedStatus);
@@ -1187,10 +1383,18 @@ export function AgentSettings() {
           <div className="mb-4 flex items-center gap-4">
             <AgentAvatar agentId={agent.id} name={agent.name} size="xl" cacheBust={avatarToken} />
             <div className="flex flex-wrap gap-2">
-              <Button onClick={() => fileRef.current?.click()}>{t("settings.changeAvatar")}</Button>
+              <Button onClick={() => fileRef.current?.click()} disabled={generatingAvatar}>
+                {t("settings.changeAvatar")}
+              </Button>
               <Button
                 onClick={handleGenerateAvatar}
-                disabled={generatingAvatar || !persona.trim()}
+                disabled={
+                  generatingAvatar ||
+                  !persona.trim() ||
+                  !name.trim() ||
+                  !avatarProviders.loaded ||
+                  avatarProviders.available.length === 0
+                }
                 className="flex items-center gap-1.5"
               >
                 {generatingAvatar ? (
@@ -1207,6 +1411,39 @@ export function AgentSettings() {
                 className="hidden"
               />
             </div>
+          </div>
+
+          <div className="mb-4 space-y-3">
+            <Field label={t("create.avatarPromptLabel")} help={t("create.avatarPromptHelp")}>
+              <Textarea
+                value={avatarPrompt}
+                onChange={(e) => setAvatarPrompt(e.target.value)}
+                placeholder={t("create.avatarPromptPlaceholder")}
+                rows={3}
+              />
+            </Field>
+            {avatarProviders.error ? (
+              <Banner tone="warn">{t("create.avatarProviderStatusError")}</Banner>
+            ) : avatarProviders.available.length > 1 ? (
+              <Field label={t("create.avatarProviderLabel")}>
+                <Select
+                  value={avatarProviders.selected}
+                  onChange={(e) => avatarProviders.setSelected(e.target.value as "gemini" | "openai")}
+                >
+                  <option value="openai">OpenAI — GPT Image 2</option>
+                  <option value="gemini">Google — Nano Banana Pro</option>
+                </Select>
+              </Field>
+            ) : avatarProviders.loaded && avatarProviders.available.length === 1 ? (
+              <div className="text-[12px] text-ink-faint">
+                {t("create.avatarProviderAuto", {
+                  provider: avatarProviders.available[0] === "openai" ? "OpenAI — GPT Image 2" : "Google — Nano Banana Pro",
+                })}
+              </div>
+            ) : avatarProviders.loaded ? (
+              <Banner tone="warn">{t("create.avatarProviderMissing")}</Banner>
+            ) : null}
+            {avatarWarning && <Banner tone="warn">{t("settings.avatarKeptWarning", { error: avatarWarning })}</Banner>}
           </div>
 
           <div className="space-y-4">
@@ -1376,13 +1613,91 @@ export function AgentSettings() {
               setEffort={setEffort}
             />
 
+            {needsCustomURL && (
+              <div className="space-y-4">
+                <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
+                  <Input
+                    mono
+                    value={customBaseURL}
+                    onChange={(e) => setCustomBaseURL(e.target.value)}
+                    disabled={customAPIKeySaving || saving}
+                    placeholder="http://localhost:8080"
+                  />
+                </Field>
+                <Field label={t("settings.customApiKey")} help={t("settings.customApiKeyHelp")}>
+                  <div className="space-y-2">
+                    <Input
+                      mono
+                      type="password"
+                      autoComplete="new-password"
+                      value={customAPIKey}
+                      onChange={(e) => {
+                        setCustomAPIKey(e.target.value);
+                        if (e.target.value) setCustomNoAuth(false);
+                      }}
+                      disabled={customAPIKeySaving || saving || customNoAuthEnabled}
+                      placeholder={customAPIKeyConfigured ? t("settings.customApiKeyConfigured") : "sk-unsloth-…"}
+                    />
+                    <div className="flex items-center gap-2">
+                      {customAPIKeyConfigured && (
+                        <Button
+                          type="button"
+                          variant="danger"
+                          disabled={customAPIKeySaving || saving}
+                          onClick={handleDeleteCustomAPIKey}
+                        >
+                          {t("settings.customApiKeyRemove")}
+                        </Button>
+                      )}
+                      {customAPIKeyConfigured && !customAPIKey.trim() && (
+                        <span className="text-[12px] text-lamp-run">{t("gs.configured")}</span>
+                      )}
+                    </div>
+                    {isCustomClaude &&
+                      (!customAPIKeyConfigured || !customAPIKeyURLSaved) && (
+                        <label className="flex items-center gap-2 text-[12px] text-ink-dim">
+                          <input
+                            type="checkbox"
+                            checked={customNoAuth}
+                            disabled={customAPIKeySaving || saving || !!customAPIKey.trim()}
+                            onChange={(e) => setCustomNoAuth(e.target.checked)}
+                          />
+                          {t("settings.customNoAuth")}
+                        </label>
+                      )}
+                  </div>
+                </Field>
+              </div>
+            )}
+
             <ModelPicker
               model={model}
               setModel={setModel}
               effort={effort}
               setEffort={setEffort}
               models={needsCustomURL ? customModels : modelsForTool(tool)}
+              disabled={needsCustomURL && customModelsStatus !== "success" && customModelsStatus !== "error"}
             />
+
+            {needsCustomURL && customModelsStatus === "idle" && (
+              <p className="text-[12px] text-ink-faint">
+                {t(isKeyOptionalCustom
+                  ? "settings.customModelURLPrerequisite"
+                  : "settings.customModelPrerequisites")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "loading" && (
+              <p className="text-[12px] text-ink-faint">
+                {t("settings.customModelLoading")}
+              </p>
+            )}
+            {needsCustomURL && customModelsStatus === "error" && (
+              <p className="text-[12px] text-lamp-warn">
+                {customModelsErrorCode === "no_models"
+                  ? t("settings.customModelNoModels")
+                  : t("settings.customModelError", { error: customModelsError })}
+              </p>
+            )}
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
@@ -1393,17 +1708,6 @@ export function AgentSettings() {
                 title={t("settings.autoEffort")}
                 desc={t("settings.autoEffortDesc")}
               />
-            )}
-
-            {needsCustomURL && (
-              <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
-                <Input
-                  mono
-                  value={customBaseURL}
-                  onChange={(e) => setCustomBaseURL(e.target.value)}
-                  placeholder="http://localhost:8080"
-                />
-              </Field>
             )}
 
             {/* Allowed Tools (custom only) */}
@@ -1907,10 +2211,18 @@ export function AgentSettings() {
                   <span className="min-w-0 flex-1 truncate text-[12px] text-ink-faint">
                     {t("settings.unsavedChanges")}
                   </span>
-                  <Button onClick={handleDiscard} disabled={saving}>
+                  <Button onClick={handleDiscard} disabled={saving || customAPIKeySaving}>
                     {t("settings.discard")}
                   </Button>
-                  <Button variant="primary" onClick={handleSave} disabled={saving}>
+                  <Button
+                    variant="primary"
+                    onClick={handleSave}
+                    disabled={
+                      saving || customAPIKeySaving ||
+                      (needsCustomURL && customModelsStatus === "loading") ||
+                      customConnectionNeedsCompletion
+                    }
+                  >
                     {saving ? t("settings.saving") : t("settings.saveChanges")}
                   </Button>
                 </div>

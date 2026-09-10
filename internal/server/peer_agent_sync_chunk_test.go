@@ -167,6 +167,57 @@ func TestChunkedSync_BeginRejectsDuplicateOpID(t *testing.T) {
 	}
 }
 
+func TestChunkedSync_BeginRejectsPendingEntryOverflow(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	now := time.Now()
+	for i := 0; i < chunkedSyncMaxPendingEntries; i++ {
+		srv.chunkedAgentSyncs["existing-"+strconv.Itoa(i)] = &chunkedSyncEntry{
+			sourceDeviceID: testChunkedSource,
+			req:            &peerAgentSyncRequest{Agent: &store.AgentRecord{ID: testChunkedAgentID}},
+			lastTouched:    now,
+		}
+	}
+	rr := postChunked(t, srv, "/api/v1/peers/agent-sync/chunked/begin", nil,
+		makeBeginRequest("overflow"), srv.handlePeerAgentSyncChunkedBegin)
+	if rr.Code != http.StatusTooManyRequests || !strings.Contains(rr.Body.String(), "too_many_pending") {
+		t.Fatalf("overflow begin: got %d body=%s, want 429 too_many_pending", rr.Code, rr.Body.String())
+	}
+	if len(srv.chunkedAgentSyncs) != chunkedSyncMaxPendingEntries {
+		t.Fatalf("pending count = %d, want cap %d", len(srv.chunkedAgentSyncs), chunkedSyncMaxPendingEntries)
+	}
+}
+
+func TestChunkedSync_BeginRejectsPerSourceOverflow(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	for i := 0; i < chunkedSyncMaxPendingEntriesPerSource; i++ {
+		srv.chunkedAgentSyncs["same-source-"+strconv.Itoa(i)] = &chunkedSyncEntry{
+			sourceDeviceID: testChunkedSource,
+			req:            &peerAgentSyncRequest{Agent: &store.AgentRecord{ID: testChunkedAgentID}},
+			lastTouched:    time.Now(),
+		}
+	}
+	rr := postChunked(t, srv, "/api/v1/peers/agent-sync/chunked/begin", nil,
+		makeBeginRequest("source-overflow"), srv.handlePeerAgentSyncChunkedBegin)
+	if rr.Code != http.StatusTooManyRequests || !strings.Contains(rr.Body.String(), "too_many_pending_for_source") {
+		t.Fatalf("per-source overflow: got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestChunkedSync_BeginRejectsTotalPendingByteOverflow(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	srv.chunkedAgentSyncs["large-other-source"] = &chunkedSyncEntry{
+		sourceDeviceID:   "other-source",
+		req:              &peerAgentSyncRequest{Agent: &store.AgentRecord{ID: "ag_other"}},
+		accumulatedBytes: chunkedSyncMaxTotalPendingBytes,
+		lastTouched:      time.Now(),
+	}
+	rr := postChunked(t, srv, "/api/v1/peers/agent-sync/chunked/begin", nil,
+		makeBeginRequest("byte-overflow"), srv.handlePeerAgentSyncChunkedBegin)
+	if rr.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rr.Body.String(), "too_large") {
+		t.Fatalf("total-byte overflow: got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestChunkedSync_ChunkAppendsAndCommit walks the full begin→chunk→
 // commit flow with synthetic messages. The commit hits applyPeerAgentSync
 // which we don't drive end-to-end here (it requires sessions / disk
@@ -484,10 +535,12 @@ func TestSplitAgentSyncIntoChunks_RespectsBudget(t *testing.T) {
 // singletons returns zero data chunks. The orchestrator still
 // commits — begin alone applies the singletons.
 func TestSplitAgentSyncIntoChunks_EmptyPayload(t *testing.T) {
+	customKey := "sk-unsloth-transfer"
 	payload := &peerAgentSyncRequest{
 		SourceDeviceID: testChunkedSource,
 		OpID:           "op-empty",
 		Agent:          &store.AgentRecord{ID: testChunkedAgentID, Name: "empty"},
+		CustomAPIKey:   &customKey,
 	}
 	begin, chunks, err := splitAgentSyncIntoChunks(payload, 1024)
 	if err != nil {
@@ -495,6 +548,9 @@ func TestSplitAgentSyncIntoChunks_EmptyPayload(t *testing.T) {
 	}
 	if begin == nil {
 		t.Fatalf("begin nil")
+	}
+	if begin.CustomAPIKey == nil || *begin.CustomAPIKey != customKey {
+		t.Fatalf("custom API key not carried in begin: %#v", begin.CustomAPIKey)
 	}
 	if len(chunks) != 0 {
 		t.Errorf("chunks len = %d want 0", len(chunks))

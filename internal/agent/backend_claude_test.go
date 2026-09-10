@@ -214,6 +214,19 @@ func TestClaudeStdinWriter_WriteAndClose(t *testing.T) {
 	}
 }
 
+type partialErrorWriteCloser struct{}
+
+func (partialErrorWriteCloser) Write(p []byte) (int, error) { return len(p) / 2, io.ErrUnexpectedEOF }
+func (partialErrorWriteCloser) Close() error                { return nil }
+
+func TestClaudeStdinWriter_PartialWriteIsDeliveryUncertain(t *testing.T) {
+	sw := &claudeStdinWriter{w: partialErrorWriteCloser{}}
+	err := sw.writeUserLine("possibly delivered")
+	if !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+}
+
 // TestClaudeTurnSteer_MarkOver verifies the fire-and-forget-window fix: on a
 // persistent session the stdin pipe stays open across turns, so the per-turn
 // steer gate — not claudeStdinWriter.closed — is what refuses a steer once the
@@ -1260,6 +1273,57 @@ func TestMergeStreamTexts(t *testing.T) {
 			got := mergeStreamTexts(r)
 			if got != tt.want {
 				t.Errorf("mergeStreamTexts() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFinalStreamText(t *testing.T) {
+	tests := []struct {
+		name          string
+		processFailed bool
+		fullText      string
+		lastAssistant string
+		assistantLast bool
+		want          string
+	}{
+		{
+			name:          "successful retry keeps both turns",
+			fullText:      "retry output",
+			lastAssistant: "original response",
+			want:          "original response\n\nretry output",
+		},
+		{
+			name:          "failed process keeps terminal assistant only",
+			processFailed: true,
+			fullText:      "partial response that streamed before failure",
+			lastAssistant: "Prompt is too long",
+			assistantLast: true,
+			want:          "Prompt is too long",
+		},
+		{
+			name:          "failed process preserves newer retry output",
+			processFailed: true,
+			fullText:      "retry output before process exit",
+			lastAssistant: "earlier complete assistant",
+			want:          "earlier complete assistant\n\nretry output before process exit",
+		},
+		{
+			name:          "failed process falls back to streamed text",
+			processFailed: true,
+			fullText:      "partial response",
+			want:          "partial response",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &streamParseResult{
+				fullText:                  tt.fullText,
+				lastAssistantText:         tt.lastAssistant,
+				lastAssistantIsLatestText: tt.assistantLast,
+			}
+			if got := finalStreamText(r, tt.processFailed); got != tt.want {
+				t.Fatalf("finalStreamText() = %q, want %q", got, tt.want)
 			}
 		})
 	}

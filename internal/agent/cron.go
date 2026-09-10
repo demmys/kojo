@@ -593,13 +593,5 @@ func (cs *cronScheduler) runCronJob(agentID string) {
 		return
 	}
 
-	// Drain events (we don't stream cron results anywhere, just persist them)
-	for range events {
-	}
-
-	if ctx.Err() == context.DeadlineExceeded {
-		cs.logger.Warn("cron job timed out", "agent", agentID, "timeout", timeout)
-	} else {
-		cs.logger.Info("cron job completed", "agent", agentID)
-	}
+	drainBackgroundChat(ctx, events, cs.logger, "cron job", agentID, timeout)
 }

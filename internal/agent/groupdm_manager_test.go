@@ -1665,6 +1665,149 @@ func TestGroupDMManager_Steer_NoActiveTurn(t *testing.T) {
 	}
 }
 
+func TestGroupDMManager_ContinueThreadUsesSystemTurnAndFreshSession(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger := newGroupMessage(UserSenderID, UserSenderName, "move now", nil)
+	future := newGroupMessage(UserSenderID, UserSenderName, "later turn", nil)
+	steer := newGroupMessage(UserSenderID, UserSenderName, "steer before arrival", nil)
+	for _, msg := range []*GroupMessage{trigger, future, steer} {
+		if err := appendGroupMessage(g.ID, msg, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gdm.latestMsgID[g.ID] = steer.ID
+	gdm.registerThreadQueued(g.ID, trigger.ID)
+	gdm.registerThreadQueued(g.ID, future.ID)
+	seen := make(chan OneShotOpts, 1)
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, message string, opts OneShotOpts) (<-chan ChatEvent, error) {
+		if agentID != "ag_alice" || !strings.Contains(message, "[system message]") || !strings.Contains(message, "arrived") {
+			t.Errorf("turn = agent %q message %q", agentID, message)
+		}
+		seen <- opts
+		ch := make(chan ChatEvent, 1)
+		ch <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "continued"}}
+		close(ch)
+		return ch, nil
+	})
+	reservation := &groupDMHandoffReservation{
+		manager: gdm, agentID: "ag_alice", groupID: g.ID, groupName: g.Name,
+		triggerMessageID: trigger.ID, reservation: gdm.threadTurns.Reserve(g.ID),
+	}
+	gdm.startThreadLive(g.ID, "", "")
+	if err := reservation.Activate(context.Background(), "arrived", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case opts := <-seen:
+		if opts.SessionKey != "groupdm:"+g.ID || !opts.ForceFreshSession {
+			t.Fatalf("opts = %#v", opts)
+		}
+		if len(opts.History) != 2 || opts.History[0].MessageID != trigger.ID || opts.History[1].MessageID != steer.ID {
+			t.Fatalf("arrival history = %+v, want trigger and steer but not later queued turn", opts.History)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("continuation turn did not start")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, msg := range msgs {
+			if msg.Content == "continued" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("thread messages = %#v", msgs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestGroupDMManager_HandoffArrivalSealsSourceSteers(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger := newGroupMessage(UserSenderID, UserSenderName, "move now", nil)
+	if err := appendGroupMessage(g.ID, trigger, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	gdm.latestMsgID[g.ID] = trigger.ID
+	gdm.startThreadLive(g.ID, "", "")
+
+	source := gdm.threadTurns.Reserve(g.ID)
+	arrival := gdm.threadTurns.Reserve(g.ID)
+	done := make(chan struct{})
+	gdm.SetOneShotForTesting(func(context.Context, string, string, OneShotOpts) (<-chan ChatEvent, error) {
+		ch := make(chan ChatEvent, 1)
+		ch <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "continued"}}
+		close(ch)
+		close(done)
+		return ch, nil
+	})
+	reservation := &groupDMHandoffReservation{
+		manager: gdm, agentID: "ag_alice", groupID: g.ID, groupName: g.Name,
+		triggerMessageID: trigger.ID, reservation: arrival,
+	}
+	if err := reservation.Activate(context.Background(), "arrived", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gdm.Steer(context.Background(), g.ID, "too late"); !errors.Is(err, ErrAgentNotBusy) {
+		t.Fatalf("err = %v, want ErrAgentNotBusy after arrival snapshot", err)
+	}
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range msgs {
+		if msg.Content == "too late" {
+			t.Fatal("sealed steer remained in transcript")
+		}
+	}
+	gdm.endThreadLive(g.ID)
+	source.Release()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("arrival did not run after source release")
+	}
+}
+
+func TestKeyedFIFOPairKeepsArrivalAheadOfNextTurn(t *testing.T) {
+	var q keyedFIFO
+	turn, arrival := q.ReservePair("thread")
+	next := q.Reserve("thread")
+	turn.Wait()
+	turn.Release()
+	arrival.Wait()
+
+	nextReady := make(chan struct{})
+	go func() {
+		next.Wait()
+		close(nextReady)
+	}()
+	select {
+	case <-nextReady:
+		t.Fatal("next human turn overtook the reserved arrival slot")
+	case <-time.After(20 * time.Millisecond):
+	}
+	arrival.Release()
+	select {
+	case <-nextReady:
+	case <-time.After(time.Second):
+		t.Fatal("next turn did not unblock after arrival release")
+	}
+	next.Release()
+}
+
 // TestGroupDMManager_Steer_InjectsWithoutNewTurn simulates a thread turn
 // already in flight (startThreadLive + a registered claude-style steer
 // handle in Manager.oneShotSteers) and asserts that Steer both (a) delivers
@@ -1756,6 +1899,75 @@ func TestGroupDMManager_Steer_UnsupportedBackend(t *testing.T) {
 
 	if _, err := gdm.Steer(context.Background(), g.ID, "steer text"); !errors.Is(err, ErrSteerUnsupported) {
 		t.Errorf("err = %v, want ErrSteerUnsupported", err)
+	}
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("failed steer remained in transcript: %+v", msgs)
+	}
+}
+
+func TestGroupDMManager_Steer_UncertainRemoteDeliveryRetainsMessage(t *testing.T) {
+	gdm, _ := setupGroupDMTest(t)
+	g, _, err := gdm.FindOrCreateDM([]string{"ag_alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gdm.SetOneShotSteerRouter(func(context.Context, string, string, string) error {
+		return fmt.Errorf("%w: connection reset", ErrSteerDeliveryUncertain)
+	})
+	gdm.startThreadLive(g.ID, "", "")
+	defer gdm.endThreadLive(g.ID)
+
+	if _, err := gdm.Steer(context.Background(), g.ID, "possibly delivered"); !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v, want ErrSteerDeliveryUncertain", err)
+	}
+	msgs, _, _, err := gdm.Messages(g.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "possibly delivered" {
+		t.Fatalf("uncertain steer message was not retained: %+v", msgs)
+	}
+}
+
+func TestManager_SteerOneShotFromOriginFencesHub(t *testing.T) {
+	_, mgr := setupGroupDMTest(t)
+	const sessionKey = "groupdm:g_fenced"
+	mgr.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	mgr.oneShotSessions = make(map[string]map[int64]string)
+	mgr.oneShotOrigins = make(map[string]map[int64]string)
+	mgr.oneShotHandoffCaps = make(map[string]map[int64]string)
+	mgr.oneShotArmed = make(map[string]map[int64]time.Time)
+	mgr.oneShotSteers = make(map[string]SteerFunc)
+	id := mgr.trackOneShot("ag_alice", func() {}, sessionKey, "hub-a", "")
+	defer mgr.untrackOneShot("ag_alice", id)
+	var got string
+	mgr.oneShotSteersMu.Lock()
+	mgr.oneShotSteers[sessionKey] = func(text string) error {
+		got = text
+		return nil
+	}
+	mgr.oneShotSteersMu.Unlock()
+	defer func() {
+		mgr.oneShotSteersMu.Lock()
+		delete(mgr.oneShotSteers, sessionKey)
+		mgr.oneShotSteersMu.Unlock()
+	}()
+
+	if err := mgr.SteerOneShotFromOrigin("ag_alice", sessionKey, "hub-b", "attack"); !errors.Is(err, ErrSteerOriginForbidden) {
+		t.Fatalf("wrong-origin err = %v, want ErrSteerOriginForbidden", err)
+	}
+	if got != "" {
+		t.Fatalf("wrong origin injected %q", got)
+	}
+	if err := mgr.SteerOneShotFromOrigin("ag_alice", sessionKey, "hub-a", "allowed"); err != nil {
+		t.Fatal(err)
+	}
+	if got != "allowed" {
+		t.Fatalf("steered text = %q", got)
 	}
 }
 

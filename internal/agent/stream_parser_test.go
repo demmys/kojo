@@ -162,6 +162,40 @@ func TestParseClaudeStream_AssistantFallback(t *testing.T) {
 	}
 }
 
+func TestParseClaudeStream_TracksTerminalAssistantAfterText(t *testing.T) {
+	_, result := collectEvents(t,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial response"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long"}]}}`,
+	)
+
+	if !result.lastAssistantIsLatestText {
+		t.Fatal("expected assistant event after text delta to be marked terminal")
+	}
+	if got := finalStreamText(result, true); got != "Prompt is too long" {
+		t.Fatalf("finalStreamText() = %q, want terminal assistant only", got)
+	}
+}
+
+func TestParseClaudeStream_NewerDeltaSupersedesTerminalAssistant(t *testing.T) {
+	_, result := collectEvents(t,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"first delta"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"complete assistant"}]}}`,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"newer retry delta"}}`,
+		`{"type":"result","subtype":"error_during_execution"}`,
+	)
+
+	if result.lastAssistantIsLatestText {
+		t.Fatal("newer text delta must supersede the complete assistant event")
+	}
+	if result.resultError == "" {
+		t.Fatal("error result subtype was not recorded")
+	}
+	want := "complete assistant\n\nfirst deltanewer retry delta"
+	if got := finalStreamText(result, result.resultError != ""); got != want {
+		t.Fatalf("finalStreamText() = %q, want %q", got, want)
+	}
+}
+
 // TestParseClaudeStream_FableUsage reproduces the fable-5 shape: the
 // top-level "assistant" event carries usage with stop_reason=null (so the
 // old StopReason guard dropped it), and the finalized output_tokens arrives

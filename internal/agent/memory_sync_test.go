@@ -28,6 +28,7 @@ func memorySyncTestEnv(t *testing.T, agentID string) *store.Store {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("APPDATA", tmp)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
 
 	st, err := store.Open(context.Background(), store.Options{ConfigDir: configdir.Path()})

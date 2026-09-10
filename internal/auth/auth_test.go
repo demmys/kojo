@@ -224,6 +224,8 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodDelete, "/api/v1/agents/ag_y/attention", ag, false},
 		{http.MethodGet, "/api/v1/agents/ag_x/attention", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/attention", guest, false},
+		// transfer warning acknowledgement is owner-only.
+		{http.MethodPost, "/api/v1/agents/ag_x/transfer-skips/dismiss", ag, false},
 		// privileged: cross-agent delete/reset
 		{http.MethodDelete, "/api/v1/agents/ag_y", priv, true},
 		{http.MethodPost, "/api/v1/agents/ag_y/reset", priv, true},
@@ -295,6 +297,14 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/begin", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/complete", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/handoff/abort", ag, false},
+		// Bare generation endpoints are Owner-only even though RolePeer may
+		// proxy holder-scoped /agents/{id} routes.
+		{http.MethodPost, "/api/v1/agents/generate-avatar",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/agents/generate-persona",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/messages",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		// §3.7 step 4 target-side pull endpoint. RolePeer is
 		// the production dispatcher (Hub signs as its own peer
 		// identity). RoleAgent / Guest must NOT reach it —
@@ -312,6 +322,11 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
 		{http.MethodGet, "/api/v1/peers/binary", ag, false},
 		{http.MethodGet, "/api/v1/peers/binary", guest, false},
+		// Remote attachment previews are fetched through the holder peer.
+		{http.MethodGet, "/api/v1/files/thumb",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/files/thumb",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
 		// §3.7 agent-sync surfaces. Same trust model: RolePeer
 		// only (handler enforces signer-equals-source + holder
 		// check). Agent / Guest principals MUST be denied —
@@ -322,6 +337,20 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		{http.MethodPost, "/api/v1/peers/agent-sync", ag, false},
 		{http.MethodPost, "/api/v1/peers/agent-sync", guest, false},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/begin",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/chunk",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/commit",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/abort",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodGet, "/api/v1/peers/agent-sync/chunked/begin",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/future",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/begin", ag, false},
+		{http.MethodPost, "/api/v1/peers/agent-sync/chunked/begin", guest, false},
 		{http.MethodPost, "/api/v1/peers/agent-sync/state",
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		{http.MethodPost, "/api/v1/peers/agent-sync/state", ag, false},
@@ -336,6 +365,14 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		{http.MethodPost, "/api/v1/peers/agent-sync/drop", ag, false},
 		{http.MethodPost, "/api/v1/peers/agent-sync/drop", guest, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
+		{http.MethodGet, "/api/v1/peers/handoff/arrival",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival", ag, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival", guest, false},
+		{http.MethodPost, "/api/v1/peers/handoff/arrival/bind",
+			Principal{Role: RolePeer, PeerID: "src-device-0"}, true},
 		// daemon self-restart — privileged agents only (Owner via the
 		// IsOwner short-circuit). Regular agents / guests / peers and
 		// GET (status endpoint) is likewise privileged-only.

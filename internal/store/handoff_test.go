@@ -307,6 +307,31 @@ func TestCompleteHandoffSelectedBlobs_NoBlobStillTransfersLock(t *testing.T) {
 	}
 }
 
+func TestCompleteHandoffSelectedBlobs_RejectsBlobOnlyMigration(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.InsertAgent(ctx, &AgentRecord{ID: "ag_x", Name: "x"}, AgentInsertOptions{}); err != nil {
+		t.Fatalf("seed agent: %v", err)
+	}
+	uri := "kojo://global/agents/ag_x/avatar.png"
+	seedHandoffBlob(t, s, uri, "peer-src", "aaa")
+	if err := s.SetBlobRefHandoffPending(ctx, uri, true); err != nil {
+		t.Fatalf("mark pending: %v", err)
+	}
+
+	_, err := s.CompleteHandoffSelectedBlobs(ctx, "ag_x", "peer-tgt", []string{uri}, 60_000)
+	if !errors.Is(err, ErrFencingMismatch) {
+		t.Fatalf("CompleteHandoffSelectedBlobs without lock: want ErrFencingMismatch, got %v", err)
+	}
+	got, err := s.GetBlobRef(ctx, uri)
+	if err != nil {
+		t.Fatalf("GetBlobRef: %v", err)
+	}
+	if got.HomePeer != "peer-src" || !got.HandoffPending {
+		t.Fatalf("blob changed despite missing lock: home=%q pending=%v", got.HomePeer, got.HandoffPending)
+	}
+}
+
 // TestCompleteHandoff_RejectsRacedLockMovement pins the
 // optimistic-concurrency invariant: a concurrent TransferAgentLock
 // that lands between our scan and our UPDATE must trigger

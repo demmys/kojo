@@ -38,6 +38,15 @@ export const MAX_SCHEDULE_MINUTES = 7 * 24 * 60;
 // "sched.resumeDefault" i18n label; the editor keeps 0 = server default.)
 export const DEFAULT_TIMEOUT_MINUTES = 10;
 
+export type AvatarProvider = "gemini" | "openai";
+
+export interface GeneratedAvatar {
+  avatarPath: string;
+  provider?: AvatarProvider;
+  fallback?: boolean;
+  warning?: string;
+}
+
 // TransferSkip is one session file the §3.7 device-switch transfer
 // left behind (see AgentInfo.lastTransferSkips).
 export interface TransferSkip {
@@ -132,6 +141,9 @@ export interface AgentInfo {
   // agent settings by the sync handler; cleared on a clean transfer.
   // The dashboard shows a "skipped during transfer" notice from it.
   lastTransferSkips?: TransferSkip[];
+  // Compare-and-set token for the visible skip warning. Dismiss calls must
+  // echo this so an old dashboard cannot hide a newer transfer's warning.
+  lastTransferSkipsGeneration?: string;
   // isSwitching is true while a §3.7 device-switch is mid-flight on
   // this peer (between SetSwitching(true) and (false)). Surfaced by
   // the server so the UI can disable mutating controls (credentials
@@ -268,6 +280,7 @@ export interface AgentConfig {
   effort?: string;
   tool?: string;
   customBaseURL?: string;
+  customApiKey?: string;
   thinkingMode?: string;
   workDir?: string;
   cronExpr?: string;
@@ -295,6 +308,7 @@ export interface AgentMessageAttachment {
   name: string;
   size: number;
   mime: string;
+  peerId?: string;
 }
 
 export interface AgentMessage {
@@ -364,6 +378,8 @@ export interface UserQuestionOption {
 
 // UserQuestion is one question in an AskUserQuestion control_request.
 export interface UserQuestion {
+  isOther?: boolean;
+  id?: string;
   question: string;
   header?: string;
   options?: UserQuestionOption[];
@@ -388,7 +404,7 @@ export interface RateLimitSnapshot extends RateLimitInfo {
 }
 
 export interface ChatEvent {
-  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question" | "rate_limit";
+  type: "status" | "text" | "thinking" | "tool_use" | "tool_result" | "done" | "error" | "message" | "attachment" | "user_question" | "question_resolved" | "rate_limit";
   status?: string;
   delta?: string;
   toolUseId?: string;
@@ -402,6 +418,7 @@ export interface ChatEvent {
   // answer endpoint, and the raw AskUserQuestion questions payload.
   requestId?: string;
   questions?: UserQuestion[];
+  questionBlocking?: boolean;
   // Set on "rate_limit" events: the latest usage-window telemetry.
   rateLimit?: RateLimitInfo;
   startedAt?: string; // RFC3339 timestamp of when processing started
@@ -605,6 +622,15 @@ export const agentApi = {
   },
 
   delete: (id: string) => del<{ ok: boolean }>(`/api/v1/agents/${id}`),
+
+  customApiKey: {
+    get: (id: string) =>
+      get<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`),
+    set: (id: string, baseURL: string, apiKey: string) =>
+      put<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`, { baseURL, apiKey }),
+    delete: (id: string) =>
+      del<{ configured: boolean }>(`/api/v1/agents/${id}/custom-api-key`),
+  },
 
   // archive: keeps all on-disk data but stops runtime activity. Reversible
   // via unarchive. Hidden from the main list; surfaced in global Settings.
@@ -837,6 +863,15 @@ export const agentApi = {
       `/api/v1/agents/${agentId}/attention`,
     ),
 
+  // Dismisses the latest transfer-loss notice. A later transfer that skips
+  // files writes a fresh notice, so this is an acknowledgement rather than a
+  // permanent suppression preference.
+  dismissTransferSkips: (agentId: string, generation: string) =>
+    post<{ dismissed: boolean }>(
+      `/api/v1/agents/${agentId}/transfer-skips/dismiss?generation=${encodeURIComponent(generation)}`,
+      {},
+    ),
+
   getQueuedMessages: (agentId: string) =>
     get<{ messages: QueuedAgentMessage[] }>(
       `/api/v1/agents/${agentId}/queued-messages`,
@@ -926,16 +961,28 @@ export const agentApi = {
   generateName: (persona: string, prompt?: string) =>
     post<{ name: string }>("/api/v1/agents/generate-name", { persona, prompt }),
 
-  generateAvatar: (persona: string, name: string, prompt?: string, previousPath?: string) =>
-    post<{ avatarPath: string }>("/api/v1/agents/generate-avatar", {
+  generateAvatar: (
+    persona: string,
+    name: string,
+    prompt?: string,
+    previousPath?: string,
+    provider?: AvatarProvider,
+    allowFallback = true,
+  ) =>
+    post<GeneratedAvatar>("/api/v1/agents/generate-avatar", {
       persona,
       name,
       prompt,
       previousPath,
+      provider,
+      allowFallback,
     }),
 
   previewAvatarUrl: (path: string) =>
     appendTokenQuery(`/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`),
+
+  discardAvatarPreview: (path: string) =>
+    del<void>(`/api/v1/agents/preview-avatar?path=${encodeURIComponent(path)}`),
 
   credentials: {
     list: (agentId: string) =>

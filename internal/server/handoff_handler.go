@@ -236,6 +236,17 @@ func (s *Server) runHandoffOp(ctx context.Context, agentID, op, targetPeerID str
 			"bad_request", fmt.Sprintf("unknown handoff op %q", op))
 	}
 
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: agentID})
+	defer unlock()
+	if expected, ok := ctx.Value(sourceHandoffVersionKey{}).(store.AgentLockVersion); ok {
+		current, err := s.agents.Store().GetAgentLockVersion(ctx, agentID)
+		if err != nil {
+			return nil, err
+		}
+		if current != expected {
+			return nil, newHandoffOpError(http.StatusConflict, "lock_transfer_failed", "source ownership changed during handoff")
+		}
+	}
 	// For begin/complete we need to know the target peer exists
 	// in peer_registry. Refuse a handoff to a peer the cluster
 	// has never seen.

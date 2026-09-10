@@ -21,32 +21,27 @@ import (
 // ChatManager is the interface the bot uses to interact with agents.
 // agent.Manager satisfies this interface directly — no adapter needed.
 type ChatManager interface {
-	Chat(ctx context.Context, agentID, message, role string, attachments []agent.MessageAttachment, source ...agent.BusySource) (<-chan agent.ChatEvent, error)
 	ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error)
-	// CanResumeSession reports whether the next ChatOneShot for this
-	// (agentID, sessionKey) pair is likely to resume an existing
-	// backend session. True when the backend honors SessionKey AND
-	// the on-disk session artifact exists AND is non-empty. The
-	// Slack bot uses this to choose between two injection modes:
-	//   - false (backend runs OneShot, or the session file was removed
-	//     or empty) → inject the full thread via FormatForInjection so
-	//     the model has every prior message.
-	//   - true AND we have already replied in this conversation →
-	//     inject only a head+tail safety net via
-	//     FormatForInjectionHeadTail. The backend's resumed transcript
-	//     already carries the bulk of the conversation; the safety net
-	//     covers the mid-thread session-reset edge case documented at
-	//     Manager.CanResumeSession (sessionResetThresholdTokens) and
-	//     the user-message delta gap between the last bot reply and
-	//     this turn.
-	//   - true but no prior bot reply (first turn of a resumable
-	//     session) → still use full FormatForInjection so the seeded
-	//     session gets the complete Slack context.
-	CanResumeSession(agentID, sessionKey string) bool
+}
+
+// oneShotSteerer is implemented by the peer-aware external chat router. Keep
+// it separate from ChatManager so lightweight/custom transports that only
+// support ordinary turns continue to degrade to FIFO follow-up messages.
+type oneShotSteerer interface {
+	SteerOneShot(ctx context.Context, agentID, sessionKey, content string) error
+}
+
+// Slack steering retains the authenticated sender, just like ordinary turns.
+type oneShotUserSteerer interface {
+	SteerOneShotAsUser(ctx context.Context, agentID, sessionKey, content, userID string) error
 }
 
 // Bot manages a single Slack Socket Mode connection for one agent.
 type Bot struct {
+	questionsMu sync.Mutex
+	questions   map[string]*slackQuestion
+	questionOps int
+
 	agentID      string
 	agentDataDir string // agent data directory for history file storage
 	config       agent.SlackBotConfig
@@ -67,6 +62,17 @@ type Bot struct {
 	threadLocksMu sync.Mutex
 	threadLocks   map[string]*threadLock // key: "channel:threadTS"
 
+	// activeTurns tracks admitted ChatOneShot turns per Slack conversation in
+	// FIFO order. Registering before a first turn's goroutine starts closes the
+	// small window where an immediate !stop could see no work.
+	activeTurnsMu sync.Mutex
+	activeTurns   map[string][]*activeTurn // key: "channel:threadTS"
+	// stoppingTurns keeps a user stop transaction attached to its original
+	// turn through terminal Slack delivery. The active turn is intentionally
+	// unregistered before finalization; without this side registry, a repeated
+	// !stop in that gap could cancel the next queued FIFO turn.
+	stoppingTurns map[string]*activeTurn // key: "channel:threadTS"
+
 	// userCache caches Slack user ID → display name for the Bot's lifetime.
 	// Display names rarely change; the cache is cleared on Bot restart.
 	userCacheMu sync.RWMutex
@@ -75,15 +81,14 @@ type Bot struct {
 	// sem limits the number of concurrent sendToAgent goroutines.
 	sem chan struct{}
 
-	// rateLimitSleep, when non-nil, replaces time.After in postMessage /
-	// appendStream's rate-limit backoff wait. Tests use this to count
+	// rateLimitSleep, when non-nil, replaces time.After in Slack API
+	// rate-limit backoff waits. Tests use this to count
 	// sleeps and run the retry loop without real wall-clock delays. nil
 	// in production.
 	rateLimitSleep func(time.Duration) <-chan time.Time
 
 	// runAsync, when non-nil, replaces the bare `go fn()` used by
-	// sendToAgent for fire-and-forget background work (currently:
-	// dead-stream cleanup after the thread mutex is released). Tests
+	// sendToAgent for fire-and-forget dead-stream cleanup. Tests
 	// use this to run the work synchronously so they can observe the
 	// resulting Slack API calls. nil in production, where the default
 	// `go fn()` semantics are used.
@@ -93,6 +98,9 @@ type Bot struct {
 	// circuit breaker. Tests advance it without sleeping. nil in
 	// production.
 	streamNow func() time.Time
+
+	// steerTimeout, when non-zero, replaces steerAttemptTimeout in tests.
+	steerTimeout time.Duration
 }
 
 const (
@@ -110,6 +118,14 @@ const (
 	// typingStatus is the assistant status text shown while processing a message.
 	typingStatus = "Thinking…"
 
+	// noReplyToken is an assistant control response consumed by the Slack
+	// transport. It must be the entire final response (surrounding whitespace is
+	// ignored); otherwise it is delivered as ordinary text. A visible non-empty
+	// token is intentional: backends such as Codex treat an empty successful
+	// completion as a recoverable failure and automatically ask the model to
+	// produce a real answer.
+	noReplyToken = agent.SlackNoReplyToken
+
 	// finalizeShortTimeout caps the single-call finalize ops
 	// (StopStream, chat.update, clearAssistantStatus) that share finCtx.
 	// chunks[1:] posting and the delivery-failure notice each get their
@@ -119,13 +135,23 @@ const (
 	// chunkPostTimeoutBase/PerChunk/Max bound the timeout budget used when
 	// posting chunks[1:] (and any postMessage fallback for chunks[0]).
 	// postMessage's rate-limit retry alone can spend 1+2+3=6 s on a single
-	// 429, so a finalize block that fires 5 chunks could need 30 s+ before
-	// any one of them gives up. We give a per-chunk allowance covering that
-	// worst case + HTTP RTT, capped at chunkPostTimeoutMax so a runaway
-	// reply (hundreds of chunks) does not hold the goroutine for minutes.
+	// 429. If markdown_text is rejected, the legacy fallback can spend that
+	// chain a second time. Allow for both attempts plus HTTP RTT.
 	chunkPostTimeoutBase     = 10 * time.Second
-	chunkPostTimeoutPerChunk = 7 * time.Second
+	chunkPostTimeoutPerChunk = 14 * time.Second
 	chunkPostTimeoutMax      = 90 * time.Second
+
+	// A remote steer normally finishes within the Codex 25s readiness/ack
+	// bounds. Cap the whole transport attempt so a broken peer cannot pin
+	// terminal sealing and every later same-thread admission indefinitely.
+	steerAttemptTimeout = 35 * time.Second
+	// User display-name lookups happen before an accepted Slack event enters
+	// steer/FIFO processing. Bound the entire set of lookups for one event so a
+	// stalled users.info call cannot pin an active-turn admission indefinitely.
+	userLookupTimeout = 5 * time.Second
+	// Socket Mode must remain responsive while steer RPCs run asynchronously,
+	// but an unbounded message burst must not create unbounded waiter goroutines.
+	maxPendingSteerAdmissions = 32
 
 	// deliveryFailureNotice is the user-visible message posted when one or
 	// more chunks of a multi-chunk reply could not be delivered. The text
@@ -178,6 +204,116 @@ func trimStreamDeathsOutsideWindow(deaths []time.Time, now time.Time) []time.Tim
 	return recent
 }
 
+// isNoReplyResponse reports whether text is the exact Slack no-reply control
+// response. Exact matching prevents ordinary discussion of the token from
+// suppressing a reply.
+func isNoReplyResponse(text string) bool {
+	return strings.TrimSpace(text) == noReplyToken
+}
+
+// couldBeNoReplyResponse is used while text is still streaming. Holding a
+// possible token prefix avoids briefly creating a Slack message containing the
+// control token. As soon as the text diverges, the buffered prefix is flushed
+// normally. An exact token remains a candidate because a later delta may still
+// turn it into ordinary prose.
+func couldBeNoReplyResponse(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(noReplyToken, trimmed)
+}
+
+// discardSuppressedStreams removes every Slack message artifact created before
+// the assistant chose no-reply. Each external call gets a fresh timeout: a slow
+// StopStream must not consume the DeleteMessage budget, and one stale dead
+// stream must not prevent later artifacts from being removed. The work is
+// intentionally synchronous so sendToAgent cannot release the per-thread lock
+// while a supposedly suppressed message is still visible.
+func (b *Bot) discardSuppressedStreams(channel, liveStream string, deadStreams []string) {
+	if liveStream != "" {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+		if _, _, err := b.api.StopStreamContext(stopCtx, channel, liveStream); err != nil {
+			b.logger.Debug("failed to stop suppressed slack stream",
+				"channel", channel, "streamTS", liveStream, "err", err)
+		}
+		stopCancel()
+	}
+
+	streams := make([]string, 0, len(deadStreams)+1)
+	streams = append(streams, deadStreams...)
+	if liveStream != "" {
+		streams = append(streams, liveStream)
+	}
+	seen := make(map[string]struct{}, len(streams))
+	for _, ts := range streams {
+		if ts == "" {
+			continue
+		}
+		if _, duplicate := seen[ts]; duplicate {
+			continue
+		}
+		seen[ts] = struct{}{}
+
+		if err := b.deleteMessageWithRateLimit(channel, ts); err != nil {
+			b.logger.Warn("failed to delete suppressed slack stream",
+				"channel", channel, "streamTS", ts, "err", err)
+		}
+	}
+}
+
+// deleteMessageWithRateLimit deletes one Slack message with the same bounded
+// Retry-After-aware backoff used by the delivery paths. It owns a fresh timeout
+// because suppression cleanup runs after the request context may have expired.
+func (b *Bot) deleteMessageWithRateLimit(channel, ts string) error {
+	deleteCtx, deleteCancel := context.WithTimeout(context.Background(), chunkPostTimeoutBase)
+	defer deleteCancel()
+
+	outcome, err := b.withRateLimitRetry(deleteCtx, func() error {
+		_, _, deleteErr := b.api.DeleteMessageContext(deleteCtx, channel, ts)
+		return deleteErr
+	}, func(delay time.Duration) {
+		b.logger.Debug("slack rate limited suppressed stream deletion; retrying",
+			"channel", channel, "streamTS", ts, "delay", delay)
+	})
+	if outcome == rlSuccess {
+		return nil
+	}
+	return err
+}
+
+// ensureUserTurnInHistory persists a Slack message that must be visible before
+// the normal bot-response history append. This covers no-reply turns and
+// accepted steers; Slack history may fail transiently or remain eventually
+// consistent while a same-turn handoff snapshot is already being captured.
+func (b *Bot) ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID string) {
+	if b.agentDataDir == "" || threadTS == "" || messageTS == "" {
+		return
+	}
+	path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
+	history, err := chathistory.LoadHistory(path)
+	if err != nil {
+		b.logger.Warn("failed to load slack history before local user append", "path", path, "err", err)
+		return
+	}
+	for _, msg := range history {
+		if msg.MessageID == messageTS {
+			return
+		}
+	}
+	userMsg := chathistory.HistoryMessage{
+		Platform:  platformSlack,
+		ChannelID: channel,
+		ThreadID:  threadTS,
+		MessageID: messageTS,
+		UserID:    userID,
+		UserName:  displayName,
+		Text:      text,
+		Timestamp: time.Now().Format(time.RFC3339),
+		IsBot:     false,
+	}
+	if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
+		b.logger.Warn("failed to save Slack user message locally", "path", path, "err", err)
+	}
+}
+
 // NewBot creates a new Bot instance. Call Run() to start it.
 // agentDataDir is the agent's data directory used for storing conversation history files.
 // parentCtx controls the Bot's lifetime: cancelling it will stop the event loop.
@@ -188,20 +324,22 @@ func NewBot(parentCtx context.Context, agentID string, agentDataDir string, cfg 
 
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &Bot{
-		agentID:      agentID,
-		agentDataDir: agentDataDir,
-		config:       cfg,
-		api:          api,
-		sm:           sm,
-		mgr:          mgr,
-		logger:       logger.With("component", "slackbot", "agent", agentID),
-		botToken:     botToken,
-		ctx:          ctx,
-		cancel:       cancel,
-		done:         make(chan struct{}),
-		threadLocks:  make(map[string]*threadLock),
-		userCache:    make(map[string]string),
-		sem:          make(chan struct{}, maxConcurrentChats),
+		agentID:       agentID,
+		agentDataDir:  agentDataDir,
+		config:        cfg,
+		api:           api,
+		sm:            sm,
+		mgr:           mgr,
+		logger:        logger.With("component", "slackbot", "agent", agentID),
+		botToken:      botToken,
+		ctx:           ctx,
+		cancel:        cancel,
+		done:          make(chan struct{}),
+		threadLocks:   make(map[string]*threadLock),
+		activeTurns:   make(map[string][]*activeTurn),
+		stoppingTurns: make(map[string]*activeTurn),
+		userCache:     make(map[string]string),
+		sem:           make(chan struct{}, maxConcurrentChats),
 	}
 }
 
@@ -263,6 +401,16 @@ func TestConnection(ctx context.Context, appToken, botToken string) (team, botUs
 
 func (b *Bot) handleEvent(ctx context.Context, evt socketmode.Event) {
 	switch evt.Type {
+	case socketmode.EventTypeInteractive:
+		cb, ok := evt.Data.(slack.InteractionCallback)
+		if !ok || evt.Request == nil {
+			return
+		}
+		payload, work := b.prepareQuestionInteraction(cb)
+		b.sm.Ack(*evt.Request, payload)
+		if work != nil {
+			go work()
+		}
 	case socketmode.EventTypeEventsAPI:
 		evtAPI, ok := evt.Data.(slackevents.EventsAPIEvent)
 		if !ok {
@@ -312,29 +460,83 @@ func (b *Bot) handleMessageEvent(ctx context.Context, ev *slackevents.MessageEve
 		return
 	}
 
-	// Extract files from the message (populated by UnmarshalJSON into ev.Message).
-	text := ev.Text
-	if ev.Message != nil && len(ev.Message.Files) > 0 {
-		b.logger.Debug("slack files attached", "count", len(ev.Message.Files))
-		downloaded, errs := b.downloadSlackFiles(ctx, ev.Message.Files)
-		text = appendFileInfo(text, downloaded, errs)
-	}
-
-	// Direct messages
+	// Stop commands bypass attachment downloads, the per-thread FIFO, and the
+	// global chat semaphore. They still honor the configured surface gate and,
+	// in channels, may only stop a turn started by the same Slack user.
+	// Otherwise the command could sit behind the exact turn it needs to
+	// interrupt, while an unrelated channel member could cancel someone else's
+	// work.
 	if ev.ChannelType == "im" {
 		if !b.config.ReactDM() {
 			return
 		}
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+		if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text) {
+			return
+		}
+	} else if b.config.ReactThread() && ev.ThreadTimeStamp != "" &&
+		b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, ev.Text) {
 		return
 	}
 
-	// Channel thread replies: respond without mention if this is a thread
-	// we've previously participated in (history exists), the last message
-	// in history was from us, and the new message doesn't mention someone else.
-	if b.config.ReactThread() && ev.ThreadTimeStamp != "" && b.shouldAutoReply(ev.Channel, ev.ThreadTimeStamp, ev.Text) {
-		b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+	accepted := ev.ChannelType == "im"
+	if !accepted {
+		// Decide acceptance before attachment download. A live turn may finish
+		// while that bounded-but-slow I/O runs; the message was nevertheless
+		// received as part of this conversation and must not disappear merely
+		// because neither active state nor final bot history is visible later.
+		activeThreadReply := b.hasActiveTurn(ev.Channel, ev.ThreadTimeStamp) && !b.mentionsOtherUser(ev.Text)
+		accepted = b.config.ReactThread() && ev.ThreadTimeStamp != "" &&
+			(activeThreadReply || b.shouldAutoReply(ev.Channel, ev.ThreadTimeStamp, ev.Text))
 	}
+	if !accepted {
+		return
+	}
+
+	replyTS := ev.ThreadTimeStamp
+	if replyTS == "" && b.config.ThreadReplies {
+		replyTS = ev.TimeStamp
+	}
+	active, admission, full := b.reserveActiveAdmission(ev.Channel, replyTS)
+	if full {
+		b.postAdmissionOverflowNotice(active, ev.Channel, replyTS)
+		return
+	}
+
+	channel, threadTS, messageTS, userID := ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User
+	text := ev.Text
+	files := []slack.File(nil)
+	if ev.Message != nil {
+		files = append(files, ev.Message.Files...)
+	}
+	process := func() {
+		var attachments []agent.MessageAttachment
+		if len(files) > 0 {
+			b.logger.Debug("slack files attached", "count", len(files))
+			downloadCtx, stopDownload := contextUntilTurnStop(ctx, active)
+			downloaded, errs := b.downloadSlackFiles(downloadCtx, files)
+			stopDownload()
+			attachments = downloadedAttachments(downloaded)
+			text = appendDownloadedFileNames(text, downloaded)
+			text = appendFileErrors(text, errs)
+		}
+		b.processIncomingWithReservedAdmission(ctx, channel, threadTS, messageTS, text, userID,
+			attachments, len(files) == 0, active, admission)
+	}
+	if len(files) > 0 && admission != nil {
+		go process()
+	} else {
+		process()
+	}
+}
+
+func (b *Bot) mentionsOtherUser(rawText string) bool {
+	mentions := reUserMention.FindAllStringSubmatch(rawText, -1)
+	for _, mention := range mentions {
+		if len(mention) > 1 && mention[1] != b.botUserID {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldAutoReply checks whether the bot should respond to a thread message
@@ -360,11 +562,8 @@ func (b *Bot) shouldAutoReply(channelID, threadTS, rawText string) bool {
 	}
 
 	// 3. Message must not mention another user (bot's own mention is OK)
-	mentions := reUserMention.FindAllStringSubmatch(rawText, -1)
-	for _, m := range mentions {
-		if len(m) > 1 && m[1] != b.botUserID {
-			return false // mentions someone other than the bot
-		}
+	if b.mentionsOtherUser(rawText) {
+		return false
 	}
 
 	return true
@@ -380,27 +579,205 @@ func (b *Bot) handleAppMentionEvent(ctx context.Context, ev *slackevents.AppMent
 	}
 	// Strip the bot mention from the message
 	text := StripBotMention(ev.Text, b.botUserID)
+	if b.handleSlackCommand(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User, text) {
+		return
+	}
+	replyTS := ev.ThreadTimeStamp
+	if replyTS == "" && b.config.ThreadReplies {
+		replyTS = ev.TimeStamp
+	}
+	active, admission, full := b.reserveActiveAdmission(ev.Channel, replyTS)
+	if full {
+		b.postAdmissionOverflowNotice(active, ev.Channel, replyTS)
+		return
+	}
+	channel, threadTS, messageTS, userID := ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, ev.User
+	files := append([]slack.File(nil), ev.Files...)
+	process := func() {
+		var attachments []agent.MessageAttachment
+		if len(files) > 0 {
+			b.logger.Debug("slack files attached to mention", "count", len(files))
+			downloadCtx, stopDownload := contextUntilTurnStop(ctx, active)
+			downloaded, errs := b.downloadSlackFiles(downloadCtx, files)
+			stopDownload()
+			attachments = downloadedAttachments(downloaded)
+			text = appendDownloadedFileNames(text, downloaded)
+			text = appendFileErrors(text, errs)
+		}
+		b.processIncomingWithReservedAdmission(ctx, channel, threadTS, messageTS, text, userID,
+			attachments, len(files) == 0, active, admission)
+	}
+	if len(files) > 0 && admission != nil {
+		go process()
+	} else {
+		process()
+	}
+}
 
-	// Download attached files (same as DM handling in handleMessageEvent)
-	if len(ev.Files) > 0 {
-		b.logger.Debug("slack files attached to mention", "count", len(ev.Files))
-		downloaded, errs := b.downloadSlackFiles(ctx, ev.Files)
-		text = appendFileInfo(text, downloaded, errs)
+// contextUntilTurnStop links slow attachment I/O to the active Slack turn.
+// A stop command must be able to seal the turn without waiting for the full
+// per-file download timeout. The message remains admitted and is converted to
+// an ordinary FIFO turn with the download error, so cancellation does not lose
+// the already accepted Slack event.
+func contextUntilTurnStop(parent context.Context, active *activeTurn) (context.Context, func()) {
+	if active == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-active.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+		close(done)
+	}()
+	return ctx, func() {
+		cancel()
+		<-done
+	}
+}
+
+const (
+	stopCommandAck         = "_Stopping current turn…_"
+	stopCommandNoActive    = "_No active turn in this thread. A saved goal may still exist: use !goal status to check, or !goal pause to keep it paused._"
+	stopCommandNotOwner    = "_Only the person who started the current turn can stop it._"
+	stopCommandDone        = "_Stopped current turn._"
+	steerDeliveryUncertain = "_I couldn't confirm whether that interruption was delivered, so I didn't retry it to avoid sending it twice._"
+)
+
+func isStopCommand(text string) bool {
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "!stop", "!cancel":
+		return true
+	default:
+		return false
+	}
+}
+
+// Command notices are posted synchronously from the Socket Mode event loop,
+// so a hung Slack API call must not stall every later event (including the
+// next !stop). Bound each notice by the single-chunk delivery budget.
+func (b *Bot) postCommandNotice(ctx context.Context, channel, threadTS, text string) bool {
+	noticeCtx, cancel := context.WithTimeout(ctx, chunkPostTimeout(1))
+	defer cancel()
+	return b.postMessage(noticeCtx, channel, threadTS, text)
+}
+
+func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, userID, text string) bool {
+	q, qerr := agent.ParseGoalCommand(SlackToPlain(text, nil))
+	if qerr != nil {
+		b.postCommandNotice(ctx, channel, threadTS, qerr.Error())
+		return true
+	}
+	if q != nil && messageTS != "" {
+		q.OperationID = "slack:" + channel + ":" + messageTS
+	}
+	if q != nil && q.Action != "start" && q.Action != "resume" {
+		replyTS := threadTS
+		if replyTS == "" && b.config.ThreadReplies {
+			replyTS = messageTS
+		}
+		go func() {
+			opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			events, err := b.mgr.ChatOneShot(opCtx, b.agentID, "", agent.OneShotOpts{SessionKey: slackSessionKey(b.agentID, channel, replyTS), Goal: q, GoalUserID: userID})
+			if err != nil {
+				b.postChatError(channel, replyTS, err.Error())
+				return
+			}
+			for ev := range events {
+				if ev.ErrorMessage != "" {
+					b.postChatError(channel, replyTS, ev.ErrorMessage)
+				} else if ev.Type == "done" && ev.Message != nil {
+					b.postCommandNotice(ctx, channel, replyTS, ev.Message.Content)
+				}
+			}
+		}()
+		return true
 	}
 
-	b.processIncoming(ctx, ev.Channel, ev.ThreadTimeStamp, ev.TimeStamp, text, ev.User)
+	// Avoid resolving user mentions just to reject an ordinary message. App
+	// mentions have already had the bot mention stripped by their handler.
+	if !isStopCommand(SlackToPlain(text, nil)) {
+		return false
+	}
+
+	replyTS := threadTS
+	if replyTS == "" && b.config.ThreadReplies {
+		replyTS = messageTS
+	}
+	active, started, denied := b.cancelActiveTurnForCommand(channel, replyTS, userID)
+	if active != nil && started {
+		// Cancellation is immediate, but its terminal path must not publish the
+		// completion notice before this acknowledgement has finished posting.
+		// Always release the barrier, even when Slack rejects the ack, so final
+		// delivery cannot remain blocked indefinitely.
+		func() {
+			defer active.completeStopAck()
+			ackCtx, ackCancel := context.WithTimeout(ctx, chunkPostTimeout(1))
+			defer ackCancel()
+			b.postMessage(ackCtx, channel, replyTS, stopCommandAck)
+		}()
+	} else if denied {
+		b.postCommandNotice(ctx, channel, replyTS, stopCommandNotOwner)
+	} else if active == nil {
+		if stopper, ok := b.mgr.(interface {
+			StopIdleGoal(context.Context, string, string, string) (bool, error)
+		}); ok {
+			stopCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			handled, err := stopper.StopIdleGoal(stopCtx, b.agentID, b.agentID+":slack:"+channel+":"+replyTS, userID)
+			cancel()
+			if handled {
+				if err != nil {
+					b.postCommandNotice(ctx, channel, replyTS, "Goal handoff stop: "+err.Error())
+				} else {
+					b.postCommandNotice(ctx, channel, replyTS, "Goal handoff cancelled. Automatic resume is fenced.")
+				}
+				return true
+			}
+		}
+		b.postCommandNotice(ctx, channel, replyTS, stopCommandNoActive)
+	}
+	// A duplicate command against the same already-stopping FIFO head is
+	// coalesced. Its first command owns the sole acknowledgement and barrier.
+	return true
 }
 
 func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS, text, userID string) {
-	if strings.TrimSpace(text) == "" {
+	b.processIncomingWithAttachments(ctx, channel, threadTS, messageTS, text, userID, nil)
+}
+
+func (b *Bot) processIncomingWithAttachments(ctx context.Context, channel, threadTS, messageTS, text, userID string, attachments []agent.MessageAttachment) {
+	b.processIncomingWithAttachmentsMode(ctx, channel, threadTS, messageTS, text, userID, attachments, true)
+}
+
+func (b *Bot) processIncomingWithAttachmentsMode(ctx context.Context, channel, threadTS, messageTS, text, userID string, attachments []agent.MessageAttachment, allowSteer bool) {
+	b.processIncomingWithReservedAdmission(ctx, channel, threadTS, messageTS, text, userID, attachments, allowSteer, nil, nil)
+}
+
+func (b *Bot) processIncomingWithReservedAdmission(ctx context.Context, channel, threadTS, messageTS, text, userID string, attachments []agent.MessageAttachment, allowSteer bool, reservedActive *activeTurn, reservedAdmission *activeSteerReservation) {
+	if strings.TrimSpace(text) == "" && len(attachments) == 0 {
+		if reservedAdmission != nil {
+			reservedAdmission.Release()
+		}
 		return
 	}
 
-	// Convert Slack formatting to plain text, resolving user mentions to display names
-	text = SlackToPlain(text, b.resolveUserName)
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, userLookupTimeout)
+	lookupCtx, stopLookup := contextUntilTurnStop(lookupCtx, reservedActive)
+	defer func() {
+		stopLookup()
+		cancelLookup()
+	}()
+	resolveUser := func(id string) string { return b.resolveUserNameContext(lookupCtx, id) }
+
+	// Convert Slack formatting to plain text, resolving user mentions to display names.
+	text = SlackToPlain(text, resolveUser)
 
 	// Resolve user display name
-	displayName := b.resolveUserName(userID)
+	displayName := resolveUser(userID)
 
 	// Determine reply thread: use existing thread or start new one
 	replyTS := threadTS
@@ -408,16 +785,170 @@ func (b *Bot) processIncoming(ctx context.Context, channel, threadTS, messageTS,
 		replyTS = messageTS // reply in a thread starting from this message
 	}
 
+	// Match the WebUI composer: plain text sent into the same conversation
+	// while a reply is live is injected into that backend turn. Reserve the
+	// attempt synchronously (the Socket Mode loop observes messages in order),
+	// then do the potentially slow peer/backend RPC asynchronously so later
+	// Slack envelopes can still be acknowledged. Attachments cannot be carried
+	// by backend steer APIs and therefore remain ordinary FIFO follow-ups.
+	if reservedAdmission != nil {
+		go b.admitIncoming(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID, attachments,
+			allowSteer && len(attachments) == 0, reservedActive, reservedAdmission)
+		return
+	}
+	active, admission, full := b.reserveActiveAdmission(channel, replyTS)
+	if full {
+		b.postAdmissionOverflowNotice(active, channel, replyTS)
+		return
+	}
+	if active != nil {
+		go b.admitIncoming(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID, attachments,
+			allowSteer && len(attachments) == 0, active, admission)
+		return
+	}
+
+	b.enqueueIncomingTurn(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID, attachments)
+}
+
+func (b *Bot) enqueueIncomingTurn(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment) {
+
 	select {
 	case b.sem <- struct{}{}:
+		turn, arrival := b.reserveThreadPair(channel, replyTS)
+		turnCtx, turnCancel := context.WithCancel(ctx)
+		active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
 		go func() {
 			defer func() { <-b.sem }()
-			b.sendToAgent(ctx, channel, threadTS, replyTS, messageTS, text, displayName, userID)
+			b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID,
+				"", attachments, false, messageTS, nil, turn, arrival, turnCtx, turnCancel, active)
 		}()
 	default:
 		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
 		b.postMessage(ctx, channel, replyTS, "I'm currently handling too many conversations. Please try again shortly.")
 	}
+}
+
+func (b *Bot) admitIncoming(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment, maySteer bool, active *activeTurn, admission *activeSteerReservation) {
+	admission.Wait()
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			admission.Release()
+		}
+	}
+	defer release()
+
+	var err error
+	if maySteer && !active.steerClosed {
+		steerer, ok := b.mgr.(oneShotSteerer)
+		if !ok {
+			err = agent.ErrSteerUnsupported
+		} else {
+			timeout := steerAttemptTimeout
+			if b.steerTimeout > 0 {
+				timeout = b.steerTimeout
+			}
+			steerCtx, steerCancel := context.WithTimeout(ctx, timeout)
+			stopWatchDone := make(chan struct{})
+			go func() {
+				select {
+				case <-active.stopCh:
+					steerCancel()
+				case <-steerCtx.Done():
+				}
+				close(stopWatchDone)
+			}()
+			content := func() string {
+				if q, _ := agent.ParseGoalCommand(text); q != nil {
+					return text
+				}
+				return buildSlackUserMessage(channel, replyTS, text, displayName)
+			}()
+			if userSteerer, ok := b.mgr.(oneShotUserSteerer); ok {
+				err = userSteerer.SteerOneShotAsUser(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content, userID)
+			} else {
+				err = steerer.SteerOneShot(steerCtx, b.agentID, slackSessionKey(b.agentID, channel, replyTS), content)
+			}
+			steerCancel()
+			<-stopWatchDone
+		}
+	} else {
+		err = agent.ErrSteerUnsupported
+	}
+
+	// Authorization rejection is final, not a delivery race. In particular it
+	// must not close steering or enqueue an unauthorized follow-up ahead of
+	// the owner's next correction.
+	if errors.Is(err, agent.ErrGoalOwnerForbidden) {
+		b.postChatError(channel, replyTS, err.Error())
+		return
+	}
+
+	if maySteer && (err == nil || errors.Is(err, agent.ErrSteerDeliveryUncertain)) {
+		steerMessage := chathistory.HistoryMessage{
+			Platform: platformSlack, ChannelID: channel, ThreadID: replyTS, MessageID: messageTS,
+			UserID: userID, UserName: displayName, Text: text, Timestamp: time.Now().Format(time.RFC3339),
+		}
+		active.steerHistory = append(active.steerHistory, steerMessage)
+		// Slack remains the canonical transcript, but persisting the already
+		// visible event locally makes a same-turn handoff snapshot deterministic
+		// even while conversations.replies is eventually consistent.
+		b.ensureUserTurnInHistory(channel, replyTS, messageTS, text, displayName, userID)
+		release()
+		if errors.Is(err, agent.ErrSteerDeliveryUncertain) {
+			b.logger.Warn("slack steer delivery outcome is uncertain; not retrying",
+				"channel", channel, "threadTS", replyTS, "messageTS", messageTS, "err", err)
+			b.postMessage(ctx, channel, replyTS, steerDeliveryUncertain)
+		}
+		return
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+	// Once any message has to become an ordinary turn (attachments, an
+	// unsupported backend, or a turn-boundary race), later messages must not
+	// leap over it by steering the older turn. Every later admission therefore
+	// follows the same FIFO conversion path.
+	active.steerClosed = true
+	// A turn ending between Slack receipt and injection, an unsupported
+	// backend, or a pre-admission peer routing failure is safe to replay as the
+	// ordinary FIFO follow-up. ErrSteerDeliveryUncertain was consumed above:
+	// retrying that case could inject the same user message twice.
+	b.logger.Debug("slack turn was not steerable; queued as a normal follow-up",
+		"channel", channel, "threadTS", replyTS, "messageTS", messageTS, "err", err)
+	b.enqueueIncomingTurnBefore(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, attachments, release)
+}
+
+// enqueueIncomingTurnBefore converts an ordered active-turn admission into a
+// normal FIFO turn. It reserves/registers the turn before releasing the
+// admission barrier, so no later steer/fallback/attachment can overtake it.
+func (b *Bot) enqueueIncomingTurnBefore(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment, releaseAdmission func()) {
+	select {
+	case b.sem <- struct{}{}:
+		turn, arrival := b.reserveThreadPair(channel, replyTS)
+		turnCtx, turnCancel := context.WithCancel(ctx)
+		active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
+		releaseAdmission()
+		go func() {
+			defer func() { <-b.sem }()
+			b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID,
+				"", attachments, false, messageTS, nil, turn, arrival, turnCtx, turnCancel, active)
+		}()
+	default:
+		releaseAdmission()
+		b.logger.Warn("too many concurrent chats, dropping message", "channel", channel)
+		b.postMessage(ctx, channel, replyTS, "I'm currently handling too many conversations. Please try again shortly.")
+	}
+}
+
+func buildSlackUserMessage(channel, threadTS, text, displayName string) string {
+	safeDisplay := sanitizeDisplayName(displayName)
+	if threadTS != "" {
+		return fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text)
+	}
+	return fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text)
 }
 
 // streamAppendInterval is the minimum interval between AppendStream calls.
@@ -446,44 +977,91 @@ const streamHeartbeatTick = 3 * time.Second
 const streamHeartbeatPayload = "\u200B"
 
 func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string) {
+	b.sendToAgentWithAttachments(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, nil)
+}
+
+func (b *Bot) sendToAgentWithAttachments(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment) {
+	b.sendToAgentTurn(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, attachments, false)
+}
+
+func (b *Bot) sendToAgentTurn(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID string, attachments []agent.MessageAttachment, syntheticSystem bool) {
 	// Serialize processing within the same thread to maintain history
 	// consistency. The lock must cover both history fetching and prompt
 	// construction so that concurrent messages to the same thread observe
 	// each other's updates rather than building prompts from stale history.
-	tl := b.acquireThreadLock(channel, replyTS)
-	tl.mu.Lock()
+	reservation, arrival := b.reserveThreadPair(channel, replyTS)
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	active := b.registerActiveTurnForUser(channel, replyTS, userID, turnCancel)
+	b.sendToAgentTurnReserved(ctx, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, "", attachments, syntheticSystem, messageTS, nil, reservation, arrival, turnCtx, turnCancel, active)
+}
+
+func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS, replyTS, messageTS, text, displayName, userID, expectedHolder string, attachments []agent.MessageAttachment, syntheticSystem bool, historyThroughTS string, presetHistory []chathistory.HistoryMessage, reservation, arrival *threadReservation, turnCtx context.Context, turnCancel context.CancelFunc, active *activeTurn) {
+	reservation.Wait()
+	var arrivalReservation *slackHandoffReservation
 	defer func() {
-		tl.mu.Unlock()
-		b.releaseThreadLock(channel, replyTS, tl)
+		b.finishActiveTurn(channel, replyTS, active)
+		turnCancel()
+		b.finishStopTransaction(channel, replyTS, active)
+		b.releaseThreadReservation(channel, replyTS, reservation)
+		if arrivalReservation != nil {
+			arrivalReservation.Release()
+		} else if arrival != nil {
+			b.releaseThreadReservation(channel, replyTS, arrival)
+		}
 	}()
+	// A synthetic arrival owns one FIFO ticket rather than a source/arrival
+	// pair. Split that ticket before exposing the turn to ChatOneShot: its next
+	// handoff must stay ahead of human turns already waiting on this thread.
+	if arrival == nil {
+		var err error
+		arrival, err = b.reserveThreadSuccessor(channel, replyTS, reservation)
+		if err != nil {
+			b.postChatError(channel, replyTS, err.Error())
+			return
+		}
+	}
+	currentUserMsg := chathistory.HistoryMessage{
+		Platform: platformSlack, ChannelID: channel, ThreadID: replyTS, MessageID: messageTS,
+		UserID: userID, UserName: displayName, Text: text, Timestamp: time.Now().Format(time.RFC3339),
+	}
 
 	// When creating a new thread (origThreadTS was empty), save the user's
 	// message to the thread history file so it appears as the first entry.
-	if origThreadTS == "" && replyTS != "" && b.agentDataDir != "" {
-		userMsg := chathistory.HistoryMessage{
-			Platform:  platformSlack,
-			ChannelID: channel,
-			ThreadID:  replyTS,
-			MessageID: messageTS,
-			UserID:    userID,
-			UserName:  displayName,
-			Text:      text,
-			Timestamp: time.Now().Format(time.RFC3339),
-			IsBot:     false,
-		}
+	if !syntheticSystem && origThreadTS == "" && replyTS != "" && b.agentDataDir != "" {
 		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, replyTS)
-		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{userMsg}); err != nil {
+		if err := chathistory.WriteMessages(path, []chathistory.HistoryMessage{currentUserMsg}); err != nil {
 			b.logger.Warn("failed to save initial user message to thread history", "err", err)
 		}
 	}
 
-	// Fetch conversation history from Slack for context injection.
-	var history []chathistory.HistoryMessage
-	if origThreadTS != "" {
-		history = FetchThreadHistory(ctx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
-	} else {
-		history = FetchChannelHistory(ctx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+	// Capture the history exactly once when the ticket reaches the FIFO head.
+	// Arrival reuses that snapshot so a later Slack post cannot leak into the
+	// fresh target session while the handoff is in flight.
+	history := append([]chathistory.HistoryMessage(nil), presetHistory...)
+	if presetHistory == nil {
+		if origThreadTS != "" {
+			history = FetchThreadHistory(turnCtx, b.api, b.agentDataDir, channel, origThreadTS, b.resolveUserName, b.logger)
+		} else {
+			history = FetchChannelHistory(turnCtx, b.api, b.agentDataDir, channel, channelHistoryLimit, b.resolveUserName, b.logger)
+		}
+		history = slackHistoryAtTurnStart(history, historyThroughTS, b.botUserID)
 	}
+	// Slack search/history is eventually consistent and its error fallback may
+	// be a stale local file. The live event is authoritative: make sure the
+	// snapshot reserved for post-handoff continuation contains its trigger.
+	if !syntheticSystem && messageTS != "" {
+		found := false
+		for _, msg := range history {
+			if msg.MessageID == messageTS {
+				found = true
+				break
+			}
+		}
+		if !found {
+			history = append(history, currentUserMsg)
+		}
+	}
+	arrivalHistory := append([]chathistory.HistoryMessage{}, history...)
 
 	// From here on, the thread handle used for posting/streaming.
 	threadTS := replyTS
@@ -496,11 +1074,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// the same text verbatim in the prompt's
 	// "[Slack @user|channel:… thread:…] text" suffix immediately below.
 	// Letting it appear in both the transcript header AND the suffix
-	// makes the model see the current turn twice on every head+tail
-	// resume — once labeled as recap, once as the live request — which
-	// was a pre-existing wart in the first-turn full-inject path but
-	// becomes the steady state once the safety net runs every turn.
-	if messageTS != "" {
+	// makes a fresh backend session see the current turn twice — once
+	// labeled as history, once as the authoritative live request.
+	if !syntheticSystem && messageTS != "" {
 		filtered := make([]chathistory.HistoryMessage, 0, len(history))
 		for _, m := range history {
 			if m.MessageID == messageTS {
@@ -519,94 +1095,15 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// per channel, which matches the chat_history layout.
 	sessionKey := slackSessionKey(b.agentID, channel, threadTS)
 
-	// Decide how to inject Slack history into the user message.
-	//
-	// Three regimes, gated by whether the backend already holds prior
-	// conversation context in its session:
-	//
-	//   1. Backend cannot resume (codex, gemini, …) OR this is the very
-	//      first turn in the thread → full FormatForInjection. The model
-	//      has no other source of Slack context, so we send everything
-	//      that fits under DefaultMaxMessages / DefaultMaxChars.
-	//
-	//   2. Backend can resume AND it already replied at least once
-	//      → FormatForInjectionHeadTail (head + omission marker + tail).
-	//      The resumed transcript already carries the full conversation,
-	//      so we only re-inject a small safety-net excerpt: the opening
-	//      few turns (which anchor the framing) and the last few turns
-	//      (which protect against two failure modes — see below).
-	//
-	//   3. History is empty → no injection.
-	//
-	// Why the head+tail safety net instead of skipping injection entirely
-	// when the backend can resume? Two failure modes the previous
-	// skip-on-resume policy did not cover:
-	//
-	//   (a) Mid-thread session reset. When the Claude session crosses
-	//       sessionResetThresholdTokens (see manager.go), sessionFileUsable
-	//       deletes the JSONL and Claude starts fresh on the next turn.
-	//       Without injection the new session has zero Slack context until
-	//       the user re-shares it.
-	//   (b) Delta gap. User messages that arrived after the last bot
-	//       reply are not in the resumed transcript (they post-date it),
-	//       so the model sees them only as referenced text in the new
-	//       user payload. The tail covers this gap.
-	//
-	// The head/tail excerpt overlaps content the resumed session already
-	// has, but FormatForInjectionHeadTail emits at most head+tail+1 lines
-	// under a "[Chat conversation history]" header, so the duplication
-	// cost is small and the framing tells the model these are recap
-	// snippets, not new events.
-	//
-	// "Already replied" is detected via the same bot-reply heuristic as
-	// before: a chat_history entry whose UserID matches our bot user or
-	// whose MessageID has the local ".bot" suffix. CanResumeSession
-	// additionally verifies the session artifact still exists on disk —
-	// claude /clear, upgrade or manual cleanup can remove it independently
-	// of Slack-side history, so the chat_history signal alone is not safe.
-	useHeadTail := false
-	if len(history) > 0 && b.mgr.CanResumeSession(b.agentID, sessionKey) {
-		// Match our own bot replies only. Two reliable signals are OR'd:
-		//
-		//   (1) UserID == b.botUserID — set by every AppendMessages write
-		//       below, and also by Slack for modern apps that expose User
-		//       on bot-posted messages.
-		//   (2) MessageID has a ".bot" suffix — the local sentinel that
-		//       AppendMessages assigns. Catches replies Slack returns with
-		//       empty User and only BotID set, where (1) would miss them.
-		//
-		// We deliberately do NOT match on IsBot alone, because unrelated
-		// bot posts in the same channel (GitHub, Datadog, …) would falsely
-		// downgrade the first-turn injection from full to head+tail and
-		// start the resumed Claude session with truncated Slack context.
-		for i := range history {
-			if !history[i].IsBot {
-				continue
-			}
-			if history[i].UserID == b.botUserID || strings.HasSuffix(history[i].MessageID, ".bot") {
-				useHeadTail = true
-				break
-			}
-		}
-	}
-
-	// Build enriched message with conversation history (when needed).
-	var sb strings.Builder
-	if len(history) > 0 {
-		if useHeadTail {
-			sb.WriteString(chathistory.FormatForInjectionHeadTail(history, b.botUserID, chathistory.DefaultHeadCount, chathistory.DefaultTailCount, chathistory.DefaultMaxChars))
-		} else {
-			sb.WriteString(chathistory.FormatForInjection(history, b.botUserID, chathistory.DefaultMaxMessages, chathistory.DefaultMaxChars))
-		}
-		sb.WriteString("\n---\n\n")
-	}
-	safeDisplay := sanitizeDisplayName(displayName)
-	if threadTS != "" {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s thread:%s] %s", safeDisplay, channel, threadTS, text))
+	// Pass the canonical Slack transcript separately. Manager formats the
+	// fresh-session fallback; each backend injects it only when it selects its
+	// native fresh-session path.
+	var message string
+	if syntheticSystem {
+		message = "[system message]\n" + text
 	} else {
-		sb.WriteString(fmt.Sprintf("[Slack @%s | channel:%s] %s", safeDisplay, channel, text))
+		message = buildSlackUserMessage(channel, threadTS, text, displayName)
 	}
-	message := sb.String()
 
 	// Volatile per-conversation context goes in SystemPromptExtra (appended
 	// to the system prompt by Manager). Per-channel/thread context is
@@ -614,19 +1111,48 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// system prompt — not the user message — keeps it out of the cacheable
 	// prefix's transcript while still teaching the agent where it is.
 	systemPromptExtra := buildSlackSystemPromptExtra(channel, threadTS, displayName, userID)
+	arrivalReservation = &slackHandoffReservation{
+		sourceCompleteErr: errors.New("Slack source did not finalize successfully"),
+		userID:            userID,
+		bot:               b, channel: channel, threadTS: threadTS,
+		reservation: arrival, history: arrivalHistory, source: active,
+	}
 
 	// Show typing indicator (best-effort; requires Agents & Assistants + assistant:write scope)
-	b.setStatus(ctx, channel, threadTS, typingStatus)
+	b.setStatus(turnCtx, channel, threadTS, typingStatus)
 
-	events, err := b.mgr.ChatOneShot(ctx, b.agentID, message, agent.OneShotOpts{
+	goal, goalErr := agent.ParseGoalCommand(text)
+	if goalErr != nil {
+		b.postMessage(ctx, channel, threadTS, goalErr.Error())
+		return
+	}
+	if goal != nil && messageTS != "" {
+		goal.OperationID = "slack:" + channel + ":" + messageTS
+	}
+	_, canAnswerQuestions := b.mgr.(oneShotQuestionAnswerer)
+	events, err := b.mgr.ChatOneShot(turnCtx, b.agentID, message, agent.OneShotOpts{
+		Goal:                              goal,
+		GoalUserID:                        userID,
+		InteractiveQuestions:              canAnswerQuestions && userID != "",
 		SessionKey:                        sessionKey,
+		History:                           history,
+		HistorySelfUserID:                 b.botUserID,
 		SystemPromptExtra:                 systemPromptExtra,
 		DisableKojoAttachmentInstructions: true,
+		Attachments:                       attachments,
+		ForceFreshSession:                 syntheticSystem,
+		ExpectedHolderPeer:                expectedHolder,
+		HandoffArrivalReservation:         arrivalReservation,
+		PreserveTerminalOnCancel:          true,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
 		b.logger.Warn("failed to start agent chat from slack", "err", err)
-		b.postMessage(ctx, channel, threadTS, "Sorry, I couldn't process your message right now. Please try again later.")
+		if active.stopRequested() && errors.Is(err, context.Canceled) {
+			b.postStopNotice(channel, threadTS, active)
+		} else {
+			b.postChatError(channel, threadTS, err.Error())
+		}
 		return
 	}
 
@@ -635,8 +1161,22 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
 	var deadStreams []string           // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
 	var recentStreamDeaths []time.Time // deaths inside streamRestartWindow; drives the rapid-failure circuit breaker
+	// Streams evicted from deadStreams are deleted asynchronously to keep the
+	// retained artifact set bounded. If that eager deletion fails, keep the TS
+	// until the turn ends so a later no-reply decision can synchronously retry
+	// it rather than leaving a visible progress artifact behind.
+	var supersededCleanupWG sync.WaitGroup
+	supersededCleanupStarted := false
+	var failedSupersededMu sync.Mutex
+	var failedSupersededStreams []string
 	var lastAppend time.Time
 	hasError := false
+	backendError := ""
+	sawTerminal := false
+	stopped := false
+	completedCleanly := false
+	terminalContent := ""
+	noReplyCandidate := true
 	streamFailed := false // true if StartStream failed permanently, use batch-post fallback
 	streamNow := time.Now
 	if b.streamNow != nil {
@@ -671,10 +1211,14 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if len(deadStreams) > maxRetainedDeadStreams {
 			oldest := deadStreams[0]
 			deadStreams = deadStreams[1:]
+			supersededCleanupWG.Add(1)
+			supersededCleanupStarted = true
 			runAsync(func() {
-				deleteCtx, deleteCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
-				defer deleteCancel()
-				if _, _, err := b.api.DeleteMessageContext(deleteCtx, channel, oldest); err != nil {
+				defer supersededCleanupWG.Done()
+				if err := b.deleteMessageWithRateLimit(channel, oldest); err != nil {
+					failedSupersededMu.Lock()
+					failedSupersededStreams = append(failedSupersededStreams, oldest)
+					failedSupersededMu.Unlock()
 					b.logger.Debug("failed to delete superseded slack stream",
 						"channel", channel, "streamTS", oldest, "err", err)
 				}
@@ -714,7 +1258,7 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 		if threadTS != "" {
 			opts = append(opts, slack.MsgOptionTS(threadTS))
 		}
-		_, ts, err := b.api.StartStreamContext(ctx, channel, opts...)
+		_, ts, err := b.api.StartStreamContext(turnCtx, channel, opts...)
 		if err != nil {
 			b.logger.Warn("failed to start slack stream, falling back to batch post", "err", err)
 			streamFailed = true
@@ -732,6 +1276,9 @@ func (b *Bot) sendToAgent(ctx context.Context, channel, origThreadTS, replyTS, m
 	// it would race the main loop on streamTS / deadStreams / lastAppend
 	// and could interleave concurrent AppendStream calls on the same
 	// streamTS. Keeping everything in one goroutine avoids that entirely.
+	questionEvents, stopQuestions := b.questionWorker(turnCtx, channel, threadTS, userID, sessionKey, active)
+	defer stopQuestions()
+	questionOverflow := false
 	heartbeat := time.NewTicker(streamHeartbeatTick)
 	defer heartbeat.Stop()
 streamLoop:
@@ -746,7 +1293,7 @@ streamLoop:
 			// append failing). Rate-limit / transient errors keep the
 			// streamTS, so a 429 storm won't churn the stream here.
 			if streamTS != "" && time.Since(lastAppend) >= streamHeartbeatInterval {
-				if b.appendStream(ctx, channel, streamTS, streamHeartbeatPayload) {
+				if b.appendStream(turnCtx, channel, streamTS, streamHeartbeatPayload) {
 					lastAppend = time.Now()
 				} else {
 					dropStream()
@@ -761,9 +1308,30 @@ streamLoop:
 		}
 
 		switch evt.Type {
+		case "user_question", "question_resolved":
+			if !questionOverflow {
+				select {
+				case questionEvents <- evt:
+				default:
+					questionOverflow = true
+					hasError = true
+					b.logger.Warn("question event queue full; cancelling turn", "agent", b.agentID)
+					turnCancel()
+				}
+			}
 		case "text":
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
+
+			// Do not expose the no-reply control token while it is still a
+			// possible prefix. If later text turns it into a normal response,
+			// pendingDelta still contains the entire prefix and is flushed below.
+			if noReplyCandidate {
+				noReplyCandidate = couldBeNoReplyResponse(response.String())
+				if noReplyCandidate {
+					continue
+				}
+			}
 
 			// Start the stream on the first text event so the user sees
 			// the reply build live.
@@ -777,7 +1345,7 @@ streamLoop:
 				delta := pendingDelta.String()
 				pendingDelta.Reset()
 				lastAppend = time.Now()
-				if !b.appendStream(ctx, channel, streamTS, delta) {
+				if !b.appendStream(turnCtx, channel, streamTS, delta) {
 					// Stream died mid-response. Park it and carry the
 					// unflushed delta into pendingDelta so the NEXT
 					// text event opens a fresh stream and flushes the
@@ -798,10 +1366,19 @@ streamLoop:
 
 			// Update assistant typing status (plain text) to show which
 			// tool is running.
-			b.setStatus(ctx, channel, threadTS, toolStatusText(evt.ToolName, evt.ToolInput))
+			b.setStatus(turnCtx, channel, threadTS, toolStatusText(evt.ToolName, evt.ToolInput))
 
 			// Inline stream indicator (Slack mrkdwn).
 			indicator := toolStatusIndicator(evt.ToolName, evt.ToolInput)
+
+			// A model may emit the no-reply token in more than one delta before
+			// its terminal event. Do not let a subsequent tool event expose that
+			// buffered control response. Tool activity that happened before the
+			// token may already have opened a stream; the final suppression path
+			// removes it.
+			if response.Len() > 0 && noReplyCandidate {
+				continue
+			}
 
 			// Append a tool-use indicator to the stream so the user sees
 			// progress during long tool executions. The final chat.update
@@ -823,13 +1400,13 @@ streamLoop:
 			if pendingDelta.Len() > 0 {
 				delta := pendingDelta.String()
 				pendingDelta.Reset()
-				if !b.appendStream(ctx, channel, streamTS, delta) {
+				if !b.appendStream(turnCtx, channel, streamTS, delta) {
 					pendingDelta.WriteString(delta)
 					dropStream()
 					continue
 				}
 			}
-			if !b.appendStream(ctx, channel, streamTS, indicator) {
+			if !b.appendStream(turnCtx, channel, streamTS, indicator) {
 				// Indicator append died. The indicator itself is
 				// ephemeral (finalize chat.update overwrites it),
 				// so no need to carry it forward. We deliberately
@@ -851,12 +1428,47 @@ streamLoop:
 		case "tool_result":
 			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
-			b.setStatus(ctx, channel, threadTS, typingStatus)
+			b.setStatus(turnCtx, channel, threadTS, typingStatus)
 
 		case "error":
+			sawTerminal = true
+			// Completion is observable at the terminal event, not only when
+			// the producer closes its channel. Reject late !stop immediately.
+			b.finishActiveTurn(channel, threadTS, active)
 			hasError = true
+			if backendError == "" {
+				backendError = evt.ErrorMessage
+			}
 			b.logger.Warn("agent returned error during slack chat", "err", evt.ErrorMessage)
+		case "done":
+			sawTerminal = true
+			b.finishActiveTurn(channel, threadTS, active)
+			completedCleanly = evt.ErrorMessage == ""
+			if evt.ErrorMessage == agent.ErrMsgCancelled {
+				stopped = true
+			} else if evt.ErrorMessage != "" {
+				hasError = true
+				if backendError == "" {
+					backendError = evt.ErrorMessage
+				}
+				b.logger.Warn("agent completed slack chat with an error", "err", evt.ErrorMessage)
+			}
+			if evt.Message != nil {
+				terminalContent = evt.Message.Content
+			}
 		}
+	}
+	// The model stream has ended. Remove the active entry before Slack
+	// finalization so a late command cannot claim it stopped completed work.
+	// Cancelling turnCtx on the Hub also tears down a peer-relayed HTTP stream;
+	// the holder receives that request cancellation and stops its backend.
+	b.finishActiveTurn(channel, threadTS, active)
+	if active.stopRequested() {
+		stopped = true
+	}
+	if !sawTerminal && !stopped {
+		hasError = true
+		backendError = "応答の完了通知が届く前に接続が終了しました。処理結果を確認してから再試行してください。"
 	}
 
 	// Use a separate context for finalization so cleanup API calls
@@ -867,6 +1479,62 @@ streamLoop:
 	// chunkPostTimeout) so rate-limit backoff doesn't truncate the reply.
 	finCtx, finCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 	defer finCancel()
+
+	// The terminal Message is the backend's authoritative full response. Live
+	// text events are deliberately forwarded non-blockingly by ChatOneShot and
+	// may therefore be incomplete under backpressure. Reconcile both builders
+	// before interpreting the control token or finalizing normal delivery. An
+	// empty terminal body is not authoritative because some test/custom
+	// backends emit a bare done event after otherwise valid text deltas.
+	if terminalContent != "" && terminalContent != response.String() {
+		response.Reset()
+		response.WriteString(terminalContent)
+		// Do not append the authoritative full body onto a stream that may
+		// already contain most of it. chat.update below replaces the stream
+		// with response; the batch fallback also reads response directly.
+		pendingDelta.Reset()
+	}
+
+	// If the event stream fails or closes before a clean terminal event while
+	// the buffered text is still a possible control-token prefix, never publish
+	// that implementation detail. Treat it as an ordinary backend failure.
+	if response.Len() > 0 && couldBeNoReplyResponse(response.String()) && (!completedCleanly || hasError) {
+		response.Reset()
+		pendingDelta.Reset()
+		hasError = true
+	}
+
+	// A clean terminal no-reply response is a transport control signal, not
+	// message content. Usually no stream exists because possible token prefixes
+	// are buffered above. If tools or earlier text opened streams before the
+	// model chose silence, remove every artifact and post nothing. Explicit
+	// backend failures still take the ordinary error path even if partial output
+	// happened to equal the token.
+	controlReply := isNoReplyResponse(response.String())
+	suppressReply := completedCleanly && !hasError && controlReply
+	if suppressReply {
+		// Eager deletion of old dead streams may still be in flight. Wait for
+		// those bounded calls and include every failed TS in the synchronous
+		// suppression cleanup so no visible progress artifact is forgotten.
+		supersededCleanupWG.Wait()
+		failedSupersededMu.Lock()
+		failedSuperseded := append([]string(nil), failedSupersededStreams...)
+		failedSupersededMu.Unlock()
+		b.discardSuppressedStreams(channel, streamTS, append(deadStreams, failedSuperseded...))
+		b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+		b.clearAssistantStatus(clearCtx, channel, threadTS)
+		clearCancel()
+		return
+	}
+	if controlReply {
+		// Never leak the transport token as user-visible content. A token that
+		// did not end in a clean done event is not a valid request for silence;
+		// route it through the existing generic failure path instead.
+		response.Reset()
+		pendingDelta.Reset()
+		hasError = true
+	}
 
 	// Flush any remaining text delta before finalizing. If the final
 	// flush also hits a dead stream, park it so the code below falls
@@ -928,6 +1596,10 @@ streamLoop:
 
 			deliveredAll := true
 			_, _, _, updateErr := b.api.UpdateMessageContext(finCtx, channel, streamTS, updateOpts...)
+			if updateErr != nil && shouldFallbackToLegacyText(updateErr) {
+				b.logger.Warn("slack markdown_text update rejected; falling back to fresh post",
+					"channel", channel, "threadTS", threadTS, "streamTS", streamTS, "err", updateErr)
+			}
 			if updateErr != nil {
 				b.logger.Warn("failed to update stream message with final text", "err", updateErr)
 			}
@@ -960,6 +1632,10 @@ streamLoop:
 				// failure notice.
 				if !b.postMessage(chunkCtx, channel, threadTS, chunks[0]) {
 					deliveredAll = false
+				} else {
+					// The full reply was posted separately; delete the stopped,
+					// stale stream during orphan cleanup.
+					deadStreams = append(deadStreams, streamTS)
 				}
 			}
 			// Remaining chunks: post as follow-up messages, but only if
@@ -976,6 +1652,13 @@ streamLoop:
 			// chat.update failure, we posted chunks[0] as a fresh message).
 			// Either way, dead partials are now superseded.
 			finalDelivered = deliveredAll
+		} else if stopped {
+			finalDelivered = b.postStopNotice(channel, threadTS, active)
+			if finalDelivered {
+				// The explicit stop notice replaces the tool/progress-only live
+				// stream; remove that stale artifact during orphan cleanup.
+				deadStreams = append(deadStreams, streamTS)
+			}
 		} else {
 			// Stream was started — usually by the first tool_use event —
 			// but the assistant never produced any reply text. Keep the
@@ -986,8 +1669,7 @@ streamLoop:
 			// overwriting the stream via chat.update (which would erase
 			// the execution trail). StopStream above is best-effort;
 			// Slack auto-finalizes the stream via TTL if it failed.
-			b.postMessage(finCtx, channel, threadTS,
-				"Sorry, something went wrong while processing your request.")
+			b.postChatError(channel, threadTS, backendError)
 		}
 	} else if response.Len() > 0 {
 		// Fallback: traditional batch post (StartStream failed or no
@@ -1005,6 +1687,8 @@ streamLoop:
 		// Batch post carried the full reply (StartStream failed or every
 		// stream died and we fell back). Dead partials are superseded.
 		finalDelivered = deliveredAll
+	} else if stopped {
+		finalDelivered = b.postStopNotice(channel, threadTS, active)
 	} else if hasError || streamFailed || len(deadStreams) > 0 {
 		// Either an explicit agent error, StartStream failed, or a stream
 		// was opened and then died (every streamTS dropped, so streamTS is
@@ -1013,7 +1697,13 @@ streamLoop:
 		// branch and go silent — the keepalive heartbeat makes this more
 		// likely by proactively dropping a TTL-dead stream during a long
 		// silence. Surface a generic failure rather than going silent.
-		b.postMessage(finCtx, channel, threadTS, "Sorry, something went wrong while processing your request.")
+		b.postChatError(channel, threadTS, backendError)
+	}
+
+	// Keep diagnostics independent of partial model Markdown (which may have
+	// an unclosed code fence), and give this post a fresh delivery timeout.
+	if hasError && !stopped && response.Len() > 0 {
+		b.postChatError(channel, threadTS, backendError)
 	}
 
 	// Clear typing indicator (auto-clears on message post, but explicit
@@ -1041,27 +1731,45 @@ streamLoop:
 	// a dropped cleanup costs at most a stale indicator (delete failure
 	// additionally leaves the duplicate partial visible until manually
 	// cleared, no worse than the pre-restart behavior).
-	if len(deadStreams) > 0 {
+	if len(deadStreams) > 0 || supersededCleanupStarted {
 		streams := deadStreams // capture so the closure can be run sync (tests) or async (prod)
 		delivered := finalDelivered
 		cleanup := func() {
+			// Eager deletion is intentionally asynchronous during the turn. Join
+			// it here and retry failures so a successfully delivered final reply
+			// cannot leave an evicted duplicate behind.
+			supersededCleanupWG.Wait()
+			failedSupersededMu.Lock()
+			streams = append(streams, failedSupersededStreams...)
+			failedSupersededMu.Unlock()
+			seen := make(map[string]struct{}, len(streams))
 			for _, ts := range streams {
-				opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+				if ts == "" {
+					continue
+				}
+				if _, duplicate := seen[ts]; duplicate {
+					continue
+				}
+				seen[ts] = struct{}{}
 				if delivered {
-					if _, _, err := b.api.DeleteMessageContext(opCtx, channel, ts); err != nil {
+					if err := b.deleteMessageWithRateLimit(channel, ts); err != nil {
 						b.logger.Debug("failed to delete orphaned slack stream",
 							"channel", channel, "streamTS", ts, "err", err)
 					}
-				} else if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
-					b.logger.Debug("failed to stop orphaned slack stream",
-						"channel", channel, "streamTS", ts, "err", err)
+				} else {
+					opCtx, opCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+					if _, _, err := b.api.StopStreamContext(opCtx, channel, ts); err != nil {
+						b.logger.Debug("failed to stop orphaned slack stream",
+							"channel", channel, "streamTS", ts, "err", err)
+					}
+					opCancel()
 				}
-				opCancel()
 			}
 		}
 		runAsync(cleanup)
 	}
 
+	var sourceHistoryErr error
 	// Save bot response to thread history so shouldAutoReply can detect
 	// that the last message was from the bot on subsequent thread messages.
 	if response.Len() > 0 && threadTS != "" && b.agentDataDir != "" {
@@ -1078,10 +1786,17 @@ streamLoop:
 		}
 		path := chathistory.HistoryFilePath(b.agentDataDir, platformSlack, channel, threadTS)
 		if err := chathistory.AppendMessages(path, []chathistory.HistoryMessage{botMsg}); err != nil {
+			sourceHistoryErr = err
 			b.logger.Warn("failed to save bot response to thread history", "err", err)
 		}
 	}
-
+	if arrivalReservation != nil {
+		arrivalReservation.mu.Lock()
+		if sourceHistoryErr == nil && !hasError && !stopped && finalDelivered {
+			arrivalReservation.sourceCompleteErr = nil
+		}
+		arrivalReservation.mu.Unlock()
+	}
 }
 
 // slackSessionKey computes the deterministic SessionKey for a Slack
@@ -1126,7 +1841,7 @@ func slackSessionKey(agentID, channel, threadTS string) string {
 func buildSlackSystemPromptExtra(channel, threadTS, displayName, userID string) string {
 	var sb strings.Builder
 	sb.WriteString("## Slack Conversation Context\n\n")
-	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
+	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
 	if threadTS != "" {
 		sb.WriteString(fmt.Sprintf("You are participating in Slack channel %s, thread %s.\n", channel, threadTS))
 	} else {
@@ -1555,9 +2270,30 @@ func (b *Bot) postChunks(ctx context.Context, channel, threadTS string, chunks [
 // time we get here. Best effort; if this also fails the postMessage log
 // entries are the trail.
 func (b *Bot) postDeliveryFailureNotice(channel, threadTS string) {
-	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
+	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1))
 	b.postMessage(noticeCtx, channel, threadTS, deliveryFailureNotice)
 	noticeCancel()
+}
+
+func (b *Bot) postStopNotice(channel, threadTS string, active *activeTurn) bool {
+	// cancelActiveTurnForCommand cancels the backend before posting the
+	// acknowledgement so stop latency stays low. The cancelled backend may
+	// reach this terminal path immediately (especially through a peer relay),
+	// therefore order only the user-visible notices here.
+	if active != nil {
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1)+time.Second)
+		if !active.waitStopAck(waitCtx) {
+			b.logger.Warn("timed out waiting for slack stop acknowledgement",
+				"channel", channel, "threadTS", threadTS)
+		}
+		waitCancel()
+	}
+	// StopStream/chat.update finalization may consume finCtx. The user-visible
+	// completion notice gets an independent budget that also covers markdown
+	// fallback and rate-limit retries.
+	noticeCtx, noticeCancel := context.WithTimeout(context.Background(), chunkPostTimeout(1))
+	defer noticeCancel()
+	return b.postMessage(noticeCtx, channel, threadTS, stopCommandDone)
 }
 
 // setStatus updates the assistant typing indicator for a thread
@@ -1574,6 +2310,35 @@ func (b *Bot) setStatus(ctx context.Context, channel, threadTS, status string) {
 // clearAssistantStatus clears the assistant typing indicator (best-effort).
 func (b *Bot) clearAssistantStatus(ctx context.Context, channel, threadTS string) {
 	b.setStatus(ctx, channel, threadTS, "") // empty = clear
+}
+
+func postMessageOpts(threadTS string, opts ...slack.MsgOption) []slack.MsgOption {
+	if threadTS != "" {
+		opts = append(opts, slack.MsgOptionTS(threadTS))
+	}
+	return opts
+}
+
+func shouldFallbackToLegacyText(err error) bool {
+	var slackErr slack.SlackErrorResponse
+	if errors.As(err, &slackErr) {
+		switch slackErr.Err {
+		// Slack can reject the blocks produced from markdown_text even
+		// though we did not submit blocks ourselves. Retry as legacy text.
+		case "invalid_blocks", "invalid_blocks_format", "markdown_text_conflict":
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bot) postMessageWithRetry(ctx context.Context, channel string, opts []slack.MsgOption) (rlOutcome, error) {
+	return b.withRateLimitRetry(ctx, func() error {
+		_, _, err := b.api.PostMessageContext(ctx, channel, opts...)
+		return err
+	}, func(wait time.Duration) {
+		b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
+	})
 }
 
 // postMessage sends a message to Slack with rate-limit retry. Returns
@@ -1606,12 +2371,7 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// <@U…>, …) the same way as the chat.update path. Mention misuse
 	// is controlled by the agent's system prompt, not by escaping at
 	// this layer.
-	opts := []slack.MsgOption{
-		slack.MsgOptionMarkdownText(text),
-	}
-	if threadTS != "" {
-		opts = append(opts, slack.MsgOptionTS(threadTS))
-	}
+	markdownOpts := postMessageOpts(threadTS, slack.MsgOptionMarkdownText(text))
 
 	// Rate-limit backoff (attempt loop, delay, injectable sleep, and the
 	// "don't sleep past the final attempt" guard that protects the 1+2+3 s
@@ -1619,15 +2379,24 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	// appendStream, postMessage treats every terminal outcome — exhaustion,
 	// ctx cancellation, and any non-rate-limit error — as a delivery
 	// failure (return false).
-	outcome, err := b.withRateLimitRetry(ctx, func() error {
-		_, _, e := b.api.PostMessageContext(ctx, channel, opts...)
-		return e
-	}, func(wait time.Duration) {
-		b.logger.Debug("slack rate limited, waiting", "retryAfter", wait)
-	})
-	switch outcome {
-	case rlSuccess:
+	outcome, err := b.postMessageWithRetry(ctx, channel, markdownOpts)
+	if outcome == rlSuccess {
 		return true
+	}
+	if outcome == rlOtherErr && shouldFallbackToLegacyText(err) {
+		b.logger.Warn("slack markdown_text post rejected, retrying with legacy text",
+			"channel", channel, "threadTS", threadTS, "err", err)
+		legacyOpts := postMessageOpts(threadTS, slack.MsgOptionText(PlainToSlack(text), false))
+		legacyOutcome, legacyErr := b.postMessageWithRetry(ctx, channel, legacyOpts)
+		if legacyOutcome == rlSuccess {
+			return true
+		}
+		b.logger.Warn("failed to post slack message after legacy text fallback",
+			"channel", channel, "threadTS", threadTS,
+			"markdownErr", err, "err", legacyErr)
+		return false
+	}
+	switch outcome {
 	case rlExhausted:
 		// Include err and RetryAfter so production logs can distinguish
 		// a Slack hard 429 from a slow recovery — without these the
@@ -1649,37 +2418,513 @@ func (b *Bot) postMessage(ctx context.Context, channel, threadTS, text string) b
 	return false
 }
 
+type activeTurn struct {
+	// ownerUserID is immutable after registration; empty means an internal turn.
+	ownerUserID string
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	stopUser    bool
+	stopOnce    sync.Once
+	stopCh      chan struct{}
+	stopAckDone chan struct{}
+	stopAckOnce sync.Once
+
+	// steerTail is a per-turn admission queue. Socket Mode reserves a slot
+	// synchronously in event order, while the peer/backend RPC runs outside the
+	// event loop. Terminal sealing joins the same queue so an admitted steer can
+	// never slip into the next native turn reusing this conversation key.
+	steerMu      sync.Mutex
+	steerTail    chan struct{}
+	steerPending int
+	steerClosed  bool
+	turnEnded    bool
+	steerHistory []chathistory.HistoryMessage
+	finishOnce   sync.Once
+	overflowOnce sync.Once
+}
+
+type activeSteerReservation struct {
+	ready <-chan struct{}
+	done  chan struct{}
+	once  sync.Once
+	turn  *activeTurn
+}
+
+func (r *activeSteerReservation) Wait() { <-r.ready }
+func (r *activeSteerReservation) Release() {
+	r.once.Do(func() {
+		close(r.done)
+		r.turn.steerMu.Lock()
+		r.turn.steerPending--
+		r.turn.steerMu.Unlock()
+	})
+}
+
+func (t *activeTurn) reserveSteer(limited bool) *activeSteerReservation {
+	t.steerMu.Lock()
+	if limited && t.steerPending >= maxPendingSteerAdmissions {
+		t.steerMu.Unlock()
+		return nil
+	}
+	ready := t.steerTail
+	done := make(chan struct{})
+	t.steerTail = done
+	t.steerPending++
+	t.steerMu.Unlock()
+	return &activeSteerReservation{ready: ready, done: done, turn: t}
+}
+
+func (t *activeTurn) requestStop() {
+	_ = t.requestStopWithAck(false)
+}
+
+// requestStopWithAck returns true only for the first user stop request. This
+// lets repeated !stop events coalesce behind the original acknowledgement.
+func (t *activeTurn) requestStopWithAck(waitForAck bool) bool {
+	t.mu.Lock()
+	if t.stopUser {
+		t.mu.Unlock()
+		return false
+	}
+	t.stopUser = true
+	if waitForAck && t.stopAckDone == nil {
+		t.stopAckDone = make(chan struct{})
+	}
+	cancel := t.cancel
+	t.mu.Unlock()
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+		cancel()
+	})
+	return true
+}
+
+func (t *activeTurn) completeStopAck() {
+	t.mu.Lock()
+	done := t.stopAckDone
+	t.mu.Unlock()
+	if done != nil {
+		t.stopAckOnce.Do(func() { close(done) })
+	}
+}
+
+func (t *activeTurn) waitStopAck(ctx context.Context) bool {
+	t.mu.Lock()
+	done := t.stopAckDone
+	t.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (t *activeTurn) stopRequested() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopUser
+}
+
+func activeTurnKey(channel, threadTS string) string { return channel + ":" + threadTS }
+
+func (b *Bot) registerActiveTurn(channel, threadTS string, cancel context.CancelFunc) *activeTurn {
+	return b.registerActiveTurnAfter(channel, threadTS, nil, "", cancel)
+}
+
+func (b *Bot) registerActiveTurnForUser(channel, threadTS, userID string, cancel context.CancelFunc) *activeTurn {
+	return b.registerActiveTurnAfter(channel, threadTS, nil, userID, cancel)
+}
+
+// registerActiveTurnAfter inserts a reserved handoff arrival immediately after
+// its source. Handoff FIFO reserves source→arrival atomically; ordinary Slack
+// events accepted later must not overtake that order in the stop registry.
+func (b *Bot) registerActiveTurnAfter(channel, threadTS string, after *activeTurn, ownerUserID string, cancel context.CancelFunc) *activeTurn {
+	steerReady := make(chan struct{})
+	close(steerReady)
+	turn := &activeTurn{cancel: cancel, ownerUserID: ownerUserID, stopCh: make(chan struct{}), steerTail: steerReady}
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	if b.activeTurns == nil {
+		b.activeTurns = make(map[string][]*activeTurn)
+	}
+	turns := b.activeTurns[key]
+	insertAt := len(turns)
+	if after != nil {
+		// If the source reached terminal delivery between Activate's checks and
+		// this lock, its reserved arrival is still ahead of every ordinary turn.
+		insertAt = 0
+		for i, candidate := range turns {
+			if candidate == after {
+				insertAt = i + 1
+				break
+			}
+		}
+	}
+	turns = append(turns, nil)
+	copy(turns[insertAt+1:], turns[insertAt:])
+	turns[insertAt] = turn
+	b.activeTurns[key] = turns
+	b.activeTurnsMu.Unlock()
+	return turn
+}
+
+func (b *Bot) hasActiveTurn(channel, threadTS string) bool {
+	b.activeTurnsMu.Lock()
+	defer b.activeTurnsMu.Unlock()
+	return len(b.activeTurns[activeTurnKey(channel, threadTS)]) > 0
+}
+
+// reserveActiveAdmission pins an incoming Slack message to the current FIFO head.
+// The reservation is taken while the active registry is locked, so terminal
+// removal must queue behind every message the Socket Mode loop admitted first.
+// A turn already stopped by an earlier !stop is not steerable; a subsequent
+// ordinary message should become a fresh FIFO turn instead.
+func (b *Bot) reserveActiveAdmission(channel, threadTS string) (*activeTurn, *activeSteerReservation, bool) {
+	b.activeTurnsMu.Lock()
+	defer b.activeTurnsMu.Unlock()
+	turns := b.activeTurns[activeTurnKey(channel, threadTS)]
+	if len(turns) == 0 || turns[0].stopRequested() {
+		return nil, nil, false
+	}
+	reservation := turns[0].reserveSteer(true)
+	if reservation == nil {
+		return turns[0], nil, true
+	}
+	return turns[0], reservation, false
+}
+
+func (b *Bot) postAdmissionOverflowNotice(turn *activeTurn, channel, threadTS string) {
+	if turn == nil {
+		return
+	}
+	turn.overflowOnce.Do(func() {
+		b.logger.Warn("too many pending Slack interruptions; dropping messages", "channel", channel, "threadTS", threadTS)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), chunkPostTimeoutBase)
+			defer cancel()
+			b.postMessage(ctx, channel, threadTS, "I'm currently handling too many interruptions in this thread. Please try again shortly.")
+		}()
+	})
+}
+
+func (b *Bot) finishActiveTurn(channel, threadTS string, turn *activeTurn) {
+	if turn == nil {
+		return
+	}
+	turn.finishOnce.Do(func() {
+		seal := turn.reserveSteer(false)
+		seal.Wait()
+		turn.steerClosed = true
+		turn.turnEnded = true
+		b.unregisterActiveTurn(channel, threadTS, turn)
+		seal.Release()
+	})
+}
+
+func (b *Bot) unregisterActiveTurn(channel, threadTS string, turn *activeTurn) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	turns := b.activeTurns[key]
+	for i, candidate := range turns {
+		if candidate != turn {
+			continue
+		}
+		turns = append(turns[:i], turns[i+1:]...)
+		if len(turns) == 0 {
+			delete(b.activeTurns, key)
+		} else {
+			b.activeTurns[key] = turns
+		}
+		break
+	}
+	b.activeTurnsMu.Unlock()
+}
+
+func (b *Bot) cancelActiveTurn(channel, threadTS string) bool {
+	active, _, _ := b.cancelActiveTurnInternal(channel, threadTS, false, "")
+	return active != nil
+}
+
+func (b *Bot) cancelActiveTurnForCommand(channel, threadTS, userID string) (*activeTurn, bool, bool) {
+	return b.cancelActiveTurnInternal(channel, threadTS, true, userID)
+}
+
+// The results are the selected turn, whether stopping started, and whether
+// authorization failed. Check ownership under the registry lock before cancel
+// or acknowledgement setup, including duplicate commands during finalization.
+func (b *Bot) cancelActiveTurnInternal(channel, threadTS string, waitForAck bool, userID string) (*activeTurn, bool, bool) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	defer b.activeTurnsMu.Unlock()
+	if waitForAck {
+		if stopping := b.stoppingTurns[key]; stopping != nil {
+			return stopping, false, userID == "" || stopping.ownerUserID != userID
+		}
+	}
+	turns := b.activeTurns[key]
+	if len(turns) == 0 {
+		return nil, false, false
+	}
+	turn := turns[0]
+	if waitForAck && (userID == "" || turn.ownerUserID != userID) {
+		return turn, false, true
+	}
+	// Holding activeTurnsMu orders this against unregisterActiveTurn: either
+	// the completed turn unregisters first, or the stop flag is visible before
+	// final Slack delivery begins.
+	started := turn.requestStopWithAck(waitForAck)
+	if waitForAck && started {
+		if b.stoppingTurns == nil {
+			b.stoppingTurns = make(map[string]*activeTurn)
+		}
+		b.stoppingTurns[key] = turn
+	}
+	return turn, started, false
+}
+
+func (b *Bot) finishStopTransaction(channel, threadTS string, turn *activeTurn) {
+	key := activeTurnKey(channel, threadTS)
+	b.activeTurnsMu.Lock()
+	if b.stoppingTurns[key] == turn {
+		delete(b.stoppingTurns, key)
+	}
+	b.activeTurnsMu.Unlock()
+}
+
 // threadLock is a reference-counted mutex for serializing per-thread processing.
 // The map entry is only removed when the last holder releases it, preventing a
 // race where a new mutex is created while another goroutine is still waiting on
 // the previous one.
 type threadLock struct {
-	mu      sync.Mutex
+	tail    chan struct{}
 	waiters int
 }
 
-// acquireThreadLock returns the threadLock for the given channel+thread,
-// creating one if needed, and increments its reference count.
-// Must be paired with releaseThreadLock after tl.mu.Unlock().
-func (b *Bot) acquireThreadLock(channel, threadTS string) *threadLock {
+// slackHistoryAtTurnStart excludes later human posts while retaining replies
+// from the preceding FIFO turn that may have completed after cutoff was posted.
+// The result is captured and reused by the paired handoff arrival.
+func slackHistoryAtTurnStart(history []chathistory.HistoryMessage, cutoff, selfUserID string) []chathistory.HistoryMessage {
+	if cutoff == "" {
+		return history
+	}
+	bounded := make([]chathistory.HistoryMessage, 0, len(history))
+	for _, msg := range history {
+		if (msg.IsBot && msg.UserID == selfUserID) || msg.MessageID == "" || msg.MessageID == incompleteMessageID || msg.MessageID <= cutoff {
+			bounded = append(bounded, msg)
+		}
+	}
+	return bounded
+}
+
+type threadReservation struct {
+	ready    <-chan struct{}
+	done     chan struct{} // guarded by Bot.threadLocksMu; transferable to a successor
+	tl       *threadLock
+	released bool // guarded by Bot.threadLocksMu
+}
+
+func (r *threadReservation) Wait() { <-r.ready }
+
+type slackHandoffReservation struct {
+	sourceCompleteErr error  // guarded by mu; observed only after source FIFO releases
+	userID            string // human who owns question forms across handoff
+
+	mu          sync.Mutex
+	bot         *Bot
+	channel     string
+	threadTS    string
+	reservation *threadReservation
+	history     []chathistory.HistoryMessage
+	source      *activeTurn
+	activated   bool
+	released    bool
+}
+
+func (r *slackHandoffReservation) Activate(ctx context.Context, prompt, expectedHolder string) error {
+	if r == nil {
+		return errors.New("Slack arrival reservation is missing")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return errors.New("Slack arrival reservation was released")
+	}
+	if r.activated {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.bot.ctx.Done():
+		return errors.New("slack bot is stopped")
+	default:
+	}
+	if r.source != nil {
+		seal := r.source.reserveSteer(false)
+		seal.Wait()
+		defer seal.Release()
+		if r.source.turnEnded {
+			return errors.New("Slack source turn has already ended")
+		}
+		// A steer is already visible in Slack, but the API can be eventually
+		// consistent. Carry the locally admitted messages into the fresh holder
+		// snapshot before sealing the source so the arrival cannot forget input
+		// the source model observed.
+		r.history = append(r.history, r.source.steerHistory...)
+		r.source.steerClosed = true
+	}
+	r.activated = true
+	// Register the continuation now, behind the source turn in the same FIFO.
+	// Once the source reaches its terminal event, !stop can therefore target a
+	// continuation waiting for its semaphore slot instead of seeing a gap.
+	arrivalCtx, arrivalCancel := context.WithCancel(r.bot.ctx)
+	ownerUserID := ""
+	if r.source != nil {
+		ownerUserID = r.source.ownerUserID
+	}
+	arrivalActive := r.bot.registerActiveTurnAfter(r.channel, r.threadTS, r.source, ownerUserID, arrivalCancel)
+	go func() {
+		// Admission is already guaranteed by the FIFO reservation. Wait for
+		// the initiating turn to release it, then take a global execution slot
+		// instead of rejecting a valid arrival while the semaphore is full.
+		r.reservation.Wait()
+		if r.source != nil {
+			select {
+			case <-r.source.stopCh:
+				// The operator stopped the source turn that created this arrival.
+				// Discard its continuation rather than resuming after cancellation.
+				// A second !stop may have targeted the arrival after the source
+				// transaction completed but before this reservation woke up; finish
+				// that command's notice transaction before releasing the FIFO slot.
+				r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
+				arrivalCancel()
+				if arrivalActive.stopRequested() {
+					r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
+				}
+				r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
+				r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+				return
+			default:
+			}
+		}
+		select {
+		case <-r.bot.ctx.Done():
+			r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
+			arrivalCancel()
+			r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+			return
+		case <-arrivalCtx.Done():
+			r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
+			if arrivalActive.stopRequested() {
+				r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
+			}
+			r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
+			r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+			return
+		case r.bot.sem <- struct{}{}:
+			// Cancellation may have become ready in the same select. It wins
+			// admission even if Go chose the semaphore send pseudo-randomly.
+			if arrivalCtx.Err() != nil {
+				<-r.bot.sem
+				r.bot.finishActiveTurn(r.channel, r.threadTS, arrivalActive)
+				if arrivalActive.stopRequested() {
+					r.bot.postStopNotice(r.channel, r.threadTS, arrivalActive)
+				}
+				r.bot.finishStopTransaction(r.channel, r.threadTS, arrivalActive)
+				r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+				return
+			}
+		}
+		defer func() { <-r.bot.sem }()
+		r.bot.sendToAgentTurnReserved(r.bot.ctx, r.channel, r.threadTS, r.threadTS,
+			"", prompt, "", r.userID, expectedHolder, nil, true, "", append([]chathistory.HistoryMessage{}, r.history...), r.reservation, nil,
+			arrivalCtx, arrivalCancel, arrivalActive)
+	}()
+	return nil
+}
+
+func (r *slackHandoffReservation) Release() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released || r.activated {
+		return
+	}
+	r.released = true
+	r.bot.releaseThreadReservation(r.channel, r.threadTS, r.reservation)
+}
+
+// reserveThread appends one FIFO ticket. Every ticket must be released once
+// it finishes or is discarded; releasing it again is harmless.
+func (b *Bot) reserveThread(channel, threadTS string) *threadReservation {
+	turn, _ := b.reserveThreadN(channel, threadTS, 1)
+	return turn
+}
+
+func (b *Bot) reserveThreadPair(channel, threadTS string) (*threadReservation, *threadReservation) {
+	return b.reserveThreadN(channel, threadTS, 2)
+}
+
+func (b *Bot) reserveThreadN(channel, threadTS string, count int) (*threadReservation, *threadReservation) {
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
 	tl, ok := b.threadLocks[key]
 	if !ok {
-		tl = &threadLock{}
+		ready := make(chan struct{})
+		close(ready)
+		tl = &threadLock{tail: ready}
 		b.threadLocks[key] = tl
 	}
-	tl.waiters++
-	return tl
+	reserve := func() *threadReservation {
+		ready := tl.tail
+		done := make(chan struct{})
+		tl.tail = done
+		tl.waiters++
+		return &threadReservation{ready: ready, done: done, tl: tl}
+	}
+	first := reserve()
+	if count == 1 {
+		return first, nil
+	}
+	return first, reserve()
 }
 
-// releaseThreadLock decrements the reference count and removes the map entry
-// when no goroutines are waiting or holding the lock.
-func (b *Bot) releaseThreadLock(channel, threadTS string, tl *threadLock) {
+// reserveThreadSuccessor splits an unreleased ticket into current→successor.
+// Existing waiters still wait on the old done channel, now owned by successor;
+// current releases only a new intermediate gate. No waiter can observe a gap,
+// and neither the tail nor any already-published ready channel needs changing.
+func (b *Bot) reserveThreadSuccessor(channel, threadTS string, current *threadReservation) (*threadReservation, error) {
+	b.threadLocksMu.Lock()
+	defer b.threadLocksMu.Unlock()
+	if current == nil || current.released || current.tl != b.threadLocks[channel+":"+threadTS] {
+		return nil, errors.New("Slack source FIFO reservation is no longer active")
+	}
+	gate := make(chan struct{})
+	next := &threadReservation{ready: gate, done: current.done, tl: current.tl}
+	current.done = gate
+	current.tl.waiters++
+	return next, nil
+}
+
+// releaseThreadReservation closes this ticket's gate and drops its reference
+// atomically with successor insertion and new ordinary reservations.
+func (b *Bot) releaseThreadReservation(channel, threadTS string, reservation *threadReservation) {
 	key := channel + ":" + threadTS
 	b.threadLocksMu.Lock()
 	defer b.threadLocksMu.Unlock()
+	if reservation.released {
+		return
+	}
+	reservation.released = true
+	close(reservation.done)
+	tl := reservation.tl
 	tl.waiters--
 	if tl.waiters == 0 {
 		delete(b.threadLocks, key)
@@ -1688,6 +2933,12 @@ func (b *Bot) releaseThreadLock(channel, threadTS string, tl *threadLock) {
 
 // resolveUserName resolves a Slack user ID to a display name, with caching.
 func (b *Bot) resolveUserName(userID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), userLookupTimeout)
+	defer cancel()
+	return b.resolveUserNameContext(ctx, userID)
+}
+
+func (b *Bot) resolveUserNameContext(ctx context.Context, userID string) string {
 	b.userCacheMu.RLock()
 	if name, ok := b.userCache[userID]; ok {
 		b.userCacheMu.RUnlock()
@@ -1695,7 +2946,7 @@ func (b *Bot) resolveUserName(userID string) string {
 	}
 	b.userCacheMu.RUnlock()
 
-	user, err := b.api.GetUserInfoContext(context.Background(), userID)
+	user, err := b.api.GetUserInfoContext(ctx, userID)
 	if err != nil {
 		b.logger.Debug("failed to resolve slack user", "userID", userID, "err", err)
 		return userID // fallback to raw ID
@@ -1714,4 +2965,20 @@ func (b *Bot) resolveUserName(userID string) string {
 	b.userCacheMu.Unlock()
 
 	return name
+}
+
+// WaitSourceComplete is a passive checkpoint barrier, not an arrival admission.
+// source FIFO release happens after delivery, history writes and cleanup defers.
+func (r *slackHandoffReservation) WaitSourceComplete(ctx context.Context) error {
+	if r == nil {
+		return errors.New("Slack arrival reservation is missing")
+	}
+	select {
+	case <-r.reservation.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sourceCompleteErr
 }

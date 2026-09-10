@@ -22,8 +22,9 @@ func isCodexThreadID(s string) bool {
 }
 
 type codexThreadRef struct {
-	ThreadID    string `json:"thread_id"`
-	RolloutPath string `json:"rollout_path,omitempty"`
+	Goal        *GoalBinding `json:"goal,omitempty"`
+	ThreadID    string       `json:"thread_id"`
+	RolloutPath string       `json:"rollout_path,omitempty"`
 }
 
 func codexThreadRefDir(agentID string) string {
@@ -57,10 +58,21 @@ func readCodexThreadRef(agentID, sessionKey string) (*codexThreadRef, error) {
 		_ = os.Remove(codexThreadRefPath(agentID, sessionKey))
 		return nil, fmt.Errorf("invalid codex thread_id %q", ref.ThreadID)
 	}
+	if ref.Goal != nil {
+		if err := os.Chmod(codexThreadRefPath(agentID, sessionKey), 0o600); err != nil {
+			return nil, err
+		}
+	}
 	return &ref, nil
 }
 
 func writeCodexThreadRef(agentID, sessionKey string, ref codexThreadRef, logger *slog.Logger) {
+	unlock := goalRefLocks.Lock(codexThreadRefPath(agentID, sessionKey))
+	defer unlock()
+	if current, err := readCodexThreadRef(agentID, sessionKey); err == nil && current != nil && current.ThreadID == ref.ThreadID && current.Goal != nil {
+		ref.Goal = current.Goal
+	}
+
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -78,18 +90,26 @@ func writeCodexThreadRef(agentID, sessionKey string, ref codexThreadRef, logger 
 		logger.Warn("codex: marshal thread ref failed", "agent", agentID, "err", err)
 		return
 	}
-	if err := atomicfile.WriteBytes(codexThreadRefPath(agentID, sessionKey), append(body, '\n'), 0o644); err != nil {
+	if err := atomicfile.WriteBytes(codexThreadRefPath(agentID, sessionKey), append(body, '\n'), 0o600); err != nil {
 		logger.Warn("codex: write thread ref failed", "agent", agentID, "err", err)
 	}
 }
 
 func deleteCodexThreadRef(agentID, sessionKey string, logger *slog.Logger) {
-	if err := os.Remove(codexThreadRefPath(agentID, sessionKey)); err != nil && !os.IsNotExist(err) {
+	if err := deleteCodexThreadRefStrict(agentID, sessionKey); err != nil {
 		if logger == nil {
 			logger = slog.Default()
 		}
 		logger.Warn("codex: remove stale thread ref failed", "agent", agentID, "err", err)
 	}
+}
+
+func deleteCodexThreadRefStrict(agentID, sessionKey string) error {
+	err := os.Remove(codexThreadRefPath(agentID, sessionKey))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 func cloneStringAnyMap(in map[string]any) map[string]any {

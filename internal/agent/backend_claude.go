@@ -56,13 +56,21 @@ func (s *claudeStdinWriter) writeUserLine(text string) error {
 		// the frontend falls back to a normal send.
 		return ErrAgentNotBusy
 	}
-	if _, err = s.w.Write(append(line, '\n')); err != nil {
+	payload := append(line, '\n')
+	n, writeErr := s.w.Write(payload)
+	if writeErr != nil {
+		if n > 0 {
+			return fmt.Errorf("%w: Claude steer stdin accepted %d/%d bytes before error: %v", ErrSteerDeliveryUncertain, n, len(payload), writeErr)
+		}
 		// A broken/closed pipe means the process died mid-turn — same
 		// caller-facing meaning as the closed flag above.
-		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
+		if errors.Is(writeErr, syscall.EPIPE) || errors.Is(writeErr, os.ErrClosed) {
 			return ErrAgentNotBusy
 		}
-		return err
+		return writeErr
+	}
+	if n != len(payload) {
+		return fmt.Errorf("%w: Claude steer stdin accepted %d/%d bytes", ErrSteerDeliveryUncertain, n, len(payload))
 	}
 	return nil
 }
@@ -89,7 +97,12 @@ func (s *claudeStdinWriter) writeControlResponse(requestID string, resp map[stri
 	if s.closed {
 		return ErrAgentNotBusy
 	}
-	if _, err = s.w.Write(append(line, '\n')); err != nil {
+	line = append(line, '\n')
+	n, err := s.w.Write(line)
+	if err == nil && n != len(line) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		if errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
 			return ErrAgentNotBusy
 		}
@@ -151,7 +164,9 @@ func (t *claudeTurnSteer) writeUserLine(text string) error {
 	// the reaper deadline bounds any residual overshoot anyway.
 	t.writes.Add(1)
 	if err := t.stdinW.writeUserLine(text); err != nil {
-		t.writes.Add(-1)
+		if !errors.Is(err, ErrSteerDeliveryUncertain) {
+			t.writes.Add(-1)
+		}
 		return err
 	}
 	return nil
@@ -224,6 +239,8 @@ const automatedQuestionTimeoutMessage = "No answer arrived within the time limit
 // question and emits a user_question event) and the AnswerFunc the Manager
 // calls to resolve it. Safe for concurrent use.
 type claudeQuestionState struct {
+	onWriteFailure func() // immutable; stop the CLI instead of leaving a consumed prompt blocked
+
 	stdinW *claudeStdinWriter
 
 	mu sync.Mutex
@@ -295,6 +312,19 @@ func (q *claudeQuestionState) stopTimerLocked(requestID string) {
 func (q *claudeQuestionState) answer(requestID string, answers map[string]any, deny bool, denyMessage string) error {
 	q.mu.Lock()
 	input, ok := q.pending[requestID]
+	if ok && !deny {
+		var original struct {
+			Questions []UserQuestion `json:"questions"`
+		}
+		if json.Unmarshal(input, &original) != nil {
+			q.mu.Unlock()
+			return ErrInvalidQuestionAnswer
+		}
+		if err := ValidateQuestionAnswers(original.Questions, answers); err != nil {
+			q.mu.Unlock()
+			return err
+		}
+	}
 	var onResolved func(string)
 	if ok {
 		delete(q.pending, requestID)
@@ -329,7 +359,11 @@ func (q *claudeQuestionState) answer(requestID string, answers map[string]any, d
 			},
 		}
 	}
-	return q.stdinW.writeControlResponse(requestID, resp)
+	err := q.stdinW.writeControlResponse(requestID, resp)
+	if err != nil && q.onWriteFailure != nil {
+		q.onWriteFailure()
+	}
+	return err
 }
 
 // denyAllPending writes a deny control_response for every still-pending
@@ -498,6 +532,24 @@ func (b *ClaudeBackend) SetProxyURL(url string) {
 	b.proxyURL = url
 }
 
+func appendCustomProxyEnv(env []string, baseURL string) []string {
+	env = append(env, "ANTHROPIC_BASE_URL="+baseURL)
+	// Preserve support for unauthenticated Anthropic-compatible proxies.
+	// Claude Code otherwise opens its login flow instead of making a request.
+	// Authenticated endpoints are handled by kojo's loopback relay; the real
+	// credential deliberately never enters the Claude Code environment.
+	return append(env, "ANTHROPIC_API_KEY=dummy")
+}
+
+func customProxyRemoveEnvPrefixes() []string {
+	return []string{
+		"ANTHROPIC_",
+		"CLAUDE_CODE_USE_",
+		"HTTP_PROXY=", "HTTPS_PROXY=", "ALL_PROXY=", "NO_PROXY=",
+		"http_proxy=", "https_proxy=", "all_proxy=", "no_proxy=",
+	}
+}
+
 func (b *ClaudeBackend) Name() string { return "claude" }
 
 func (b *ClaudeBackend) Available() bool {
@@ -523,6 +575,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
 	}
+	if err := ensureClaudeProjectDir(dir); err != nil {
+		return nil, fmt.Errorf("prepare claude project dir: %w", err)
+	}
 
 	// SystemPromptExtra is appended by the manager before reaching us — see
 	// Manager.ChatOneShot. The backend treats systemPrompt as the final
@@ -530,7 +585,10 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// already placed at offset 0.
 	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 	args := inv.args
-	if inv.bootstrapRecentContext && opts.RecentMessagesContext != "" {
+	fresh := !opts.OneShot && inv.bootstrapRecentContext
+	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext,
+		!opts.OneShot && !fresh)
+	if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
 
@@ -542,7 +600,16 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
 	cmd := exec.CommandContext(ctx, claudePath, args...)
-	cmd.Env = filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
+	if b.proxyURL != "" {
+		// A custom endpoint must not inherit the daemon's Anthropic cloud
+		// credentials. Besides leaking a secret to another service, an
+		// inherited API key takes precedence over ANTHROPIC_AUTH_TOKEN in
+		// some Claude Code versions.
+		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
+	}
+	cmd.Env = filterEnv(removeEnv, agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	// Token conservation: agents persist state in files (MEMORY.md, memory/),
 	// not in Claude's conversation history. 1M context only inflates
 	// cache_read/cache_creation across runs without adding real value, and its
@@ -555,10 +622,8 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85",
 	)
 	if b.proxyURL != "" {
-		cmd.Env = append(cmd.Env, "ANTHROPIC_BASE_URL="+b.proxyURL)
-		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			cmd.Env = append(cmd.Env, "ANTHROPIC_API_KEY=dummy")
-		}
+		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
+		cmd.Env = append(cmd.Env, "NO_PROXY=127.0.0.1,localhost")
 	}
 	cmd.Dir = dir
 	// Send SIGTERM on context cancellation, then SIGKILL after 10s grace period.
@@ -609,6 +674,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	var qstate *claudeQuestionState
 	if opts.OnQuestionReady != nil {
 		qstate = newClaudeQuestionState(stdinW)
+		qstate.onWriteFailure = func() { _ = cmd.Process.Kill() }
 		qstate.setOnResolved(opts.OnQuestionResolved)
 		opts.OnQuestionReady(qstate.answer)
 	}
@@ -658,6 +724,9 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 				return
 			}
 		}
+		if processError == "" && result.resultError != "" && ctx.Err() == nil {
+			processError = result.resultError
+		}
 
 		// Determine final text. mergeStreamTexts prepends text from
 		// earlier assistant turns (lastAssistantText) that was captured
@@ -666,7 +735,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		// retries a malformed tool call: the first turn's text lands in
 		// lastAssistantText, and the retry's error message lands in
 		// fullText. Without merging, the original text is silently lost.
-		finalText := mergeStreamTexts(result)
+		finalText := finalStreamText(result, processError != "")
 
 		// Last resort: recover from Claude session JSONL when the stream
 		// produced no usable text. Only used as fallback, never overrides
@@ -855,12 +924,17 @@ type streamParseResult struct {
 	fullText          string
 	thinking          string
 	lastAssistantText string
-	streamSessionID   string
-	toolUses          []ToolUse
-	usage             *Usage
-	cancelled         bool   // true if send returned false (context cancelled)
-	origin            string // "result" event origin.kind, e.g. "task-notification"
-	usageCumulative   bool   // usage came from result.modelUsage (cumulative per process)
+	// lastAssistantIsLatestText is true when the most recent textual event
+	// was a complete assistant event and text deltas already preceded it.
+	// A subsequent text delta clears it, preserving newer retry output.
+	lastAssistantIsLatestText bool
+	streamSessionID           string
+	resultError               string // non-empty when result subtype starts with "error"
+	toolUses                  []ToolUse
+	usage                     *Usage
+	cancelled                 bool   // true if send returned false (context cancelled)
+	origin                    string // "result" event origin.kind, e.g. "task-notification"
+	usageCumulative           bool   // usage came from result.modelUsage (cumulative per process)
 }
 
 // applyUsage merges non-zero token metrics into res.usage, allocating it
@@ -914,6 +988,19 @@ func mergeStreamTexts(r *streamParseResult) string {
 		return r.fullText
 	}
 	return r.lastAssistantText + "\n\n" + r.fullText
+}
+
+// finalStreamText selects the terminal assistant content. A failed Claude
+// process can emit a complete final assistant event containing an error such
+// as "Prompt is too long" after it already streamed an unrelated partial
+// response. In that case lastAssistantText is the authoritative terminal
+// message; merging it with fullText produces a fabricated hybrid response.
+// Successful turns retain mergeStreamTexts' malformed-tool retry recovery.
+func finalStreamText(r *streamParseResult, turnFailed bool) string {
+	if turnFailed && r.lastAssistantIsLatestText && r.lastAssistantText != "" {
+		return r.lastAssistantText
+	}
+	return mergeStreamTexts(r)
 }
 
 // parseClaudeStream reads Claude's stream-json output from r and emits ChatEvents
@@ -1148,6 +1235,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		}
 		if atext.Len() > 0 {
 			res.lastAssistantText = atext.String()
+			res.lastAssistantIsLatestText = fullText.Len() > 0
 		}
 
 		// Record usage whenever the assistant turn reports any metric.
@@ -1213,6 +1301,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		case "text_delta":
 			if event.Delta.Text != "" {
 				fullText.WriteString(event.Delta.Text)
+				res.lastAssistantIsLatestText = false
 				if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
 					res.cancelled = true
 					return false
@@ -1298,6 +1387,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 
 	case "result":
 		isResult = true
+		if strings.HasPrefix(event.Subtype, "error") {
+			res.resultError = "claude turn failed: " + event.Subtype
+		}
 		if event.SessionID != "" {
 			res.streamSessionID = event.SessionID
 		}
@@ -1331,6 +1423,7 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		if event.Result != "" {
 			if fullText.Len() == 0 {
 				fullText.WriteString(event.Result)
+				res.lastAssistantIsLatestText = false
 				if !send(ChatEvent{Type: "text", Delta: event.Result}) {
 					// Record the cancelled send but still report the result
 					// boundary: returning early here would leave the caller
@@ -1982,24 +2075,45 @@ func expectedClaudeSessionID(agentID, sessionKey string, oneShot bool) string {
 // state so a fresh --session-id spawn succeeds immediately; the lost in-flight
 // context is recovered on the next turn via recent-messages bootstrap.
 func resetClaudeSessionFiles(agentID, sessionKey string, logger *slog.Logger) {
+	if err := resetClaudeSessionFilesStrict(agentID, sessionKey); err != nil && logger != nil {
+		logger.Warn("reset claude session files failed", "agent", agentID, "err", err)
+		return
+	}
+	if logger != nil {
+		logger.Warn("reset claude session file to clear stale in-use state",
+			"agent", agentID, "sessionID", expectedClaudeSessionID(agentID, sessionKey, false))
+	}
+}
+
+// resetClaudeSessionFilesStrict removes every native artifact that can make a
+// deterministic Claude session resume or appear in-use. Handoff arrival uses
+// the strict form and fails closed: continuing with a partially removed torn
+// session is more dangerous than surfacing a retryable turn error.
+func resetClaudeSessionFilesStrict(agentID, sessionKey string) error {
 	sessionID := expectedClaudeSessionID(agentID, sessionKey, false)
 	if sessionID == "" {
-		return
+		return nil
 	}
 	// claude encodes its project dir from the process's RESOLVED cwd, so the
 	// path must be symlink-resolved (on macOS the agent dir under /tmp resolves
 	// to /private/tmp; filepath.Abs alone would target a nonexistent
 	// "-tmp-..." project dir and the delete would silently no-op).
-	dir := agentDir(agentID)
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = resolved
-	}
-	absDir, err := filepath.Abs(dir)
+	dir, err := filepath.Abs(agentDir(agentID))
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.Remove(filepath.Join(claudeProjectDir(absDir), sessionID+".jsonl"))
-	_ = os.RemoveAll(filepath.Join(claudeConfigDir(), "session-env", sessionID))
+	dirs := []string{dir}
+	if resolved, rerr := filepath.EvalSymlinks(dir); rerr == nil && resolved != dir {
+		dirs = append(dirs, resolved)
+	}
+	for _, projectRoot := range dirs {
+		if err := os.Remove(filepath.Join(claudeProjectDir(projectRoot), sessionID+".jsonl")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(claudeConfigDir(), "session-env", sessionID)); err != nil {
+		return err
+	}
 	// Also drop any lingering per-pid session lease that names this session.
 	leaseDir := filepath.Join(claudeConfigDir(), "sessions")
 	if entries, derr := os.ReadDir(leaseDir); derr == nil {
@@ -2008,15 +2122,23 @@ func resetClaudeSessionFiles(agentID, sessionKey string, logger *slog.Logger) {
 				continue
 			}
 			p := filepath.Join(leaseDir, e.Name())
-			if data, rerr := os.ReadFile(p); rerr == nil && strings.Contains(string(data), sessionID) {
-				_ = os.Remove(p)
+			data, rerr := os.ReadFile(p)
+			if rerr != nil {
+				if os.IsNotExist(rerr) {
+					continue
+				}
+				return rerr
+			}
+			if strings.Contains(string(data), sessionID) {
+				if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+					return err
+				}
 			}
 		}
+	} else if !os.IsNotExist(derr) {
+		return derr
 	}
-	if logger != nil {
-		logger.Warn("reset claude session file to clear stale in-use state",
-			"agent", agentID, "sessionID", sessionID)
-	}
+	return nil
 }
 
 // removeClaudeSession best-effort deletes the Claude session JSONL for the

@@ -126,14 +126,20 @@ func TestCustomBareChat_SendsHistoryInOrder(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	b := NewCustomBareBackend(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b := NewCustomBareBackend(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	ch, err := b.Chat(context.Background(),
 		&Agent{ID: "ag_hist", Tool: ToolCustomBare, CustomBaseURL: srv.URL, Model: "m"},
 		"current turn", "SYSTEM",
-		ChatOptions{History: []HistoryTurn{
-			{Role: "user", Content: "older question"},
-			{Role: "assistant", Content: "older answer"},
-		}})
+		ChatOptions{
+			// ChatOneShot derives this from the same canonical history for
+			// sessionful backends. custom-bare must prefer its structured replay
+			// rather than inject the formatted copy into the current turn too.
+			FreshSessionContext: "formatted duplicate of older question and answer",
+			History: []HistoryTurn{
+				{Role: "user", Content: "older question"},
+				{Role: "assistant", Content: "older answer"},
+			},
+		})
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
@@ -176,7 +182,7 @@ func TestCustomBareChat_FoldsTrailingUserTurn(t *testing.T) {
 		"<persona-anchor>\n" + personaAnchorHeader + "\nterse\n</persona-anchor>\n\n" +
 		"current turn"
 
-	b := NewCustomBareBackend(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b := NewCustomBareBackend(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	ch, err := b.Chat(context.Background(),
 		&Agent{ID: "ag_hist", Tool: ToolCustomBare, CustomBaseURL: srv.URL, Model: "m"},
 		current, "",

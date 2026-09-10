@@ -14,10 +14,11 @@ type AgentDataDirFunc func(agentID string) string
 
 // hubCommand represents a serialized operation on the Hub's event loop.
 type hubCommand struct {
-	kind    hubCmdKind
-	agentID string
-	cfg     agent.SlackBotConfig
-	result  chan<- bool // for IsRunning; nil for fire-and-forget commands
+	sessionKey string
+	kind       hubCmdKind
+	agentID    string
+	cfg        agent.SlackBotConfig
+	result     chan<- bool // for IsRunning; nil for fire-and-forget commands
 }
 
 type hubCmdKind int
@@ -28,6 +29,7 @@ const (
 	cmdReconfigure
 	cmdIsRunning
 	cmdStop
+	cmdResumeGoal
 )
 
 // Hub manages all SlackBot instances across agents.
@@ -71,6 +73,12 @@ func (h *Hub) loop() {
 
 	for cmd := range h.cmdCh {
 		switch cmd.kind {
+		case cmdResumeGoal:
+			bot, ok := bots[cmd.agentID]
+			if ok {
+				go bot.resumeGoal(cmd.sessionKey)
+			}
+			cmd.result <- ok
 		case cmdStartBot:
 			h.doStartBot(bots, cmd.agentID, cmd.cfg)
 
@@ -202,4 +210,19 @@ func (h *Hub) IsRunning(agentID string) bool {
 		return false
 	}
 	return <-ch
+}
+
+// ResumeGoal re-enters the normal Slack admission and streaming path so
+// recovery replies go back to the original channel/thread, not main WebUI.
+func (h *Hub) ResumeGoal(agentID, sessionKey string) bool {
+	result := make(chan bool, 1)
+	if !h.send(hubCommand{kind: cmdResumeGoal, agentID: agentID, sessionKey: sessionKey, result: result}) {
+		return false
+	}
+	select {
+	case ok := <-result:
+		return ok
+	case <-h.done:
+		return false
+	}
 }

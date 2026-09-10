@@ -91,10 +91,13 @@ func httpServerErrorLog(logger *slog.Logger) *log.Logger {
 var wsOriginPatterns = []string{"100.*.*.*", "*.ts.net", "localhost:*", "127.0.0.1:*"}
 
 type Server struct {
-	sessions *session.Manager
-	agents   *agent.Manager
-	groupdms *agent.GroupDMManager
-	slackHub *slackbot.Hub
+	goalHandoffBarriers sync.Map // op -> passive source adapter completion barrier
+	goalStopFences      sync.Map // emergency in-memory stop fence when durable storage is unavailable
+	sessions            *session.Manager
+	agents              *agent.Manager
+	groupdms            *agent.GroupDMManager
+	slackHub            *slackbot.Hub
+	externalChat        *externalChatRouter
 	// extensions is the kojo extension-package registry (packages
 	// installed from a git URL). Nil on PeerOnly daemons and when
 	// the registry directory could not be opened; every handler
@@ -129,25 +132,17 @@ type Server struct {
 	// complete (see handleAgentHandoffFinalize), so an aborted
 	// switch doesn't leave target peer with stale runtime state.
 	onAgentSynced func(ctx context.Context, agentID string) error
-	// onAgentSyncFinalized runs after a successful complete on
-	// the source side, when the orchestrator notifies target via
-	// POST /api/v1/peers/agent-sync/finalize. Adopts the raw
-	// $KOJO_AGENT_TOKEN into the local TokenStore, registers
-	// the agent with AgentLockGuard so the lock acquired during
-	// complete doesn't expire from this peer, and fires a
-	// system-message chat so the agent can resume immediately.
-	// sourceDeviceID identifies the originating peer (for the
-	// arrival notification prompt).
-	// opID is the orchestrator-minted UUID for this particular
-	// switch attempt; carried through so the arrival-chat dedup
-	// can key on (agentID, opID) instead of agentID alone — without
-	// that, the in-memory dedup map never clears and subsequent
-	// switches back to this peer silently skip their auto-continue.
+	// onAgentSyncFinalized runs after the source's complete/drain and the
+	// target's durable acceptance. It adopts the agent token, registers Guard
+	// with the accepted lock token, and activates runtime side channels.
+	// allowedProxy is the resolved response-surface Hub (not necessarily the
+	// immediate source). Arrival dispatch happens in the HTTP handler after
+	// this hook and optional transcript tail application. opID binds retries.
 	// Returns tokenReissued=true when rawToken was empty and the
 	// hook auto-re-issued a fresh agent token on this peer (Task A
 	// auto-repair) — surfaced in the arrival prompt so the agent
 	// knows no manual re-issue is needed.
-	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (tokenReissued bool, err error)
+	onAgentSyncFinalized func(ctx context.Context, agentID, rawToken, allowedProxy, opID string) (tokenReissued bool, err error)
 	// onAgentReleasedAsSource fires after the orchestrator's
 	// successful complete + finalize. Source peer drops the
 	// agent from its local AgentLockGuard so a target lease
@@ -161,6 +156,17 @@ type Server struct {
 	// back up without a daemon restart. Set via
 	// SetOnAgentForceReclaimed.
 	onAgentForceReclaimed func(ctx context.Context, agentID string)
+	// onLocalAgentActivated fires when this daemon creates or
+	// re-activates an agent that is immediately owned locally
+	// (create / fork / unarchive). cmd/kojo wires it to
+	// AgentLockGuard.AddAgent so agents born after daemon boot get
+	// a live agent_locks row without waiting for a restart.
+	onLocalAgentActivated func(ctx context.Context, agentID string)
+	// onLocalAgentDeactivated fires when this daemon archives or
+	// deletes a locally-owned agent. cmd/kojo wires it to
+	// AgentLockGuard.RemoveAgent so inactive agents stop refreshing
+	// runtime ownership leases.
+	onLocalAgentDeactivated func(ctx context.Context, agentID string)
 	// Queue-and-forward drain scheduler state (handoff_queue_handlers.go).
 	// One drain pass in flight at a time; triggers that land mid-pass
 	// set the rerun flag instead of stacking goroutines.
@@ -193,6 +199,15 @@ type Server struct {
 	// the claim (the drain re-checks row existence and skips) or is
 	// told delivery is already in flight. Guarded by handoffDrainMu.
 	handoffDelivering map[string]struct{}
+	// handoffArrivalCaps are one-time Hub-minted capabilities carried only on
+	// the private Hub→holder turn and holder→Hub callback paths.
+	handoffArrivalMu   sync.Mutex
+	handoffArrivalCaps map[string]*handoffArrivalCapability
+	// pendingFinalizeLocks serializes retries of one target-side finalize op.
+	// Without this, overlapping requests can make one path choose legacy
+	// fallback while another concurrently admits the origin conversation.
+	pendingFinalizeMu    sync.Mutex
+	pendingFinalizeLocks map[pendingSyncKey]*pendingFinalizeLock
 	// onAgentRuntimePurged fires after the inter-peer state
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
@@ -254,6 +269,14 @@ type Server struct {
 	// becomes RolePeer (on a peer daemon) or RoleOwner (on the Hub
 	// when the listener is the public one). Wired from --unsafe.
 	unsafePeer bool
+	// externalChatRelays authorizes short-lived Hub callbacks for files
+	// produced by an agent during a remotely dispatched Slack turn.
+	externalChatRelays *externalChatRelayRegistry
+	// externalChatAttachmentAcks holds the application-level acknowledgement
+	// for holder-produced attachment events until the Hub response adapter has
+	// accepted their metadata. It is an embedded value so zero-value test
+	// Servers get the same safe lazy initialization as production Servers.
+	externalChatAttachmentAcks externalChatAttachmentAckRegistry
 	// identityMu guards nodeKeyResolver + selfNodeKey, both of
 	// which can be (re)wired after server construction.
 	identityMu sync.RWMutex
@@ -493,6 +516,7 @@ func New(cfg Config) *Server {
 		repoDir:              cfg.RepoDir,
 		updateChecker:        cfg.UpdateChecker,
 		unsafePeer:           cfg.Unsafe,
+		externalChatRelays:   newExternalChatRelayRegistry(),
 		thumbPurgeDone:       make(chan struct{}),
 		ttsSweepDone:         make(chan struct{}),
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
@@ -525,12 +549,18 @@ func New(cfg Config) *Server {
 	// peer would race the Hub's hub for the same Slack tokens.
 	if s.agents != nil && !cfg.PeerOnly {
 		creds := s.agents.Credentials()
+		s.externalChat = newExternalChatRouter(s)
+		if s.groupdms != nil {
+			s.groupdms.SetOneShotRouter(s.externalChat.ChatOneShot)
+			s.groupdms.SetOneShotSteerRouter(s.externalChat.SteerOneShot)
+		}
 		s.slackHub = slackbot.NewHub(
-			s.agents, creds,
+			s.externalChat, creds,
 			func(id string) string { return agent.AgentDir(id) },
 			logger,
 		)
-		for _, a := range s.agents.List() {
+		allAgents := append(s.agents.List(), s.agents.ListRemote()...)
+		for _, a := range allAgents {
 			if a.Archived {
 				continue
 			}
@@ -736,6 +766,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 
 	// Custom API model discovery
 	mux.HandleFunc("GET /api/v1/custom-models", s.handleCustomModels)
+	mux.HandleFunc("POST /api/v1/custom-models", s.handleCustomModels)
 
 	// File browser
 	mux.HandleFunc("GET /api/v1/files", s.handleListFiles)
@@ -839,6 +870,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// DELETE) are Hub-only — peer pairing is an operator workflow
 	// that runs on the Hub.
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
+		// The canonical Hub owns external chat connections. A holder peer
+		// exposes only the fenced agent-turn endpoint used by the Hub.
+		mux.HandleFunc("GET /api/v1/agents/{id}/external-chat/ready", s.handleExternalChatReady)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat", s.handleExternalChatText)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/steer", s.handleExternalChatSteer)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/goal-stop", s.handleExternalGoalStop)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/attachment-ack", s.handleExternalChatAttachmentAck)
+		mux.HandleFunc("POST /api/v1/agents/{id}/external-chat/file", s.handleExternalChatFile)
 		mux.HandleFunc("GET /api/v1/peers", s.handleListPeers)
 		mux.HandleFunc("GET /api/v1/peers/self", s.handleGetSelfPeer)
 		if !cfg.PeerOnly {
@@ -904,6 +943,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// Owner OR self-agent; the policy layer enforces the
 		// caller-matches-{id} invariant for non-owner principals.
 		mux.HandleFunc("POST /api/v1/agents/{id}/handoff/switch", s.handleAgentHandoffSwitch)
+		mux.HandleFunc("POST /api/v1/peers/goals/handoff", s.handleGoalHandoffOrigin)
+		mux.HandleFunc("GET /api/v1/goal-handoffs/{op}", s.handleGoalHandoffStatus)
 		// Target-side pull endpoint that the orchestrator dials.
 		// Owner OR RolePeer (the orchestrator signs as its own
 		// peer identity); the source-side blob serve at
@@ -941,6 +982,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 		// them after the orchestrator's complete succeeds, drop
 		// rolls them back on abort.
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/finalize", s.handlePeerAgentSyncFinalize)
+		mux.HandleFunc("POST /api/v1/peers/handoff/arrival/bind", s.handleHandoffArrivalBind)
+		mux.HandleFunc("POST /api/v1/peers/goals/resume", s.handlePeerGoalResume)
+		mux.HandleFunc("POST /api/v1/peers/handoff/arrival", s.handleHandoffArrivalContinuation)
 		mux.HandleFunc("POST /api/v1/peers/agent-sync/drop", s.handlePeerAgentSyncDrop)
 	}
 
@@ -990,11 +1034,13 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ratelimit", s.handleGetAgentRateLimit)
+	mux.HandleFunc("GET /api/v1/agents/{id}/goal", s.handleGetGoal)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files", s.handleListAgentFiles)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/view", s.handleViewAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/raw", s.handleRawAgentFile)
 	mux.HandleFunc("GET /api/v1/agents/{id}/files/thumb", s.handleThumbAgentFile)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}", s.handleUpdateAgent)
+	mux.HandleFunc("POST /api/v1/agents/{id}/transfer-skips/dismiss", s.handleDismissTransferSkips)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset", s.handleResetAgentData)
 	mux.HandleFunc("POST /api/v1/agents/{id}/memory/truncate", s.handleTruncateAgentMemory)
 	mux.HandleFunc("POST /api/v1/agents/{id}/messages/{msgId}/rewind", s.handleRewindToMessage)
@@ -1072,7 +1118,13 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/generate-name", s.handleGenerateName)
 	mux.HandleFunc("POST /api/v1/agents/generate-avatar", s.handleGenerateAvatar)
 	mux.HandleFunc("GET /api/v1/agents/preview-avatar", s.handlePreviewAvatar)
+	mux.HandleFunc("DELETE /api/v1/agents/preview-avatar", s.handleDiscardPreviewAvatar)
 	mux.HandleFunc("GET /api/v1/agents/{id}/credentials", s.handleListCredentials)
+	mux.HandleFunc("GET /api/v1/agents/{id}/custom-api-key", s.handleGetCustomAPIKey)
+	mux.HandleFunc("PUT /api/v1/agents/{id}/custom-api-key", s.handleSetCustomAPIKey)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/custom-api-key", s.handleDeleteCustomAPIKey)
+	mux.HandleFunc("GET /api/v1/agents/{id}/custom-models", s.handleCustomModels)
+	mux.HandleFunc("POST /api/v1/agents/{id}/custom-models", s.handleCustomModels)
 	mux.HandleFunc("POST /api/v1/agents/{id}/credentials", s.handleAddCredential)
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/credentials/{credId}", s.handleUpdateCredential)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/credentials/{credId}", s.handleDeleteCredential)
@@ -1399,12 +1451,21 @@ type pendingSyncKey struct {
 	OpID    string
 }
 
-// pendingSyncEntry is the per-op state captured at agent-sync
-// time. RawToken is the only field today; structuring as a
-// struct leaves room for future per-op state (claude session
-// digests, sync timestamps) without another schema change.
+// pendingSyncEntry is the per-op state captured at agent-sync time and updated
+// as finalize commits side effects. It is sealed as one value so token,
+// delivery-decision, and degraded-transfer metadata survive target restarts
+// without separate partially-updated rows.
 type pendingSyncEntry struct {
-	RawToken string `json:"raw_token"`
+	SourceDeviceID string `json:"source_device_id,omitempty"`
+	IncomingFenced bool   `json:"incoming_fenced,omitempty"`
+	RawToken       string `json:"raw_token"`
+	// ArrivalHandled records that origin continuation admission or its legacy
+	// fallback already succeeded. ArrivalUncertain records an attempted origin
+	// delivery whose outcome cannot be distinguished after a transport loss.
+	// Both survive target restart so a later finalize retry never duplicates an
+	// earlier arrival decision.
+	ArrivalHandled   bool `json:"arrival_handled,omitempty"`
+	ArrivalUncertain bool `json:"arrival_uncertain,omitempty"`
 	// DegradedFlushes / TransferSkips carry the per-switch loss
 	// metadata from the agent-sync payload to the finalize step,
 	// where they feed the arrival prompt's caveat block.
@@ -1511,6 +1572,37 @@ func (s *Server) recordPendingAgentSync(ctx context.Context, agentID, opID strin
 	s.pendingAgentSyncs[pendingSyncKey{AgentID: agentID, OpID: opID}] = entry
 	s.pendingTokensMu.Unlock()
 	return nil
+}
+
+// updatePendingAgentSyncAfterSideEffect checkpoints an idempotency decision
+// made after the pending row was created. Unlike initial record, the in-memory
+// cache is updated even if durable persistence fails: the side effect already
+// happened, so same-process retries must not replay it. The error still keeps
+// finalize from reporting success and surfaces the durability failure.
+func (s *Server) updatePendingAgentSyncAfterSideEffect(ctx context.Context, agentID, opID string, entry pendingSyncEntry) error {
+	var persistErr error
+	if st := s.pendingSyncStore(); st != nil && len(s.pendingSyncKEK) > 0 {
+		sealed, err := s.sealPendingSync(agentID, opID, entry)
+		if err != nil {
+			persistErr = err
+		} else if _, err := st.PutKV(ctx, &store.KVRecord{
+			Namespace:      pendingAgentSyncNamespace,
+			Key:            pendingAgentSyncKey(agentID, opID),
+			ValueEncrypted: sealed,
+			Type:           store.KVTypeBinary,
+			Scope:          store.KVScopeMachine,
+			Secret:         true,
+		}, store.KVPutOptions{}); err != nil {
+			persistErr = fmt.Errorf("updatePendingAgentSyncAfterSideEffect: put kv: %w", err)
+		}
+	}
+	s.pendingTokensMu.Lock()
+	if s.pendingAgentSyncs == nil {
+		s.pendingAgentSyncs = make(map[pendingSyncKey]pendingSyncEntry)
+	}
+	s.pendingAgentSyncs[pendingSyncKey{AgentID: agentID, OpID: opID}] = entry
+	s.pendingTokensMu.Unlock()
+	return persistErr
 }
 
 // consumePendingAgentSync returns the stashed entry for the
@@ -1673,7 +1765,7 @@ func (s *Server) currentSelfNodeKey() string {
 // SetOnAgentSyncFinalized installs the post-complete hook that
 // the orchestrator's /api/v1/peers/agent-sync/finalize endpoint
 // invokes. See onAgentSyncFinalized for the contract.
-func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, sourceDeviceID, opID string) (bool, error)) {
+func (s *Server) SetOnAgentSyncFinalized(fn func(ctx context.Context, agentID, rawToken, allowedProxy, opID string) (bool, error)) {
 	s.onAgentSyncFinalized = fn
 }
 
@@ -1693,6 +1785,19 @@ func (s *Server) SetOnAgentForceReclaimed(fn func(ctx context.Context, agentID s
 	s.onAgentForceReclaimed = fn
 }
 
+// SetOnLocalAgentActivated installs the local lifecycle hook used
+// when an agent becomes active on this daemon outside the peer-sync
+// finalize path (create / fork / unarchive).
+func (s *Server) SetOnLocalAgentActivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentActivated = fn
+}
+
+// SetOnLocalAgentDeactivated installs the local lifecycle hook used
+// when an agent stops being active on this daemon via archive/delete.
+func (s *Server) SetOnLocalAgentDeactivated(fn func(ctx context.Context, agentID string)) {
+	s.onLocalAgentDeactivated = fn
+}
+
 // SetOnAgentRuntimePurged installs the inter-peer state-probe
 // self-heal hook. See onAgentRuntimePurged for the contract.
 func (s *Server) SetOnAgentRuntimePurged(fn func(ctx context.Context, agentID string)) {
@@ -1708,6 +1813,9 @@ func (s *Server) SetTLSConfig(tlsCfg *tls.Config) {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.agents != nil {
+		s.agents.PreserveNativeGoalsOnShutdown()
+	}
 	s.logger.Info("shutting down...")
 
 	// Drain HTTP listeners first so no new requests can land while the

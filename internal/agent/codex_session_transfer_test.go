@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func setupCodexTransferTest(t *testing.T) (agentID, codexRoot string) {
@@ -54,6 +56,87 @@ func TestReadCodexSessionFiles_ReadsRefAndRollout(t *testing.T) {
 	}
 	if string(th.RolloutContent) == "" {
 		t.Fatalf("rollout content empty")
+	}
+}
+
+func TestReadCodexSessionFiles_NewestRefFirst(t *testing.T) {
+	agentID, codexRoot := setupCodexTransferTest(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	type fixture struct {
+		key, threadID string
+	}
+	fixtures := []fixture{
+		{"", "019e7cc9-dd5e-7971-b654-7840c683879e"},
+		{"slack:test", "019e7cc9-dd5e-7971-b654-7840c683879f"},
+	}
+	for i, f := range fixtures {
+		rel := filepath.Join("sessions", "2026", "05", "31", "rollout-"+f.threadID+".jsonl")
+		path := filepath.Join(codexRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(f.threadID), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeCodexThreadRef(agentID, f.key, codexThreadRef{ThreadID: f.threadID, RolloutPath: path}, logger)
+		refPath := codexThreadRefPath(agentID, f.key)
+		mtime := time.Now().Add(time.Duration(i) * time.Hour)
+		if err := os.Chtimes(refPath, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, skipped, err := ReadCodexSessionFiles(agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 0 || got == nil || len(got.Threads) != 2 {
+		t.Fatalf("got=%+v skipped=%+v", got, skipped)
+	}
+	if got.Threads[0].ThreadID != fixtures[1].threadID || got.Threads[1].ThreadID != fixtures[0].threadID {
+		t.Fatalf("thread order = %s, %s; want newest ref first", got.Threads[0].ThreadID, got.Threads[1].ThreadID)
+	}
+}
+
+func TestReadCodexSessionFiles_RefCountKeepsNewestAndSkipsOlder(t *testing.T) {
+	agentID, codexRoot := setupCodexTransferTest(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	baseTime := time.Now().Add(-time.Hour)
+	threadIDs := make([]string, codexSessionTransferMaxThreads+1)
+	for i := range threadIDs {
+		threadID := fmt.Sprintf("019e7cc9-dd5e-7971-b654-%012x", i+1)
+		threadIDs[i] = threadID
+		rel := filepath.Join("sessions", "2026", "05", "31", "rollout-"+threadID+".jsonl")
+		rolloutPath := filepath.Join(codexRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(rolloutPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(rolloutPath, []byte(threadID), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		key := fmt.Sprintf("slack:test:%03d", i)
+		writeCodexThreadRef(agentID, key, codexThreadRef{ThreadID: threadID, RolloutPath: rolloutPath}, logger)
+		refPath := codexThreadRefPath(agentID, key)
+		mtime := baseTime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(refPath, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, skipped, err := ReadCodexSessionFiles(agentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || len(got.Threads) != codexSessionTransferMaxThreads {
+		t.Fatalf("threads=%v, want newest %d", got, codexSessionTransferMaxThreads)
+	}
+	if got.Threads[0].ThreadID != threadIDs[len(threadIDs)-1] ||
+		got.Threads[len(got.Threads)-1].ThreadID != threadIDs[1] {
+		t.Fatalf("kept range = %s ... %s; want newest through second-oldest",
+			got.Threads[0].ThreadID, got.Threads[len(got.Threads)-1].ThreadID)
+	}
+	if len(skipped) != 1 || skipped[0].Reason != "capacity" {
+		t.Fatalf("skipped=%+v, want one capacity skip", skipped)
 	}
 }
 
@@ -119,5 +202,51 @@ func TestStageCodexSession_RollbackAndCommit(t *testing.T) {
 	}
 	if _, err := os.Stat(refPath); !os.IsNotExist(err) {
 		t.Fatalf("ref survived clear: %v", err)
+	}
+}
+
+func TestStageCodexSession_RemovesOmittedRefsAndRollsBack(t *testing.T) {
+	agentID, codexRoot := setupCodexTransferTest(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	staleThread := "019e7cc9-dd5e-7971-b654-7840c683879d"
+	staleRollout := filepath.Join(codexRoot, "sessions", "stale-"+staleThread+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(staleRollout), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staleRollout, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeCodexThreadRef(agentID, "slack:stale", codexThreadRef{
+		ThreadID: staleThread, RolloutPath: staleRollout,
+	}, logger)
+	staleRef := codexThreadRefPath(agentID, "slack:stale")
+
+	newThread := "019e7cc9-dd5e-7971-b654-7840c683879e"
+	newRel := filepath.ToSlash(filepath.Join("sessions", "new-"+newThread+".jsonl"))
+	transfer := &CodexSessionTransfer{Threads: []CodexThreadTransfer{{
+		RefName: "main.json", ThreadID: newThread, RolloutRelPath: newRel,
+		RolloutContent: []byte("new"),
+	}}}
+	commit, rollback, err := StageCodexSession(agentID, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(staleRef); !os.IsNotExist(err) {
+		t.Fatalf("omitted ref remains staged: %v", err)
+	}
+	rollback()
+	if _, err := os.Stat(staleRef); err != nil {
+		t.Fatalf("omitted ref not restored by rollback: %v", err)
+	}
+	_ = commit
+
+	commit, rollback, err = StageCodexSession(agentID, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	_ = rollback
+	if _, err := os.Stat(staleRef); !os.IsNotExist(err) {
+		t.Fatalf("omitted ref survived commit: %v", err)
 	}
 }

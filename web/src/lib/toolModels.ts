@@ -66,9 +66,9 @@ const codexEffortModels = new Set(toolModels.codex.models);
 // "ultra", which kojo's effort scale doesn't model). Older gpt-5.x models
 // stop at xhigh. Keep in sync with agent.go codexMaxEffortModels.
 const codexMaxModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// gpt-6-astra and gpt-5.6-sol advertise default_reasoning_level "low";
-// every other codex model defaults to medium.
-const codexLowDefaultModels = new Set(["gpt-6-astra", "gpt-5.6-sol"]);
+// codex CLI 0.153.4 advertises default_reasoning_level "medium" for
+// gpt-6-astra; gpt-5.6-sol remains the only listed model that defaults low.
+const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
 // grok CLI 1.0.3 models_cache.json: grok-4.6 lists efforts
 // [xhigh,high,medium,low]; grok-4.5 lists [high,medium,low]. Neither
 // advertises "max". Keep in sync with agent.go grokEffortModels /
@@ -111,6 +111,10 @@ export function sessionEffortLevelsForModel(model: string): string[] {
 
 /** Return available effort levels for a given model. */
 export function effortLevelsForModel(model: string): readonly EffortLevel[] {
+  // With the CLI-default model, the concrete model (and therefore support
+  // for xhigh/max) is not known. Offer only the common safe ladder; in
+  // particular Codex drops max when no model id is available for gating.
+  if (!model) return ["low", "medium", "high"] as const;
   if (codexMaxModels.has(model)) return effortLevels;
   if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokXhighModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;

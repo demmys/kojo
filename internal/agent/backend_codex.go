@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -71,6 +72,38 @@ func (b *CodexBackend) Available() bool {
 }
 
 func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage string, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, error) {
+	if err := checkGoalHandoffAdmission(agent.ID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
+	if err := opts.Goal.Validate(); err != nil {
+		return nil, err
+	}
+	if opts.Goal != nil && opts.OneShot {
+		return nil, errors.New("native goals require a persistent conversation")
+	}
+	goalKey := codexThreadRefPath(agent.ID, opts.SessionKey)
+	runtime := &codexGoalRuntime{isGoal: opts.Goal != nil, runID: opts.GoalRunID, origin: opts.OriginPeerID, userID: opts.GoalUserID, agentID: agent.ID, key: opts.SessionKey, pending: make(map[int64]chan *rpcMessage)}
+	if opts.Goal != nil {
+		runtime.resumeHandoffID = opts.Goal.ExpectedHandoffID
+	}
+	if !opts.OneShot {
+		if old, loaded := codexGoalRuntimes.LoadOrStore(goalKey, runtime); loaded {
+			if opts.Goal == nil {
+				return nil, ErrAgentBusy
+			}
+			g, err := old.(*codexGoalRuntime).control(ctx, opts.Goal)
+			if err != nil {
+				return nil, err
+			}
+			return goalControlEvents(g, agent.ID, opts.SessionKey), nil
+		}
+	}
+	launched := false
+	defer func() {
+		if !launched && !opts.OneShot {
+			codexGoalRuntimes.CompareAndDelete(goalKey, runtime)
+		}
+	}()
 	codexPath, err := exec.LookPath("codex")
 	if err != nil {
 		return nil, fmt.Errorf("codex not found in PATH")
@@ -82,8 +115,27 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	}
 
 	args := []string{"app-server"}
+	binding, bindingErr := goalBindingFor(agent.ID, opts.SessionKey)
+	if bindingErr != nil && (opts.Goal != nil || opts.ResumeGoalOnReply) {
+		return nil, bindingErr
+	}
+	if opts.Goal != nil || binding != nil {
+		args = append(args, "-c", "features.goals=true")
+		if effort := codexEffortForProtocol(agent.Model, agent.Effort); effort != "" {
+			args = append(args, "-c", "model_reasoning_effort="+tomlString(effort))
+		}
+	} else {
+		// Only explicitly enabled conversations may create native goals.
+		args = append(args, "-c", "features.goals=false")
+	}
 	for _, kv := range b.extraConfig {
 		args = append(args, "-c", kv)
+	}
+	// Default mode otherwise rejects request_user_input before emitting its
+	// server request. Enable it only when this caller can answer questions;
+	// keep execution in Default mode (Plan mode would prevent normal work).
+	if opts.OnQuestionReady != nil {
+		args = append(args, "-c", "features.default_mode_request_user_input=true")
 	}
 	for name, srv := range opts.MCPServers {
 		if srv.isStdio() {
@@ -116,7 +168,30 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	cmd := exec.CommandContext(ctx, codexPath, args...)
 	cmd.Dir = dir
 	cmd.Env = filterEnv([]string{"AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, agent.ID, dir)
+	cmd.Env = appendKojoTurnEnv(cmd.Env, opts)
 	cmd.Cancel = func() error {
+		// Persist intent before killing a possibly unresponsive CLI. A later
+		// thread/resume reconciles this fence before it can resume native goals.
+		runtime.mu.Lock()
+		stopped := runtime.stopRequested
+		isGoal := runtime.isGoal
+		runtime.mu.Unlock()
+		preserve := opts.PreserveGoalOnCancel != nil && opts.PreserveGoalOnCancel()
+		if opts.GoalRunID != "" && isGoal {
+			preserve = true
+		}
+		if !opts.OneShot && (isGoal || (binding != nil && binding.State != nil)) {
+			_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+				if b.State != nil && b.State.Status != "complete" {
+					if stopped || !preserve {
+						cancelGoalHandoff(b, "goal execution cancelled")
+						b.DesiredPaused = true
+						b.Generation++
+					}
+					b.RecoveryPending = preserve && !stopped && !b.DesiredPaused
+				}
+			})
+		}
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
 	cmd.WaitDelay = 10 * time.Second
@@ -138,10 +213,15 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		return nil, fmt.Errorf("start codex app-server: %w", err)
 	}
 
+	launched = true
 	ch := make(chan ChatEvent, 64)
 
 	go func() {
 		defer close(ch)
+		defer runtime.close()
+		if !opts.OneShot {
+			defer codexGoalRuntimes.CompareAndDelete(goalKey, runtime)
+		}
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
@@ -156,10 +236,45 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			data = append(data, '\n')
 			writeMu.Lock()
 			defer writeMu.Unlock()
-			_, werr := stdin.Write(data)
-			return werr
+			n, werr := stdin.Write(data)
+			if werr == nil && n != len(data) {
+				werr = io.ErrShortWrite
+			}
+			if werr != nil {
+				return &codexRPCWriteError{Written: n, Err: werr}
+			}
+			return nil
 		}
-		respondServerRequest := newCodexServerRequestResponder(writeLine)
+		fallbackResponder := newCodexServerRequestResponder(writeLine)
+		respondServerRequest := codexServerRequestResponder(func(msg *rpcMessage) (string, error) {
+			if msg.Method == "serverRequest/resolved" {
+				return "resolved", nil
+			}
+			return fallbackResponder(msg)
+		})
+		var qs *codexQuestionState
+		if opts.OnQuestionReady != nil {
+			qs = newCodexQuestionState(writeLine, send, opts.OnQuestionResolved)
+			qs.onWriteFailure = func() { _ = cmd.Process.Kill() }
+			defer qs.close()
+			opts.OnQuestionReady(qs.answer)
+			fallback := respondServerRequest
+			respondServerRequest = func(msg *rpcMessage) (string, error) {
+				if msg.Method == "serverRequest/resolved" {
+					var p struct {
+						RequestID json.RawMessage `json:"requestId"`
+					}
+					if msg.Params != nil && json.Unmarshal(*msg.Params, &p) == nil {
+						qs.resolveRPC(p.RequestID)
+					}
+					return "resolved", nil
+				}
+				if msg.Method == "item/tool/requestUserInput" {
+					return qs.register(msg, opts.AutomatedTrigger)
+				}
+				return fallback(msg)
+			}
+		}
 		sendRPCErr := func(method string, params any) (int64, error) {
 			id := reqID.Add(1)
 			err := writeLine(rpcRequest{
@@ -260,6 +375,141 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Step 2: Send initialized notification (no params per protocol)
 		sendNotify("initialized")
 
+		// Goal controls on an idle conversation operate on persisted native
+		// state WITHOUT thread/resume (resuming an active goal can start work).
+		refBefore, refErr := readCodexThreadRef(agent.ID, opts.SessionKey)
+		if refErr != nil && (opts.Goal != nil || opts.ResumeGoalOnReply) {
+			send(ChatEvent{Type: "error", ErrorMessage: refErr.Error()})
+			shutdown()
+			return
+		}
+		if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil {
+			if opts.Goal.ExpectedHandoffID != "" && !goalHandoffResumeAllowed(refBefore, opts.Goal) {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal handoff changed or was cancelled before resume"})
+				shutdown()
+				return
+			}
+			if refBefore == nil || refBefore.Goal == nil || (refBefore.Goal.DesiredPaused && opts.Goal.ExpectedHandoffID == "") || refBefore.ThreadID != opts.Goal.ExpectedThreadID || refBefore.Goal.Generation != *opts.Goal.ExpectedGeneration || (opts.Goal.ExpectedRunID != "" && opts.Goal.ExpectedRunID != refBefore.Goal.RunID) {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal changed or paused since recovery was scheduled"})
+				shutdown()
+				return
+			}
+		}
+		if opts.Goal != nil && refBefore != nil && goalOperationSeen(refBefore.Goal, opts.Goal.OperationID) {
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(refBefore.Goal.State)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
+			shutdown()
+			return
+		}
+		controlOnly := opts.Goal != nil && opts.Goal.Action != "start" && opts.Goal.Action != "resume"
+		if controlOnly {
+			if refBefore == nil {
+				send(ChatEvent{Type: "done", Message: assembleAssistantMessage("Goal: none.", "", nil, nil)})
+				shutdown()
+				return
+			}
+			if opts.Goal.Action == "pause" || opts.Goal.Action == "clear" {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+					b.DesiredPaused = true
+					b.Generation++
+					cancelGoalHandoff(b, "goal explicitly paused or cleared")
+				}); err != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+					shutdown()
+					return
+				}
+			}
+			method, params := goalRPC(opts.Goal, refBefore.ThreadID)
+			id := sendRPC(method, params)
+			msg, ok, err := waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+			if err != nil || !ok || msg.Error != nil {
+				detail := "goal API unavailable"
+				if err != nil {
+					detail = err.Error()
+				} else if ok && msg.Error != nil {
+					detail = msg.Error.Message
+				}
+				send(ChatEvent{Type: "error", ErrorMessage: detail})
+				shutdown()
+				return
+			}
+			goal := decodeGoal(msg.Result)
+			if opts.Goal.Action == "clear" {
+				goal = nil
+			}
+			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.State = goal; rememberGoalOperation(b, opts.Goal.OperationID) }); err != nil {
+				send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				shutdown()
+				return
+			}
+			send(ChatEvent{Type: "goal", Goal: goal})
+			send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(goal)+goalHandoffSummary(agent.ID, opts.SessionKey), "", nil, nil)})
+			shutdown()
+			return
+		}
+		if opts.Goal != nil && opts.Goal.Action == "resume" && (refBefore == nil || refBefore.Goal == nil || refBefore.Goal.State == nil) {
+			send(ChatEvent{Type: "error", ErrorMessage: "no goal to resume"})
+			shutdown()
+			return
+		}
+		if refBefore != nil && refBefore.Goal != nil {
+			// Never let resume activate a stored goal before this runner owns its
+			// stream. Pausing preserves native usage accounting.
+			id := sendRPC("thread/goal/get", map[string]any{"threadId": refBefore.ThreadID})
+			msg, ok, err := waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+			if err != nil || !ok || msg.Error != nil {
+				send(ChatEvent{Type: "error", ErrorMessage: "cannot read native goal before resume"})
+				shutdown()
+				return
+			}
+			old := decodeGoal(msg.Result)
+			if opts.ResumeGoalOnReply && opts.Goal == nil && goalResumesOnReply(refBefore.Goal, old) {
+				opts.Goal = &GoalRequest{Action: "resume"}
+				runtime.mu.Lock()
+				runtime.isGoal = true
+				runtime.mu.Unlock()
+			}
+			if opts.Goal != nil && opts.Goal.ExpectedGeneration != nil && (old == nil || (old.Status != "active" && !(old.Status == "paused" && (refBefore.Goal.ActivationPending || goalHandoffResumeAllowed(refBefore, opts.Goal))))) {
+				if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) { g.State = old }); err != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				} else {
+					send(ChatEvent{Type: "done", Message: assembleAssistantMessage(goalSummary(old), "", nil, nil)})
+				}
+				shutdown()
+				return
+			}
+
+			if opts.Goal != nil && opts.Goal.Action == "start" && old != nil && old.Status != "complete" {
+				send(ChatEvent{Type: "error", ErrorMessage: "this conversation already has a goal; clear it before starting another"})
+				shutdown()
+				return
+			}
+			if opts.Goal != nil && opts.Goal.Action == "resume" && (old == nil || old.Status == "complete") {
+				send(ChatEvent{Type: "error", ErrorMessage: "no unfinished goal to resume"})
+				shutdown()
+				return
+			}
+			if opts.Goal == nil && old != nil && old.Status == "active" && !refBefore.Goal.DesiredPaused {
+				send(ChatEvent{Type: "error", ErrorMessage: "this conversation has an active goal without a runner; use !goal resume or !goal pause"})
+				shutdown()
+				return
+			}
+			if old != nil && old.Status == "active" {
+				if opts.Goal != nil {
+					if err := updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) { b.ActivationPending = true }); err != nil {
+						send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+						shutdown()
+						return
+					}
+				}
+				id = sendRPC("thread/goal/set", map[string]any{"threadId": refBefore.ThreadID, "status": "paused"})
+				msg, ok, err = waitCodexRPCResponse(scanner, id, respondServerRequest, b.logger)
+				if err != nil || !ok || msg.Error != nil {
+					send(ChatEvent{Type: "error", ErrorMessage: "cannot pause native goal before resume"})
+					shutdown()
+					return
+				}
+			}
+		}
 		// Step 3: Start or resume thread.
 		//
 		// systemPrompt (already merged with any SystemPromptExtra by the
@@ -285,13 +535,25 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			threadParams["baseInstructions"] = systemPrompt
 		}
 
+		if opts.Goal != nil {
+			setup := userMessage
+			if opts.Goal.Action == "resume" && refBefore != nil && refBefore.Goal != nil {
+				setup = refBefore.Goal.SetupContext
+			}
+			if len(setup) > 1<<20 {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal setup context exceeds 1 MiB"})
+				shutdown()
+				return
+			}
+			threadParams["baseInstructions"] = systemPrompt + "\n\nGoal setup context (reference data for the explicit goal):\n" + setup
+		}
 		var rolloutPath string
 		var existingRef *codexThreadRef
+		resumed := false
 		if !opts.OneShot {
 			if ref, rerr := readCodexThreadRef(agent.ID, opts.SessionKey); rerr == nil && ref != nil && ref.ThreadID != "" {
 				existingRef = ref
-				resumeParams := cloneStringAnyMap(threadParams)
-				resumeParams["threadId"] = ref.ThreadID
+				resumeParams := buildCodexResumeParams(threadParams, ref.ThreadID)
 				threadStartID = sendRPC("thread/resume", resumeParams)
 				msg, ok, waitErr := waitCodexRPCResponse(scanner, threadStartID, respondServerRequest, b.logger)
 				if waitErr != nil {
@@ -309,12 +571,18 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 					return
 				}
 				if msg.Error != nil {
+					if ref.Goal != nil || opts.Goal != nil {
+						send(ChatEvent{Type: "error", ErrorMessage: "goal thread resume failed: " + msg.Error.Message})
+						shutdown()
+						return
+					}
 					b.logger.Warn("codex thread/resume failed; starting a fresh thread",
 						"agent", agent.ID, "sessionKey", opts.SessionKey,
 						"thread_id", ref.ThreadID, "err", msg.Error.Message)
 					deleteCodexThreadRef(agent.ID, opts.SessionKey, b.logger)
 				} else {
 					threadID, rolloutPath = decodeCodexThreadResult(msg.Result)
+					resumed = threadID != ""
 					if rolloutPath == "" {
 						rolloutPath = ref.RolloutPath
 					}
@@ -362,8 +630,19 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			writeCodexThreadRef(agent.ID, opts.SessionKey, codexThreadRef{
 				ThreadID:    threadID,
 				RolloutPath: rolloutPath,
+				Goal: func() *GoalBinding {
+					if existingRef != nil {
+						return existingRef.Goal
+					}
+					return nil
+				}(),
 			}, b.logger)
 		}
+
+		// Context fallback selection is centralized here because only the
+		// backend knows whether thread/resume actually succeeded or
+		// thread/start was used.
+		userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumed)
 
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through
@@ -391,12 +670,148 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// response by parseCodexStream), so the steerer blocks steer calls
 		// until that id lands.
 		var steerer *codexSteerer
-		if opts.OnSteerReady != nil {
+		if opts.OnSteerReady != nil || qs != nil {
 			steerer = newCodexSteerer(threadID, sendRPCErr)
 			defer steerer.close()
-			opts.OnSteerReady(steerer.steer)
+			if qs != nil {
+				qs.steer = steerer.steer
+			}
+			if opts.Goal == nil && opts.OnSteerReady != nil {
+				opts.OnSteerReady(func(text string) error {
+					q, err := ParseGoalCommand(text)
+					if err != nil {
+						return err
+					}
+					if q != nil {
+						return errors.New("wait for the ordinary turn to finish before changing its goal")
+					}
+					return steerer.steer(text)
+				})
+			}
 		}
 
+		if opts.Goal != nil {
+			runtime.mu.Lock()
+			runtime.write = sendRPCErr
+			runtime.threadID = threadID
+			runtime.mu.Unlock()
+			if ctx.Err() != nil {
+				shutdown()
+				return
+			}
+			runtime.mu.Lock()
+			stopped := runtime.stopRequested
+			if stopped {
+				runtime.mu.Unlock()
+				shutdown()
+				return
+			}
+			activationAdmitted := false
+			if err := updateGoalBinding(agent.ID, opts.SessionKey, func(g *GoalBinding) {
+				if ctx.Err() != nil {
+					g.DesiredPaused = true
+					return
+				}
+				if opts.Goal.Action == "start" {
+					g.SetupContext = userMessage
+					g.State = &CodexGoal{ThreadID: threadID, Objective: opts.Goal.Objective, Status: "active", TokenBudget: opts.Goal.TokenBudget}
+				}
+				if opts.Goal.ExpectedHandoffID != "" {
+					if g.Handoff == nil || g.Handoff.ID != opts.Goal.ExpectedHandoffID || g.Handoff.Phase != "resume_pending" || g.Generation != *opts.Goal.ExpectedGeneration || g.RunID != opts.Goal.ExpectedRunID {
+						return
+					}
+					g.Handoff.Phase = "resuming"
+				} else if opts.Goal.ExpectedGeneration == nil {
+					g.Handoff = nil // old operation must not stop this explicit replacement
+				}
+				g.Generation++
+				g.DesiredPaused = false
+				g.RecoveryPending = false
+				g.ActivationPending = true
+				if opts.Goal.ExpectedGeneration == nil {
+					g.RecoveryAttempts = 0
+					g.RuntimeFailures = 0
+				}
+				g.RunID = opts.GoalRunID
+				if opts.GoalUserID != "" {
+					g.UserID = opts.GoalUserID
+				}
+				if opts.OriginPeerID != "" {
+					g.OriginPeerID = opts.OriginPeerID
+				}
+				activationAdmitted = true
+				// Pending activation is fenced before RPC; success is recorded on ACK.
+			}); err != nil {
+				runtime.mu.Unlock()
+				send(ChatEvent{Type: "error", ErrorMessage: err.Error()})
+				shutdown()
+				return
+			}
+			runtime.mu.Unlock()
+			if !activationAdmitted {
+				send(ChatEvent{Type: "error", ErrorMessage: "goal activation was cancelled"})
+				shutdown()
+				return
+			}
+			if opts.OnSteerReady != nil {
+				opts.OnSteerReady(func(text string) error {
+					q, err := ParseGoalCommand(text)
+					if err != nil {
+						return err
+					}
+					if q != nil {
+						g, err := runtime.control(ctx, q)
+						if err == nil {
+							send(ChatEvent{Type: "text", Delta: "\n\n" + goalSummary(g) + "\n"})
+						}
+						return err
+					}
+					return steerer.steer(text)
+				})
+			}
+			if ctx.Err() != nil {
+				shutdown()
+				return
+			}
+			var replyStart func() (int64, error)
+			if opts.ResumeGoalOnReply {
+				replyStart = func() (int64, error) { return startTurn(userMessage) }
+			}
+			result := runCodexGoalWithReply(scanner, opts.Goal, runtime, steerer, respondServerRequest, b.logger, send, replyStart, qs)
+			if runtime.wantsHandoff() {
+				shutdownErr := shutdown()
+				if result.processError != "" {
+					shutdownErr = errors.New(result.processError)
+				}
+				runtime.finishHandoff(shutdownErr)
+				if shutdownErr != nil && result.processError == "" {
+					result.processError = "Goal handoff failed: " + shutdownErr.Error()
+				}
+				result.fullText.WriteString(goalHandoffSummary(agent.ID, opts.SessionKey))
+				send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+				return
+			}
+			if ctx.Err() != nil {
+				shutdown()
+				emitCancelDone(ctx, ch, result.fullText.String(), result.thinking.String(), result.toolUses, result.usage)
+				return
+			}
+			if result.processError != "" {
+				_ = updateGoalBinding(agent.ID, opts.SessionKey, func(b *GoalBinding) {
+					if b.State != nil && b.State.Status == "active" && !b.DesiredPaused {
+						b.RuntimeFailures++
+						b.RecoveryPending = b.RuntimeFailures < 3
+						if b.RuntimeFailures >= 3 {
+							b.DesiredPaused = true
+							b.Generation++
+						}
+					}
+				})
+			}
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
+			shutdown()
+			return
+		}
 		if !send(ChatEvent{Type: "status", Status: "thinking"}) {
 			shutdown()
 			return
@@ -412,12 +827,13 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			ctx,
 			scanner,
 			userMessage,
-			codexEmptyCompletionMaxRetries,
+			codexRetryPolicy(opts),
 			startTurn,
 			steerer,
 			respondServerRequest,
 			b.logger.With("agent", agent.ID, "sessionKey", opts.SessionKey),
 			send,
+			qs,
 		)
 		if steerer != nil {
 			// The turn is over (or the stream broke) — refuse further
@@ -433,7 +849,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 			return
 		}
 		if result.turnCompleted {
-			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError})
+			send(ChatEvent{Type: "done", Message: result.buildMessage(), Usage: result.usage, ErrorMessage: result.processError, ErrorCode: result.processErrorCode})
 			shutdown()
 			return
 		}
@@ -482,16 +898,33 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	return ch, nil
 }
 
+// buildCodexResumeParams asks app-server to restore the thread without
+// returning its historical turns. Kojo only needs the resumed thread's ID and
+// rollout path; hydrating every turn can make the single JSON-RPC response
+// exceed the bounded line reader when a thread contains large tool outputs or
+// image data. excludeTurns affects only the response payload, not the history
+// Codex restores for subsequent turns.
+func buildCodexResumeParams(threadParams map[string]any, threadID string) map[string]any {
+	resumeParams := cloneStringAnyMap(threadParams)
+	resumeParams["threadId"] = threadID
+	resumeParams["excludeTurns"] = true
+	return resumeParams
+}
+
 // codexStreamResult holds the accumulated state from parsing a Codex stream.
 type codexStreamResult struct {
-	fullText      strings.Builder
-	thinking      strings.Builder
-	toolUses      []ToolUse
-	usage         *Usage
-	processError  string // non-empty if turn/completed reported an error
-	turnStatus    string // status reported by the newest turn/completed
-	turnCompleted bool   // true if turn/completed was received
-	cancelled     bool   // true if send returned false (context cancelled)
+	questions        *codexQuestionState
+	questionText     string // fallback for a run ending immediately after an async question
+	fullText         strings.Builder
+	thinking         strings.Builder
+	toolUses         []ToolUse
+	usage            *Usage
+	processError     string // non-empty if turn/completed reported an error
+	processErrorCode string // app-server codexErrorInfo classification
+	activity         bool   // any model item, delta, or server request; fail closed for overload replay
+	turnStatus       string // status reported by the newest turn/completed
+	turnCompleted    bool   // true if turn/completed was received
+	cancelled        bool   // true if send returned false (context cancelled)
 
 	// streamedReasoning records the reasoning item ids that already arrived
 	// as item/reasoning/*Delta notifications, so the completed item for the
@@ -510,25 +943,27 @@ type codexStreamResult struct {
 type codexTurnStarter func(input string) (int64, error)
 
 // runCodexTurns processes one logical user request, automatically continuing
-// the same Codex thread when app-server reports a successful completion but
-// supplies no final assistant response. Tool/thinking state from each attempt
+// the same Codex thread after empty successful completions, and (for check-ins)
+// explicit overload failures before work starts. Tool/thinking state from each attempt
 // is retained in the terminal Message; live events are already emitted by
 // parseCodexStream as each attempt runs.
 func runCodexTurns(
 	ctx context.Context,
 	scanner *jsonlLineScanner,
 	initialInput string,
-	maxEmptyRetries int,
+	policy codexTurnRetryPolicy,
 	startTurn codexTurnStarter,
 	steerer *codexSteerer,
 	respondServerRequest codexServerRequestResponder,
 	logger *slog.Logger,
 	send func(ChatEvent) bool,
+	questions ...*codexQuestionState,
 ) *codexStreamResult {
 	combined := &codexStreamResult{}
 	input := initialInput
 
-	for attempt := 0; ; attempt++ {
+	emptyRetries, overloadRetries := 0, 0
+	for {
 		if ctx.Err() != nil {
 			combined.cancelled = true
 			combined.turnCompleted = false
@@ -543,8 +978,28 @@ func runCodexTurns(
 			return combined
 		}
 
-		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send)
+		result := parseCodexStream(scanner, turnStartID, steerer, respondServerRequest, logger, send, questions...)
 		combined.absorb(result)
+
+		// Retry only explicit overload failures before any work across the whole
+		// logical request. Never replay tools, partial output, or unknown failures.
+		if ctx.Err() == nil && !result.cancelled && result.turnCompleted &&
+			result.turnStatus == "failed" && result.processErrorCode == "serverOverloaded" &&
+			!combined.activity && overloadRetries < len(policy.overloadDelays) &&
+			steerer.prepareOverloadRetry(policy.overloadDelays[overloadRetries]) {
+			delay := policy.overloadDelays[overloadRetries]
+			overloadRetries++
+			logger.Warn("codex overloaded before work; waiting to retry",
+				"retry", overloadRetries, "maxRetries", len(policy.overloadDelays),
+				"delay", delay, "errorCode", result.processErrorCode, "err", result.processError)
+			if !waitCodexRetry(ctx, delay) {
+				combined.cancelled = true
+				combined.turnCompleted = false
+				return combined
+			}
+			input = codexOverloadRetryPrompt
+			continue
+		}
 
 		// Only a clean, successful completion with no final answer is
 		// recoverable here. Failed/interrupted turns, cancellation, and broken
@@ -552,15 +1007,16 @@ func runCodexTurns(
 		if result.cancelled || !result.turnCompleted || result.turnStatus != "completed" || result.processError != "" || result.hasFinalResponse() {
 			return combined
 		}
-		if attempt >= maxEmptyRetries {
+		if emptyRetries >= policy.maxEmptyRetries {
 			combined.processError = codexEmptyCompletionError
 			logger.Warn("codex turn completed without final response; automatic retries exhausted",
-				"retries", maxEmptyRetries)
+				"retries", policy.maxEmptyRetries)
 			return combined
 		}
 
 		logger.Warn("codex turn completed without final response; starting automatic continuation",
-			"retry", attempt+1, "maxRetries", maxEmptyRetries)
+			"retry", emptyRetries+1, "maxRetries", policy.maxEmptyRetries)
+		emptyRetries++
 		input = codexEmptyCompletionRetryPrompt
 	}
 }
@@ -574,6 +1030,9 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 	}
 	r.fullText.WriteString(next.fullText.String())
 	r.thinking.WriteString(next.thinking.String())
+	if next.questionText != "" {
+		r.questionText = strings.TrimSpace(r.questionText + "\n\n" + next.questionText)
+	}
 	r.toolUses = append(r.toolUses, next.toolUses...)
 	if next.usage != nil {
 		if r.usage == nil {
@@ -587,6 +1046,8 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 			r.usage.CostUSD += next.usage.CostUSD
 		}
 	}
+	r.activity = r.activity || next.activity
+	r.processErrorCode = next.processErrorCode
 	r.processError = next.processError
 	r.turnStatus = next.turnStatus
 	r.turnCompleted = next.turnCompleted
@@ -597,17 +1058,21 @@ func (r *codexStreamResult) absorb(next *codexStreamResult) {
 // tool calls and reasoning prove work happened, but they are not a response to
 // the user. Whitespace-only model output is likewise not a usable completion.
 func (r *codexStreamResult) hasFinalResponse() bool {
-	return strings.TrimSpace(r.fullText.String()) != ""
+	return strings.TrimSpace(r.fullText.String()) != "" || strings.TrimSpace(r.questionText) != ""
 }
 
 // buildMessage creates a Message from accumulated stream data.
 func (r *codexStreamResult) buildMessage() *Message {
-	return assembleAssistantMessage(r.fullText.String(), r.thinking.String(), r.toolUses, r.usage)
+	text := r.fullText.String()
+	if strings.TrimSpace(text) == "" {
+		text = r.questionText
+	}
+	return assembleAssistantMessage(text, r.thinking.String(), r.toolUses, r.usage)
 }
 
 // hasOutput returns true if the stream produced any text or tool uses.
 func (r *codexStreamResult) hasOutput() bool {
-	return r.fullText.Len() > 0 || len(r.toolUses) > 0
+	return r.fullText.Len() > 0 || r.questionText != "" || len(r.toolUses) > 0
 }
 
 // parseCodexStream reads Codex app-server JSON-RPC notifications from a scanner
@@ -616,8 +1081,11 @@ func (r *codexStreamResult) hasOutput() bool {
 // steer may be nil; when set, the active turn id from the turn/start
 // response (or the turn/started notification) is forwarded to it so
 // mid-turn turn/steer requests can be issued.
-func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codexSteerer, respondServerRequest codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool) *codexStreamResult {
+func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codexSteerer, respondServerRequest codexServerRequestResponder, logger *slog.Logger, send func(ChatEvent) bool, questions ...*codexQuestionState) *codexStreamResult {
 	res := &codexStreamResult{}
+	if len(questions) > 0 {
+		res.questions = questions[0]
+	}
 	itemPhases := make(map[string]string) // itemID -> phase ("commentary" or "final_answer")
 
 	for scanner.Scan() {
@@ -629,6 +1097,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 		var msg rpcMessage
 		if err := json.Unmarshal([]byte(line), &msg); err != nil {
 			logger.Debug("codex rpc parse error", "line", line, "err", err)
+			res.activity = true // Unreadable notifications cannot prove that no work ran.
 			continue
 		}
 
@@ -643,6 +1112,7 @@ func parseCodexStream(scanner *jsonlLineScanner, turnStartID int64, steer *codex
 			return res
 		}
 		if handled {
+			res.activity = true
 			continue
 		}
 
@@ -715,6 +1185,20 @@ func decodeCodexTurnID(result *json.RawMessage) string {
 // handleNotification processes a single JSON-RPC notification.
 // Returns true if the stream should stop (turn completed or cancelled).
 func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map[string]string, logger *slog.Logger, send func(ChatEvent) bool) bool {
+	// Include unrendered/unknown item kinds (file changes, collab tools, etc.)
+	// in the safety guard, not just the subset the UI knows how to display.
+	if msg.Method == "item/started" || msg.Method == "item/completed" {
+		var params struct {
+			Item struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		if msg.Params == nil || json.Unmarshal(*msg.Params, &params) != nil || params.Item.Type != "userMessage" {
+			res.activity = true
+		}
+	} else if strings.HasPrefix(msg.Method, "item/") {
+		res.activity = true
+	}
 	switch msg.Method {
 	case "item/started":
 		return res.handleItemStarted(msg, itemPhases, send)
@@ -776,8 +1260,8 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 		if msg.Params != nil {
 			var params struct {
 				Turn struct {
-					Status string    `json:"status"`
-					Error  *rpcError `json:"error"`
+					Status string          `json:"status"`
+					Error  *codexTurnError `json:"error"`
 				} `json:"turn"`
 			}
 			json.Unmarshal(*msg.Params, &params)
@@ -785,7 +1269,10 @@ func (res *codexStreamResult) handleNotification(msg *rpcMessage, itemPhases map
 			if params.Turn.Status == "failed" || params.Turn.Status == "interrupted" {
 				res.processError = "codex turn " + params.Turn.Status
 				if params.Turn.Error != nil {
-					res.processError = params.Turn.Error.Message
+					if params.Turn.Error.Message != "" {
+						res.processError = params.Turn.Error.Message
+					}
+					res.processErrorCode = codexErrorCode(params.Turn.Error.CodexErrorInfo)
 				}
 			}
 		}
@@ -981,6 +1468,8 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 	}
 	var params struct {
 		Item struct {
+			Delivery         string          `json:"delivery"`
+			Questions        json.RawMessage `json:"questions"`
 			ID               string          `json:"id"`
 			Type             string          `json:"type"`
 			Text             string          `json:"text"`
@@ -1034,6 +1523,18 @@ func (res *codexStreamResult) handleItemCompleted(msg *rpcMessage, itemPhases ma
 			return true
 		}
 	case "agentMessage":
+		// Message-delivered questions have no server RPC awaiting a reply.
+		// Do not mix their text into the later final answer (or post it twice).
+		if res.questions != nil && params.Item.Delivery == "async" && len(params.Item.Questions) > 0 && string(params.Item.Questions) != "null" && string(params.Item.Questions) != "[]" {
+			seen := res.questions.asyncSeen[params.Item.ID]
+			if err := res.questions.registerAsync(msg); err == nil {
+				if !seen {
+					res.questionText = strings.TrimSpace(res.questionText + "\n\n" + params.Item.Text)
+				}
+				return false
+			}
+			// An unsupported form remains readable as ordinary text.
+		}
 		// app-server normally streams agentMessage deltas, but the completed
 		// item is the authoritative snapshot. If no delta arrived at all, use
 		// its text as a fallback so a valid final answer is not mistaken for an
@@ -1248,6 +1749,13 @@ func codexDynamicToolName(msg *rpcMessage) (string, error) {
 // can continue. Infrastructure and unknown requests fail the turn instead of
 // being silently converted into a recoverable tool error.
 func handleCodexServerRequest(msg *rpcMessage, respond codexServerRequestResponder, logger *slog.Logger) (bool, error) {
+	if msg != nil && msg.Method == "serverRequest/resolved" && msg.ID == nil {
+		if respond != nil {
+			_, err := respond(msg)
+			return true, err
+		}
+		return true, nil
+	}
 	if msg == nil || msg.ID == nil || msg.Method == "" {
 		return false, nil
 	}

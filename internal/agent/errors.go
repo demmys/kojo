@@ -39,6 +39,15 @@ var (
 	// ErrAgentNotBusy is returned by Steer / SteerOneShot when there is no
 	// turn currently running to steer.
 	ErrAgentNotBusy = errors.New("agent has no turn in progress")
+	// ErrSteerDeliveryUncertain means a steer may have reached the backend or
+	// remote holder before its acknowledgement was lost. Callers must not
+	// delete the already-persisted canonical message: the model may have
+	// observed it.
+	ErrSteerDeliveryUncertain = errors.New("steer delivery outcome is uncertain")
+	ErrSteerOriginForbidden   = errors.New("steer origin is not allowed for this turn")
+
+	// ErrInvalidQuestionAnswer rejects incomplete or malformed answer payloads.
+	ErrInvalidQuestionAnswer = errors.New("invalid question answers")
 
 	// ErrQuestionNotFound is returned by Manager.AnswerQuestion when the
 	// given requestID does not match any pending user_question on the

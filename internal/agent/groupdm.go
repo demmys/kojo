@@ -352,6 +352,39 @@ func loadGroupMessages(groupID string, limit int, before string) ([]*GroupMessag
 	return out, hasMore, headID, nil
 }
 
+// loadGroupMessagesThroughContext returns the bounded transcript ending at
+// throughID, inclusive. The caller supplies context so handoff callback
+// cancellation prevents a late arrival from being admitted after fallback.
+func loadGroupMessagesThroughContext(parent context.Context, groupID string, limit int, throughID string) ([]*GroupMessage, error) {
+	db := getGlobalStore()
+	if db == nil {
+		return nil, errStoreNotReady
+	}
+	ctx, cancel := boundedCtx(parent)
+	defer cancel()
+	throughSeq, ok, err := groupMessageSeq(ctx, db, groupID, throughID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve through cursor: %w", err)
+	}
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	opts := store.GroupDMMessageListOptions{
+		BeforeSeq: throughSeq + 1, // exclusive cursor; +1 includes throughSeq
+		Order:     "desc",
+		Limit:     limit,
+	}
+	recs, err := db.ListGroupDMMessages(ctx, groupID, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := reverseToOldestFirst(recs)
+	if err := populateAgentNames(ctx, db, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // loadLatestGroupMessageID returns the ID of the newest message in a
 // group's transcript. Returns ("", nil) if the group has no messages.
 func loadLatestGroupMessageID(groupID string) (string, error) {

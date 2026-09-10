@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -518,7 +519,27 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), a.ID)
 	writeJSONResponse(w, http.StatusOK, a)
+}
+
+func (s *Server) reconcileLocalAgentLifecycle(ctx context.Context, agentID string) {
+	if s == nil || s.agents == nil || agentID == "" {
+		return
+	}
+	release := s.agents.LockPatch(agentID)
+	defer release()
+
+	a, ok := s.agents.Get(agentID)
+	if ok && !a.Archived {
+		if s.onLocalAgentActivated != nil {
+			s.onLocalAgentActivated(ctx, agentID)
+		}
+		return
+	}
+	if s.onLocalAgentDeactivated != nil {
+		s.onLocalAgentDeactivated(ctx, agentID)
+	}
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -937,6 +958,7 @@ func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), a.ID)
 	writeJSONResponse(w, http.StatusOK, a)
 }
 
@@ -1004,6 +1026,7 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	if s.slackHub != nil {
 		s.slackHub.StopBot(id)
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), id)
 	if s.extensions != nil {
 		// Drop the deleted agent's extension bindings. Archive keeps
 		// them: the row comes back on unarchive, and so should its
@@ -1066,6 +1089,7 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.reconcileLocalAgentLifecycle(r.Context(), id)
 	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do
 	// this — slackHub lives on the server, not the manager. The
 	// `!a.Archived` re-check guards against a concurrent
@@ -1822,6 +1846,8 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
 		case errors.Is(err, agent.ErrSteerUnsupported):
 			writeError(w, http.StatusConflict, "unsupported", err.Error())
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", "the steer may have reached the backend; the message was retained")
 		case errors.Is(err, agent.ErrAgentBusy):
 			writeError(w, http.StatusConflict, "busy", "agent is busy")
 		default:
@@ -1838,6 +1864,7 @@ func (s *Server) handleSteerAgent(w http.ResponseWriter, r *http.Request) {
 // {"requestId":"...","deny":true} to refuse. Mirrors the auth posture of the
 // steer handler (server-wide auth listener).
 func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	id := r.PathValue("id")
 
 	var body struct {
@@ -1861,8 +1888,12 @@ func (s *Server) handleAnswerAgentQuestion(w http.ResponseWriter, r *http.Reques
 
 	if err := s.agents.AnswerQuestion(r.Context(), id, body.RequestID, body.Answers, body.Deny, body.DenyMessage); err != nil {
 		switch {
+		case errors.Is(err, agent.ErrSteerDeliveryUncertain):
+			writeError(w, http.StatusBadGateway, "delivery_uncertain", "the answer may have reached the backend; do not resend it automatically")
 		case errors.Is(err, agent.ErrAgentNotBusy):
 			writeError(w, http.StatusConflict, "not_busy", "agent has no turn in progress")
+		case errors.Is(err, agent.ErrInvalidQuestionAnswer):
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		case errors.Is(err, agent.ErrQuestionNotFound):
 			writeError(w, http.StatusNotFound, "not_found", "no pending question with that request id")
 		default:
@@ -1923,6 +1954,10 @@ func writeTranscriptEditError(w http.ResponseWriter, err error, msgID string) {
 
 // --- Generate Handlers ---
 
+// Indirection keeps handler lifecycle/cleanup contracts testable without
+// calling an external image provider.
+var generateAvatarWithAI = agent.GenerateAvatarWithAI
+
 func (s *Server) handleGeneratePersona(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CurrentPersona string `json:"currentPersona"`
@@ -1969,34 +2004,96 @@ func (s *Server) handleGenerateName(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGenerateAvatar(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Persona      string `json:"persona"`
-		Name         string `json:"name"`
-		Prompt       string `json:"prompt"`
-		PreviousPath string `json:"previousPath"`
+		Persona       string `json:"persona"`
+		Name          string `json:"name"`
+		Prompt        string `json:"prompt"`
+		Provider      string `json:"provider"`
+		PreviousPath  string `json:"previousPath"`
+		AllowFallback *bool  `json:"allowFallback"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+	if !readCappedJSON(w, r, 64<<10, "request body too large", "invalid request body", &req) {
 		return
 	}
 
-	// Clean up previous temp avatar if provided
-	if req.PreviousPath != "" {
-		cleanupTempAvatar(req.PreviousPath)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "name is required")
+		return
+	}
+	if req.Provider != "" && req.Provider != string(agent.AvatarProviderGemini) && req.Provider != string(agent.AvatarProviderOpenAI) {
+		writeError(w, http.StatusBadRequest, "bad_request", "provider must be gemini or openai")
+		return
 	}
 
-	avatarPath, err := agent.GenerateAvatarWithAI(r.Context(), "", req.Persona, req.Name, req.Prompt, s.logger)
+	avatarPath, provider, err := generateAvatarWithAI(
+		r.Context(), s.agents.Credentials(), req.Provider, req.Persona, req.Name, req.Prompt, s.logger,
+	)
 	if err != nil {
-		s.logger.Warn("AI avatar generation failed, using SVG fallback", "err", err)
+		s.logger.Warn("AI avatar generation failed", "provider", provider, "err", err)
+		// A regeneration failure must not delete or replace the preview the
+		// user already has. First-time generation retains the initials SVG
+		// fallback, but surfaces a visible warning to the Web UI.
+		allowFallback := req.AllowFallback == nil || *req.AllowFallback
+		if req.PreviousPath != "" || !allowFallback {
+			status := http.StatusBadGateway
+			code := "avatar_generation_failed"
+			var generationErr *agent.AvatarGenerationError
+			if errors.As(err, &generationErr) {
+				status = generationErr.HTTPStatus
+				code = generationErr.Code
+			}
+			writeError(w, status, code, err.Error())
+			return
+		}
+		if r.Context().Err() != nil {
+			return
+		}
 		svgPath, svgErr := agent.GenerateSVGAvatarFile(req.Name)
 		if svgErr != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", svgErr.Error())
 			return
 		}
-		writeJSONResponse(w, http.StatusOK, map[string]any{"avatarPath": svgPath, "fallback": true})
+		if !writeAvatarJSONResponse(w, http.StatusOK, map[string]any{
+			"avatarPath": svgPath,
+			"fallback":   true,
+			"provider":   provider,
+			"warning":    err.Error(),
+		}) {
+			cleanupTempAvatar(svgPath)
+		}
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		cleanupTempAvatar(avatarPath)
 		return
 	}
 
-	writeJSONResponse(w, http.StatusOK, map[string]string{"avatarPath": avatarPath})
+	if !writeAvatarJSONResponse(w, http.StatusOK, map[string]any{
+		"avatarPath": avatarPath,
+		"provider":   provider,
+		"fallback":   false,
+	}) {
+		cleanupTempAvatar(avatarPath)
+		return
+	}
+	// Retire the previous preview only after the replacement was generated and
+	// the success response was written. A cancelled request keeps the old path.
+	if req.PreviousPath != "" {
+		cleanupTempAvatar(req.PreviousPath)
+	}
+}
+
+// writeAvatarJSONResponse is the checked variant used by the preview
+// lifecycle: only a successfully encoded response permits retiring the old
+// temp path. The generic helper logs write failures but cannot report them.
+func writeAvatarJSONResponse(w http.ResponseWriter, status int, v any) bool {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Default().Error("writeAvatarJSONResponse: encode failed", "status", status, "err", err)
+		return false
+	}
+	return true
 }
 
 // cleanupTempAvatar removes a previously generated temp avatar directory.
@@ -2043,6 +2140,27 @@ func (s *Server) handlePreviewAvatar(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.ServeFile(w, r, absPath)
+}
+
+// handleDiscardPreviewAvatar releases a generated preview that the create UI
+// no longer needs (manual-file switch or navigation away).
+func (s *Server) handleDiscardPreviewAvatar(w http.ResponseWriter, r *http.Request) {
+	avatarPath := r.URL.Query().Get("path")
+	if avatarPath == "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "path is required")
+		return
+	}
+	absPath, err := agent.ValidateTempAvatarPath(avatarPath)
+	if err != nil {
+		if errors.Is(err, agent.ErrAvatarNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	cleanupTempAvatar(absPath)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleUploadGeneratedAvatar copies a generated avatar to the agent's directory.
@@ -2365,8 +2483,7 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 	var req struct {
 		AvatarPath string `json:"avatarPath"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+	if !readCappedJSON(w, r, 16<<10, "request body too large", "invalid request body", &req) {
 		return
 	}
 
@@ -2385,6 +2502,9 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
+	// The client has no retry surface for a failed publish, so this handler owns
+	// the validated generated temp path from here on and always removes its dir.
+	defer cleanupTempAvatar(absPath)
 
 	ext := strings.ToLower(filepath.Ext(absPath))
 
@@ -2411,9 +2531,6 @@ func (s *Server) handleUploadGeneratedAvatar(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		return
 	}
-
-	// Clean up the temp file
-	os.Remove(absPath)
 
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }

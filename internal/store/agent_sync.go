@@ -18,13 +18,14 @@ import (
 // WorkspaceFiles clears its corresponding rows (the agent existed
 // on source without that surface, so target should mirror).
 type AgentSyncPayload struct {
-	Agent          *AgentRecord
-	Persona        *AgentPersonaRecord         // nil = no persona on source
-	Memory         *AgentMemoryRecord          // nil = no MEMORY.md on source
-	Messages       []*MessageRecord            // empty = clear (full mode) OR no new rows (incremental mode)
-	MemoryEntries  []*MemoryEntryRecord        // empty = clear (full mode) OR no new rows (incremental mode)
-	Tasks          []*AgentTaskRecord          // empty = clear target's tasks
-	WorkspaceFiles []*AgentWorkspaceFileRecord // empty = clear (full mode) OR no new rows (incremental mode)
+	IncomingHandoff *IncomingHandoff // receiver-local, never imported from the wire
+	Agent           *AgentRecord
+	Persona         *AgentPersonaRecord         // nil = no persona on source
+	Memory          *AgentMemoryRecord          // nil = no MEMORY.md on source
+	Messages        []*MessageRecord            // empty = clear (full mode) OR no new rows (incremental mode)
+	MemoryEntries   []*MemoryEntryRecord        // empty = clear (full mode) OR no new rows (incremental mode)
+	Tasks           []*AgentTaskRecord          // empty = clear target's tasks
+	WorkspaceFiles  []*AgentWorkspaceFileRecord // empty = clear (full mode) OR no new rows (incremental mode)
 
 	// IncrementalMessages, when true, switches syncMessagesTx
 	// from "delete-then-insert" (source-wins full replace) to
@@ -153,6 +154,14 @@ func (s *Store) SyncAgentFromPeer(ctx context.Context, payload AgentSyncPayload)
 
 	if err := syncAgentRowTx(ctx, tx, payload.Agent); err != nil {
 		return err
+	}
+	if payload.IncomingHandoff != nil {
+		if payload.IncomingHandoff.AgentID != agentID {
+			return ErrStaleHandoff
+		}
+		if err := prepareIncomingHandoffTx(ctx, tx, payload.IncomingHandoff); err != nil {
+			return err
+		}
 	}
 	if err := syncAgentPersonaTx(ctx, tx, agentID, payload.Persona); err != nil {
 		return err

@@ -16,6 +16,7 @@ const VIDEO_EXTS = /\.(mp4|webm|mov|avi|mkv|ogv|m4v|flv|wmv)$/i;
 type MediaPreviewItem = {
   path: string;
   type: MediaPreviewType;
+  peerId?: string;
 };
 
 export function getFileType(path: string): "image" | "video" | "other" {
@@ -117,7 +118,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
     () =>
       attachments.flatMap((att) => {
         const type = attachmentPreviewType(att);
-        return type ? [{ path: att.path, type }] : [];
+        return type ? [{ path: att.path, type, peerId: att.peerId }] : [];
       }),
     [attachments],
   );
@@ -136,8 +137,8 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
     <>
       <div className="flex flex-wrap gap-1.5 mb-2">
         {attachments.map((att) => {
-          const url = attachmentURL(att.path);
-          const thumbUrl = attachmentThumbURL(att.path, 400);
+          const url = attachmentURL(att.path, att.peerId);
+          const thumbUrl = attachmentThumbURL(att.path, 400, att.peerId);
           const previewType = attachmentPreviewType(att);
           if (previewType === "image") {
             return (
@@ -191,6 +192,7 @@ export function AttachmentList({ attachments, isUser }: { attachments: AgentMess
       {preview && (
         <MediaOverlay
           path={preview.path}
+          peerId={preview.peerId}
           type={preview.type}
           currentIndex={previewIndex}
           total={previewable.length}

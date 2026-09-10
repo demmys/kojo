@@ -20,6 +20,7 @@ export interface GeminiApiKeyHook {
   saving: boolean;
   /** Resolves once the initial GET has completed. */
   loaded: boolean;
+  loadError: boolean;
   /** Embedding model name reported by the initial GET (null until loaded). */
   initialEmbeddingModel: string | null;
   /** Monotonically-increasing counter; bumps on each successful save. */
@@ -40,19 +41,30 @@ export function useGeminiApiKey(
   const [input, setInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [initialEmbeddingModel, setInitialEmbeddingModel] = useState<string | null>(null);
   const [saveToken, setSaveToken] = useState(0);
 
   useEffect(() => {
+    let active = true;
     agentApi.apiKeys
       .get("gemini")
       .then((r: { configured: boolean; hasFallback?: boolean; embeddingModel?: string }) => {
+        if (!active) return;
         setConfigured(r.configured);
         setHasFallback(r.hasFallback ?? false);
         setInitialEmbeddingModel(r.embeddingModel ?? null);
+        setLoadError(false);
       })
-      .catch(() => {})
-      .finally(() => setLoaded(true));
+      .catch(() => {
+        if (active) setLoadError(true);
+      })
+      .finally(() => {
+        if (active) setLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const toggleEditing = useCallback(() => {
@@ -67,6 +79,7 @@ export function useGeminiApiKey(
     onError("");
     try {
       await agentApi.apiKeys.set("gemini", input.trim());
+      setLoadError(false);
       setConfigured(true);
       setEditing(false);
       setInput("");
@@ -83,6 +96,7 @@ export function useGeminiApiKey(
     if (!confirm("Remove Gemini API key?")) return;
     try {
       await agentApi.apiKeys.delete("gemini");
+      setLoadError(false);
       setConfigured(false);
     } catch (err) {
       onError(errMsg(err));
@@ -96,6 +110,7 @@ export function useGeminiApiKey(
     input,
     saving,
     loaded,
+    loadError,
     initialEmbeddingModel,
     saveToken,
     setInput,

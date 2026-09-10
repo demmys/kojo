@@ -16,12 +16,14 @@ export function ModelPicker({
   effort,
   setEffort,
   models,
+  disabled = false,
 }: {
   model: string;
   setModel: (m: string) => void;
   effort: EffortLevel | "";
   setEffort: (e: EffortLevel | "") => void;
   models: string[];
+  disabled?: boolean;
 }) {
   const t = useT();
   const onChange = (m: string) => {
@@ -31,7 +33,7 @@ export function ModelPicker({
   return (
     <Field label={t("settings.model")}>
       {models.length > 0 ? (
-        <Select value={model} onChange={(e) => onChange(e.target.value)}>
+        <Select value={model} onChange={(e) => onChange(e.target.value)} disabled={disabled}>
           {/* An unset model means "backend CLI default". Always offered
               so users can return to it, and so an empty stored value is
               shown as such instead of the browser faking the first list
@@ -51,6 +53,7 @@ export function ModelPicker({
           mono
           value={model}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           placeholder={t("field.modelName")}
         />
       )}

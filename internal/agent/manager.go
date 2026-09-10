@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/atomicfile"
 	"github.com/loppo-llc/kojo/internal/blob"
+	"github.com/loppo-llc/kojo/internal/chathistory"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -53,6 +55,8 @@ func (s BusySource) String() string {
 }
 
 type busyEntry struct {
+	questionLifecycle *questionLifecycle
+
 	cancel      context.CancelFunc
 	startedAt   time.Time
 	broadcaster *chatBroadcaster // fan-out for reconnecting clients
@@ -69,7 +73,7 @@ type busyEntry struct {
 	// backend's stdin pipe has become ready.
 	steer SteerFunc
 	// answer, when set, resolves a pending interactive AskUserQuestion on the
-	// running turn (claude backend only — see ChatOptions.OnQuestionReady).
+	// running turn (claude/codex backends — see ChatOptions.OnQuestionReady).
 	// nil for backends/turns that can't surface a question to a user.
 	answer AnswerFunc
 	// outCh is the raw event channel the broadcaster fans out from. Steer
@@ -92,13 +96,15 @@ type busyEntry struct {
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
 type Manager struct {
-	mu       sync.Mutex
-	agents   map[string]*Agent
-	backends map[string]ChatBackend
-	store    *agentStore
-	creds    *CredentialStore
-	cron     *cronScheduler
-	logger   *slog.Logger
+	goalShutdown  atomic.Bool
+	goalLifecycle atomic.Pointer[context.Context]
+	mu            sync.Mutex
+	agents        map[string]*Agent
+	backends      map[string]ChatBackend
+	store         *agentStore
+	creds         *CredentialStore
+	cron          *cronScheduler
+	logger        *slog.Logger
 	// fileWatcher reflects agent-CLI disk writes (MEMORY.md, memory/,
 	// persona.md, workspace files) into the DB promptly. nil until
 	// StartFileWatcher runs; guarded by mu.
@@ -245,22 +251,26 @@ type Manager struct {
 	// Unlike busy (which allows only one chat per agent), multiple one-shot
 	// chats may run concurrently for the same agent.
 	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
-	oneShotSeq       int64
-	oneShotCancels   map[string]map[int64]context.CancelFunc // agentID → id → cancel
-	oneShotSessions  map[string]map[int64]string             // agentID → id → SessionKey (restart-wake thread routing)
-	oneShotArmed     map[string]map[int64]time.Time          // agentID → id → armed-at (DrainBlockers age reporting)
-	oneShotCancelsMu sync.Mutex
+	oneShotSeq         int64
+	oneShotCancels     map[string]map[int64]context.CancelFunc // agentID → id → cancel
+	oneShotSessions    map[string]map[int64]string             // agentID → id → SessionKey (restart-wake thread routing)
+	oneShotOrigins     map[string]map[int64]string             // agentID → id → Hub peer that owns the response surface
+	oneShotHandoffCaps map[string]map[int64]string             // agentID → id → Hub-minted continuation capability
+	oneShotArmed       map[string]map[int64]time.Time          // agentID → id → armed-at (DrainBlockers age reporting)
+	oneShotDone        map[string]map[int64]chan struct{}      // agentID → id → closed when backend turn fully exits
+	oneShotCancelsMu   sync.Mutex
 
 	// oneShotSteers tracks the steer handle for an in-flight ChatOneShot
 	// turn that opted into session resumption via OneShotOpts.SessionKey
 	// (e.g. Slack/group-DM thread turns — see runThreadTurn). Keyed by
 	// SessionKey rather than agentID since one agent can run several
 	// independent thread turns concurrently, each on its own session.
-	// Only populated for backends that support steering (claude);
+	// Only populated for backends that support steering (claude/codex);
 	// registered when the backend's stdin pipe becomes ready and removed
 	// when the turn's goroutine exits.
-	oneShotSteers   map[string]SteerFunc
-	oneShotSteersMu sync.Mutex
+	oneShotSteers    map[string]SteerFunc
+	oneShotQuestions map[int64]*oneShotQuestionTurn // guarded by oneShotCancelsMu
+	oneShotSteersMu  sync.Mutex
 
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
@@ -482,27 +492,30 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			ToolClaude:       NewClaudeBackend(logger),
 			ToolCodex:        NewCodexBackend(logger),
 			ToolGrok:         NewGrokBackend(logger),
-			ToolCustomClaude: NewCustomClaudeBackend(logger),
-			ToolCustomCodex:  NewCustomCodexBackend(logger),
-			ToolCustomBare:   NewCustomBareBackend(logger),
+			ToolCustomClaude: NewCustomClaudeBackend(logger, creds),
+			ToolCustomCodex:  NewCustomCodexBackend(logger, creds),
+			ToolCustomBare:   NewCustomBareBackend(logger, creds),
 		},
-		store:           st,
-		creds:           creds,
-		logger:          logger,
-		busy:            make(map[string]busyEntry),
-		resetting:       make(map[string]bool),
-		switching:       make(map[string]bool),
-		notifying:       make(map[string]int),
-		preparing:       make(map[string]int),
-		mutating:        make(map[string]int),
-		editing:         make(map[string]bool),
-		profileGen:      make(map[string]bool),
-		memIndexes:      make(map[string]*MemoryIndex),
-		chatWatchers:    make(map[string]map[*chatWatcher]struct{}),
-		oneShotCancels:  make(map[string]map[int64]context.CancelFunc),
-		oneShotSessions: make(map[string]map[int64]string),
-		oneShotArmed:    make(map[string]map[int64]time.Time),
-		oneShotSteers:   make(map[string]SteerFunc),
+		store:              st,
+		creds:              creds,
+		logger:             logger,
+		busy:               make(map[string]busyEntry),
+		resetting:          make(map[string]bool),
+		switching:          make(map[string]bool),
+		notifying:          make(map[string]int),
+		preparing:          make(map[string]int),
+		mutating:           make(map[string]int),
+		editing:            make(map[string]bool),
+		profileGen:         make(map[string]bool),
+		memIndexes:         make(map[string]*MemoryIndex),
+		chatWatchers:       make(map[string]map[*chatWatcher]struct{}),
+		oneShotCancels:     make(map[string]map[int64]context.CancelFunc),
+		oneShotSessions:    make(map[string]map[int64]string),
+		oneShotOrigins:     make(map[string]map[int64]string),
+		oneShotHandoffCaps: make(map[string]map[int64]string),
+		oneShotArmed:       make(map[string]map[int64]time.Time),
+		oneShotDone:        make(map[string]map[int64]chan struct{}),
+		oneShotSteers:      make(map[string]SteerFunc),
 	}
 
 	// Register the persistent-session background-turn handler so unsolicited
@@ -530,6 +543,17 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		logger.Warn("failed to load agents", "err", err)
 	}
 	for _, a := range agents {
+		// v0→v1 external-CLI migration linked the new encoded Claude
+		// project path to the old one. If --clean v0 later removed that
+		// target, repair the surviving dangling link at daemon startup so
+		// autosummary and the first post-restart chat can persist sessions.
+		// Best-effort: one broken filesystem entry must not prevent every
+		// other agent from loading.
+		if repaired, repairErr := repairDanglingClaudeProjectDir(agentDir(a.ID)); repairErr != nil {
+			logger.Warn("claude project directory repair failed", "agent", a.ID, "err", repairErr)
+		} else if repaired {
+			logger.Info("repaired dangling claude project directory symlink", "agent", a.ID)
+		}
 		has, hash := m.avatarMeta(a.ID)
 		applyAvatarMeta(a, has, hash)
 		// Load last message preview
@@ -705,6 +729,9 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
+	if len(cfg.CustomAPIKey) > CustomAPIKeyMaxBytes {
+		return nil, fmt.Errorf("customApiKey exceeds %d bytes", CustomAPIKeyMaxBytes)
+	}
 
 	a, err := newAgent(cfg)
 	if err != nil {
@@ -720,6 +747,22 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 		return nil, err
 	}
 	defer releaseMut()
+
+	customKeyStored := false
+	if strings.TrimSpace(cfg.CustomAPIKey) != "" {
+		if m.creds == nil {
+			return nil, fmt.Errorf("credential store is not available")
+		}
+		if err := StoreCustomAPIKey(m.creds, a.ID, a.CustomBaseURL, cfg.CustomAPIKey); err != nil {
+			return nil, fmt.Errorf("store custom API key: %w", err)
+		}
+		customKeyStored = true
+		defer func() {
+			if customKeyStored {
+				_ = StoreCustomAPIKey(m.creds, a.ID, "", "")
+			}
+		}()
+	}
 
 	if err := ensureAgentDir(a); err != nil {
 		return nil, fmt.Errorf("create agent dir: %w", err)
@@ -745,6 +788,8 @@ func (m *Manager) Create(cfg AgentConfig) (*Agent, error) {
 	m.mu.Unlock()
 
 	m.save()
+	// The agent row is now durable; retain the encrypted custom key.
+	customKeyStored = false
 
 	// Sync the freshly-minted MEMORY.md / memory/ tree into the DB.
 	// ensureAgentDir already wrote the initial MEMORY.md, but the
@@ -1048,6 +1093,17 @@ func (m *Manager) GetRemote(id string) *Agent {
 		}
 	}
 	return a
+}
+
+// GetAny returns an agent whether its runtime is local or held by a peer.
+// Hub-owned integrations use the persisted remote mirror for configuration;
+// execution paths must continue to use Get so they cannot run a remote agent.
+func (m *Manager) GetAny(id string) (*Agent, bool) {
+	if a, ok := m.Get(id); ok {
+		return a, true
+	}
+	a := m.GetRemote(id)
+	return a, a != nil
 }
 
 // List returns deep copies of all agents.
@@ -1418,6 +1474,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// since Effort / Model can also be patched in this PATCH; we
 	// compute the prospective values and validate the combination
 	// before releasing the lock to the persona-write path.
+	prospTool := a.Tool
+	if cfg.Tool != nil {
+		prospTool = *cfg.Tool
+	}
 	prospEffort := a.Effort
 	if cfg.Effort != nil {
 		prospEffort = *cfg.Effort
@@ -1426,7 +1486,14 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.Model != nil {
 		prospModel = *cfg.Model
 	}
-	if !ValidModelEffort(prospModel, prospEffort) {
+	if current := normalizeRetiredGrokModel(prospTool, prospModel); current != prospModel {
+		prospModel = current
+		// cfg is a by-value request copy. Pointing Model at the normalized
+		// local makes the later mutation store exactly what was validated,
+		// including when a tool-only PATCH turns a custom model into Grok.
+		cfg.Model = &prospModel
+	}
+	if !ValidToolModelEffort(prospTool, prospModel, prospEffort) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("unsupported effort level %q for model %q", prospEffort, prospModel)
 	}
@@ -1446,10 +1513,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// the same PATCH so we have to compute the post-PATCH pair
 	// and validate the combination here, not at the per-field
 	// site below where a.Tool may already be the new value.
-	prospTool := a.Tool
-	if cfg.Tool != nil {
-		prospTool = *cfg.Tool
-	}
 	prospBaseURL := a.CustomBaseURL
 	if cfg.CustomBaseURL != nil {
 		prospBaseURL = *cfg.CustomBaseURL
@@ -1568,6 +1631,7 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	// substituted curl string (grok seeing a claude body) or
 	// produce wrong wording in the UI.
 	oldTool := a.Tool
+	oldCustomBaseURL := a.CustomBaseURL
 
 	oldPersona := a.Persona
 	oldOverride := a.PublicProfileOverride
@@ -1728,6 +1792,16 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 
 	m.save()
+	customBaseURLChanged := cfg.CustomBaseURL != nil &&
+		strings.TrimSpace(*cfg.CustomBaseURL) != strings.TrimSpace(oldCustomBaseURL)
+	if customBaseURLChanged && m.creds != nil {
+		// Credentials are endpoint-scoped. Once the URL changes, remove the
+		// old binding rather than letting it silently reactivate if the agent is
+		// later pointed back at that host.
+		if err := StoreCustomAPIKey(m.creds, id, "", ""); err != nil && m.logger != nil {
+			m.logger.Warn("failed to clear custom API key after base URL change", "agent", id, "err", err)
+		}
+	}
 
 	// §3.7 device-switch skill: re-sync the SKILL.md on disk now if
 	// either the toggle was touched OR the tool changed (claude↔grok
@@ -1801,10 +1875,22 @@ func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
 // variant skips the inner guard so the whole handler is one
 // transactional unit under the outer mutation.
 //
+// For a remote runtime this updates only the Hub-owned slackBot field in the
+// persisted mirror, leaving all holder-owned settings untouched.
+//
 // MUST NOT be called from any path that does NOT already hold
-// AcquireMutation for this agent.
+// AcquireMutation and LockPatch for this agent.
 func (m *Manager) UpdateSlackBotAlreadyGuarded(id string, cfg *SlackBotConfig) error {
-	return m.updateSlackBotUnguarded(id, cfg)
+	m.mu.Lock()
+	_, local := m.agents[id]
+	m.mu.Unlock()
+	if local {
+		return m.updateSlackBotUnguarded(id, cfg)
+	}
+	if m.store == nil {
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	return m.store.UpdateAgentSetting(id, "slackBot", cfg, cfg == nil)
 }
 
 func (m *Manager) updateSlackBotUnguarded(id string, cfg *SlackBotConfig) error {
@@ -1858,6 +1944,7 @@ type chatPrep struct {
 	backend               ChatBackend
 	sysPrompt             string
 	volatileContext       string
+	freshSessionContext   string
 	recentMessagesContext string
 	history               []HistoryTurn
 	mcpServers            map[string]mcpServerEntry
@@ -1886,6 +1973,15 @@ func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
 // is about to be truncated (e.g. regenerate), since the index would still
 // contain entries from messages that are being removed.
 func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexNewMessages bool, skipMemoryContext bool, opts prepareChatOptions) (*chatPrep, error) {
+	if st := m.Store(); st != nil {
+		blocked, err := st.IsIncomingHandoffIncomplete(ctx, agentID)
+		if err != nil {
+			return nil, fmt.Errorf("incoming handoff fence: %w", err)
+		}
+		if blocked {
+			return nil, ErrAgentBusy
+		}
+	}
 	// Cheap pre-check: refuse archived agents (and unknown ones) before any
 	// disk I/O like syncPersona, so dormant agents don't leak side effects
 	// into persona files / publicProfile regeneration.
@@ -2050,6 +2146,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
+	freshSessionContext := ""
 	recentMessagesContext := ""
 	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
 		!agentCopy.InjectionDisabled(InjectionRecentConversation) {
@@ -2074,6 +2171,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		backend:               backend,
 		sysPrompt:             sysPrompt,
 		volatileContext:       volatileContext,
+		freshSessionContext:   freshSessionContext,
 		recentMessagesContext: recentMessagesContext,
 		history:               history,
 		mcpServers:            mcpServers,
@@ -2172,6 +2270,22 @@ func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turn
 // An optional BusySource may be passed to tag the busy entry; defaults to
 // BusySourceUser when omitted.
 func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, role string, attachments []MessageAttachment, source ...BusySource) (<-chan ChatEvent, error) {
+	goal, _ := ctx.Value(goalRequestContextKey{}).(*GoalRequest)
+	if goal == nil && role != "system" {
+		var err error
+		goal, err = ParseGoalCommand(userMessage)
+		if err != nil {
+			return nil, err
+		}
+		if goal != nil {
+			if err = m.validateGoalBackend(agentID, goal); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := checkGoalHandoffAdmission(agentID, "", goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing checks switching AND increments the
 	// preparing counter under one busyMu lock — Step -1's
 	// WaitChatIdle observes the counter so a race between
@@ -2196,6 +2310,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
+	applySlackMCPRelay(prep, agentID, slackMCPBaseURLFromContext(ctx))
 
 	// Check if agent is busy, editing, being reset, or switching
 	m.busyMu.Lock()
@@ -2283,8 +2398,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+		Goal:                  goal,
+		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		MCPServers:            prep.mcpServers,
-		AutomatedTrigger:      role == "system",
+		AutomatedTrigger:      role == "system" && goal == nil,
+		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
+		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
 		OnSteerReady: func(fn SteerFunc) {
@@ -2343,10 +2462,17 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	_, callerCh, _ := bc.Subscribe()
 
 	go func() {
+		defer signalChatCompletion(ctx)
 		defer close(outCh)
 		defer m.clearBusy(agentID)
 		defer cancel()
 		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		// Background callers keep draining after Abort cancels only chatCtx.
+		// processChatEvents deliberately stops forwarding on cancellation, so
+		// preserve that outcome for them before the broadcaster closes.
+		if src == BusySourceCron && chatCtx.Err() != nil && ctx.Err() == nil {
+			outCh <- ChatEvent{Type: "done", ErrorMessage: ErrMsgCancelled}
+		}
 
 		m.updatePostChatIndex(agentID)
 		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
@@ -2394,6 +2520,18 @@ func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
 // pass OneShotOpts{} for the legacy ephemeral-session behaviour.
 type OneShotOpts struct {
+	GoalUserID string // initiating Slack user, retained for recovery question ownership
+	GoalRunID  string // transport-owned nonce; never model input
+	Goal       *GoalRequest
+	// InteractiveQuestions opts in only when the response surface can answer.
+	InteractiveQuestions bool
+
+	// PreserveTerminalOnCancel keeps a cancelled terminal event pending until
+	// the response adapter consumes it. Slack enables this because its live text
+	// deltas are intentionally lossy and the terminal message is authoritative.
+	// Leave false for transports that may abandon the returned channel on cancel.
+	PreserveTerminalOnCancel bool
+
 	// SessionKey, when non-empty, opts INTO Claude session resumption keyed
 	// by this string instead of staying purely ephemeral. Slack sets this
 	// to a stable hash of (agentID, channel, threadTS) so repeated DMs in
@@ -2402,11 +2540,58 @@ type OneShotOpts struct {
 	// session and from other Slack threads. Empty string preserves the
 	// pre-PR-#12 "fresh ephemeral session per call" behaviour.
 	//
-	// Honored only by backends in backendSupportsSessionKey (claude/codex/grok). For
+	// Honored only by backends in backendSupportsSessionKey
+	// (claude/custom-claude/codex/custom-codex/grok). For
 	// other backends the manager drops the key and falls back to OneShot,
 	// rather than risk silently mixing thread contexts on a backend that
 	// would interpret !OneShot as "resume the agent's latest session".
 	SessionKey string
+
+	// OriginPeerID names the Hub peer that owns the response surface. It is
+	// transport metadata, not model context. Device handoff uses it together
+	// with SessionKey to send the target-side arrival turn back to the Slack or
+	// WebUI thread that initiated the switch.
+	OriginPeerID string
+
+	// HandoffCapability is opaque transport metadata minted by the response
+	// surface Hub. It authorizes only this turn's post-handoff continuation.
+	HandoffCapability string
+	// ExpectedHolderPeer fences a queued post-handoff turn to the holder that
+	// issued the callback. The Hub router rejects it if another handoff wins
+	// before this FIFO reservation reaches execution.
+	ExpectedHolderPeer string
+	// HandoffArrivalReservation is a response-adapter-owned FIFO slot reserved
+	// immediately behind this turn. The Hub capability ledger activates it if
+	// the turn moves devices, or the adapter releases it when the turn ends.
+	HandoffArrivalReservation HandoffArrivalReservation
+	// ResponseAttachmentGroupID enables holder-local attachment capture for a
+	// WebUI thread. The actual staging path is derived on the holder so remote
+	// turns never receive a Hub-local filesystem path.
+	ResponseAttachmentGroupID   string
+	ResponseAttachmentMessageID string
+
+	// ForceFreshSession discards the transferred native backend session for
+	// SessionKey before this turn starts. Handoff arrival turns use this because
+	// the source snapshot was captured while the switch tool call was in flight;
+	// resuming that artifact would continue a torn native turn. The response
+	// surface's canonical History is injected into the fresh session instead.
+	ForceFreshSession bool
+
+	// History is the response surface's canonical transcript, excluding the
+	// current user message. Manager formats it both as the common fresh-session
+	// fallback and as a bounded resume safety recap. This keeps
+	// continuity policy out of Slack and GroupDM call sites.
+	History []chathistory.HistoryMessage
+
+	// HistorySelfUserID identifies this agent's messages inside History.
+	HistorySelfUserID string
+
+	// FreshSessionContext and ResumeSessionContext are preformatted, bounded
+	// equivalents of History. Trusted internal transports use these instead of
+	// relaying an unbounded canonical transcript. Ordinary callers should pass
+	// History and let Manager derive both contexts locally.
+	FreshSessionContext  string
+	ResumeSessionContext string
 
 	// SystemPromptExtra is appended to the system prompt for this call
 	// only. Slack uses it to inject per-channel/thread context
@@ -2420,6 +2605,21 @@ type OneShotOpts struct {
 	// per-call capability rather than an Agent setting so WebUI and external
 	// conversations can run concurrently without changing each other's prompt.
 	DisableKojoAttachmentInstructions bool
+
+	// Attachments are files already materialized on the machine running the
+	// backend. External transports use this field so ChatOneShot formats the
+	// same attachment block as the interactive WebUI chat path.
+	Attachments []MessageAttachment
+
+	// SlackMCPBaseURL overrides the local Slack MCP endpoint for this turn.
+	// Runtime peers use the canonical Hub URL so Slack credentials stay on the
+	// Hub while the agent backend itself runs on the holder.
+	SlackMCPBaseURL string
+}
+
+type HandoffArrivalReservation interface {
+	Activate(ctx context.Context, prompt, expectedHolder string) error
+	Release()
 }
 
 // ChatOneShot runs a one-shot chat that does not save to the agent's
@@ -2432,6 +2632,26 @@ type OneShotOpts struct {
 // conversation (e.g. Slack thread) share context. Otherwise the chat runs
 // as a fresh ephemeral session each time, matching the legacy behaviour.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+	if opts.SessionKey != "" {
+		unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, opts.SessionKey))
+		defer unlock()
+	}
+
+	if opts.Goal != nil {
+		if err := m.validateGoalBackend(agentID, opts.Goal); err != nil {
+			return nil, err
+		}
+	}
+
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex {
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := checkGoalHandoffAdmission(agentID, opts.SessionKey, opts.Goal); err != nil {
+		return nil, err
+	}
 	// acquirePreparing: see Chat() for the contract — gates
 	// switching AND increments the preparing counter so Step
 	// -1's WaitChatIdle observes the in-flight prepareChat.
@@ -2439,6 +2659,21 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	defer m.releasePreparing(agentID)
+	// Control requests must not register a second one-shot or replace the
+	// active run's steer/cancel callbacks. The holder fence above still applies.
+	if opts.Goal != nil {
+		if active, ok := codexGoalRuntimes.Load(codexThreadRefPath(agentID, opts.SessionKey)); ok {
+			runtime := active.(*codexGoalRuntime)
+			if opts.OriginPeerID != "" && runtime.origin != opts.OriginPeerID {
+				return nil, ErrSteerOriginForbidden
+			}
+			g, err := runtime.control(ctx, opts.Goal)
+			if err != nil {
+				return nil, err
+			}
+			return goalControlEvents(g, agentID, opts.SessionKey), nil
+		}
+	}
 
 	// Concurrent dynamic-effort resolution, same as Chat. One-shot
 	// callers (Slack/Discord) are always human-driven → systemTurn=false.
@@ -2451,8 +2686,15 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
+	applySlackMCPRelay(prep, agentID, opts.SlackMCPBaseURL)
 
 	chatCtx, cancel := context.WithCancel(ctx)
+	var responseAttachments *attachWatcher
+	var responseAttachmentStageDir string
+	if opts.ResponseAttachmentGroupID != "" && opts.ResponseAttachmentMessageID != "" {
+		responseAttachmentStageDir = threadAttachmentStageDir(agentID, opts.ResponseAttachmentGroupID)
+		opts.SystemPromptExtra = strings.TrimSpace(opts.SystemPromptExtra + "\n\n" + threadAttachmentPrompt(responseAttachmentStageDir))
+	}
 
 	m.busyMu.Lock()
 	if m.resetting[agentID] {
@@ -2474,8 +2716,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// after a reset/delete has already drained and started wiping.
 	// Lock nesting (busyMu → oneShotCancelsMu) is safe: no code path
 	// acquires them in the opposite order.
-	osID := m.trackOneShot(agentID, cancel, opts.SessionKey)
+	osID := m.trackOneShot(agentID, cancel, opts.SessionKey, opts.OriginPeerID, opts.HandoffCapability)
 	m.busyMu.Unlock()
+	if responseAttachmentStageDir != "" {
+		responseAttachments = m.watchAndStreamAttachmentsFromDir(chatCtx, agentID,
+			opts.ResponseAttachmentMessageID, responseAttachmentStageDir)
+	}
 
 	outCh := make(chan ChatEvent, 64)
 
@@ -2498,8 +2744,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// chat path: keep dynamic data out of the system prompt to preserve
 	// the prompt cache.
 	effectiveMessage := userMessage
+	if len(opts.Attachments) > 0 {
+		effectiveMessage = formatMessageWithAttachments(effectiveMessage, opts.Attachments)
+	}
 	if prep.volatileContext != "" {
-		effectiveMessage = prep.volatileContext + userMessage
+		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
 
 	// Gate SessionKey to backends that actually honor it. Other backends
@@ -2519,6 +2768,40 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	} else {
 		sessionKey = ""
 	}
+	resumeGoalOnReply := prep.backend.Name() == ToolCodex && opts.Goal == nil && opts.GoalUserID != "" && strings.HasPrefix(sessionKey, agentID+":slack:")
+	if opts.ForceFreshSession && sessionKey != "" && prep.backend.Name() == ToolCodex {
+		binding, err := goalBindingFor(agentID, sessionKey)
+		if err != nil {
+			cancel()
+			m.untrackOneShot(agentID, osID)
+			return nil, err
+		}
+		if binding != nil && binding.State != nil {
+			opts.ForceFreshSession = false
+			if !resumeGoalOnReply && !binding.DesiredPaused && binding.State.Status == "active" {
+				opts.Goal = &GoalRequest{Action: "resume"}
+			}
+		}
+	}
+	if opts.ForceFreshSession && sessionKey != "" {
+		var resetErr error
+		switch prep.backend.Name() {
+		case ToolClaude, ToolCustomClaude:
+			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
+		case ToolCodex, ToolCustomCodex:
+			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
+		case ToolGrok:
+			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
+		}
+		if resetErr != nil {
+			if responseAttachments != nil {
+				m.deleteIngestedAttachments(responseAttachments.StopAndDrain())
+			}
+			cancel()
+			m.untrackOneShot(agentID, osID)
+			return nil, fmt.Errorf("reset native conversation session: %w", resetErr)
+		}
+	}
 
 	// NOTE: SystemPromptExtra was already merged into prep.sysPrompt above,
 	// so it is intentionally NOT forwarded via ChatOptions — that would
@@ -2526,9 +2809,22 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// ChatOptions for future backends that want to inject it at a custom
 	// offset rather than the end of the system prompt.
 	chatOpts := ChatOptions{
-		OneShot:    oneShotMode,
-		MCPServers: prep.mcpServers,
-		SessionKey: sessionKey,
+		ResumeGoalOnReply:    resumeGoalOnReply,
+		Goal:                 opts.Goal,
+		GoalRunID:            opts.GoalRunID,
+		GoalUserID:           opts.GoalUserID,
+		OriginPeerID:         opts.OriginPeerID,
+		PreserveGoalOnCancel: func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
+		OneShot:              oneShotMode,
+		MCPServers:           prep.mcpServers,
+		SessionKey:           sessionKey,
+		ConversationKey:      opts.SessionKey,
+	}
+	chatOpts.FreshSessionContext = opts.FreshSessionContext
+	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
+	if chatOpts.FreshSessionContext == "" && chatOpts.ResumeSessionContext == "" {
+		chatOpts.FreshSessionContext, chatOpts.ResumeSessionContext =
+			FormatOneShotHistoryContexts(opts.History, opts.HistorySelfUserID)
 	}
 	if sessionKey != "" {
 		// Register a nil placeholder immediately so SteerOneShot can
@@ -2545,8 +2841,12 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			m.oneShotSteersMu.Unlock()
 		}
 	}
+	questionTurn := m.setupOneShotQuestions(chatCtx, agentID, osID, opts, &chatOpts)
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
+		if responseAttachments != nil {
+			m.deleteIngestedAttachments(responseAttachments.StopAndDrain())
+		}
 		outCh <- ChatEvent{Type: "error", ErrorMessage: err.Error()}
 		close(outCh)
 		cancel()
@@ -2561,6 +2861,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 		return nil, err
 	}
+	backendCh = m.oneShotQuestionEvents(chatCtx, backendCh, questionTurn)
+	if responseAttachments != nil {
+		backendCh = m.captureOneShotResponseAttachments(chatCtx, agentID,
+			opts.ResponseAttachmentMessageID, responseAttachmentStageDir, backendCh, responseAttachments)
+	}
 
 	go func() {
 		defer close(outCh)
@@ -2573,10 +2878,75 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 				m.oneShotSteersMu.Unlock()
 			}()
 		}
-		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh)
+		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh, opts.PreserveTerminalOnCancel)
 	}()
 
 	return outCh, nil
+}
+
+func (m *Manager) captureOneShotResponseAttachments(ctx context.Context, agentID, messageID, stageDir string, backend <-chan ChatEvent, watcher *attachWatcher) <-chan ChatEvent {
+	out := make(chan ChatEvent, 64)
+	go func() {
+		defer close(out)
+		abortCleanup := func(attachments []MessageAttachment) {
+			if attachments == nil {
+				attachments = watcher.StopAndDrain()
+			}
+			m.deleteIngestedAttachments(attachments)
+			if safe, ok := safeStageDirAt(agentID, stageDir, m.logger); ok {
+				_ = os.RemoveAll(safe)
+			}
+		}
+		for ev := range backend {
+			if ev.Type != "done" && ev.Type != "error" {
+				if !ctxSend(ctx, out, ev) {
+					abortCleanup(nil)
+					return
+				}
+				continue
+			}
+			attachments := watcher.StopAndDrain()
+			scanCtx, cancel := context.WithTimeout(context.Background(), attachScanCeiling)
+			attachments = append(attachments,
+				m.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, messageID, stageDir, attachments)...)
+			cancel()
+			if safe, ok := safeStageDirAt(agentID, stageDir, m.logger); ok {
+				_ = os.RemoveAll(safe)
+			}
+			if len(attachments) > 0 {
+				attachmentEvent := ChatEvent{Type: "attachment", Attachments: attachments, attachmentClaim: newAttachmentOwnership()}
+				if !ctxSend(ctx, out, attachmentEvent) {
+					abortCleanup(attachments)
+					return
+				}
+				settleOwnership := func() {
+					// The response adapter may commit only after the terminal event
+					// closes its stream. Do not let the producer turn's cancellation
+					// reject a correctly-delivered attachment before the adapter can
+					// claim it; an unclaimed event is still reclaimed after a bound.
+					ownershipCtx, ownershipCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+					accepted := attachmentEvent.waitAttachmentOwnership(ownershipCtx)
+					ownershipCancel()
+					if !accepted {
+						abortCleanup(attachments)
+					}
+				}
+				if !ctxSend(ctx, out, ev) {
+					go settleOwnership()
+					return
+				}
+				// Ownership may resolve only after the response adapter has
+				// persisted the reply, so it cannot block the terminal event or
+				// channel close that let the adapter reach that commit point.
+				go settleOwnership()
+				return
+			}
+			ctxSend(ctx, out, ev)
+			return
+		}
+		abortCleanup(nil)
+	}()
+	return out
 }
 
 // SteerOneShot injects an additional user message into an in-flight
@@ -2597,24 +2967,138 @@ func (m *Manager) SteerOneShot(sessionKey, text string) error {
 	return fn(text)
 }
 
+// SteerOneShotForAgent is the holder-facing fenced variant of SteerOneShot.
+// Session keys are stable response-surface identifiers, not authorization
+// boundaries; verify that the key belongs to an in-flight turn for agentID
+// before an inter-peer request may inject into it.
+func (m *Manager) SteerOneShotForAgent(agentID, sessionKey, text string) error {
+	if _, ok := m.InFlightOneShotOrigin(agentID, sessionKey); !ok {
+		return ErrAgentNotBusy
+	}
+	return m.SteerOneShot(sessionKey, text)
+}
+
+// SteerOneShotFromOrigin atomically validates an inter-peer steer against the
+// exact Hub that opened the in-flight one-shot and captures that turn's steer
+// closure. A same-session replacement therefore cannot redirect delivery
+// between origin validation and backend injection.
+func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text string) error {
+	if sessionKey == "" || originPeerID == "" {
+		return ErrSteerOriginForbidden
+	}
+	m.oneShotCancelsMu.Lock()
+	matched := false
+	for id, key := range m.oneShotSessions[agentID] {
+		if key != sessionKey {
+			continue
+		}
+		if matched {
+			m.oneShotCancelsMu.Unlock()
+			return ErrAgentNotBusy
+		}
+		if m.oneShotOrigins[agentID][id] != originPeerID {
+			m.oneShotCancelsMu.Unlock()
+			return ErrSteerOriginForbidden
+		}
+		matched = true
+	}
+	if !matched {
+		m.oneShotCancelsMu.Unlock()
+		return ErrAgentNotBusy
+	}
+	m.oneShotSteersMu.Lock()
+	fn, ok := m.oneShotSteers[sessionKey]
+	m.oneShotSteersMu.Unlock()
+	// The captured closure belongs to the validated turn. Release the global
+	// lifetime registry before the backend call (Codex may wait up to 25s for
+	// turn readiness/ack); a replacement turn cannot redirect this closure.
+	m.oneShotCancelsMu.Unlock()
+	if !ok {
+		return ErrAgentNotBusy
+	}
+	if fn == nil {
+		return ErrSteerUnsupported
+	}
+	return fn(text)
+}
+
+// SteerOneShotAsUser checks Slack goal ownership on the holder before capturing
+// the live turn callback. Admission serialization prevents a replacement run
+// from being authorized with the previous run's owner.
+func (m *Manager) SteerOneShotAsUser(agentID, sessionKey, originPeerID, text, userID string) error {
+	unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, sessionKey))
+	defer unlock()
+	q, _ := ParseGoalCommand(text)
+	if err := checkGoalHandoffAdmission(agentID, sessionKey, q); err != nil {
+		return err
+	}
+	if a, ok := m.Get(agentID); ok && a.Tool == ToolCodex && strings.HasPrefix(sessionKey, agentID+":slack:") {
+		opts := OneShotOpts{SessionKey: sessionKey, GoalUserID: userID}
+		if userID == "" {
+			binding, err := goalBindingFor(agentID, sessionKey)
+			if err != nil {
+				return err
+			}
+			if NativeGoalRunning(agentID, sessionKey) || (binding != nil && binding.State != nil && binding.State.Status != "complete") {
+				return errors.New("Slack goal steering requires the initiating user; upgrade the Hub if it omitted the user")
+			}
+		}
+		if err := authorizeSlackGoal(agentID, opts); err != nil {
+			return err
+		}
+	}
+	if originPeerID != "" {
+		return m.SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text)
+	}
+	return m.SteerOneShotForAgent(agentID, sessionKey, text)
+}
+
 // processOneShotEvents is like processChatEvents but does not persist
 // messages to the transcript. It still forwards events to outCh.
-func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserveTerminalOnCancel bool) {
 	for {
 		select {
 		case event, ok := <-backendCh:
 			if !ok {
 				return
 			}
-			// Terminal events use blocking send; streaming events are non-blocking.
-			if event.Type == "done" || event.Type == "error" {
+			// Terminal, question lifecycle and attachment events use blocking send. Attachments carry
+			// blob ownership: dropping one after the holder ingested it would leak
+			// an unreferenced blob or leave a persisted reply without its file.
+			if event.Type == "attachment" || event.Type == "user_question" || event.Type == "question_resolved" {
+				select {
+				case outCh <- event:
+				case <-ctx.Done():
+					event.rejectAttachmentOwnership()
+					m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
+					return
+				}
+			} else if event.Type == "done" || event.Type == "error" {
 				// Sync persona in case agent edited it during this chat
 				if event.Type == "done" {
 					m.syncPersona(agentID)
 				}
+				// Prefer the terminal event when the caller is still draining
+				// outCh, even if cancellation became ready at the same instant.
+				// This preserves an authoritative cancelled partial for local
+				// backends. A peer relay intentionally couples cancellation to its
+				// HTTP stream, so only deltas already decoded on the Hub are
+				// available there; the Slack adapter preserves those separately.
+				select {
+				case outCh <- event:
+					continue
+				default:
+				}
+				if ctx.Err() != nil {
+					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					drainOneShotAfterCancel(backendCh)
+					return
+				}
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
+					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					drainOneShotAfterCancel(backendCh)
 					return
 				}
 			} else {
@@ -2624,8 +3108,38 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				}
 			}
 		case <-ctx.Done():
-			for range backendCh {
+			m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
+			return
+		}
+	}
+}
+
+func forwardOneShotTerminalAfterCancel(outCh chan<- ChatEvent, event ChatEvent, preserve bool) {
+	if preserve {
+		outCh <- event
+	}
+}
+
+func drainOneShotAfterCancel(backendCh <-chan ChatEvent) {
+	for event := range backendCh {
+		if event.Type == "attachment" {
+			event.rejectAttachmentOwnership()
+		}
+	}
+}
+
+func (m *Manager) drainOneShotUntilTerminalAfterCancel(agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserve bool) {
+	for event := range backendCh {
+		if event.Type == "attachment" {
+			event.rejectAttachmentOwnership()
+			continue
+		}
+		if event.Type == "done" || event.Type == "error" {
+			if event.Type == "done" {
+				m.syncPersona(agentID)
 			}
+			forwardOneShotTerminalAfterCancel(outCh, event, preserve)
+			drainOneShotAfterCancel(backendCh)
 			return
 		}
 	}
@@ -2726,6 +3240,16 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 }
 
 func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+	m.busyMu.Lock()
+	lifecycle := m.questionLifecycleLocked(agentID)
+	m.busyMu.Unlock()
+	var resolvedEvents <-chan ChatEvent
+	if lifecycle != nil {
+		resolvedEvents = lifecycle.events
+		defer lifecycle.close()
+	}
+	resolvedQuestions := make(map[string]bool)
+
 	// Safety net: whatever happens to this turn (normal done, error, abort,
 	// or the backend process dying outright), drop every AskUserQuestion
 	// still tracked as pending for this agent. Without this, a question
@@ -2982,6 +3506,21 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 
 	for {
 		select {
+		case event := <-resolvedEvents:
+			// The callback may have fired before the queued user_question
+			// was consumed. Clear state again at this ordered boundary.
+			m.busyMu.Lock()
+			if set := m.pendingQuestions[agentID]; set != nil {
+				delete(set, event.RequestID)
+				if len(set) == 0 {
+					delete(m.pendingQuestions, agentID)
+				}
+			}
+			m.busyMu.Unlock()
+			resolvedQuestions[event.RequestID] = true
+			if !ctxSend(ctx, outCh, event) {
+				return
+			}
 		case event, ok := <-backendCh:
 			if !ok {
 				return
@@ -3002,8 +3541,23 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// the OnQuestionRaised web-push notification reflect it. Cleared
 			// via ChatOptions.OnQuestionResolved on answer/deny/timeout, or
 			// by the clearAllQuestionsForAgent defer above at turn end.
+			if event.Type == "question_resolved" {
+				resolvedQuestions[event.RequestID] = true
+				// Native lifecycle events already take the reliable path;
+				// avoid feeding them back through the callback queue.
+				m.busyMu.Lock()
+				if set := m.pendingQuestions[agentID]; set != nil {
+					delete(set, event.RequestID)
+				}
+				m.busyMu.Unlock()
+			}
 			if event.Type == "user_question" {
-				m.markQuestionRaised(agentID, event.RequestID)
+				if resolvedQuestions[event.RequestID] {
+					continue
+				}
+				if event.QuestionBlocking == nil || *event.QuestionBlocking {
+					m.markQuestionRaised(agentID, event.RequestID)
+				}
 			}
 
 			// Terminal events (done/error) use blocking send so the
@@ -3012,7 +3566,7 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			// the UI never rendered, wedging the turn. Streaming events use
 			// non-blocking send — if no reader (WS disconnected),
 			// they are dropped but processing continues.
-			if event.Type == "done" || event.Type == "error" || event.Type == "user_question" {
+			if event.Type == "done" || event.Type == "error" || event.Type == "user_question" || event.Type == "question_resolved" {
 				select {
 				case outCh <- event:
 				case <-ctx.Done():
@@ -3259,13 +3813,7 @@ func (m *Manager) Checkin(agentID string) error {
 
 	go func() {
 		defer cancel()
-		for range events {
-		}
-		if ctx.Err() == context.DeadlineExceeded {
-			m.logger.Warn("manual checkin timed out", "agent", agentID, "timeout", timeout)
-		} else {
-			m.logger.Info("manual checkin completed", "agent", agentID)
-		}
+		drainBackgroundChat(ctx, events, m.logger, "manual checkin", agentID, timeout)
 	}()
 	return nil
 }
@@ -3387,7 +3935,7 @@ func (m *Manager) IsAgentDMAvailable(agentID string) (bool, bool) {
 
 // trackOneShot registers a one-shot chat's cancel func so it can be
 // cleaned up on Shutdown or agent Delete. Returns an ID for untracking.
-func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessionKey string) int64 {
+func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessionKey, originPeerID, handoffCapability string) int64 {
 	m.oneShotCancelsMu.Lock()
 	defer m.oneShotCancelsMu.Unlock()
 	m.oneShotSeq++
@@ -3403,6 +3951,20 @@ func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessio
 		m.oneShotSessions[agentID] = make(map[int64]string)
 	}
 	m.oneShotSessions[agentID][id] = sessionKey
+	if m.oneShotOrigins == nil {
+		m.oneShotOrigins = make(map[string]map[int64]string)
+	}
+	if m.oneShotOrigins[agentID] == nil {
+		m.oneShotOrigins[agentID] = make(map[int64]string)
+	}
+	m.oneShotOrigins[agentID][id] = originPeerID
+	if m.oneShotHandoffCaps == nil {
+		m.oneShotHandoffCaps = make(map[string]map[int64]string)
+	}
+	if m.oneShotHandoffCaps[agentID] == nil {
+		m.oneShotHandoffCaps[agentID] = make(map[int64]string)
+	}
+	m.oneShotHandoffCaps[agentID][id] = handoffCapability
 	// Record when the one-shot was armed so DrainBlockers can report its
 	// age — a long-lived one-shot that never untracks is the most likely
 	// culprit for a stuck restart drain.
@@ -3410,7 +3972,46 @@ func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessio
 		m.oneShotArmed[agentID] = make(map[int64]time.Time)
 	}
 	m.oneShotArmed[agentID][id] = time.Now()
+	if m.oneShotDone == nil {
+		m.oneShotDone = make(map[string]map[int64]chan struct{})
+	}
+	if m.oneShotDone[agentID] == nil {
+		m.oneShotDone[agentID] = make(map[int64]chan struct{})
+	}
+	m.oneShotDone[agentID][id] = make(chan struct{})
 	return id
+}
+
+// OneShotOrigin identifies the exact external/thread turn that made a
+// self-authenticated API call. SessionKey is supplied by the per-turn process
+// environment and prevents another concurrent one-shot from being mistaken
+// for the caller; OriginPeerID tells handoff where the response adapter lives.
+type OneShotOrigin struct {
+	ID                int64
+	SessionKey        string
+	OriginPeerID      string
+	HandoffCapability string
+}
+
+// InFlightOneShotOrigin resolves a running one-shot by its exact SessionKey.
+// It returns false for an empty key, no match, or an ambiguous duplicate.
+func (m *Manager) InFlightOneShotOrigin(agentID, sessionKey string) (OneShotOrigin, bool) {
+	if sessionKey == "" {
+		return OneShotOrigin{}, false
+	}
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	var out OneShotOrigin
+	for id, key := range m.oneShotSessions[agentID] {
+		if key != sessionKey {
+			continue
+		}
+		if out.ID != 0 {
+			return OneShotOrigin{}, false
+		}
+		out = OneShotOrigin{ID: id, SessionKey: key, OriginPeerID: m.oneShotOrigins[agentID][id], HandoffCapability: m.oneShotHandoffCaps[agentID][id]}
+	}
+	return out, out.ID != 0
 }
 
 // InFlightOneShotSessionKey returns the SessionKey of the agent's
@@ -3440,6 +4041,7 @@ func (m *Manager) InFlightOneShotSessionKey(agentID string) string {
 func (m *Manager) untrackOneShot(agentID string, id int64) {
 	m.oneShotCancelsMu.Lock()
 	defer m.oneShotCancelsMu.Unlock()
+	delete(m.oneShotQuestions, id)
 	if set, ok := m.oneShotCancels[agentID]; ok {
 		delete(set, id)
 		if len(set) == 0 {
@@ -3452,11 +4054,50 @@ func (m *Manager) untrackOneShot(agentID string, id int64) {
 			delete(m.oneShotSessions, agentID)
 		}
 	}
+	if set, ok := m.oneShotOrigins[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotOrigins, agentID)
+		}
+	}
+	if set, ok := m.oneShotHandoffCaps[agentID]; ok {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotHandoffCaps, agentID)
+		}
+	}
 	if set, ok := m.oneShotArmed[agentID]; ok {
 		delete(set, id)
 		if len(set) == 0 {
 			delete(m.oneShotArmed, agentID)
 		}
+	}
+	if set, ok := m.oneShotDone[agentID]; ok {
+		if done := set[id]; done != nil {
+			close(done)
+		}
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotDone, agentID)
+		}
+	}
+}
+
+// WaitOneShotDone waits until the exact external turn has fully left its
+// backend goroutine. Downgraded handoffs use this as a barrier before firing a
+// legacy main-chat arrival on the target.
+func (m *Manager) WaitOneShotDone(ctx context.Context, agentID string, id int64) error {
+	m.oneShotCancelsMu.Lock()
+	done := m.oneShotDone[agentID][id]
+	m.oneShotCancelsMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -3465,9 +4106,19 @@ func (m *Manager) untrackOneShot(agentID string, id int64) {
 // goroutines to finish (see waitOneShotClear) can observe completion as
 // each goroutine removes itself via untrackOneShot.
 func (m *Manager) cancelOneShots(agentID string) {
+	m.cancelOneShotsExcept(agentID, 0)
+}
+
+// cancelOneShotsExcept cancels every one-shot except preserveID. A
+// self-initiated handoff keeps its own HTTP-driving turn alive long enough to
+// receive the switch result while still quiescing every other external turn.
+func (m *Manager) cancelOneShotsExcept(agentID string, preserveID int64) {
 	m.oneShotCancelsMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(m.oneShotCancels[agentID]))
-	for _, cancel := range m.oneShotCancels[agentID] {
+	for id, cancel := range m.oneShotCancels[agentID] {
+		if id == preserveID {
+			continue
+		}
 		cancels = append(cancels, cancel)
 	}
 	m.oneShotCancelsMu.Unlock()
@@ -3476,12 +4127,32 @@ func (m *Manager) cancelOneShots(agentID string) {
 	}
 }
 
+// DetachOneShot removes a live turn from lifecycle cancellation tracking
+// without cancelling its context. Source release uses this only after the
+// handoff is irreversible so the caller can receive the HTTP result and exit
+// naturally while the rest of the local runtime is torn down.
+func (m *Manager) DetachOneShot(agentID string, id int64) {
+	if id == 0 {
+		return
+	}
+	m.oneShotCancelsMu.Lock()
+	if set := m.oneShotCancels[agentID]; set != nil {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(m.oneShotCancels, agentID)
+		}
+	}
+	m.oneShotCancelsMu.Unlock()
+}
+
 // cancelAllOneShots cancels all in-flight one-shot chats across all agents.
 func (m *Manager) cancelAllOneShots() {
 	m.oneShotCancelsMu.Lock()
 	all := m.oneShotCancels
 	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
+	m.oneShotOrigins = make(map[string]map[int64]string)
+	m.oneShotHandoffCaps = make(map[string]map[int64]string)
 	m.oneShotArmed = make(map[string]map[int64]time.Time)
 	m.oneShotCancelsMu.Unlock()
 	for _, cancels := range all {
@@ -3860,6 +4531,12 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		return err
 	}
 	m.refreshLastMessage(agentID)
+	// prepareChat ran before truncation so setup failures could not mutate the
+	// transcript. Rebuild the fresh-session fallback now from the committed
+	// prefix; otherwise regenerate could inject the answer it just removed.
+	if !prep.agentCopy.InjectionDisabled(InjectionRecentConversation) {
+		prep.freshSessionContext = m.buildSessionHistoryContext(context.Background(), agentID, rt.SourceID)
+	}
 
 	var regenHistory []HistoryTurn
 	if backendReplaysHistory(prep.backend) &&
@@ -3887,6 +4564,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer cancel()
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			FreshSessionContext: prep.freshSessionContext,
 			// Session-less backends replay the transcript; here it has
 			// to stop short of the message being re-run, which travels
 			// as effectiveMessage. The truncate above already removed
@@ -4114,6 +4792,35 @@ func (m *Manager) save() {
 // safe to drop".
 func (m *Manager) LockPatch(id string) (release func()) {
 	return m.patchMus.Lock(id)
+}
+
+// DismissTransferSkips acknowledges the latest device-transfer loss notice.
+// The acknowledgement is persisted even when the agent is currently held by
+// a remote peer, then the matching warning is hidden from the local cache. A
+// future transfer with new skips creates a new generation.
+func (m *Manager) DismissTransferSkips(id, expectedGeneration string) (bool, error) {
+	if m == nil || m.store == nil || id == "" {
+		return false, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	acknowledged, err := m.store.AcknowledgeTransferSkips(id, expectedGeneration)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// Only hide the generation the caller actually observed. If a new transfer
+	// reloaded the cache while the request was in flight, leave that warning
+	// visible; the store CAS above returns ErrTransferSkipsChanged in the same
+	// situation for the persisted row.
+	m.mu.Lock()
+	if a, ok := m.agents[id]; ok && a.LastTransferSkipsGeneration == expectedGeneration {
+		a.LastTransferSkips = nil
+		a.LastTransferSkipsGeneration = ""
+	}
+	m.mu.Unlock()
+	return acknowledged, nil
 }
 
 // copyAgent returns a deep copy of an Agent, including pointer fields.

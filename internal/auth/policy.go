@@ -199,6 +199,17 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			return true
 		}
 		if method == http.MethodPost &&
+			strings.HasPrefix(path, "/api/v1/peers/agent-sync/chunked/") {
+			// Large, non-droppable history payloads use the same
+			// RolePeer-authenticated agent-sync protocol in four phases.
+			// Keep the suffix list explicit so a future route under the
+			// prefix is not admitted accidentally.
+			switch strings.TrimPrefix(path, "/api/v1/peers/agent-sync/chunked/") {
+			case "begin", "chunk", "commit", "abort":
+				return true
+			}
+		}
+		if method == http.MethodPost &&
 			(path == "/api/v1/peers/agent-sync/finalize" ||
 				path == "/api/v1/peers/agent-sync/drop") {
 			// Two-phase agent-sync companions. finalize
@@ -215,6 +226,12 @@ func AllowNonOwner(p Principal, method, path string) bool {
 			// run inside the handler.
 			return true
 		}
+		if method == http.MethodPost && (path == "/api/v1/peers/handoff/arrival" || path == "/api/v1/peers/handoff/arrival/bind" || path == "/api/v1/peers/goals/resume" || path == "/api/v1/peers/goals/handoff") {
+			// Target holder asks the origin Hub to resume the exact external
+			// conversation that initiated a completed device switch. The
+			// handler binds holder_device_id to the authenticated PeerID.
+			return true
+		}
 		// kojo-attach hub-ingest path.
 		if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/peers/blobs-ingest/") {
 			return true
@@ -226,6 +243,16 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// trust signal. --unsafe collapses the WhoIs check and
 		// unconditionally stamps RolePeer on every caller (LAN /
 		// docker / CI escape hatch).
+		// Bare generation/preview endpoints are Owner-only. They are not
+		// holder-scoped agent proxy routes, and generate-* can incur provider
+		// charges; do not let the broad per-agent peer proxy prefix admit them.
+		switch path {
+		case "/api/v1/agents/generate-persona",
+			"/api/v1/agents/generate-name",
+			"/api/v1/agents/generate-avatar",
+			"/api/v1/agents/preview-avatar":
+			return false
+		}
 		if strings.HasPrefix(path, "/api/v1/agents/") {
 			return true
 		}
@@ -245,7 +272,8 @@ func AllowNonOwner(p Principal, method, path string) bool {
 		// Hub UI hits when it has selected a remote peer in the
 		// session screen's File/Attachments tabs.
 		if method == http.MethodGet && (path == "/api/v1/files" ||
-			path == "/api/v1/files/view" || path == "/api/v1/files/raw") {
+			path == "/api/v1/files/view" || path == "/api/v1/files/raw" ||
+			path == "/api/v1/files/thumb") {
 			return true
 		}
 		if method == http.MethodPost && path == "/api/v1/upload" {

@@ -55,6 +55,31 @@ func rpcServerRequestLine(id any, method string, params any) string {
 	return string(data)
 }
 
+func TestBuildCodexResumeParamsExcludesHistoricalTurns(t *testing.T) {
+	base := map[string]any{
+		"cwd":     "/workspace",
+		"sandbox": "danger-full-access",
+	}
+
+	got := buildCodexResumeParams(base, "thread-123")
+
+	if got["threadId"] != "thread-123" {
+		t.Fatalf("threadId = %v, want thread-123", got["threadId"])
+	}
+	if exclude, ok := got["excludeTurns"].(bool); !ok || !exclude {
+		t.Fatalf("excludeTurns = %#v, want true", got["excludeTurns"])
+	}
+	if got["cwd"] != base["cwd"] || got["sandbox"] != base["sandbox"] {
+		t.Fatalf("resume params lost base fields: got %#v, base %#v", got, base)
+	}
+	if _, ok := base["threadId"]; ok {
+		t.Fatal("buildCodexResumeParams mutated base thread params with threadId")
+	}
+	if _, ok := base["excludeTurns"]; ok {
+		t.Fatal("buildCodexResumeParams mutated base thread params with excludeTurns")
+	}
+}
+
 // collectCodexEvents runs parseCodexStream on the given lines and collects all emitted events.
 func collectCodexEvents(t *testing.T, turnStartID int64, lines ...string) ([]ChatEvent, *codexStreamResult) {
 	t.Helper()
@@ -716,7 +741,7 @@ func TestRunCodexTurns_RetriesEmptyCompletionAndPreservesWork(t *testing.T) {
 		context.Background(),
 		newCodexLineScanner(strings.NewReader(input)),
 		"original request",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		startTurn,
 		nil,
 		nil,
@@ -775,7 +800,7 @@ func TestRunCodexTurns_StopsAfterBoundedEmptyCompletionRetries(t *testing.T) {
 		context.Background(),
 		newCodexLineScanner(strings.NewReader(strings.Join(lines, "\n")+"\n")),
 		"original request",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		func(string) (int64, error) {
 			starts++
 			return int64(starts), nil
@@ -842,7 +867,7 @@ func TestRunCodexTurns_DoesNotRetryFailedOrAnsweredTurn(t *testing.T) {
 				context.Background(),
 				newCodexLineScanner(strings.NewReader(strings.Join(tt.lines, "\n")+"\n")),
 				"original",
-				codexEmptyCompletionMaxRetries,
+				codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 				func(string) (int64, error) { starts++; return 1, nil },
 				nil,
 				nil,
@@ -870,7 +895,7 @@ func TestRunCodexTurns_ContextCancelledBeforeRetryStart(t *testing.T) {
 		ctx,
 		newCodexLineScanner(strings.NewReader("")),
 		"original",
-		codexEmptyCompletionMaxRetries,
+		codexTurnRetryPolicy{maxEmptyRetries: codexEmptyCompletionMaxRetries},
 		func(string) (int64, error) { starts++; return 1, nil },
 		nil,
 		nil,

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -51,6 +52,8 @@ type peerAgentSyncStateRequest struct {
 const peerAgentSyncStateMaxBody = 4 << 10 // 4 KiB; body is two short strings.
 
 func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Kojo-Native-Goal", "v1")
+	w.Header().Set("X-Kojo-Goal-Handoff", "v1")
 	p, ok := requirePeerOrOwner(w, r)
 	if !ok {
 		return
@@ -72,11 +75,11 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 			"invalid json: "+err.Error())
 		return
 	}
-	if req.AgentID == "" {
+	if !agent.IsPathSafeAgentID(req.AgentID) {
 		writeError(w, http.StatusBadRequest, "bad_request", "agent_id required")
 		return
 	}
-	if p.IsPeer() {
+	if p.IsPeer() || p.PeerID != "" {
 		// Peer principals must declare the source they're
 		// orchestrating from; we enforce signer-equals-source so
 		// a stray peer can't probe arbitrary device sync states.
@@ -90,62 +93,16 @@ func (s *Server) handlePeerAgentSyncState(w http.ResponseWriter, r *http.Request
 				"signer peer device_id does not match source_device_id")
 			return
 		}
-		// Holder check (defence in depth, matches handlePeerAgentSync's
-		// guard at peer_agent_sync_handler.go's existing-lock branch):
-		// when target already has an agent_locks row for this agent,
-		// the signer MUST be the current holder. Without this, any
-		// registered peer could enumerate target's sync state for an
-		// agent it never owned — leaking turn counts and etags. Lock
-		// absence is OK (first-time / freshly-released agent).
-		lock, lerr := s.agents.Store().GetAgentLock(r.Context(), req.AgentID)
-		if lerr != nil && !errors.Is(lerr, store.ErrNotFound) {
-			writeError(w, http.StatusInternalServerError, "internal",
-				"agent_lock lookup: "+lerr.Error())
+	}
+	if req.SourceDeviceID != "" {
+		_, delegatedBy, err := s.authorizeIncomingSource(r.Context(), req.AgentID, req.SourceDeviceID)
+		if err != nil {
+			writeError(w, http.StatusConflict, "wrong_holder", err.Error())
 			return
 		}
-		if lock != nil && lock.HolderPeer != "" && lock.HolderPeer != req.SourceDeviceID {
-			// Stale-row self-heal: a holder ≠ source row blocks
-			// every retry of the orchestrator's switch (the
-			// agent-sync handler's existingLock guard 409s) and
-			// can only be opened by tearing the row down.
-			//
-			// Trust gate: REQUIRED here despite the operator
-			// inconvenience. Purge deletes the lock row, and
-			// the next agent-sync from the same signer admits
-			// With the trusted column gone every Bearer-authed
-			// caller is trusted; the prior `kojo --peer-trust`
-			// guard would always pass now. Keep the comment for
-			// audit-trail context but skip the runtime check.
-			s.logger.Warn("state probe: purging stale agent runtime state on target",
-				"agent", req.AgentID, "source", req.SourceDeviceID,
-				"stale_holder", lock.HolderPeer,
-				"lease_expires_at", lock.LeaseExpiresAt)
-			if err := s.agents.Store().PurgeAgentRuntimeStateForRetry(
-				r.Context(), req.AgentID,
-			); err != nil {
-				s.logger.Error("state probe: stale state purge failed",
-					"agent", req.AgentID, "err", err)
-				writeError(w, http.StatusInternalServerError, "internal",
-					"stale state purge: "+err.Error())
-				return
-			}
-			// Tear down in-memory runtime side channels so the
-			// guard's refresh loop doesn't immediately re-Acquire
-			// the lock we just deleted, and cron / notify / slack
-			// stop driving the now-purged agent until the
-			// orchestrator's agent-sync re-adopts it.
-			if s.onAgentRuntimePurged != nil {
-				s.onAgentRuntimePurged(r.Context(), req.AgentID)
-			}
-			// Force full sync. Without this the orchestrator
-			// would consult GetAgentSyncState below, find stale
-			// max(seq) on messages / memory_entries left over
-			// from the prior switch, and ship only the delta —
-			// any rows the source generated AFTER the prior
-			// sync but BEFORE the purge would be missing from
-			// the response and never replayed on target.
-			// Empty state ≡ Known=false, which triggers full
-			// sync on the source.
+		if delegatedBy != "" {
+			// Multi-hop return: preserve the shadow row/fence and request a full
+			// snapshot rather than purging the local agent to bypass authorization.
 			writeJSONResponse(w, http.StatusOK, store.AgentSyncState{})
 			return
 		}

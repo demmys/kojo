@@ -90,6 +90,13 @@ func AgentFencingMiddleware(st AgentFencingStore, selfPeerID string, logger *slo
 				next.ServeHTTP(w, r)
 				return
 			}
+			// Slack Socket configuration and credentials are Hub-owned even
+			// while the agent runtime is remote. These writes intentionally
+			// target the Hub mirror, not the lock holder's runtime state.
+			if sok && (sub == "/slackbot" || sub == "/slackbot/test") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			// Queue-and-forward cancel (DELETE
 			// /agents/{id}/queued-messages/{qid}) mutates the
 			// hub-side handoff_queued_messages table, not the

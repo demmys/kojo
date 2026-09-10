@@ -138,8 +138,8 @@ func TestCodexSteerer_CloseFailsPendingWaiter(t *testing.T) {
 	s.close()
 
 	err := <-done
-	if !errors.Is(err, ErrAgentNotBusy) {
-		t.Fatalf("expected ErrAgentNotBusy-wrapped error, got %v", err)
+	if !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("expected ErrSteerDeliveryUncertain-wrapped error, got %v", err)
 	}
 }
 
@@ -297,4 +297,99 @@ func TestParseCodexStream_SteerErrorResponseNotTurnError(t *testing.T) {
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "turn mismatch") {
 		t.Fatalf("steer should surface the rejection, got %v", err)
 	}
+}
+
+func TestCodexSteerWaitsThroughOverloadBackoff(t *testing.T) {
+	s, _ := newTestSteerer(t)
+	s.setTurnID("old")
+	s.finishTurn()
+	done := make(chan error, 1)
+	go func() { done <- s.steerWithTimeouts("follow-up", 50*time.Millisecond, codexSteerRespWait) }()
+	if !s.prepareOverloadRetry(150 * time.Millisecond) {
+		t.Fatal("backoff unexpectedly refused")
+	}
+	// This is longer than the usual readiness budget. It must not fail while
+	// the backend is intentionally waiting, whether steer began before or after
+	// prepareOverloadRetry.
+	select {
+	case err := <-done:
+		t.Fatalf("steer ended during backoff: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	s.setTurnID("retry")
+	waitPending(t, s, 42)
+	s.resolve(42, nil)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCodexSteerCloseDuringOverloadBackoff(t *testing.T) {
+	s, _ := newTestSteerer(t)
+	s.prepareOverloadRetry(time.Hour)
+	done := steerAsync(s, "follow-up")
+	s.close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrAgentNotBusy) {
+			t.Fatalf("err = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("steer did not unblock on cancellation")
+	}
+}
+
+func TestCodexSteerPendingDeliveryDisablesOverloadRetry(t *testing.T) {
+	s, _ := newTestSteerer(t)
+	s.setTurnID("old")
+	done := steerAsync(s, "follow-up")
+	waitPending(t, s, 42)
+	s.finishTurn()
+	if s.prepareOverloadRetry(time.Second) {
+		t.Fatal("retry allowed with unacknowledged input")
+	}
+	s.close()
+	if err := <-done; !errors.Is(err, ErrSteerDeliveryUncertain) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCodexSteerUncertainDeliveryDisablesOverloadRetry(t *testing.T) {
+	t.Run("partial write", func(t *testing.T) {
+		s := newCodexSteerer("thread", func(string, any) (int64, error) {
+			return 1, &codexRPCWriteError{Written: 5, Err: errors.New("broken pipe")}
+		})
+		s.setTurnID("old")
+		if err := s.steer("follow-up"); !errors.Is(err, ErrSteerDeliveryUncertain) {
+			t.Fatalf("err = %v", err)
+		}
+		s.finishTurn()
+		if s.prepareOverloadRetry(time.Second) {
+			t.Fatal("retry allowed after partial write")
+		}
+	})
+	t.Run("ack timeout", func(t *testing.T) {
+		s, _ := newTestSteerer(t)
+		s.setTurnID("old")
+		if err := s.steerWithTimeouts("follow-up", time.Second, time.Millisecond); !errors.Is(err, ErrSteerDeliveryUncertain) {
+			t.Fatalf("err = %v", err)
+		}
+		s.finishTurn()
+		if s.prepareOverloadRetry(time.Second) {
+			t.Fatal("retry allowed after acknowledgement timeout")
+		}
+	})
+	t.Run("zero byte write is safe", func(t *testing.T) {
+		s := newCodexSteerer("thread", func(string, any) (int64, error) {
+			return 1, &codexRPCWriteError{Written: 0, Err: errors.New("closed pipe")}
+		})
+		s.setTurnID("old")
+		if err := s.steer("follow-up"); !errors.Is(err, ErrAgentNotBusy) {
+			t.Fatalf("err = %v", err)
+		}
+		s.finishTurn()
+		if !s.prepareOverloadRetry(time.Second) {
+			t.Fatal("known non-delivery unnecessarily blocked recovery")
+		}
+	})
 }

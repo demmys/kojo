@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,9 @@ import (
 	"github.com/slack-go/slack"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/store"
 )
 
 type contextKey int
@@ -28,6 +32,8 @@ type contextKey int
 const (
 	mcpAgentIDKey contextKey = iota
 	mcpReqIDKey
+	mcpCallerPeerKey
+	mcpRemoteRelayKey
 )
 
 // newMCPHandler creates the MCP HTTP handler that serves Slack tools.
@@ -142,6 +148,14 @@ func newMCPHandler(agents *agent.Manager, logger *slog.Logger) http.Handler {
 			ctx = context.WithValue(ctx, mcpAgentIDKey, agentID)
 			if reqID, ok := r.Context().Value(mcpReqIDKey).(string); ok {
 				ctx = context.WithValue(ctx, mcpReqIDKey, reqID)
+			}
+			p := auth.FromContext(r.Context())
+			if p.PeerID != "" {
+				ctx = context.WithValue(ctx, mcpCallerPeerKey, p.PeerID)
+			}
+			relayRequested := r.Header.Get("X-Kojo-External-Chat-Relay") == "1" || r.URL.Query().Get("external_chat_relay") == "1"
+			if relayRequested && (p.PeerID != "" || p.IsOwner()) {
+				ctx = context.WithValue(ctx, mcpRemoteRelayKey, true)
 			}
 			return ctx
 		}),
@@ -284,29 +298,40 @@ func reqIDFromCtx(ctx context.Context) string {
 // and returns a Slack API client. Returns nil and an error message if
 // the agent has no Slack bot configured.
 func getSlackClient(ctx context.Context, agents *agent.Manager) (*slack.Client, string) {
+	token, errMsg := getSlackToken(ctx, agents)
+	if token == "" {
+		return nil, errMsg
+	}
+	return slack.New(token), ""
+}
+
+// getSlackToken applies the same archived-agent and credential checks used by
+// every Slack MCP tool. The upload tool also needs the token for its
+// cancellation-safe multipart request, so keep token resolution in one place.
+func getSlackToken(ctx context.Context, agents *agent.Manager) (string, string) {
 	agentID, _ := ctx.Value(mcpAgentIDKey).(string)
 	if agentID == "" {
-		return nil, "agent ID not found in request context"
+		return "", "agent ID not found in request context"
 	}
 
 	// Refuse archived agents: their Slack token is retained on disk so the
 	// agent can be unarchived later, but while archived the agent must not
 	// be allowed to call Slack APIs (or any other tool) through MCP.
 	if a, ok := agents.Get(agentID); ok && a.Archived {
-		return nil, fmt.Sprintf("agent %s is archived", agentID)
+		return "", fmt.Sprintf("agent %s is archived", agentID)
 	}
 
 	creds := agents.Credentials()
 	if creds == nil {
-		return nil, "credential store not available"
+		return "", "credential store not available"
 	}
 
 	token, err := creds.GetToken("slack", agentID, "", "bot_token")
 	if err != nil || token == "" {
-		return nil, fmt.Sprintf("Slack bot token not configured for agent %s", agentID)
+		return "", fmt.Sprintf("Slack bot token not configured for agent %s", agentID)
 	}
 
-	return slack.New(token), ""
+	return token, ""
 }
 
 // listChannelsDefaults centralizes the tunables for slack_list_channels so
@@ -1165,10 +1190,11 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 			"hasFilePath", filePath != "", "contentLen", len(content),
 		)
 
-		api, errMsg := getSlackClient(ctx, agents)
-		if api == nil {
+		token, errMsg := getSlackToken(ctx, agents)
+		if token == "" {
 			return mcp.NewToolResultError(errMsg), nil
 		}
+		api := slack.New(token)
 
 		if channel == "" || filename == "" {
 			return mcp.NewToolResultError("'channel' and 'filename' are required"), nil
@@ -1206,7 +1232,9 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		// upload to a file outside the upload directory. Streaming through
 		// the fd we already pinned closes that window.
 		if filePath != "" {
-			f, size, errKind := openUploadPath(filePath)
+			callerPeer, _ := ctx.Value(mcpCallerPeerKey).(string)
+			remoteRelay, _ := ctx.Value(mcpRemoteRelayKey).(bool)
+			f, size, errKind := openMCPUploadSource(ctx, agents, agentID, callerPeer, remoteRelay, filePath)
 			if errKind != "" {
 				logger.Warn("mcp tool aborted",
 					"reqID", reqID, "agent", agentID, "tool", "slack_upload_file",
@@ -1222,7 +1250,7 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 			params.FileSize = len(content)
 		}
 
-		fileSummary, err := api.UploadFileContext(ctx, params)
+		fileSummary, err := uploadSlackFileContext(ctx, api, token, params)
 		if err != nil {
 			logger.Warn("mcp tool error", "reqID", reqID, "agent", agentID, "tool", "slack_upload_file", "err", err)
 			return mcp.NewToolResultError(fmt.Sprintf("failed to upload file: %v", err)), nil
@@ -1242,6 +1270,181 @@ func slackUploadFileHandler(agents *agent.Manager, logger *slog.Logger) mcpserve
 		data, _ := json.Marshal(result)
 		return mcp.NewToolResultText(string(data)), nil
 	}
+}
+
+// uploadSlackFileContext mirrors slack-go's three-step external upload while
+// using a cancellation-safe multipart writer for the data transfer. slack-go
+// v0.21.0 uses an unbuffered producer error channel: if the source stream fails
+// (for example because a holder peer disconnects), its producer can block
+// before closing the pipe and leave both the upload and goroutine stuck.
+func uploadSlackFileContext(ctx context.Context, api *slack.Client, token string, params slack.UploadFileParameters) (*slack.FileSummary, error) {
+	if params.Filename == "" {
+		return nil, fmt.Errorf("file.upload.v2: filename cannot be empty")
+	}
+	if params.FileSize == 0 {
+		return nil, fmt.Errorf("file.upload.v2: file size cannot be 0")
+	}
+
+	upload, err := api.GetUploadURLExternalContext(ctx, slack.GetUploadURLExternalParameters{
+		AltTxt:      params.AltTxt,
+		FileName:    params.Filename,
+		FileSize:    params.FileSize,
+		SnippetType: params.SnippetType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("GetUploadURLExternal: %w", err)
+	}
+
+	var source io.Reader
+	if params.Reader != nil {
+		source = params.Reader
+	} else {
+		source = strings.NewReader(params.Content)
+	}
+	if err := postSlackMultipartFile(ctx, http.DefaultClient, upload.UploadURL, token, params.Filename, source); err != nil {
+		return nil, fmt.Errorf("UploadToURL: %w", err)
+	}
+
+	completed, err := api.CompleteUploadExternalContext(ctx, slack.CompleteUploadExternalParameters{
+		Files:           []slack.FileSummary{{ID: upload.FileID, Title: params.Title}},
+		Channel:         params.Channel,
+		InitialComment:  params.InitialComment,
+		ThreadTimestamp: params.ThreadTimestamp,
+		Blocks:          params.Blocks,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("CompleteUploadExternal: %w", err)
+	}
+	if len(completed.Files) != 1 {
+		return nil, fmt.Errorf("file.upload.v2: something went wrong; received %d files instead of 1", len(completed.Files))
+	}
+	return &completed.Files[0], nil
+}
+
+// postSlackMultipartFile streams one file to Slack's pre-signed upload URL.
+// The producer result is buffered and every failure path closes both ends that
+// may be blocking, so a source/read failure or request cancellation cannot
+// strand the multipart goroutine.
+func postSlackMultipartFile(ctx context.Context, client *http.Client, uploadURL, token, filename string, source io.Reader) error {
+	pipeReader, pipeWriter := io.Pipe()
+	multipartWriter := multipart.NewWriter(pipeWriter)
+	producerDone := make(chan error, 1)
+
+	closeSource := func() {
+		if closer, ok := source.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	abort := func(err error) {
+		_ = pipeReader.CloseWithError(err)
+		_ = pipeWriter.CloseWithError(err)
+		closeSource()
+	}
+
+	go func() {
+		part, err := multipartWriter.CreateFormFile("file", filename)
+		if err == nil {
+			_, err = io.Copy(part, source)
+		}
+		if err == nil {
+			err = multipartWriter.Close()
+		}
+		if err != nil {
+			_ = pipeWriter.CloseWithError(err)
+		} else {
+			_ = pipeWriter.Close()
+		}
+		producerDone <- err
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, pipeReader)
+	if err != nil {
+		abort(err)
+		return err
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		abort(err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		err := fmt.Errorf("upload returned HTTP %d", resp.StatusCode)
+		abort(err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	select {
+	case err := <-producerDone:
+		if err != nil {
+			abort(err)
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		abort(ctx.Err())
+		return ctx.Err()
+	}
+}
+
+const maxMCPRelayedUploadBytes int64 = 1 << 30
+
+// openMCPUploadSource returns a pinned local upload file or a bounded stream
+// from the runtime peer that is currently executing this external Slack turn.
+func openMCPUploadSource(ctx context.Context, agents *agent.Manager, agentID, callerPeer string, remoteRelay bool, path string) (io.ReadCloser, int64, string) {
+	if !remoteRelay {
+		return openUploadPath(path)
+	}
+	if agents == nil || agents.Store() == nil {
+		return nil, 0, uploadErrOpenFail
+	}
+	lock, err := agents.Store().GetAgentLock(ctx, agentID)
+	if err != nil || lock == nil || lock.LeaseExpiresAt <= store.NowMillis() || lock.HolderPeer == "" {
+		return nil, 0, uploadErrOpenFail
+	}
+	if callerPeer != "" && callerPeer != lock.HolderPeer {
+		return nil, 0, uploadErrOpenFail
+	}
+	holder := lock.HolderPeer
+	rec, err := agents.Store().GetPeer(ctx, holder)
+	if err != nil || rec.Status != store.PeerStatusOnline {
+		return nil, 0, uploadErrOpenFail
+	}
+	addr, err := peer.NormalizeAddress(rec.URL)
+	if err != nil {
+		return nil, 0, uploadErrOpenFail
+	}
+	body, err := json.Marshal(map[string]string{"path": path})
+	if err != nil {
+		return nil, 0, uploadErrInvalid
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		addr+"/api/v1/agents/"+agentID+"/external-chat/file", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, uploadErrOpenFail
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := peer.NoKeepAliveHTTPClient(0).Do(req)
+	if err != nil {
+		return nil, 0, uploadErrOpenFail
+	}
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		return nil, 0, uploadErrOpenFail
+	}
+	size := resp.ContentLength
+	if size < 0 || size > maxMCPRelayedUploadBytes || size > int64(^uint(0)>>1) {
+		_ = resp.Body.Close()
+		return nil, 0, uploadErrInvalid
+	}
+	return resp.Body, size, ""
 }
 
 // ---------------------------------------------------------------------------

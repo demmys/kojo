@@ -144,6 +144,14 @@ kojo then:
 3. Re-installs the agent's skills on the target.
 4. Resumes the conversation on the target.
 
+Canonical conversation history and memory are never trimmed to make the
+handoff fit. Native Claude/Codex/Grok session artifacts are considered in
+most-recently-active order and only the set that fits inside the 128 MiB
+decompressed agent-sync JSON budget is transferred. If an older artifact is
+left behind, opening that conversation starts a new native session bootstrapped
+from the canonical transcript. When canonical data alone exceeds 128 MiB,
+kojo uses chunked agent-sync instead of dropping history.
+
 The chat stays open while the switch happens; new messages are queued
 and replayed once the target finishes coming up. Credentials sync
 automatically — you do not re-enter API keys on the new machine.

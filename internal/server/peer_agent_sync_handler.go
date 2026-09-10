@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -97,9 +98,9 @@ func decodeSyncB64(w http.ResponseWriter, label string, i int, b64 string) ([]by
 // bounded separately by peerAgentSyncMaxWireBody; senders gzip
 // the JSON to stay under that, but the JSON itself can be much
 // larger when decompressed (real ag_f71bf5.. observed ~60 MiB).
-// 128 MiB covers a thousands-of-turns agent with comfortable
-// headroom for claude session JSONLs (capped at 32 MiB each in
-// claude_session_transfer.go).
+// 128 MiB covers a thousands-of-turns agent. The switch orchestrator keeps
+// all history rows and fills the remaining raw-JSON capacity with native
+// session artifacts in newest-activity order.
 const peerAgentSyncMaxBody = 128 << 20
 
 // peerAgentSyncMaxWireBody caps the on-the-wire body size,
@@ -223,6 +224,11 @@ type peerAgentSyncRequest struct {
 	// silently dropping edits across peer clock skew, same rationale
 	// as workspace_files.
 	Credentials *[]*agent.Credential `json:"credentials,omitempty"`
+	// CustomAPIKey is the agent-scoped inference credential in plaintext.
+	// A non-nil pointer is authoritative; an empty string clears the target.
+	// It is separate from Credentials so internal service tokens never appear
+	// in the agent-visible password vault.
+	CustomAPIKey *string `json:"custom_api_key,omitempty"`
 
 	// COMPAT: both fields below are omitempty, so only degraded /
 	// lossy transfers put them on the wire. An OLD target binary
@@ -245,11 +251,8 @@ type peerAgentSyncRequest struct {
 
 // agentRecordTool extracts the agent's backend CLI name from an
 // AgentRecord. Tool is stored inside the dynamic Settings map
-// (`{"tool":"grok"}`); this helper centralises the cast so the
-// grok-session-tombstone branch doesn't repeat the lookup pattern
-// inline. Returns "" when Settings is nil or the value isn't a
-// string — both fall through to the non-tombstone path, which is
-// the safer default for an unrecognised record shape.
+// (`{"tool":"grok"}`); this helper centralises the cast for source-side
+// session selection. It returns "" when Settings is nil or malformed.
 func agentRecordTool(rec *store.AgentRecord) string {
 	if rec == nil || rec.Settings == nil {
 		return ""
@@ -271,6 +274,14 @@ func agentRecordUsesCodex(rec *store.AgentRecord) bool {
 	default:
 		return false
 	}
+}
+
+func agentRecordCustomBaseURL(rec *store.AgentRecord) string {
+	if rec == nil || rec.Settings == nil {
+		return ""
+	}
+	v, _ := rec.Settings["customBaseURL"].(string)
+	return v
 }
 
 // claudeSessionWire is the JSON shape of one transferred JSONL
@@ -310,12 +321,14 @@ type codexSessionWire struct {
 }
 
 type codexThreadWire struct {
-	RefName           string                 `json:"ref_name"`
-	ThreadID          string                 `json:"thread_id"`
-	RolloutRelPath    string                 `json:"rollout_rel_path"`
-	RolloutContentB64 string                 `json:"rollout_content_b64"`
-	ThreadRow         *agent.CodexSQLiteRow  `json:"thread_row,omitempty"`
-	DynamicToolRows   []agent.CodexSQLiteRow `json:"dynamic_tool_rows,omitempty"`
+	Goal              *agent.GoalBinding       `json:"goal,omitempty"`
+	NativeGoal        *agent.CodexGoalTransfer `json:"native_goal,omitempty"`
+	RefName           string                   `json:"ref_name"`
+	ThreadID          string                   `json:"thread_id"`
+	RolloutRelPath    string                   `json:"rollout_rel_path"`
+	RolloutContentB64 string                   `json:"rollout_content_b64"`
+	ThreadRow         *agent.CodexSQLiteRow    `json:"thread_row,omitempty"`
+	DynamicToolRows   []agent.CodexSQLiteRow   `json:"dynamic_tool_rows,omitempty"`
 }
 
 type peerAgentSyncResponse struct {
@@ -461,6 +474,10 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 			"agent record with id required")
 		return false
 	}
+	if req.CustomAPIKey != nil && len(*req.CustomAPIKey) > agent.CustomAPIKeyMaxBytes {
+		writeError(w, http.StatusBadRequest, "bad_request", "custom_api_key exceeds size limit")
+		return false
+	}
 	// Path-safety gate: agent.id flows into filepath.Join for the
 	// portable workspace path, AgentDir, claude session JSONL paths
 	// and persona/memory file lookups. An id containing path
@@ -478,20 +495,17 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 			"source_device_id must not equal the local peer")
 		return false
 	}
-	// Holder verification: if target already has an agent_locks
-	// row for this agentID, the signer MUST be the recorded
-	// holder. This blocks a stray/malicious authenticated peer
-	// from clobbering target's view of an agent it didn't
-	// originate, even within the v1 trust realm. First-time
-	// syncs (no lock row yet) are allowed because there's
-	// nothing on target to protect.
+	// Never accept a remote snapshot over a local ownership claim. A
+	// different remote shadow needs delegation evidence; applyPeerAgentSync
+	// resolves and fences it before any snapshot/filesystem writes. Chunked
+	// staging may proceed, but commit uses that same authoritative gate.
 	existingLock, lerr := s.agents.Store().GetAgentLock(r.Context(), req.Agent.ID)
 	if lerr != nil && !errors.Is(lerr, store.ErrNotFound) {
 		writeError(w, http.StatusInternalServerError, "internal",
 			"lookup agent lock: "+lerr.Error())
 		return false
 	}
-	if existingLock != nil && existingLock.HolderPeer != req.SourceDeviceID {
+	if existingLock != nil && existingLock.HolderPeer != req.SourceDeviceID && (s.peerID == nil || existingLock.HolderPeer == s.peerID.DeviceID) {
 		writeError(w, http.StatusConflict, "wrong_holder",
 			"agent_locks.holder_peer does not match source_device_id; refusing sync")
 		return false
@@ -504,6 +518,43 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 // handlePeerAgentSyncChunkedCommit (chunked). The caller is responsible
 // for validating req via validatePeerAgentSyncRequest first.
 func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req *peerAgentSyncRequest) {
+	// Serialize receiver lifecycle changes, including force-reclaim, across
+	// validation and all phase-1 side effects (single-shot AND chunked paths).
+	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: req.Agent.ID})
+	defer unlock()
+	if !s.validatePeerAgentSyncRequest(w, r, req, auth.FromContext(r.Context())) {
+		return
+	}
+	var incoming *store.IncomingHandoff
+	if s.peerID != nil {
+		prior, err := s.agents.Store().GetIncomingHandoff(r.Context(), req.Agent.ID, req.OpID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeError(w, 500, "internal", err.Error())
+			return
+		}
+		if prior != nil && (prior.Phase != "prepared" || prior.SourcePeer != req.SourceDeviceID) {
+			writeError(w, 409, "stale_handoff", "operation already accepted or retired; use a new handoff")
+			return
+		}
+		version, delegatedBy, err := s.authorizeIncomingSource(r.Context(), req.Agent.ID, req.SourceDeviceID)
+		if err != nil {
+			writeError(w, 409, "wrong_holder", err.Error())
+			return
+		}
+		incoming = &store.IncomingHandoff{AgentID: req.Agent.ID, OpID: req.OpID, SourcePeer: req.SourceDeviceID, TargetPeer: s.peerID.DeviceID, Expected: version, DelegatedBy: delegatedBy}
+		if prior != nil && prior.Expected != version {
+			writeError(w, 409, "stale_handoff", "ownership changed since phase-1")
+			return
+		}
+		if err := s.agents.Store().ValidateIncomingHandoff(r.Context(), incoming); err != nil {
+			if errors.Is(err, store.ErrStaleHandoff) {
+				writeError(w, 409, "stale_handoff", "operation cancelled, superseded, or another handoff is pending")
+			} else {
+				writeError(w, 500, "internal", err.Error())
+			}
+			return
+		}
+	}
 	// Cross-platform workDir: the user-facing Settings.workDir
 	// (peer-local per docs §3.8) is rewritten to a portable
 	// default so a /Users/alice/... path from a macOS source
@@ -521,14 +572,6 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		req.Agent.Settings = map[string]any{}
 	}
 	req.Agent.Settings["workDir"] = targetWorkDir
-	// Loss visibility: persist this transfer's skip list on the
-	// agent row so the owner UI can render a "skipped during
-	// transfer" notice. Always reset first so a clean transfer
-	// clears a stale notice from a previous lossy switch.
-	delete(req.Agent.Settings, "lastTransferSkips")
-	if len(req.TransferSkips) > 0 {
-		req.Agent.Settings["lastTransferSkips"] = req.TransferSkips
-	}
 	// MkdirAll for the portable default workDir runs AFTER the
 	// base64 decode loop below so a 400 on malformed claude_sessions
 	// doesn't leave a stub directory behind on target. The
@@ -588,14 +631,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			if !ok {
 				return
 			}
-			decodedCodex.Threads = append(decodedCodex.Threads, agent.CodexThreadTransfer{
-				RefName:         ct.RefName,
-				ThreadID:        ct.ThreadID,
-				RolloutRelPath:  ct.RolloutRelPath,
-				RolloutContent:  body,
-				ThreadRow:       ct.ThreadRow,
-				DynamicToolRows: ct.DynamicToolRows,
-			})
+			decodedCodex.Threads = append(decodedCodex.Threads, ct.toTransfer(body))
 		}
 	}
 
@@ -613,8 +649,8 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 
 	// Two-phase sync to make sessions + DB atomic-ish across
 	// failures:
-	//   1. StageClaudeSessionFiles writes the new JSONLs and
-	//      moves any pre-existing files aside as backups.
+	//   1. StageClaudeSessionSnapshot writes the selected JSONLs and
+	//      moves pre-existing/omitted files aside as backups.
 	//      Returns commit (drop backups) and rollback (restore
 	//      backups) callbacks.
 	//   2. SyncAgentFromPeer runs the DB write.
@@ -626,7 +662,12 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// hole the prior order had: abort/drop on source still
 	// can't reach across to target's filesystem, but the
 	// rollback callback fired inline does.
-	sessionCommit, sessionRollback, serr := agent.StageClaudeSessionFiles(req.Agent.ID, decodedSessions)
+	// Always apply an authoritative Claude snapshot. A non-Claude source sends
+	// no Claude artifacts, which deliberately tombstones target-local leftovers
+	// from a previous backend. Otherwise switching back to Claude later could
+	// resume divergent target history instead of bootstrapping from the
+	// canonical Kojo transcript.
+	sessionCommit, sessionRollback, serr := agent.StageClaudeSessionSnapshot(req.Agent.ID, decodedSessions)
 	if serr != nil {
 		s.logger.Error("peer agent-sync: claude session stage failed",
 			"agent", req.Agent.ID, "err", serr)
@@ -641,18 +682,13 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// switch. On DB failure later we roll back BOTH; on success
 	// we commit BOTH.
 	//
-	// Tombstone branch: when the inbound payload says the agent IS
-	// a grok agent but carries NO GrokSession (source has no
-	// session yet OR cleared it via ResetSession), we don't just
-	// skip — we proactively purge any pre-existing grok state on
-	// target. Without this, target's stale `.grok/session_id`
-	// (inherited from a previous time target hosted the agent)
-	// would still drive `--resume` on the next chat, presenting
-	// the user with a local-history conversation that bears no
-	// relation to source's current state.
+	// Tombstone branch: no GrokSession means either the active Grok backend has
+	// no session yet, or Grok is inactive. In both cases target-local Grok state
+	// is non-authoritative and must be purged; otherwise a later backend switch
+	// could resume divergent history.
 	var grokCommit, grokRollback func()
 	var gserr error
-	if req.Agent != nil && agentRecordTool(req.Agent) == "grok" && decodedGrok == nil {
+	if decodedGrok == nil {
 		grokCommit, grokRollback, gserr = agent.StageGrokSessionCleanup(req.Agent.ID)
 	} else {
 		grokCommit, grokRollback, gserr = agent.StageGrokSession(req.Agent.ID, decodedGrok)
@@ -668,13 +704,12 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// codex session: same two-phase staging as claude/grok. A codex
-	// agent with no CodexSession block means source has no resumable
-	// thread; purge target's stale per-agent codex refs so the next
-	// chat starts fresh instead of resuming an old local thread.
+	// Codex follows the same authoritative-snapshot rule. Absence means either
+	// no active Codex session or an inactive backend, so stale target refs are
+	// removed and any future Codex turn uses canonical-history fallback.
 	var codexCommit, codexRollback func()
 	var cserr error
-	if req.Agent != nil && agentRecordUsesCodex(req.Agent) && decodedCodex == nil {
+	if decodedCodex == nil {
 		codexCommit, codexRollback, cserr = agent.StageCodexSessionCleanup(req.Agent.ID)
 	} else {
 		codexCommit, codexRollback, cserr = agent.StageCodexSession(req.Agent.ID, decodedCodex)
@@ -725,24 +760,34 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	// Hold memorySyncMu across BOTH the DB write and the disk
-	// materialize. Without one lock spanning both, a concurrent
-	// prepareChat on this peer could slip between commit and
-	// materialize, scan the STALE disk, and UPSERT the old bodies
-	// back into the DB — silently rolling back what we just synced.
-	// The lock is per-agent, so concurrent syncs for OTHER agents
-	// are unaffected.
-	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
-
 	incrementalMessages := req.SinceMessageSeq > 0
 	incrementalMemoryEntries := req.SinceMemoryEntryUpdatedAt > 0
 
+	// Serialize settings owned by the receiving peer against their mutation
+	// endpoints. This protects both Hub-owned Slack state and the owner-facing
+	// transfer-warning acknowledgement. Keep the established LockPatch ->
+	// memorySync order used by the settings/persona paths.
+	releaseSlackPatch := s.agents.LockPatch(req.Agent.ID)
+	// Preserve the repository-wide LockPatch -> memorySync order used by
+	// memory/persona writes. Hold memorySyncMu across BOTH the DB write and
+	// disk materialize so prepareChat cannot scan stale disk between them and
+	// overwrite the freshly synced rows.
+	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
+	if err := s.applyReceiverOwnedSettingsToSyncRecord(r.Context(), req.Agent, req.OpID, req.TransferSkips); err != nil {
+		releaseSlackPatch()
+		releaseMemSync()
+		writeError(w, http.StatusInternalServerError, "internal",
+			"merge receiver-owned settings: "+err.Error())
+		return
+	}
+
 	if err := s.agents.Store().SyncAgentFromPeer(r.Context(), store.AgentSyncPayload{
-		Agent:         req.Agent,
-		Persona:       req.Persona,
-		Memory:        req.Memory,
-		Messages:      req.Messages,
-		MemoryEntries: req.MemoryEntries,
+		IncomingHandoff: incoming,
+		Agent:           req.Agent,
+		Persona:         req.Persona,
+		Memory:          req.Memory,
+		Messages:        req.Messages,
+		MemoryEntries:   req.MemoryEntries,
 		// Workspace files: always full-replace. See the
 		// peerAgentSyncRequest doc-comment for the rationale.
 		WorkspaceFiles:           req.WorkspaceFiles,
@@ -750,6 +795,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		IncrementalMessages:      incrementalMessages,
 		IncrementalMemoryEntries: incrementalMemoryEntries,
 	}); err != nil {
+		releaseSlackPatch()
 		releaseMemSync()
 		if sessionRollback != nil {
 			sessionRollback()
@@ -766,6 +812,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			"sync apply: "+err.Error())
 		return
 	}
+	releaseSlackPatch()
 	if sessionCommit != nil {
 		sessionCommit()
 	}
@@ -849,6 +896,20 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			return
 		}
 	}
+	if req.CustomAPIKey != nil {
+		if s.agents == nil || !s.agents.HasCredentials() {
+			releaseMemSync()
+			writeError(w, http.StatusServiceUnavailable, "unavailable",
+				"target credential store unavailable; cannot land custom API key")
+			return
+		}
+		if cerr := agent.StoreCustomAPIKey(s.agents.Credentials(), req.Agent.ID, agentRecordCustomBaseURL(req.Agent), *req.CustomAPIKey); cerr != nil {
+			releaseMemSync()
+			writeError(w, http.StatusInternalServerError, "internal",
+				"store custom API key: "+cerr.Error())
+			return
+		}
+	}
 
 	// Reconcile target's MEMORY.md + memory/* tree against the
 	// authoritative post-commit DB state. Without this, target's
@@ -900,6 +961,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// so a stale drop from a previous attempt can't erase the
 	// fresh retry's entry.
 	if err := s.recordPendingAgentSync(r.Context(), req.Agent.ID, req.OpID, pendingSyncEntry{
+		SourceDeviceID: req.SourceDeviceID, IncomingFenced: incoming != nil,
 		RawToken:        req.AgentToken,
 		DegradedFlushes: req.DegradedFlushes,
 		TransferSkips:   req.TransferSkips,
@@ -921,4 +983,186 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	}
 
 	writeJSONResponse(w, http.StatusOK, peerAgentSyncResponse{AgentID: req.Agent.ID})
+}
+
+// applyReceiverOwnedSettingsToSyncRecord merges every settings field owned by
+// the receiving peer, then refreshes record metadata exactly once. Combining
+// transfer acknowledgement and Hub Slack ownership in one pass is important:
+// a retry of the same sync must converge on the current row rather than bumping
+// version/ETag once per independently merged field.
+func (s *Server) applyReceiverOwnedSettingsToSyncRecord(ctx context.Context, rec *store.AgentRecord, opID string, skips []agent.SkippedSessionFile) error {
+	if rec == nil {
+		return errors.New("nil agent record")
+	}
+	if rec.Settings == nil {
+		rec.Settings = make(map[string]any)
+	}
+	originalSettings := make(map[string]any, len(rec.Settings))
+	for key, value := range rec.Settings {
+		originalSettings[key] = value
+	}
+
+	current, err := s.agents.Store().GetAgent(ctx, rec.ID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if err := mergeTransferSkipsSettings(rec.Settings, current, opID, skips); err != nil {
+		return err
+	}
+	s.mergeSlackOwnershipSettings(rec.Settings, current)
+	finalizeReceiverOwnedSettingsMetadata(rec, current, originalSettings)
+	return nil
+}
+
+// mergeTransferSkipsSettings replaces the source snapshot's prior transfer
+// warning with this switch's result. A retry of the same op_id preserves the
+// receiver's acknowledgement; a new or clean transfer clears it.
+func mergeTransferSkipsSettings(settings map[string]any, current *store.AgentRecord, opID string, skips []agent.SkippedSessionFile) error {
+	for _, key := range []string{
+		"lastTransferSkips",
+		"lastTransferSkipsOpID",
+		"lastTransferSkipsDismissedGeneration",
+	} {
+		takeSettingFold(settings, key)
+	}
+	if len(skips) > 0 {
+		raw, err := json.Marshal(skips)
+		if err != nil {
+			return err
+		}
+		var normalized any
+		if err := json.Unmarshal(raw, &normalized); err != nil {
+			return err
+		}
+		settings["lastTransferSkips"] = normalized
+		settings["lastTransferSkipsOpID"] = opID
+		if current != nil {
+			currentOp, _ := current.Settings["lastTransferSkipsOpID"].(string)
+			currentDismissed, _ := current.Settings["lastTransferSkipsDismissedGeneration"].(string)
+			if currentOp == opID && currentDismissed == opID {
+				settings["lastTransferSkipsDismissedGeneration"] = opID
+			}
+		}
+	}
+	return nil
+}
+
+// applySlackOwnershipToSyncRecord makes the wire's AgentRecord consistent
+// with where Slack is actually owned. Holder peers never retain a stale copy
+// of slackBot. The Hub preserves its local value when a runtime returns. Any
+// changed record gets fresh metadata so its ETag still hashes the bytes that
+// SyncAgentFromPeer will persist.
+func (s *Server) applySlackOwnershipToSyncRecord(ctx context.Context, rec *store.AgentRecord) error {
+	if rec == nil {
+		return errors.New("nil agent record")
+	}
+	if rec.Settings == nil {
+		rec.Settings = make(map[string]any)
+	}
+	originalSettings := make(map[string]any, len(rec.Settings))
+	for key, value := range rec.Settings {
+		originalSettings[key] = value
+	}
+	current, err := s.agents.Store().GetAgent(ctx, rec.ID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	s.mergeSlackOwnershipSettings(rec.Settings, current)
+	finalizeReceiverOwnedSettingsMetadata(rec, current, originalSettings)
+	return nil
+}
+
+func (s *Server) mergeSlackOwnershipSettings(settings map[string]any, current *store.AgentRecord) {
+	takeSettingFold(settings, "slackBot")
+	if s.slackHub != nil && current != nil {
+		if desiredValue, desiredHas := findSettingFold(current.Settings, "slackBot"); desiredHas {
+			settings["slackBot"] = desiredValue
+		}
+	}
+}
+
+func finalizeReceiverOwnedSettingsMetadata(rec, current *store.AgentRecord, originalSettings map[string]any) {
+	if reflect.DeepEqual(originalSettings, rec.Settings) {
+		return
+	}
+	maxVersion := rec.Version
+	if current != nil && current.Version > maxVersion {
+		maxVersion = current.Version
+	}
+	// Agent-sync is retried as a whole after failures in later phases. If a
+	// previous attempt already persisted these merged bytes, retain its
+	// metadata instead of bumping version/ETag on every retry.
+	currentMetadataCoversSource := current != nil &&
+		(current.Version > rec.Version ||
+			current.Version == rec.Version && current.UpdatedAt >= rec.UpdatedAt)
+	if currentMetadataCoversSource && sameSyncedAgentContent(rec, current) {
+		rec.Seq = current.Seq
+		rec.Version = current.Version
+		rec.UpdatedAt = current.UpdatedAt
+		rec.CreatedAt = current.CreatedAt
+		rec.ETag = current.ETag
+		return
+	}
+	rec.Version = maxVersion + 1
+	mergedUpdatedAt := store.NowMillis()
+	if rec.UpdatedAt > mergedUpdatedAt {
+		mergedUpdatedAt = rec.UpdatedAt
+	}
+	if current != nil && current.UpdatedAt > mergedUpdatedAt {
+		mergedUpdatedAt = current.UpdatedAt
+	}
+	rec.UpdatedAt = mergedUpdatedAt
+	rec.ETag = "" // SyncAgentFromPeer recomputes it from the merged record.
+}
+
+func findSettingFold(settings map[string]any, wanted string) (any, bool) {
+	for key, value := range settings {
+		if strings.EqualFold(key, wanted) {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func sameSyncedAgentContent(a, b *store.AgentRecord) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	// SyncAgentFromPeer persists empty persona/workspace references as the
+	// agent ID. Compare that canonical form so a retry of the same sync does
+	// not manufacture another version merely because the wire used the
+	// shorthand empty value.
+	canonicalRef := func(value, agentID string) string {
+		if value == "" {
+			return agentID
+		}
+		return value
+	}
+	return a.ID == b.ID && a.Name == b.Name &&
+		canonicalRef(a.PersonaRef, a.ID) == canonicalRef(b.PersonaRef, b.ID) &&
+		canonicalRef(a.WorkspaceID, a.ID) == canonicalRef(b.WorkspaceID, b.ID) &&
+		a.PeerID == b.PeerID && a.Seq == b.Seq &&
+		reflect.DeepEqual(a.Settings, b.Settings) && reflect.DeepEqual(a.DeletedAt, b.DeletedAt)
+}
+
+func takeSettingFold(settings map[string]any, wanted string) (any, bool) {
+	var value any
+	found := false
+	for key, candidate := range settings {
+		if strings.EqualFold(key, wanted) {
+			if !found {
+				value = candidate
+				found = true
+			}
+			delete(settings, key)
+		}
+	}
+	return value, found
+}
+
+func codexThreadToWire(th agent.CodexThreadTransfer) codexThreadWire {
+	return codexThreadWire{Goal: th.Goal, NativeGoal: th.NativeGoal, RefName: th.RefName, ThreadID: th.ThreadID, RolloutRelPath: th.RolloutRelPath, RolloutContentB64: base64.StdEncoding.EncodeToString(th.RolloutContent), ThreadRow: th.ThreadRow, DynamicToolRows: th.DynamicToolRows}
+}
+func (ct codexThreadWire) toTransfer(body []byte) agent.CodexThreadTransfer {
+	return agent.CodexThreadTransfer{Goal: ct.Goal, NativeGoal: ct.NativeGoal, RefName: ct.RefName, ThreadID: ct.ThreadID, RolloutRelPath: ct.RolloutRelPath, RolloutContent: body, ThreadRow: ct.ThreadRow, DynamicToolRows: ct.DynamicToolRows}
 }

@@ -56,7 +56,7 @@ func TestSlackSessionKey_EmptyThread_CollapsesToChannel(t *testing.T) {
 
 func TestBuildSlackSystemPromptExtra_IncludesContext(t *testing.T) {
 	got := buildSlackSystemPromptExtra("C123", "1700000000.000100", "alice", "U999")
-	for _, want := range []string{"C123", "1700000000.000100", "alice", "U999", "Slack Conversation Context"} {
+	for _, want := range []string{"C123", "1700000000.000100", "alice", "U999", "Slack Conversation Context", noReplyToken} {
 		if !contains(got, want) {
 			t.Errorf("system prompt extra missing %q in:\n%s", want, got)
 		}
@@ -64,6 +64,40 @@ func TestBuildSlackSystemPromptExtra_IncludesContext(t *testing.T) {
 	// Display name must be quoted so the agent reads it as data, not directive.
 	if !contains(got, `"alice"`) {
 		t.Errorf("expected quoted display name in:\n%s", got)
+	}
+}
+
+func TestNoReplyResponseMatching(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{name: "exact", text: noReplyToken, want: true},
+		{name: "surrounding whitespace", text: " \n" + noReplyToken + "\t", want: true},
+		{name: "discussion", text: noReplyToken + " means silence", want: false},
+		{name: "embedded", text: "Use " + noReplyToken, want: false},
+		{name: "empty", text: "", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNoReplyResponse(tc.text); got != tc.want {
+				t.Fatalf("isNoReplyResponse(%q) = %v, want %v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCouldBeNoReplyResponse(t *testing.T) {
+	for _, prefix := range []string{"", " ", "[[", "[[NO_", noReplyToken, noReplyToken + " \n"} {
+		if !couldBeNoReplyResponse(prefix) {
+			t.Errorf("couldBeNoReplyResponse(%q) = false, want true", prefix)
+		}
+	}
+	for _, ordinary := range []string{"hello", "[[NOT", noReplyToken + " because"} {
+		if couldBeNoReplyResponse(ordinary) {
+			t.Errorf("couldBeNoReplyResponse(%q) = true, want false", ordinary)
+		}
 	}
 }
 

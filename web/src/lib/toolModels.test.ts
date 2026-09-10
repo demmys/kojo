@@ -110,9 +110,13 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultModelForTool("codex")).toBe("gpt-6-astra");
   });
 
-  it("gpt-6-astra supports xhigh and max, and defaults to low", () => {
+  it("gpt-6-astra supports xhigh and max, and defaults to medium", () => {
     expect(effortLevelsForModel("gpt-6-astra")).toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(defaultEffortForModel("gpt-6-astra")).toBe("low");
+    expect(defaultEffortForModel("gpt-6-astra")).toBe("medium");
+  });
+
+  it("offers only the safe effort ladder for the CLI-default model", () => {
+    expect(effortLevelsForModel("")).toEqual(["low", "medium", "high"]);
   });
 
   it("still lists the gpt-5.6 family", () => {

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -51,19 +52,25 @@ type CodexSQLiteRow struct {
 }
 
 type CodexThreadTransfer struct {
-	RefName         string           `json:"ref_name"`
-	ThreadID        string           `json:"thread_id"`
-	RolloutRelPath  string           `json:"rollout_rel_path"`
-	RolloutContent  []byte           `json:"rollout_content"`
-	ThreadRow       *CodexSQLiteRow  `json:"thread_row,omitempty"`
-	DynamicToolRows []CodexSQLiteRow `json:"dynamic_tool_rows,omitempty"`
+	Goal            *GoalBinding       `json:"goal,omitempty"`
+	NativeGoal      *CodexGoalTransfer `json:"native_goal,omitempty"`
+	RefName         string             `json:"ref_name"`
+	ThreadID        string             `json:"thread_id"`
+	RolloutRelPath  string             `json:"rollout_rel_path"`
+	RolloutContent  []byte             `json:"rollout_content"`
+	ThreadRow       *CodexSQLiteRow    `json:"thread_row,omitempty"`
+	DynamicToolRows []CodexSQLiteRow   `json:"dynamic_tool_rows,omitempty"`
 }
 
 type CodexSessionTransfer struct {
 	Threads []CodexThreadTransfer `json:"threads"`
 }
 
-const codexSessionFileMaxBytes = 32 << 20
+// The orchestrator enforces the lower effective aggregate limit after JSON
+// base64 overhead and transcript size are known. This reader-side guard only
+// rejects a single pathological rollout before loading it into memory.
+var codexSessionFileMaxBytes int64 = 128 << 20
+
 const codexSessionTransferMaxThreads = 128
 
 var codexSessionTransferMaxTotalBytes int64 = 256 << 20
@@ -154,7 +161,21 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 		}
 		return nil, nil, fmt.Errorf("agent.ReadCodexSessionFiles: readdir refs: %w", err)
 	}
-	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	// Ref files are atomically rewritten after each successful turn, so their
+	// mtime is a cheap, backend-owned last-activity signal. Preserve newest
+	// first all the way to the wire; the switch budgeter can then keep the
+	// freshest threads without understanding SessionKey semantics.
+	slices.SortFunc(entries, func(a, b os.DirEntry) int {
+		ai, aerr := a.Info()
+		bi, berr := b.Info()
+		if aerr == nil && berr == nil && !ai.ModTime().Equal(bi.ModTime()) {
+			if ai.ModTime().After(bi.ModTime()) {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.Name(), b.Name())
+	})
 
 	root := codexHome()
 	if root == "" {
@@ -216,10 +237,23 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 			})
 			continue
 		}
-		totalBytes += st.Size()
-		if totalBytes > codexSessionTransferMaxTotalBytes {
-			return nil, skipped, fmt.Errorf("agent.ReadCodexSessionFiles: session payload exceeds %d bytes", codexSessionTransferMaxTotalBytes)
+		if len(out.Threads) >= codexSessionTransferMaxThreads {
+			skipped = append(skipped, SkippedSessionFile{
+				Path: rel, Reason: "capacity", SizeBytes: st.Size(),
+			})
+			continue
 		}
+		// Entries are newest-first. Once the defensive reader budget is
+		// exhausted, leave this older rollout behind rather than failing the
+		// entire device switch. The orchestrator later applies the stricter
+		// exact JSON-envelope budget after history size is known.
+		if totalBytes+st.Size() > codexSessionTransferMaxTotalBytes {
+			skipped = append(skipped, SkippedSessionFile{
+				Path: rel, Reason: "capacity", SizeBytes: st.Size(),
+			})
+			continue
+		}
+		totalBytes += st.Size()
 		body, readErr := os.ReadFile(full)
 		if readErr != nil {
 			return nil, skipped, fmt.Errorf("agent.ReadCodexSessionFiles: read %s: %w", rel, readErr)
@@ -236,7 +270,12 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 			}
 		}
 
+		nativeGoal, gerr := readCodexGoalTransfer(ref.ThreadID)
+		if gerr != nil {
+			return nil, skipped, fmt.Errorf("read native goal: %w", gerr)
+		}
 		out.Threads = append(out.Threads, CodexThreadTransfer{
+			Goal: ref.Goal, NativeGoal: nativeGoal,
 			RefName:         refName,
 			ThreadID:        ref.ThreadID,
 			RolloutRelPath:  rel,
@@ -244,9 +283,27 @@ func ReadCodexSessionFiles(agentID string) (*CodexSessionTransfer, []SkippedSess
 			ThreadRow:       threadRow,
 			DynamicToolRows: toolRows,
 		})
-		if len(out.Threads) > codexSessionTransferMaxThreads {
-			return nil, skipped, fmt.Errorf("agent.ReadCodexSessionFiles: too many codex thread refs (%d > %d)",
-				len(out.Threads), codexSessionTransferMaxThreads)
+	}
+	// Capacity limits may drop old ordinary sessions, but must never silently
+	// drop a durable unfinished goal. Refuse the handoff instead.
+	selected := map[string]bool{}
+	for _, th := range out.Threads {
+		selected[th.RefName] = true
+	}
+	entries, readErr := os.ReadDir(codexThreadRefDir(agentID))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return nil, skipped, readErr
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !validCodexThreadRefName(entry.Name()) || selected[entry.Name()] {
+			continue
+		}
+		ref, err := readCodexThreadRefFile(filepath.Join(codexThreadRefDir(agentID), entry.Name()))
+		if err != nil {
+			return nil, skipped, err
+		}
+		if ref.Goal != nil && ref.Goal.State != nil && ref.Goal.State.Status != "complete" {
+			return nil, skipped, errors.New("handoff would omit an unfinished native goal; clear it or increase transfer capacity")
 		}
 	}
 	if len(out.Threads) == 0 {
@@ -367,6 +424,9 @@ func clearCodexSessionCounted(agentID string) (filesRemoved, threadsRemoved int,
 	}
 
 	if len(threadIDs) > 0 {
+		if gerr := clearNativeGoalRows(threadIDs); gerr != nil {
+			err = errors.Join(err, gerr)
+		}
 		threadsRemoved = len(threadIDs)
 		if dbPath := codexStateDBPath(); dbPath != "" {
 			if db, oerr := sql.Open("sqlite", codexSQLiteDSN(dbPath, false)); oerr == nil {
@@ -474,6 +534,16 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 	seenRollouts := map[string]struct{}{}
 	var totalBytes int64
 	for _, th := range transfer.Threads {
+		if th.Goal != nil && (codexThreadRefName(th.Goal.SessionKey) != th.RefName || th.Goal.Generation < 0 || len(th.Goal.SetupContext) > 1<<20 || (th.Goal.State != nil && th.Goal.State.ThreadID != th.ThreadID)) {
+			cleanupTmps()
+			return nil, nil, errors.New("native goal binding does not match conversation pointer")
+		}
+		if th.NativeGoal != nil {
+			if err := validateGoalRow(th.NativeGoal.Row, th.ThreadID); err != nil {
+				cleanupTmps()
+				return nil, nil, err
+			}
+		}
 		if !isCodexThreadID(th.ThreadID) {
 			cleanupTmps()
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: invalid thread_id %q", th.ThreadID)
@@ -499,7 +569,7 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		}
 		seenRollouts[strings.ToLower(rel)] = struct{}{}
 
-		if len(th.RolloutContent) > codexSessionFileMaxBytes {
+		if int64(len(th.RolloutContent)) > codexSessionFileMaxBytes {
 			cleanupTmps()
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: rollout %q exceeds per-file cap", rel)
 		}
@@ -519,6 +589,7 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: stage rollout %s: %w", rel, err)
 		}
 		refBody, _ := json.MarshalIndent(codexThreadRef{
+			Goal:        th.Goal,
 			ThreadID:    th.ThreadID,
 			RolloutPath: rolloutFinal,
 		}, "", "  ")
@@ -527,6 +598,27 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 			cleanupTmps()
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: stage ref %s: %w", th.RefName, err)
 		}
+	}
+
+	// The transfer is an authoritative capacity-bounded snapshot. Tombstone
+	// target refs absent from it so omitted older threads cannot resume stale
+	// target-local rollouts; those turns will instead bootstrap from Kojo's
+	// canonical conversation history. Rollout/SQLite garbage is harmless once
+	// no per-agent ref can reach it and is cleaned by normal session GC/reset.
+	refDir := filepath.Join(absAgentDir, ".codex", "threads")
+	if entries, readErr := os.ReadDir(refDir); readErr == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+				continue
+			}
+			if _, keep := seenRefs[strings.ToLower(entry.Name())]; keep {
+				continue
+			}
+			staged = append(staged, stagedFile{final: filepath.Join(refDir, entry.Name())})
+		}
+	} else if !os.IsNotExist(readErr) {
+		cleanupTmps()
+		return nil, nil, fmt.Errorf("agent.StageCodexSession: list existing refs: %w", readErr)
 	}
 
 	rollbackFiles := func() {
@@ -555,12 +647,28 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 				return nil, nil, fmt.Errorf("agent.StageCodexSession: backup %s: %w", s.final, err)
 			}
 		}
+		if s.tmp == "" { // authoritative-snapshot tombstone
+			continue
+		}
 		if err := os.Rename(s.tmp, s.final); err != nil {
 			cleanupTmps()
 			rollbackFiles()
 			return nil, nil, fmt.Errorf("agent.StageCodexSession: rename %s: %w", s.final, err)
 		}
 		s.tmp = ""
+	}
+	// transfer.Threads is newest-first. Ref mtime is the next source peer's
+	// activity signal, so restore that relative order after staging instead of
+	// inheriting temp-file creation timing (which would make the last/oldest ref
+	// appear freshest).
+	now := time.Now()
+	for i, th := range transfer.Threads {
+		refPath := filepath.Join(absAgentDir, ".codex", "threads", th.RefName)
+		mtime := now.Add(-time.Duration(i) * time.Second)
+		if err := os.Chtimes(refPath, mtime, mtime); err != nil {
+			rollbackFiles()
+			return nil, nil, fmt.Errorf("agent.StageCodexSession: preserve ref activity order: %w", err)
+		}
 	}
 
 	dbCommit, dbRollback, dbErr := stageCodexSQLiteRows(agentID, absAgentDir, absRoot, transfer)
@@ -569,6 +677,14 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		return nil, nil, dbErr
 	}
 
+	goalCommit, goalRollback, goalErr := stageCodexGoals(absRoot, transfer)
+	if goalErr != nil {
+		if dbRollback != nil {
+			dbRollback()
+		}
+		rollbackFiles()
+		return nil, nil, goalErr
+	}
 	lockReleasedToCallbacks = true
 	var done bool
 	commit = func() {
@@ -577,6 +693,9 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		}
 		done = true
 		defer releaseOnce()
+		if goalCommit != nil {
+			goalCommit()
+		}
 		if dbCommit != nil {
 			dbCommit()
 		}
@@ -592,6 +711,9 @@ func StageCodexSession(agentID string, transfer *CodexSessionTransfer) (commit f
 		}
 		done = true
 		defer releaseOnce()
+		if goalRollback != nil {
+			goalRollback()
+		}
 		if dbRollback != nil {
 			dbRollback()
 		}

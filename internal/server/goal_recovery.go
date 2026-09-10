@@ -42,6 +42,55 @@ func (s *Server) RunNativeGoalRecovery(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.recoverNativeGoals("", "", true)
+			s.retryStalledGoalHandoffResumes()
+		}
+	}
+}
+
+// goalHandoffResumeGrace is how long a destination waits after dispatching
+// `!goal resume-if` before treating a still-resume_pending handoff as lost.
+const goalHandoffResumeGrace = 2 * time.Minute
+
+// retryStalledGoalHandoffResumes re-dispatches the exact accepted identity when
+// finalize's asynchronous resume never reached admission (surface dropped the
+// command, or the daemon restarted in between). Bounded per handoff; the
+// origin stop check is repeated on every attempt so a stop issued after
+// finalize still fences the resume.
+func (s *Server) retryStalledGoalHandoffResumes() {
+	if s.agents == nil || s.peerID == nil || s.agents.NativeGoalsShuttingDown() {
+		return
+	}
+	self := s.peerID.DeviceID
+	for id, bindings := range s.agents.StalledGoalHandoffResumes(self, goalHandoffResumeGrace) {
+		for _, b := range bindings {
+			if b.Handoff == nil || b.State == nil {
+				continue
+			}
+			if !s.agents.ClaimGoalHandoffResume(id, b.SessionKey, b.Handoff.ID) {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			origin := b.OriginPeerID
+			if origin == "" {
+				origin = b.Handoff.SourcePeerID
+			}
+			err := s.callGoalHandoffOrigin(ctx, origin, goalHandoffOriginRequest{Action: "check", OpID: b.Handoff.ID, AgentID: id})
+			if err == nil {
+				req := goalRecoveryRequest{AgentID: id, SessionKey: b.SessionKey, ThreadID: b.State.ThreadID, Generation: b.Generation, UserID: b.UserID, RunID: b.RunID, HolderID: self, HandoffID: b.Handoff.ID}
+				// Same routing as finalize: main WebUI follows the agent, Slack
+				// retains the original Hub.
+				if b.SessionKey != "" && b.OriginPeerID != "" && b.OriginPeerID != self {
+					err = s.requestGoalRecovery(ctx, b.OriginPeerID, req)
+				} else {
+					err = s.resumeGoalSurface(ctx, req)
+				}
+			}
+			cancel()
+			if err != nil {
+				s.logger.Warn("goal handoff resume retry not admitted; explicit resume available", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "attempt", b.Handoff.ResumeAttempts+1, "err", err)
+			} else {
+				s.logger.Info("goal handoff resume re-dispatched", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "attempt", b.Handoff.ResumeAttempts+1)
+			}
 		}
 	}
 }

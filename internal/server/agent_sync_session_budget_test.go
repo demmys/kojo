@@ -122,3 +122,37 @@ func TestFitAgentSyncSessions_HistoryOverCapDropsOnlySessions(t *testing.T) {
 		t.Fatalf("history was trimmed: %+v", req.Messages)
 	}
 }
+
+func TestFitAgentSyncSessions_RejectsUnfinishedGoalWhenOverCap(t *testing.T) {
+	req := &peerAgentSyncRequest{
+		SourceDeviceID: "src", Agent: &store.AgentRecord{ID: "ag_x"},
+		CodexSession: &codexSessionWire{Threads: []codexThreadWire{{
+			Goal:    &agent.GoalBinding{State: &agent.CodexGoal{Status: "paused"}},
+			RefName: "goal.json", ThreadID: "thread-goal",
+			RolloutRelPath:    "sessions/goal.jsonl",
+			RolloutContentB64: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("g", 4096))),
+		}}},
+	}
+	if _, _, err := fitAgentSyncSessions(req, 512); err == nil || !strings.Contains(err.Error(), "unfinished native goal") {
+		t.Fatalf("err=%v, want unfinished-goal capacity rejection", err)
+	}
+}
+
+func TestFitAgentSyncSessions_RejectsUnfinishedNativeGoalRowWhenOverCap(t *testing.T) {
+	columns := []string{"thread_id", "goal_id", "objective", "status", "token_budget", "tokens_used", "time_used_seconds", "created_at_ms", "updated_at_ms"}
+	values := []agent.CodexSQLiteValue{
+		{Type: "text", Text: "thread-goal"}, {Type: "text", Text: "goal-1"}, {Type: "text", Text: "keep going"},
+		{Type: "text", Text: "active"}, {Type: "null"}, {Type: "int", Int: 1}, {Type: "int", Int: 1}, {Type: "int", Int: 1}, {Type: "int", Int: 1},
+	}
+	req := &peerAgentSyncRequest{
+		SourceDeviceID: "src", Agent: &store.AgentRecord{ID: "ag_x"},
+		CodexSession: &codexSessionWire{Threads: []codexThreadWire{{
+			NativeGoal: &agent.CodexGoalTransfer{Row: &agent.CodexSQLiteRow{Columns: columns, Values: values}},
+			RefName:    "goal.json", ThreadID: "thread-goal", RolloutRelPath: "sessions/goal.jsonl",
+			RolloutContentB64: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("g", 4096))),
+		}}},
+	}
+	if _, _, err := fitAgentSyncSessions(req, 512); err == nil || !strings.Contains(err.Error(), "unfinished native goal") {
+		t.Fatalf("err=%v, want unfinished-goal capacity rejection", err)
+	}
+}

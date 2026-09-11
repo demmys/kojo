@@ -1069,7 +1069,6 @@ export function GroupDMChat() {
         <div className="mx-auto max-w-[760px] px-4 py-3">
         {sendError && <DismissibleError message={sendError} onDismiss={() => setSendError(null)} />}
         {uploadError && <DismissibleError message={uploadError} onDismiss={() => setUploadError(null)} />}
-        {isThread && threadAgentTool === "codex" && group?.members[0] && <GoalControls agentId={group.members[0].agentId} sessionKey={id ? "groupdm:"+id : null} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={awaitingReply} onCommand={(command) => void handleSend(command)} />}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb={false} />
         <div className="flex items-end gap-2">
           <input
@@ -1084,6 +1083,7 @@ export function GroupDMChat() {
             uploading={uploading}
             disabled={uploading || sending}
           />
+          {isThread && threadAgentTool === "codex" && group?.members[0] && <GoalControls agentId={group.members[0].agentId} sessionKey={id ? "groupdm:"+id : null} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={awaitingReply} onCommand={(command) => void handleSend(command)} />}
           <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
             <textarea
               ref={textareaRef}

@@ -388,6 +388,11 @@ func (s *Server) dispatchHandoffArrivalContinuation(ctx context.Context, originP
 		} else if !current {
 			s.logger.Warn("device-switch: dropping stale origin-conversation arrival",
 				"agent", req.AgentID, "op_id", req.OpID, "holder", req.HolderDeviceID)
+			if deliveryUncertain {
+				// An earlier attempt may already have reached the Hub; the caller
+				// must keep the durable uncertain intent rather than replay.
+				return fmt.Errorf("%w; holder is no longer current", errHandoffArrivalUncertain)
+			}
 			return errors.New("handoff arrival holder is no longer current")
 		} else {
 			attemptCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -405,6 +410,9 @@ func (s *Server) dispatchHandoffArrivalContinuation(ctx context.Context, originP
 		if attempt+1 < attempts {
 			select {
 			case <-ctx.Done():
+				if deliveryUncertain {
+					return fmt.Errorf("%w; fallback suppressed: %v", errHandoffArrivalUncertain, ctx.Err())
+				}
 				return ctx.Err()
 			case <-time.After(retryBackoff):
 			}

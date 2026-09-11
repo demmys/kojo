@@ -50,6 +50,12 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest, "bad_request", "missing agent id")
 		return
 	}
+	// Exclude the whole device-switch transaction, not just its finalize
+	// step: a reclaim landing between complete and finalize would leave the
+	// source and target runtimes both active. Same lock order as
+	// handleSwitchDevice (switch-transaction, then the finalize key).
+	unlockSwitch := s.lockPendingFinalize(pendingSyncKey{AgentID: id, OpID: "switch-transaction"})
+	defer unlockSwitch()
 	unlock := s.lockPendingFinalize(pendingSyncKey{AgentID: id})
 	defer unlock()
 	// Confirm the agent exists in the store so an operator typo

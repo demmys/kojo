@@ -69,8 +69,11 @@ func (s *Server) handleGoalHandoffOrigin(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "bad_request", err.Error())
 		return
 	}
+	// A paired peer reaching the Hub-public listener is stamped RoleOwner with
+	// its PeerID; keep that identity. Only a local Owner without a peer
+	// identity signs as this device.
 	signer := p.PeerID
-	if p.IsOwner() && s.peerID != nil {
+	if p.IsOwner() && signer == "" && s.peerID != nil {
 		signer = s.peerID.DeviceID
 	}
 	if err := s.applyGoalHandoffOrigin(r.Context(), signer, q); err != nil {

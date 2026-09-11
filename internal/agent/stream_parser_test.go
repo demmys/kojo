@@ -619,6 +619,31 @@ func TestMatchToolOutput_IDNotFound(t *testing.T) {
 
 // --- filterEnv characterization tests ---
 
+// The spawn sites in Chat and claudeSession.start do
+// filterEnv(...) then append(claudeProcessEnv...). An inherited
+// CLAUDE_CODE_SILENT_TURN_REMINDER (e.g. the operator's shell exporting
+// =1) must not survive, and the final env must carry exactly one =0.
+func TestFilterEnv_ClaudeProcessEnvOverridesInherited(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_SILENT_TURN_REMINDER", "1")
+	t.Setenv("CLAUDE_CODE_DISABLE_1M_CONTEXT", "0")
+
+	env := filterEnv([]string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}, "ag_test", "/tmp/ag_test")
+	env = append(env, claudeProcessEnv...)
+
+	counts := map[string]int{}
+	for _, e := range env {
+		if strings.HasPrefix(e, "CLAUDE_CODE_SILENT_TURN_REMINDER=") || strings.HasPrefix(e, "CLAUDE_CODE_DISABLE_1M_CONTEXT=") {
+			counts[e]++
+		}
+	}
+	if counts["CLAUDE_CODE_SILENT_TURN_REMINDER=0"] != 1 || counts["CLAUDE_CODE_SILENT_TURN_REMINDER=1"] != 0 {
+		t.Errorf("silent turn reminder env: %v", counts)
+	}
+	if counts["CLAUDE_CODE_DISABLE_1M_CONTEXT=1"] != 1 || counts["CLAUDE_CODE_DISABLE_1M_CONTEXT=0"] != 0 {
+		t.Errorf("1M context env: %v", counts)
+	}
+}
+
 func TestFilterEnv_RemovesPrefixes(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_TEST", "val1")
 	t.Setenv("AGENT_BROWSER_SESSION", "old")

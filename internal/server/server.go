@@ -1459,9 +1459,10 @@ type pendingSyncEntry struct {
 	SourceDeviceID string `json:"source_device_id,omitempty"`
 	IncomingFenced bool   `json:"incoming_fenced,omitempty"`
 	RawToken       string `json:"raw_token"`
-	// ArrivalHandled records that origin continuation admission or its legacy
-	// fallback already succeeded. ArrivalUncertain records an attempted origin
-	// delivery whose outcome cannot be distinguished after a transport loss.
+	// ArrivalHandled records that origin continuation admission, a terminal
+	// goal-handoff decision, or its legacy fallback has been resolved.
+	// ArrivalUncertain records an attempted origin delivery whose outcome cannot
+	// be distinguished after a transport loss.
 	// Both survive target restart so a later finalize retry never duplicates an
 	// earlier arrival decision.
 	ArrivalHandled   bool `json:"arrival_handled,omitempty"`

@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -278,17 +279,12 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
-	// Accept committed holder+proxy together. Only mark admission-ready once
-	// the runtime hook succeeded, without a second holder-only proxy rewrite.
-	if entry.IncomingFenced {
-		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
-			writeError(w, 409, "stale_handoff", err.Error())
-			return
-		}
-	}
-	// Apply the optional tail after acceptance and runtime activation, but
-	// before building the arrival prompt. AppendMessage independently verifies
-	// the current local fencing token in its transaction.
+	// Apply the optional tail after the runtime hook but BEFORE activation:
+	// activation opens local turn admission, and a turn admitted in that gap
+	// would read history without the source's final message. AppendMessage
+	// independently verifies the current local fencing token in its
+	// transaction, and a lock_not_self here leaves the fence un-activated so
+	// the orchestrator's retry re-runs the whole tail+activate sequence.
 	if req.TailMessage != nil && s.agents != nil && s.agents.Store() != nil {
 		if err := s.applyFinalizeTailMessage(r.Context(), req.AgentID, req.TailMessage); err != nil {
 			if errors.Is(err, errTailLockNotSelf) {
@@ -305,8 +301,17 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	// Accept committed holder+proxy together. Only mark admission-ready once
+	// the runtime hook and the tail apply succeeded, without a second
+	// holder-only proxy rewrite.
+	if entry.IncomingFenced {
+		if err := s.agents.Store().ActivateIncomingHandoff(r.Context(), req.AgentID, req.OpID); err != nil {
+			writeError(w, 409, "stale_handoff", err.Error())
+			return
+		}
+	}
 
-	// Build the arrival only AFTER the tail apply. The external continuation
+	// Build the arrival only AFTER the tail apply and activation. The external continuation
 	// carries this exact prompt to the Hub; the legacy path below asks Manager
 	// to build the same prompt for main WebUI delivery.
 	sourceName := req.SourceDeviceID
@@ -338,17 +343,20 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 					writeError(w, 409, "goal_changed", err.Error())
 					return
 				}
-				entry.ArrivalUncertain = true
-				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
-					writeError(w, 500, "internal", err.Error())
-					return
-				}
 				origin := binding.OriginPeerID
 				if origin == "" {
 					origin = req.SourceDeviceID
 				}
 				if err := s.callGoalHandoffOrigin(r.Context(), origin, goalHandoffOriginRequest{Action: "check", OpID: req.OpID, AgentID: req.AgentID}); err != nil {
 					writeError(w, 409, "goal_handoff_stopped", err.Error())
+					return
+				}
+				// Persist the uncertain intent only after the side-effect-free
+				// origin check, immediately before the resume side effect; a
+				// failed check must stay retryable rather than 503 forever.
+				entry.ArrivalUncertain = true
+				if err := s.recordPendingAgentSync(r.Context(), req.AgentID, req.OpID, entry); err != nil {
+					writeError(w, 500, "internal", err.Error())
 					return
 				}
 				recovery := goalRecoveryRequest{AgentID: req.AgentID, SessionKey: binding.SessionKey, ThreadID: binding.State.ThreadID, Generation: binding.Generation, UserID: binding.UserID, RunID: binding.RunID, HolderID: s.peerID.DeviceID, HandoffID: req.OpID}
@@ -399,8 +407,22 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 				return
 			}
 			if err := s.dispatchHandoffArrivalContinuation(r.Context(), req.Continuation.OriginPeerID, arrivalReq, fallback); err != nil {
-				// Keep the durable intent on failure: cancellation may bypass
-				// dispatch's final uncertain classification after an earlier send.
+				// Only a delivery that may have reached the Hub keeps the durable
+				// intent; a definite failure (holder changed, verify error, no send
+				// began) must not poison every later finalize with 503.
+				if !errors.Is(err, errHandoffArrivalUncertain) {
+					entry.ArrivalUncertain = false
+					// The definite failure may itself be the request context being
+					// cancelled; the clear must still persist or every later
+					// finalize keeps returning 503.
+					clearCtx, clearCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+					perr := s.updatePendingAgentSyncAfterSideEffect(clearCtx, req.AgentID, req.OpID, entry)
+					clearCancel()
+					if perr != nil {
+						s.logger.Error("peer agent-sync finalize: clearing arrival intent failed; pending retained",
+							"agent", req.AgentID, "op_id", req.OpID, "err", perr)
+					}
+				}
 				s.logger.Warn("peer agent-sync finalize: arrival was not admitted; pending retained for retry",
 					"agent", req.AgentID, "op_id", req.OpID, "err", err)
 				writeError(w, http.StatusServiceUnavailable, "arrival_not_admitted", err.Error())

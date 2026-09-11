@@ -269,6 +269,23 @@ const messages = {
   "composer.stopVoice": { ja: "音声入力を停止", en: "Stop voice input" },
   "composer.send": { ja: "送信", en: "Send" },
   "composer.stop": { ja: "停止", en: "Stop" },
+  "goal.title": { ja: "Goal モード (Codex native)", en: "Goal mode (Codex native)" },
+  "goal.statusUnavailable": { ja: "Goal の状態を取得できません", en: "Goal status unavailable" },
+  "goal.status": { ja: "状態", en: "Status" },
+  "goal.pause": { ja: "一時停止", en: "Pause" },
+  "goal.resume": { ja: "再開", en: "Resume" },
+  "goal.clear": { ja: "クリア", en: "Clear" },
+  "goal.budget": { ja: "トークン予算 (任意)", en: "Token budget (optional)" },
+  "goal.armed": { ja: "Goal モード有効", en: "Goal mode on" },
+  "goal.off": { ja: "Goal モード無効", en: "Goal mode off" },
+  "goal.state.active": { ja: "実行中", en: "active" },
+  "goal.state.paused": { ja: "一時停止中", en: "paused" },
+  "goal.state.blocked": { ja: "ブロック中", en: "blocked" },
+  "goal.state.usageLimited": { ja: "利用上限", en: "usage limited" },
+  "goal.state.budgetLimited": { ja: "予算上限", en: "budget limited" },
+  "goal.state.complete": { ja: "完了", en: "complete" },
+  "goal.usage": { ja: "{tokens} tokens · {seconds}秒", en: "{tokens} tokens · {seconds}s" },
+  "goal.hint": { ja: "Goal が止まるまで続行します。native のトークン予算は超過することがあります。!goal budget N で予算を設定できます。", en: "Continues until the goal stops. Native token budgets may be exceeded. Set a budget with !goal budget N." },
 
   // ── Dashboard ──
   "dash.fleetSummary": {

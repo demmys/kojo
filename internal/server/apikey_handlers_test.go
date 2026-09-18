@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 func TestHandleGetAPIKeyReportsStoredAndEnvironmentAvailability(t *testing.T) {
 	srv := newSTTTestServer(t)
 	t.Setenv("OPENAI_API_KEY", "env-openai-key")
+	t.Setenv("TYPESAFE_API_KEY", "env-typesafe-key")
 	if err := srv.agents.Credentials().SetToken("gemini", "", "", "api_key", "stored-gemini-key", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
@@ -26,6 +29,7 @@ func TestHandleGetAPIKeyReportsStoredAndEnvironmentAvailability(t *testing.T) {
 	}{
 		{provider: "gemini", configured: true, hasFallback: false},
 		{provider: "openai", configured: false, hasFallback: true},
+		{provider: "typesafe", configured: false, hasFallback: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
@@ -93,5 +97,43 @@ func TestHandleSetAPIKeyRejectsTrailingDataPastLimit(t *testing.T) {
 	srv.handleSetAPIKey(rr, req)
 	if rr.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandleGetAPIKeyTypeSafeFileFallback(t *testing.T) {
+	srv := newSTTTestServer(t) // HOME is a temp dir
+	t.Setenv("TYPESAFE_API_KEY", "")
+	get := func() bool {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/api-keys/typesafe", nil)
+		req.SetPathValue("provider", "typesafe")
+		rr := httptest.NewRecorder()
+		srv.handleGetAPIKey(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var got struct {
+			Configured  bool `json:"configured"`
+			HasFallback bool `json:"hasFallback"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Configured {
+			t.Fatalf("configured must be false: %+v", got)
+		}
+		return got.HasFallback
+	}
+	if get() {
+		t.Fatal("no env, no file → hasFallback must be false")
+	}
+	dir := filepath.Join(os.Getenv("HOME"), ".config", "typesafe")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "credentials"), []byte("file-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !get() {
+		t.Fatal("credentials file → hasFallback must be true")
 	}
 }

@@ -11,6 +11,7 @@ import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
 import { useOpenAIApiKey } from "./globalsettings/useOpenAIApiKey";
 import { useXAIApiKey } from "./globalsettings/useXAIApiKey";
+import { useTypeSafeApiKey } from "./globalsettings/useTypeSafeApiKey";
 import { useEnterSends } from "../lib/preferences";
 import { useLocale, setLocale, useT, availableLocales } from "../lib/i18n";
 import { PageHeader } from "./ui/PageHeader";
@@ -48,6 +49,7 @@ export function GlobalSettings() {
   );
   const openai = useOpenAIApiKey(setError, flashSuccess);
   const xai = useXAIApiKey(setError, flashSuccess);
+  const typesafe = useTypeSafeApiKey(setError, flashSuccess);
 
   return (
     <div className="h-full overflow-y-auto bg-app text-ink">
@@ -65,7 +67,7 @@ export function GlobalSettings() {
             </Select>
           </Field>
         </SectionCard>
-        <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} />
+        <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} typesafe={typesafe} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />
 

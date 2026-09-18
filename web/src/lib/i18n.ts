@@ -1399,8 +1399,8 @@ const messages = {
   // ── GlobalSettings sections ──
   "gs.apiKeys": { ja: "API キー", en: "API Keys" },
   "gs.apiKeysDesc": {
-    ja: "API キーの暗号化ストレージ。埋め込み・画像生成・音声入力に使う。",
-    en: "Encrypted storage for API keys. Used for embedding, image generation, and voice input.",
+    ja: "API キーの暗号化ストレージ。埋め込み・画像生成・音声入力・effort 判定に使う。",
+    en: "Encrypted storage for API keys. Used for embedding, image generation, voice input, and effort classification.",
   },
   "gs.configured": { ja: "設定済み", en: "Configured" },
   "gs.usingFallback": { ja: "フォールバックを使用中", en: "Using fallback" },
@@ -1414,6 +1414,11 @@ const messages = {
   },
   "gs.removeOpenaiKey": { ja: "OpenAI API キーを削除", en: "Remove OpenAI API key" },
   "gs.removeXaiKey": { ja: "xAI API キーを削除", en: "Remove xAI API key" },
+  "gs.removeTypesafeKey": { ja: "TypeSafe API キーを削除", en: "Remove TypeSafe API key" },
+  "gs.typesafeHelp": {
+    ja: "Jev によるターンごとの effort 自動判定 (未設定なら claude CLI で判定)",
+    en: "Per-turn auto effort classification with Jev (falls back to the claude CLI when unset)",
+  },
   "gs.save": { ja: "保存", en: "Save" },
   "gs.embeddingModel": { ja: "埋め込みモデル", en: "Embedding Model" },
   "gs.loadingModels": { ja: "モデルを読み込み中...", en: "Loading models..." },

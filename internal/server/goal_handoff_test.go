@@ -278,6 +278,19 @@ func TestGoalResumeAuthorizationUsesLockNotCachedSource(t *testing.T) {
 	}
 }
 
+func TestGoalResumeRejectsHubOwnerPeerIdentityMismatch(t *testing.T) {
+	s, router, id := prepareRemoteExternalChat(t, "http://holder.example:8080")
+	s.externalChat = router
+	q := goalRecoveryRequest{AgentID: id, HolderID: "holder", SessionKey: id + ":slack:C:T", ThreadID: "019e7cc9-dd5e-7971-b654-7840c683879e", Generation: 5, UserID: "UOWNER"}
+	body, _ := json.Marshal(q)
+	req := authedRequest(httptest.NewRequest("POST", "/", bytes.NewReader(body)), auth.Principal{Role: auth.RoleOwner, PeerID: "other-peer"})
+	w := httptest.NewRecorder()
+	s.handlePeerGoalResume(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "holder identity mismatch") {
+		t.Fatalf("%d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestReconcileResolvedGoalHandoffRetiresUncertainFinalize(t *testing.T) {
 	s := newChunkedSyncTestServer(t)
 	s.peerID = &peer.Identity{DeviceID: "target"}

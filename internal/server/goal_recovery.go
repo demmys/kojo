@@ -229,7 +229,10 @@ func (s *Server) handlePeerGoalResume(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "bad_request", err.Error())
 		return
 	}
-	if p.IsPeer() && p.PeerID != req.HolderID {
+	// Paired peers reaching the Hub-public listener are stamped RoleOwner with
+	// PeerID. Bind either peer-shaped principal to the claimed holder; only a
+	// local Owner without a peer identity may act without this comparison.
+	if p.PeerID != "" && p.PeerID != req.HolderID {
 		writeError(w, 403, "forbidden", "holder identity mismatch")
 		return
 	}

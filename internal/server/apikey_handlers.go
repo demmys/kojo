@@ -61,6 +61,17 @@ func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// TypeSafe (Jev) mirrors agent.LoadTypeSafeAPIKey: env var, then
+	// the ~/.config/typesafe/credentials file.
+	if provider == "typesafe" {
+		if strings.TrimSpace(os.Getenv("TYPESAFE_API_KEY")) != "" {
+			hasFallback = true
+		} else if home, err := os.UserHomeDir(); err == nil {
+			data, err := os.ReadFile(filepath.Join(home, ".config", "typesafe", "credentials"))
+			hasFallback = err == nil && strings.TrimSpace(string(data)) != ""
+		}
+	}
+
 	resp := map[string]any{
 		"provider":    provider,
 		"configured":  configured,

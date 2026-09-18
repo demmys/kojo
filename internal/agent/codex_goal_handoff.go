@@ -19,6 +19,11 @@ type GoalHandoff struct {
 	TargetPeerID string `json:"targetPeerId"`
 	Phase        string `json:"phase"`
 	Error        string `json:"error,omitempty"`
+	// AcceptedAt (unix ms) marks the last resume dispatch on the destination;
+	// ResumeAttempts bounds the destination's automatic re-dispatch when the
+	// asynchronous `!goal resume-if` never reaches admission.
+	AcceptedAt     int64 `json:"acceptedAt,omitempty"`
+	ResumeAttempts int   `json:"resumeAttempts,omitempty"`
 }
 
 func (h *GoalHandoff) Pending() bool {
@@ -211,6 +216,7 @@ func (m *Manager) AcceptGoalHandoff(id, key, op, source, target string) (*GoalBi
 			return
 		}
 		h.Phase = "resume_pending"
+		h.AcceptedAt = time.Now().UnixMilli()
 		accepted = true
 	})
 	if err != nil {

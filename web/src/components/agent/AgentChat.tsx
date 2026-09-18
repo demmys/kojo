@@ -1430,7 +1430,6 @@ export function AgentChat() {
             onDismiss={() => speech.stop()}
           />
         )}
-        {agent?.tool === "codex" && id && <GoalControls agentId={id} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={streaming} onCommand={handleSend} />}
         {/* Pending file attachments */}
         <PendingAttachments files={pendingFiles} onRemove={removePendingFile} thumb />
         <div className="flex items-end gap-2">
@@ -1447,6 +1446,7 @@ export function AgentChat() {
             disabled={uploading || streaming || holderOffline}
             title={holderOffline ? t("chat.holderPeerOffline") : t("composer.attachFiles")}
           />
+          {agent?.tool === "codex" && id && <GoalControls agentId={id} enabled={goalMode} onToggle={setGoalMode} budget={goalBudget} onBudget={setGoalBudget} running={streaming} onCommand={handleSend} />}
           <div className="min-w-0 flex-1 rounded-xl border border-hairline bg-raised px-1 focus-within:border-copper/50">
             <textarea
               ref={textareaRef}

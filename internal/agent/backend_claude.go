@@ -617,10 +617,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// kojo's own session-reset logic (sessionFileUsable) for history pruning.
 	// Auto-compact stays enabled as a late safety net but threshold is
 	// tightened so that if reset misses, claude compacts before pricing spikes.
-	cmd.Env = append(cmd.Env,
-		"CLAUDE_CODE_DISABLE_1M_CONTEXT=1",
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85",
-	)
+	cmd.Env = append(cmd.Env, claudeProcessEnv...)
 	if b.proxyURL != "" {
 		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
 		cmd.Env = append(cmd.Env, "NO_PROXY=127.0.0.1,localhost")
@@ -786,6 +783,28 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}()
 
 	return ch, nil
+}
+
+// claudeProcessEnv is appended to the Claude CLI processes that run agent
+// turns (one-shot Chat in this file and the persistent claudeSession).
+// runCLIGenerate callers (autosummary, effort classifier) are prompt-only
+// and never reach the conditions below, so they are left alone. The 1M /
+// autocompact settings are explained at the Chat call site.
+//
+// CLAUDE_CODE_SILENT_TURN_REMINDER=0 disables the CLI's silent_turn_reminder:
+// after 5 consecutive assistant messages without a text block it injects an
+// attachment ("The user hasn't heard from you in a while — say in a few
+// words what you're doing, then continue"), up to 3 times per user turn.
+// In kojo the agent's pre-tool text is already streamed to the client, so
+// the reminder only makes the model restate what it just said and the
+// transcript ends up with the same sentence twice. The env var is a
+// tri-state override in the CLI ("0"/"false" -> off) that wins over the
+// remote feature gate. It must be appended after filterEnv, which strips
+// every inherited CLAUDE_CODE* variable.
+var claudeProcessEnv = []string{
+	"CLAUDE_CODE_DISABLE_1M_CONTEXT=1",
+	"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85",
+	"CLAUDE_CODE_SILENT_TURN_REMINDER=0",
 }
 
 type claudeInvocation struct {

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // effortClassifierSystemPrompt drives the one-shot per-turn difficulty
@@ -37,6 +38,93 @@ var classifyEffort = runClaudeEffortClassifier
 var classifierCLIAvailable = func() bool {
 	_, err := exec.LookPath("claude")
 	return err == nil
+}
+
+// Jev (TypeSafe System One) is the preferred classifier when a key is
+// configured: one HTTP round trip (~hundreds of ms, ~400 input tokens)
+// instead of spawning the claude CLI. The claude classifier stays as the
+// fallback when Jev is unconfigured or fails.
+const (
+	// jevEffortTimeout bounds the Jev call. Jev answers in well under a
+	// second; anything slower is an outage and the CLI/heuristic path
+	// should take over without stalling the turn.
+	jevEffortTimeout = 5 * time.Second
+	// jevEffortTieMargin: when a higher-effort tier's probability is
+	// within this margin of the top tier, prefer the higher effort. An
+	// under-provisioned hard task costs quality; an over-provisioned easy
+	// one only costs a few tokens, so ties break upward.
+	jevEffortTieMargin = 0.15
+)
+
+// jevEffortCriteria are the tier definitions sent as Choice criteria —
+// the same rubric as effortClassifierSystemPrompt, kept in English (Jev's
+// primary training language) regardless of the message language.
+var jevEffortCriteria = map[string]string{
+	"low":    "Greetings, small talk, acknowledgements, simple factual questions, short casual replies, or a one-line instruction the assistant can act on directly",
+	"medium": "Multi-step questions, short writing or editing tasks, simple code snippets, planning a small task",
+	"high":   "Debugging, multi-file code work, math or logic problems, long-document analysis, ambiguous requests with several constraints, investigations whose scope is unknown up front",
+}
+
+// classifyEffortJev is the Jev classification seam, swapped out by unit
+// tests. Returns the raw tier ("low"/"medium"/"high").
+var classifyEffortJev = runJevEffortClassifier
+
+// runJevEffortClassifier asks Jev one Choice question over the current
+// message and reduces the returned distribution with pickEffortTier. Keep
+// historical diary context local: configuring a global classifier key must
+// not silently disclose an agent's activity log to a third party.
+func runJevEffortClassifier(ctx context.Context, apiKey, userMessage string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, jevEffortTimeout)
+	defer cancel()
+	state := map[string]string{
+		"message": headRunes(userMessage, effortClassifierMessageCap),
+	}
+	resp, err := jevCall(ctx, apiKey, state, map[string]jevQuestion{
+		"effort": {
+			Type:         "choice",
+			Instructions: "How much reasoning effort will an AI coding/chat assistant need to answer `message`?",
+			Criteria:     jevEffortCriteria,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	ans, ok := resp.Answers["effort"]
+	if !ok {
+		return "", errors.New("typesafe: no effort answer")
+	}
+	return pickEffortTier(ans)
+}
+
+// pickEffortTier reduces a Choice answer to a tier. With a probability
+// distribution it walks tiers from high to low and takes the first whose
+// probability is within jevEffortTieMargin of the maximum (ties break
+// toward more effort); without one it trusts the reported choice.
+func pickEffortTier(ans jevAnswer) (string, error) {
+	tiers := []string{"high", "medium", "low"}
+	if len(ans.Probabilities) > 0 {
+		best := -1.0
+		for _, t := range tiers {
+			if p := ans.Probabilities[t]; p > best {
+				best = p
+			}
+		}
+		// best <= 0 means only unknown keys were reported; fall
+		// through and trust the choice instead.
+		if best > 0 {
+			for _, t := range tiers {
+				if ans.Probabilities[t] >= best-jevEffortTieMargin {
+					return t, nil
+				}
+			}
+		}
+	}
+	switch c := strings.ToLower(strings.TrimSpace(ans.Choice)); c {
+	case "low", "medium", "high":
+		return c, nil
+	default:
+		return "", errors.New("typesafe: effort choice missing")
+	}
 }
 
 // effortRank orders effort tiers for the ceiling comparison in
@@ -128,14 +216,16 @@ func mapTierToEffort(a *Agent, tier string) string {
 // resolveTurnEffort picks the effort level for a single turn.
 //
 // Returns the effort string to launch the backend with, and a source tag
-// for logging: "static" (feature off / unsupported tool / no CLI),
-// "rule" (system turn → low, no LLM call), "llm" (classifier verdict),
-// or "heuristic" (classifier failed; length-based fallback).
+// for logging: "static" (feature off / unsupported tool / no classifier),
+// "rule" (system turn → low, no LLM call), "jev:<tier>" (Jev verdict),
+// "llm:<tier>" (claude CLI classifier verdict), or "heuristic"
+// (classifiers failed; length-based fallback).
 //
-// ctx bounds the classifier call — derive it from the chat context so an
-// aborted turn kills the classifier too. Never returns an error: any
-// failure degrades to the agent's static Effort.
-func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, systemTurn bool, recentDiary string, logger *slog.Logger) (effort string, source string) {
+// jevKey is the TypeSafe API key ("" = Jev unconfigured → claude CLI
+// path). ctx bounds the classifier calls — derive it from the chat
+// context so an aborted turn kills the classifier too. Never returns an
+// error: any failure degrades to the agent's static Effort.
+func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, systemTurn bool, recentDiary string, jevKey string, logger *slog.Logger) (effort string, source string) {
 	if !a.IsAutoEffortEnabled() || (a.Tool != "claude" && a.Tool != "grok") {
 		return a.Effort, "static"
 	}
@@ -148,10 +238,32 @@ func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, system
 		}
 		return a.Effort, "static"
 	}
-	// The classifier always runs on the claude CLI (even for grok
+	// Jev first: one cheap HTTP call, no subprocess. Any failure falls
+	// through to the claude CLI classifier (then the heuristic) so a
+	// TypeSafe outage never changes behavior beyond added latency.
+	if jevKey != "" {
+		tier, err := classifyEffortJev(ctx, jevKey, userMessage)
+		if err == nil {
+			return mapTierToEffort(a, tier), "jev:" + tier
+		}
+		if ctx.Err() != nil {
+			// The turn itself is gone; nothing downstream can run.
+			return a.Effort, "static"
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			// Our own 5s budget expired. Don't stack the CLI's 15s on
+			// top of it: go straight to the heuristic.
+			logger.Info("jev effort classifier timed out; using heuristic",
+				"agent", a.ID, "err", err)
+			return heuristicOrStatic(a, userMessage)
+		}
+		logger.Warn("jev effort classifier failed; falling back",
+			"agent", a.ID, "err", err)
+	}
+	// The CLI classifier always runs on the claude CLI (even for grok
 	// agents); without it, stay static rather than guess.
 	if !classifierCLIAvailable() {
-		return a.Effort, "static"
+		return heuristicOrStaticIfJev(a, userMessage, jevKey)
 	}
 	out, err := classifyEffort(ctx, buildEffortClassifierPrompt(recentDiary, userMessage))
 	if err != nil {
@@ -194,4 +306,15 @@ func heuristicOrStatic(a *Agent, userMessage string) (string, string) {
 		return eff, "heuristic"
 	}
 	return a.Effort, "static"
+}
+
+// heuristicOrStaticIfJev is the no-CLI branch: with no classifier at all
+// the historical behavior (stay static, don't guess) is kept; when Jev
+// was configured but failed, the length heuristic is a better degrade
+// than silently running every turn at the static ceiling.
+func heuristicOrStaticIfJev(a *Agent, userMessage, jevKey string) (string, string) {
+	if jevKey == "" {
+		return a.Effort, "static"
+	}
+	return heuristicOrStatic(a, userMessage)
 }

@@ -343,7 +343,7 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
 	}
 	cmd.Env = filterEnv(removeEnv, agentID, dir)
-	cmd.Env = append(cmd.Env, "CLAUDE_CODE_DISABLE_1M_CONTEXT=1", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85")
+	cmd.Env = append(cmd.Env, claudeProcessEnv...)
 	if b.proxyURL != "" {
 		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
 		cmd.Env = append(cmd.Env, "NO_PROXY=127.0.0.1,localhost")

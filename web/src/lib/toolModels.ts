@@ -25,8 +25,8 @@ export const toolModels: Record<string, ToolModelConfig> = {
     ],
   },
   grok: {
-    default: "grok-4.6",
-    models: ["grok-4.6", "grok-4.5"],
+    default: "grok-4.7",
+    models: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
   },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
@@ -69,20 +69,20 @@ const codexMaxModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "
 // codex CLI 0.153.4 advertises default_reasoning_level "medium" for
 // gpt-6-astra; gpt-5.6-sol remains the only listed model that defaults low.
 const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
-// grok CLI 1.0.3 models_cache.json: grok-4.6 lists efforts
-// [xhigh,high,medium,low]; grok-4.5 lists [high,medium,low]. Neither
-// advertises "max". Keep in sync with agent.go grokEffortModels /
-// grokXhighModels.
+// grok CLI 1.0.40 models_cache.json: grok-4.7, grok-4.7-build-fast and
+// grok-4.6 list efforts [xhigh,high,medium,low]; grok-4.5 lists
+// [high,medium,low]. None advertises "max". Keep in sync with agent.go
+// grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
-const grokXhighModels = new Set(["grok-4.6"]);
+const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**
  * Models whose default effort is xhigh (rather than high).
  * Opus 5 / 4.8 and both Fable models support xhigh and max but default to
  * high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated as
- * Opus 5, so it defaults to high. grok-4.6 advertises low/medium/high/xhigh and grok-4.5
- * low/medium/high; both carry reasoning_effort "high" as the CLI default,
- * so neither is listed here.
+ * Opus 5, so it defaults to high. grok-4.7 / grok-4.7-build-fast / grok-4.6
+ * advertise low/medium/high/xhigh and grok-4.5 low/medium/high; all carry
+ * reasoning_effort "high" as the CLI default, so none is listed here.
  */
 const defaultXhighModels = new Set(["claude-opus-4-7"]);
 

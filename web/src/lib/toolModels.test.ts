@@ -139,13 +139,15 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   });
 
   it("lists both grok models, newest first", () => {
-    expect(modelsForTool("grok")).toEqual(["grok-4.6", "grok-4.5"]);
-    expect(defaultModelForTool("grok")).toBe("grok-4.6");
+    expect(modelsForTool("grok")).toEqual(["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]);
+    expect(defaultModelForTool("grok")).toBe("grok-4.7");
   });
 
-  it("grok-4.6 offers xhigh but not max, and defaults to high", () => {
-    expect(effortLevelsForModel("grok-4.6")).toEqual(["low", "medium", "high", "xhigh"]);
-    expect(defaultEffortForModel("grok-4.6")).toBe("high");
+  it("grok-4.7 / 4.7-build-fast / 4.6 offer xhigh but not max, and default to high", () => {
+    for (const m of ["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]) {
+      expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high", "xhigh"]);
+      expect(defaultEffortForModel(m)).toBe("high");
+    }
   });
 
   it("grok-4.5 offers only low/medium/high and defaults to high", () => {

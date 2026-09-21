@@ -20,14 +20,20 @@
 //   claude-haiku-4-5 :  1 /  5
 //
 // xAI source: https://docs.x.ai/developers/pricing plus the per-model pages
-// https://docs.x.ai/developers/models/grok-4.6 and .../grok-4.5
-// (fetched 2026-08-13).
+// https://docs.x.ai/developers/models/grok-4.7, .../grok-4.6 and .../grok-4.5
+// (grok-4.7 fetched 2026-09-22, the rest 2026-08-13).
 // xAI publishes an explicit cached-input rate and has no cache-write surcharge
 // (cacheCreation tokens bill at the plain input rate when reported).
+//   grok-4.7: input $2.00 / cached input $0.50 / output $6.00 per 1M
 //   grok-4.6: input $2.00 / cached input $0.50 / output $6.00 per 1M
 //   grok-4.5: input $2.00 / cached input $0.30 / output $6.00 per 1M
-// Both models double every rate for requests whose prompt reaches 200k tokens
-// (the whole request bills at the long-context tier). kojo prices the short-
+//   grok-4.7-build-fast: input $4.00 / cached input $1.00 / output $12.00 per 1M
+// grok-4.7-build-fast has no per-model page (it is not on the public xAI API;
+// Grok Build and Cursor only) but the pricing page's "Grok 4.7 Fast pricing"
+// section (fetched 2026-09-22) lists it at twice the standard grok-4.7 rates.
+// The standard models double every rate for requests whose prompt reaches
+// 200k tokens; build-fast's long-context tier is 1.5x ($6.00 / $1.50 / $18.00).
+// The whole request bills at the long-context tier. kojo prices the short-
 // context tier only, so estimates understate very large turns by up to 2x.
 //
 // claude-fable-5-1 is the one id in this table that departs from the 0.1x
@@ -103,7 +109,9 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-sonnet-5": pricedAnthropic(3, 15),
   "claude-sonnet-4-6": pricedAnthropic(3, 15),
   "claude-haiku-4-5": pricedAnthropic(1, 5),
-  // xAI — https://docs.x.ai/developers/pricing (2026-08-13)
+  // xAI — https://docs.x.ai/developers/pricing (grok-4.7 2026-09-22, rest 2026-08-13)
+  "grok-4.7": pricedXai(2, 6, 0.5),
+  "grok-4.7-build-fast": pricedXai(4, 12, 1),
   "grok-4.6": pricedXai(2, 6, 0.5),
   "grok-4.5": pricedXai(2, 6, 0.3),
 };

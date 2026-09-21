@@ -41,6 +41,18 @@ describe("priceModel", () => {
   });
 
   it("prices xAI grok models with their explicit cache-read rates", () => {
+    expect(priceModel("grok-4.7")).toEqual({
+      input: 2,
+      output: 6,
+      cacheRead: 0.5,
+      cacheWrite: 2,
+    });
+    expect(priceModel("grok-4.7-build-fast")).toEqual({
+      input: 4,
+      output: 12,
+      cacheRead: 1,
+      cacheWrite: 4,
+    });
     expect(priceModel("grok-4.6")).toEqual({
       input: 2,
       output: 6,

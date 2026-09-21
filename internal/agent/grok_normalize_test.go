@@ -16,13 +16,16 @@ func TestNormalizeAgent_GrokBuildMigration(t *testing.T) {
 		wantModel  string
 		wantEffort string
 	}{
-		{"grok-build max → grok-4.6 high", "grok-build", "max", "grok-4.6", "high"},
-		{"grok-build xhigh kept (4.6 supports it)", "grok-build", "xhigh", "grok-4.6", "xhigh"},
-		{"grok-build medium kept", "grok-build", "medium", "grok-4.6", "medium"},
-		{"grok-composer max clamped", "grok-composer-2.5-fast", "max", "grok-4.6", "high"},
+		{"grok-build max → grok-4.7 high", "grok-build", "max", "grok-4.7", "high"},
+		{"grok-build xhigh kept (4.7 supports it)", "grok-build", "xhigh", "grok-4.7", "xhigh"},
+		{"grok-build medium kept", "grok-build", "medium", "grok-4.7", "medium"},
+		{"grok-composer max clamped", "grok-composer-2.5-fast", "max", "grok-4.7", "high"},
 		{"grok-4.5 xhigh clamped", "grok-4.5", "xhigh", "grok-4.5", "high"},
 		{"grok-4.5 high kept", "grok-4.5", "high", "grok-4.5", "high"},
 		{"grok-4.6 xhigh kept", "grok-4.6", "xhigh", "grok-4.6", "xhigh"},
+		{"grok-4.7 xhigh kept", "grok-4.7", "xhigh", "grok-4.7", "xhigh"},
+		{"grok-4.7 max clamped", "grok-4.7", "max", "grok-4.7", "high"},
+		{"grok-4.7-build-fast xhigh kept", "grok-4.7-build-fast", "xhigh", "grok-4.7-build-fast", "xhigh"},
 	}
 
 	for _, tc := range cases {
@@ -80,8 +83,8 @@ func TestNewAgent_NormalizesRetiredGrokModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Model != "grok-4.6" || a.Effort != "xhigh" {
-		t.Fatalf("model/effort = %q/%q, want grok-4.6/xhigh", a.Model, a.Effort)
+	if a.Model != "grok-4.7" || a.Effort != "xhigh" {
+		t.Fatalf("model/effort = %q/%q, want grok-4.7/xhigh", a.Model, a.Effort)
 	}
 }
 
@@ -100,7 +103,7 @@ func TestManagerUpdate_NormalizesRetiredGrokModelImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Model != "grok-4.6" {
-		t.Fatalf("model = %q, want grok-4.6 without reload", got.Model)
+	if got.Model != "grok-4.7" {
+		t.Fatalf("model = %q, want grok-4.7 without reload", got.Model)
 	}
 }

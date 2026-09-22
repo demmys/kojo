@@ -167,9 +167,9 @@ func TestValidModelEffort(t *testing.T) {
 	if !ValidModelEffort("claude-opus-5", "max") {
 		t.Errorf("expected max to be valid for claude-opus-5")
 	}
-	// grok 1.0.3: grok-4.6 advertises low/medium/high/xhigh, grok-4.5 stops
-	// at high. Neither advertises max.
-	for _, m := range []string{"grok-4.6", "grok-4.5"} {
+	// grok 1.0.40: grok-4.7, grok-4.7-build-fast and grok-4.6 advertise
+	// low/medium/high/xhigh, grok-4.5 stops at high. None advertises max.
+	for _, m := range []string{"grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"} {
 		if ValidModelEffort(m, "max") {
 			t.Errorf("expected max to be invalid for grok model %q", m)
 		}
@@ -177,8 +177,10 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected high to be valid for grok model %q", m)
 		}
 	}
-	if !ValidModelEffort("grok-4.6", "xhigh") {
-		t.Errorf("expected xhigh to be valid for grok-4.6")
+	for _, m := range []string{"grok-4.7", "grok-4.7-build-fast", "grok-4.6"} {
+		if !ValidModelEffort(m, "xhigh") {
+			t.Errorf("expected xhigh to be valid for %q", m)
+		}
 	}
 	if ValidModelEffort("grok-4.5", "xhigh") {
 		t.Errorf("expected xhigh to be invalid for grok-4.5")

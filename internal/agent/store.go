@@ -1029,11 +1029,11 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 
 	// Migrate retired grok model ids to the current default. grok CLI
 	// 0.2.91 dropped "grok-build" and 1.0.3 dropped
-	// "grok-composer-2.5-fast" (its models endpoint now lists only
-	// grok-4.6 and grok-4.5); passing a dropped id errors "unknown model
-	// id". After the model rewrite, clamp any effort the new model no
-	// longer accepts (e.g. a legacy composer agent stored max, which
-	// neither grok model advertises) back down to "high".
+	// "grok-composer-2.5-fast" (1.0.40's models endpoint lists grok-4.7,
+	// grok-4.7-build-fast, grok-4.6 and grok-4.5); passing a dropped id
+	// errors "unknown model id". After the model rewrite, clamp any effort
+	// the new model no longer accepts (e.g. a legacy composer agent stored
+	// max, which no grok model advertises) back down to "high".
 	// This is a read-path rewrite (the row itself keeps the old value until
 	// the next save), so it runs on every hydration — log at Debug to avoid
 	// per-turn spam. The clamp is scoped to grok models: rewriting effort

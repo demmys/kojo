@@ -159,11 +159,11 @@ func NormalizeThinkingMode(mode string) string {
 // xhighModels lists models that support the "xhigh" effort level.
 var xhighModels = map[string]bool{
 	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
-	// grok CLI 1.0.3's models_cache.json advertises xhigh for grok-4.6
-	// but only low/medium/high for grok-4.5; neither offers max. Keep
-	// this in sync with web/src/lib/toolModels.ts xhighModels /
-	// grokXhighModels.
-	"grok-4.6":    true,
+	// grok CLI 1.0.40's models_cache.json advertises xhigh for grok-4.7,
+	// grok-4.7-build-fast and grok-4.6 but only low/medium/high for
+	// grok-4.5; none offers max. Keep this in sync with
+	// web/src/lib/toolModels.ts xhighModels / grokXhighModels.
+	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true,
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
@@ -188,25 +188,26 @@ var codexMaxEffortModels = map[string]bool{
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
-// grokEffortModels lists the grok CLI's models (1.0.3: grok-4.6 lists
-// efforts [xhigh,high,medium,low], grok-4.5 lists [high,medium,low]).
-// Neither advertises max, so max is rejected here even though it'd
-// otherwise pass the generic non-codex allowance; xhigh is gated per
-// model via xhighModels.
+// grokEffortModels lists the grok CLI's models (1.0.40: grok-4.7,
+// grok-4.7-build-fast and grok-4.6 list efforts [xhigh,high,medium,low],
+// grok-4.5 lists [high,medium,low]). None advertises max, so max is
+// rejected here even though it'd otherwise pass the generic non-codex
+// allowance; xhigh is gated per model via xhighModels.
 var grokEffortModels = map[string]bool{
-	"grok-4.6": true, "grok-4.5": true,
+	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true, "grok-4.5": true,
 }
 
 // retiredGrokModels maps model ids the grok CLI no longer accepts onto the
 // current default. The rewrite happens both on persisted reads and on create /
 // update writes. Every retired id points at the newest model rather than its
-// nearest surviving sibling: input/output rates match across the two live grok
-// models (only the cached-input rate differs, and 4.6's is the higher of the
-// two), so the newest id is the choice least likely to strand an agent on a
-// model that retires next.
+// nearest surviving sibling: the standard (non-fast) grok models all bill the
+// same input/output rates (only the cached-input rate differs, and 4.7 bills
+// exactly like 4.6), so the newest standard id is the choice least likely to
+// strand an agent on a model that retires next. grok-4.7-build-fast is
+// deliberately not a migration target: it costs twice as much.
 var retiredGrokModels = map[string]string{
-	"grok-build":             "grok-4.6",
-	"grok-composer-2.5-fast": "grok-4.6",
+	"grok-build":             "grok-4.7",
+	"grok-composer-2.5-fast": "grok-4.7",
 }
 
 // normalizeRetiredGrokModel rewrites model ids retired by the Grok CLI.

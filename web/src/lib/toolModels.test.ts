@@ -111,10 +111,10 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {
     // codex CLI 0.155.0 models_cache.json, visibility "list" only —
     // gpt-reserve and codex-auto-review are hidden and stay out. The gpt-6
-    // trio keeps the cache's own order (sol, astra, luna).
+    // trio keeps the cache's own order (astra, sol, luna).
     expect(modelsForTool("codex")).toEqual([
-      "gpt-6-sol",
       "gpt-6-astra",
+      "gpt-6-sol",
       "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",

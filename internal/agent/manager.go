@@ -2206,13 +2206,14 @@ func (m *Manager) resolveTurnEffortAsync(ctx context.Context, agentID, userMessa
 	ch := make(chan turnEffort, 1)
 	go func() {
 		start := time.Now()
-		var diary string
-		// Diary read only matters for the LLM path; skip the disk
-		// read for system turns / disabled agents / other tools.
+		var diary, jevKey string
+		// Diary/key reads only matter for the LLM path; skip the disk
+		// reads for system turns / disabled agents / other tools.
 		if !systemTurn && snap.IsAutoEffortEnabled() && (snap.Tool == "claude" || snap.Tool == "grok") {
 			diary = RecentDiarySummary(agentID)
+			jevKey, _ = LoadTypeSafeAPIKey(m.creds) // "" → claude CLI classifier
 		}
-		eff, src := resolveTurnEffort(ctx, &snap, userMessage, systemTurn, diary, m.logger)
+		eff, src := resolveTurnEffort(ctx, &snap, userMessage, systemTurn, diary, jevKey, m.logger)
 		ch <- turnEffort{effort: eff, source: src, elapsed: time.Since(start)}
 	}()
 	return ch
@@ -2238,11 +2239,14 @@ func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turn
 		(prep.agentCopy.Tool != "claude" && prep.agentCopy.Tool != "grok") {
 		return
 	}
-	// Recover the raw verdict: the llm path encodes it as "llm:<tier>"
-	// (its res.effort was mapped against the pre-prepare snapshot); the
-	// rule/heuristic paths emit the tier directly in res.effort.
+	// Recover the raw verdict: the classifier paths encode it as
+	// "jev:<tier>" / "llm:<tier>" (their res.effort was mapped against
+	// the pre-prepare snapshot); the rule/heuristic paths emit the tier
+	// directly in res.effort.
 	tier := res.effort
-	if t, ok := strings.CutPrefix(res.source, "llm:"); ok {
+	if t, ok := strings.CutPrefix(res.source, "jev:"); ok {
+		tier = t
+	} else if t, ok := strings.CutPrefix(res.source, "llm:"); ok {
 		tier = t
 	}
 	switch tier {

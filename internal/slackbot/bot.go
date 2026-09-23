@@ -656,10 +656,19 @@ func isStopCommand(text string) bool {
 	}
 }
 
+// Command notices are posted synchronously from the Socket Mode event loop,
+// so a hung Slack API call must not stall every later event (including the
+// next !stop). Bound each notice by the single-chunk delivery budget.
+func (b *Bot) postCommandNotice(ctx context.Context, channel, threadTS, text string) bool {
+	noticeCtx, cancel := context.WithTimeout(ctx, chunkPostTimeout(1))
+	defer cancel()
+	return b.postMessage(noticeCtx, channel, threadTS, text)
+}
+
 func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, messageTS, userID, text string) bool {
 	q, qerr := agent.ParseGoalCommand(SlackToPlain(text, nil))
 	if qerr != nil {
-		b.postMessage(ctx, channel, threadTS, qerr.Error())
+		b.postCommandNotice(ctx, channel, threadTS, qerr.Error())
 		return true
 	}
 	if q != nil && messageTS != "" {
@@ -682,7 +691,7 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 				if ev.ErrorMessage != "" {
 					b.postChatError(channel, replyTS, ev.ErrorMessage)
 				} else if ev.Type == "done" && ev.Message != nil {
-					b.postMessage(ctx, channel, replyTS, ev.Message.Content)
+					b.postCommandNotice(ctx, channel, replyTS, ev.Message.Content)
 				}
 			}
 		}()
@@ -712,7 +721,7 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 			b.postMessage(ackCtx, channel, replyTS, stopCommandAck)
 		}()
 	} else if denied {
-		b.postMessage(ctx, channel, replyTS, stopCommandNotOwner)
+		b.postCommandNotice(ctx, channel, replyTS, stopCommandNotOwner)
 	} else if active == nil {
 		if stopper, ok := b.mgr.(interface {
 			StopIdleGoal(context.Context, string, string, string) (bool, error)
@@ -722,14 +731,14 @@ func (b *Bot) handleSlackCommand(ctx context.Context, channel, threadTS, message
 			cancel()
 			if handled {
 				if err != nil {
-					b.postMessage(ctx, channel, replyTS, "Goal handoff stop: "+err.Error())
+					b.postCommandNotice(ctx, channel, replyTS, "Goal handoff stop: "+err.Error())
 				} else {
-					b.postMessage(ctx, channel, replyTS, "Goal handoff cancelled. Automatic resume is fenced.")
+					b.postCommandNotice(ctx, channel, replyTS, "Goal handoff cancelled. Automatic resume is fenced.")
 				}
 				return true
 			}
 		}
-		b.postMessage(ctx, channel, replyTS, stopCommandNoActive)
+		b.postCommandNotice(ctx, channel, replyTS, stopCommandNoActive)
 	}
 	// A duplicate command against the same already-stopping FIFO head is
 	// coalesced. Its first command owns the sole acknowledgement and barrier.

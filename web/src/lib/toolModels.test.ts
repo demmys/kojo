@@ -36,6 +36,21 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     }
   });
 
+  it("lists claude-opus-5-5 directly below the opus alias", () => {
+    const models = modelsForTool("claude");
+    expect(models).toContain("claude-opus-5-5");
+    expect(models.indexOf("claude-opus-5-5")).toBe(models.indexOf("opus") + 1);
+    expect(models.indexOf("claude-opus-5-5")).toBe(models.indexOf("claude-opus-5") - 1);
+  });
+
+  it("Opus 5.5 supports xhigh and max but defaults to medium", () => {
+    // https://platform.claude.com/docs/en/build-with-claude/effort: Opus 5.5
+    // supports all five levels and is the only Claude model defaulting to
+    // medium.
+    expect(effortLevelsForModel("claude-opus-5-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(defaultEffortForModel("claude-opus-5-5")).toBe("medium");
+  });
+
   it("Opus 5 supports xhigh and max but defaults to high", () => {
     expect(effortLevelsForModel("claude-opus-5")).toContain("xhigh");
     expect(effortLevelsForModel("claude-opus-5")).toContain("max");
@@ -94,10 +109,13 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   });
 
   it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {
-    // codex CLI 0.153.3 models_cache.json, visibility "list" only —
-    // gpt-reserve and codex-auto-review are hidden and stay out.
+    // codex CLI 0.155.0 models_cache.json, visibility "list" only —
+    // gpt-reserve and codex-auto-review are hidden and stay out. The gpt-6
+    // trio keeps the cache's own order (astra, sol, luna).
     expect(modelsForTool("codex")).toEqual([
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -110,9 +128,14 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultModelForTool("codex")).toBe("gpt-6-astra");
   });
 
-  it("gpt-6-astra supports xhigh and max, and defaults to medium", () => {
-    expect(effortLevelsForModel("gpt-6-astra")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  it("gpt-6 family supports xhigh and max and defaults to medium", () => {
+    // codex CLI 0.155.0 models_cache.json default_reasoning_level.
+    for (const m of ["gpt-6-sol", "gpt-6-astra", "gpt-6-luna"]) {
+      expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    }
+    expect(defaultEffortForModel("gpt-6-sol")).toBe("medium");
     expect(defaultEffortForModel("gpt-6-astra")).toBe("medium");
+    expect(defaultEffortForModel("gpt-6-luna")).toBe("medium");
   });
 
   it("offers only the safe effort ladder for the CLI-default model", () => {
@@ -158,14 +181,17 @@ describe("toolModels — Opus 5 / effort defaults", () => {
 });
 
 describe("sessionEffortLevelsForModel — ultra is session-only", () => {
-  it("adds ultra for gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra", () => {
+  it("adds ultra for gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra", () => {
+    expect(sessionEffortLevelsForModel("gpt-6-sol")).toContain("ultra");
+    expect(sessionEffortLevelsForModel("gpt-6-sol").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-6-astra")).toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-6-astra").slice(-2)).toEqual(["max", "ultra"]);
     expect(sessionEffortLevelsForModel("gpt-5.6-sol")).toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.6-terra")).toContain("ultra");
   });
 
-  it("does not add ultra for gpt-5.6-luna or other models", () => {
+  it("does not add ultra for gpt-6-luna, gpt-5.6-luna or other models", () => {
+    expect(sessionEffortLevelsForModel("gpt-6-luna")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.6-luna")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("gpt-5.5")).not.toContain("ultra");
     expect(sessionEffortLevelsForModel("claude-fable-5-1")).not.toContain("ultra");
@@ -173,7 +199,7 @@ describe("sessionEffortLevelsForModel — ultra is session-only", () => {
   });
 
   it("agent-facing effortLevelsForModel never offers ultra", () => {
-    for (const m of ["gpt-5.6-sol", "gpt-5.6-terra"]) {
+    for (const m of ["gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]) {
       expect(effortLevelsForModel(m)).not.toContain("ultra" as never);
     }
   });

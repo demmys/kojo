@@ -158,14 +158,16 @@ func TestValidEffort(t *testing.T) {
 
 func TestValidModelEffort(t *testing.T) {
 	// xhigh is valid for opus models, the Fable family, and Sonnet 5
-	for _, m := range []string{"opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
+	for _, m := range []string{"opus", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
 	}
-	// Opus 5 supports max effort (full ladder: low … max)
-	if !ValidModelEffort("claude-opus-5", "max") {
-		t.Errorf("expected max to be valid for claude-opus-5")
+	// Opus 5.5 and Opus 5 support max effort (full ladder: low … max)
+	for _, m := range []string{"claude-opus-5-5", "claude-opus-5"} {
+		if !ValidModelEffort(m, "max") {
+			t.Errorf("expected max to be valid for %q", m)
+		}
 	}
 	// grok 1.0.40: grok-4.7, grok-4.7-build-fast and grok-4.6 advertise
 	// low/medium/high/xhigh, grok-4.5 stops at high. None advertises max.
@@ -208,9 +210,9 @@ func TestValidModelEffort(t *testing.T) {
 			t.Errorf("expected minimal to be valid for codex model %q", m)
 		}
 	}
-	// gpt-6-astra and the gpt-5.6 family (codex CLI 0.153.3): xhigh AND
-	// max are valid.
-	for _, m := range []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+	// The gpt-6 family (sol, astra, luna) and the gpt-5.6 family (codex
+	// CLI 0.155.0): xhigh AND max are valid.
+	for _, m := range []string{"gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for codex model %q", m)
 		}

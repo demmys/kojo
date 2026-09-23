@@ -2,6 +2,7 @@ import type { EmbeddingModelHook } from "./useEmbeddingModel";
 import type { GeminiApiKeyHook } from "./useGeminiApiKey";
 import type { OpenAIApiKeyHook } from "./useOpenAIApiKey";
 import type { XAIApiKeyHook } from "./useXAIApiKey";
+import type { TypeSafeApiKeyHook } from "./useTypeSafeApiKey";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
 import { Input } from "../ui/Input";
@@ -14,10 +15,11 @@ interface Props {
   embedding: EmbeddingModelHook;
   openai: OpenAIApiKeyHook;
   xai: XAIApiKeyHook;
+  typesafe: TypeSafeApiKeyHook;
 }
 
-/** API Keys section — image, embedding, and voice service credentials. */
-export function ApiKeysSection({ gemini, embedding, openai, xai }: Props) {
+/** API Keys section — image, embedding, voice, and judgment-model credentials. */
+export function ApiKeysSection({ gemini, embedding, openai, xai, typesafe }: Props) {
   const t = useT();
   return (
     <SectionCard
@@ -208,6 +210,57 @@ export function ApiKeysSection({ gemini, embedding, openai, xai }: Props) {
               className="w-full"
             >
               {xai.saving ? t("settings.saving") : t("gs.save")}
+            </Button>
+          </div>
+        )}
+      </div>
+      <div className="mt-3 rounded-[10px] border border-hairline bg-raised p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">TypeSafe (Jev) API</div>
+            <div className="mt-0.5 text-[12px]">
+              {typesafe.configured ? (
+                <span className="text-lamp-run">{t("gs.configured")}</span>
+              ) : typesafe.hasFallback ? (
+                <span className="text-lamp-warn">{t("gs.usingFallback")}</span>
+              ) : (
+                <span className="text-ink-faint">{t("gs.notConfigured")}</span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[11px] text-ink-faint">{t("gs.typesafeHelp")}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button onClick={typesafe.toggleEditing}>
+              {typesafe.editing ? t("common.cancel") : typesafe.configured ? t("gs.update") : t("gs.configure")}
+            </Button>
+            {typesafe.configured && (
+              <button
+                onClick={typesafe.remove}
+                aria-label={t("gs.removeTypesafeKey")}
+                className="rounded-md px-1.5 text-ink-faint transition-colors hover:text-lamp-err"
+              >
+                &times;
+              </button>
+            )}
+          </div>
+        </div>
+
+        {typesafe.editing && (
+          <div className="mt-3 space-y-2 border-t border-hairline pt-3">
+            <Input
+              mono
+              type="password"
+              value={typesafe.input}
+              onChange={(e) => typesafe.setInput(e.target.value)}
+              placeholder="apikey..."
+            />
+            <Button
+              variant="primary"
+              onClick={typesafe.save}
+              disabled={typesafe.saving || !typesafe.input.trim()}
+              className="w-full"
+            >
+              {typesafe.saving ? t("settings.saving") : t("gs.save")}
             </Button>
           </div>
         )}

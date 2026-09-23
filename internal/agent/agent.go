@@ -157,34 +157,39 @@ func NormalizeThinkingMode(mode string) string {
 }
 
 // xhighModels lists models that support the "xhigh" effort level.
+// Anthropic: https://platform.claude.com/docs/en/build-with-claude/effort
+// (fetched 2026-09-23) lists xhigh for Fable 5.1 / Fable 5 / Opus 5.5 /
+// Opus 5 / Opus 4.8 / Opus 4.7 / Sonnet 5; Opus 5.5 supports all five
+// levels like Opus 5.
 var xhighModels = map[string]bool{
-	"opus": true, "claude-sonnet-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"opus": true, "claude-sonnet-5": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok CLI 1.0.40's models_cache.json advertises xhigh for grok-4.7,
 	// grok-4.7-build-fast and grok-4.6 but only low/medium/high for
 	// grok-4.5; none offers max. Keep this in sync with
 	// web/src/lib/toolModels.ts xhighModels / grokXhighModels.
 	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true,
-	"gpt-6-astra": true,
+	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 var codexEffortModels = map[string]bool{
-	"gpt-6-astra": true,
+	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 // codexMaxEffortModels lists codex models that support the "max" effort
-// level. codex CLI 0.153.3 models_cache.json advertises
-// low/medium/high/xhigh/max for gpt-6-astra and the gpt-5.6 family
-// (astra, sol and terra also list "ultra", which kojo's effort scale
-// doesn't model). Older gpt-5.x models stop at xhigh. Keep in sync with
-// web/src/lib/toolModels.ts codexMaxModels.
+// level. codex CLI 0.155.0 models_cache.json advertises
+// low/medium/high/xhigh/max for the gpt-6 family (sol, astra, luna) and
+// the gpt-5.6 family (sol, terra, luna). Within those, gpt-6-sol and
+// gpt-6-astra, plus gpt-5.6-sol and gpt-5.6-terra, also list "ultra",
+// which kojo's effort scale doesn't model. Older gpt-5.x models stop at
+// xhigh. Keep in sync with web/src/lib/toolModels.ts codexMaxModels.
 var codexMaxEffortModels = map[string]bool{
-	"gpt-6-astra": true,
+	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 

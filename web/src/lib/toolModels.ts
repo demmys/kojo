@@ -8,12 +8,14 @@ export interface ToolModelConfig {
 export const toolModels: Record<string, ToolModelConfig> = {
   claude: {
     default: "sonnet",
-    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
+    models: ["sonnet", "claude-sonnet-5", "claude-sonnet-4-6", "opus", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "haiku"],
   },
   codex: {
     default: "gpt-6-astra",
     models: [
       "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
@@ -58,17 +60,28 @@ export function modelsForTool(tool: string): string[] {
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 export type EffortLevel = (typeof effortLevels)[number];
 
-/** Models that support the xhigh effort level. */
-const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
+/**
+ * Models that support the xhigh effort level. Anthropic's effort doc
+ * (https://platform.claude.com/docs/en/build-with-claude/effort, fetched
+ * 2026-09-23) lists xhigh for Fable 5.1 / Fable 5 / Opus 5.5 / Opus 5 /
+ * Opus 4.8 / Opus 4.7 / Sonnet 5.
+ */
+const xhighModels = new Set(["opus", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"]);
 const codexEffortModels = new Set(toolModels.codex.models);
-// codex CLI 0.153.3 models_cache.json: gpt-6-astra and the gpt-5.6 family
-// advertise low/medium/high/xhigh/max (astra, sol and terra also list
-// "ultra", which kojo's effort scale doesn't model). Older gpt-5.x models
-// stop at xhigh. Keep in sync with agent.go codexMaxEffortModels.
-const codexMaxModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
-// codex CLI 0.153.4 advertises default_reasoning_level "medium" for
-// gpt-6-astra; gpt-5.6-sol remains the only listed model that defaults low.
+// codex CLI 0.155.0 models_cache.json: the gpt-6 family (sol, astra, luna)
+// and the gpt-5.6 family advertise low/medium/high/xhigh/max (gpt-6-sol,
+// gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra also list "ultra", which
+// kojo's effort scale doesn't model). Older gpt-5.x models stop at xhigh.
+// Keep in sync with agent.go codexMaxEffortModels.
+const codexMaxModels = new Set(["gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+// codex CLI 0.155.0 models_cache.json default_reasoning_level: gpt-5.6-sol
+// is the only listed model that defaults to "low". Every other codex model,
+// including the gpt-6 family, defaults to "medium".
 const codexLowDefaultModels = new Set(["gpt-5.6-sol"]);
+// Claude models whose API default effort is "medium" rather than "high":
+// https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
+// 2026-09-23) — Opus 5.5 is the first Claude model to default to medium.
+const claudeMediumDefaultModels = new Set(["claude-opus-5-5"]);
 // grok CLI 1.0.40 models_cache.json: grok-4.7, grok-4.7-build-fast and
 // grok-4.6 list efforts [xhigh,high,medium,low]; grok-4.5 lists
 // [high,medium,low]. None advertises "max". Keep in sync with agent.go
@@ -79,7 +92,8 @@ const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"])
 /**
  * Models whose default effort is xhigh (rather than high).
  * Opus 5 / 4.8 and both Fable models support xhigh and max but default to
- * high; only Opus 4.7 defaults to xhigh. The "opus" alias is treated as
+ * high; only Opus 4.7 defaults to xhigh (and Opus 5.5 to medium, see
+ * claudeMediumDefaultModels). The "opus" alias is treated as
  * Opus 5, so it defaults to high. grok-4.7 / grok-4.7-build-fast / grok-4.6
  * advertise low/medium/high/xhigh and grok-4.5 low/medium/high; all carry
  * reasoning_effort "high" as the CLI default, so none is listed here.
@@ -90,13 +104,13 @@ export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex";
 }
 
-// codex CLI 0.153.3: gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
+// codex CLI 0.155.0: gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
 // additionally advertise the "ultra" reasoning level (multi-agent
-// orchestration mode). It is a different beast from the plain effort
+// orchestration mode); gpt-6-luna and gpt-5.6-luna stop at max. It is a different beast from the plain effort
 // ladder — long-running and expensive — so kojo's per-agent effort scale
 // intentionally stops at "max"; ultra is offered ONLY as a per-session
 // choice in NewSession.
-const codexUltraModels = new Set(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
+const codexUltraModels = new Set(["gpt-6-sol", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]);
 
 /**
  * Effort levels offered when starting an ad-hoc session for the given
@@ -127,5 +141,6 @@ export function effortLevelsForModel(model: string): readonly EffortLevel[] {
 export function defaultEffortForModel(model: string): string {
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexEffortModels.has(model)) return "medium";
+  if (claudeMediumDefaultModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";
 }

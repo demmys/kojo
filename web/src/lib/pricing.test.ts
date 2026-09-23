@@ -30,6 +30,19 @@ describe("priceModel", () => {
     expect(priceModel("claude-sonnet-4-6")?.output).toBe(15);
   });
 
+  it("prices Opus 5.5 at $4/$20 with a 0.05x cache read", () => {
+    // https://platform.claude.com/docs/en/models/opus-5-5/overview: input $4,
+    // output $20, 5m cache write $5, cache read $0.20.
+    expect(priceModel("claude-opus-5-5")).toEqual({
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite: 5,
+    });
+    // The opus alias stays on Opus 5 until the claude CLI resolves it to 5.5.
+    expect(priceModel("opus")).not.toEqual(priceModel("claude-opus-5-5"));
+  });
+
   it("reads cache at 0.025x for Fable 5.1, 0.1x for Fable 5", () => {
     // Same base rates; only the cache-read multiplier differs.
     expect(priceModel("claude-fable-5-1")).toEqual({

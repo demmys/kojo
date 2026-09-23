@@ -130,6 +130,10 @@ func pickEffortTier(ans jevAnswer) (string, error) {
 // effortRank orders effort tiers for the ceiling comparison in
 // resolveTurnEffort. The empty string (model default) is treated as the
 // "high" tier — claude/grok models default to high (or better) effort.
+// claude-opus-5-5 is the one exception (its API default is medium); an
+// agent on it with an empty effort therefore has its ceiling read one
+// level above what the model actually runs at, which only ever lets the
+// classifier pin an explicit "medium" that equals the default anyway.
 var effortRank = map[string]int{
 	"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6,
 }

@@ -9,6 +9,7 @@
 // Anthropic base input/output rates (USD / 1M tokens):
 //   claude-fable-5-1 : 10 / 50   (cache read 0.025x, not 0.1x — see below)
 //   claude-fable-5   : 10 / 50
+//   claude-opus-5-5  :  4 / 20   (cache read 0.05x, not 0.1x — see below)
 //   claude-opus-5    :  5 / 25
 //   claude-opus-4-8  :  5 / 25
 //   claude-opus-4-7  :  5 / 25
@@ -36,11 +37,16 @@
 // The whole request bills at the long-context tier. kojo prices the short-
 // context tier only, so estimates understate very large turns by up to 2x.
 //
-// claude-fable-5-1 is the one id in this table that departs from the 0.1x
-// cache-read rule: https://platform.claude.com/docs/en/about-claude/pricing
-// (fetched 2026-09-02) prices its cache hits and refreshes at 0.025x the base
-// input rate, i.e. $0.25/1M against Fable 5's $1/1M. Everything else about the
-// two Fable models — input, output, both cache-write TTLs — is identical.
+// claude-fable-5-1 and claude-opus-5-5 are the two ids in this table that
+// depart from the 0.1x cache-read rule:
+//   - https://platform.claude.com/docs/en/about-claude/pricing (fetched
+//     2026-09-02) prices Fable 5.1's cache hits and refreshes at 0.025x the
+//     base input rate, i.e. $0.25/1M against Fable 5's $1/1M. Everything else
+//     about the two Fable models — input, output, both cache-write TTLs — is
+//     identical.
+//   - https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
+//     2026-09-23) lists Opus 5.5 at $4 input / $20 output, 5m cache write
+//     $5 (the usual 1.25x) but cache read $0.20, i.e. 0.05x.
 // (Mythos 5.1 carries the same exception, but kojo does not offer it: the
 // model is gated behind Anthropic's trusted access, so it never reaches
 // toolModels.ts and has no row here.)
@@ -63,7 +69,7 @@ export interface ModelPricing {
  * Anthropic: cache read 0.1x, cache write 5m 1.25x base input.
  *
  * The cache-read multiplier is an option rather than a constant because Fable
- * 5.1 reads cache at 0.025x. It is named at the call site on purpose: the
+ * 5.1 reads cache at 0.025x and Opus 5.5 at 0.05x. It is named at the call site on purpose: the
  * third positional argument of pricedXai below is a dollar rate, and two
  * neighbouring helpers whose third argument means different things is exactly
  * the mix-up that would misprice a model by 10x.
@@ -102,6 +108,7 @@ function pricedXai(
 const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-fable-5-1": pricedAnthropic(10, 50, { cacheReadRate: 0.025 }),
   "claude-fable-5": pricedAnthropic(10, 50),
+  "claude-opus-5-5": pricedAnthropic(4, 20, { cacheReadRate: 0.05 }),
   "claude-opus-5": pricedAnthropic(5, 25),
   "claude-opus-4-8": pricedAnthropic(5, 25),
   "claude-opus-4-7": pricedAnthropic(5, 25),
@@ -118,6 +125,9 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
 
 // kojo agent.model aliases (see web/src/lib/toolModels.ts) mapped to a
 // canonical id. "opus" → Opus 5, "sonnet" → Sonnet 5, "haiku" → Haiku 4.5.
+// The "opus" alias follows what the installed claude CLI resolves it to:
+// 2.1.276 still maps it to claude-opus-5 (its binary carries no opus-5-5
+// id at all), so it stays on Opus 5 pricing until the CLI moves.
 const ALIASES: Record<string, string> = {
   opus: "claude-opus-5",
   sonnet: "claude-sonnet-5",

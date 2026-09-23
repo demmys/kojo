@@ -70,25 +70,34 @@ func (s *Server) retryStalledGoalHandoffResumes(blocked map[pendingSyncKey]struc
 			if _, unresolved := blocked[pendingSyncKey{AgentID: id, OpID: b.Handoff.ID}]; unresolved {
 				continue
 			}
+			// A temporary source outage must not consume the bounded resume
+			// budget: no resume has been dispatched yet. Authorize the exact
+			// enumerated handoff first, then atomically claim its next attempt;
+			// ClaimGoalHandoffResume rechecks the operation identity and phase
+			// so a stale enumeration cannot be dispatched after this check.
+			origin := b.OriginPeerID
+			if origin == "" {
+				origin = b.Handoff.SourcePeerID
+			}
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 20*time.Second)
+			err := s.callGoalHandoffOrigin(checkCtx, origin, goalHandoffOriginRequest{Action: "check", OpID: b.Handoff.ID, AgentID: id})
+			checkCancel()
+			if err != nil {
+				s.logger.Warn("goal handoff resume authorization unavailable; retry not charged", "agent", id, "sessionKey", b.SessionKey, "handoff", b.Handoff.ID, "err", err)
+				continue
+			}
 			claimed, ok := s.agents.ClaimGoalHandoffResume(id, b.SessionKey, b.Handoff.ID)
 			if !ok || claimed.Handoff == nil || claimed.State == nil {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			origin := claimed.OriginPeerID
-			if origin == "" {
-				origin = claimed.Handoff.SourcePeerID
-			}
-			err := s.callGoalHandoffOrigin(ctx, origin, goalHandoffOriginRequest{Action: "check", OpID: claimed.Handoff.ID, AgentID: id})
-			if err == nil {
-				req := goalRecoveryRequest{AgentID: id, SessionKey: claimed.SessionKey, ThreadID: claimed.State.ThreadID, Generation: claimed.Generation, UserID: claimed.UserID, RunID: claimed.RunID, HolderID: self, HandoffID: claimed.Handoff.ID}
-				// Same routing as finalize: main WebUI follows the agent, Slack
-				// retains the original Hub.
-				if claimed.SessionKey != "" && claimed.OriginPeerID != "" && claimed.OriginPeerID != self {
-					err = s.requestGoalRecovery(ctx, claimed.OriginPeerID, req)
-				} else {
-					err = s.resumeGoalSurface(ctx, req)
-				}
+			req := goalRecoveryRequest{AgentID: id, SessionKey: claimed.SessionKey, ThreadID: claimed.State.ThreadID, Generation: claimed.Generation, UserID: claimed.UserID, RunID: claimed.RunID, HolderID: self, HandoffID: claimed.Handoff.ID}
+			// Same routing as finalize: main WebUI follows the agent, Slack
+			// retains the original Hub.
+			if claimed.SessionKey != "" && claimed.OriginPeerID != "" && claimed.OriginPeerID != self {
+				err = s.requestGoalRecovery(ctx, claimed.OriginPeerID, req)
+			} else {
+				err = s.resumeGoalSurface(ctx, req)
 			}
 			cancel()
 			if err != nil {

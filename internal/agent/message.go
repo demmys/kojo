@@ -103,8 +103,12 @@ type ChatEvent struct {
 	Message         *Message            `json:"message,omitempty"`
 	Attachments     []MessageAttachment `json:"attachments,omitempty"` // streamed kojo-attach files
 	attachmentClaim *attachmentOwnership
-	Usage           *Usage `json:"usage,omitempty"`
-	ErrorMessage    string `json:"errorMessage,omitempty"`
+	// textSegmentStart marks the first delta of a new assistant text segment
+	// (Claude text content block, Codex agentMessage item). Holder-local only:
+	// the Slack no-reply filter consumes it before events leave the process.
+	textSegmentStart bool
+	Usage            *Usage `json:"usage,omitempty"`
+	ErrorMessage     string `json:"errorMessage,omitempty"`
 	// ErrorCode preserves the backend classification separately from human-readable text.
 	ErrorCode string `json:"errorCode,omitempty"`
 	// ParentToolUseID is set when this event originates from a subagent

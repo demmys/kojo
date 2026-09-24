@@ -204,11 +204,15 @@ func trimStreamDeathsOutsideWindow(deaths []time.Time, now time.Time) []time.Tim
 	return recent
 }
 
-// isNoReplyResponse reports whether text is the exact Slack no-reply control
-// response. Exact matching prevents ordinary discussion of the token from
-// suppressing a reply.
+// isNoReplyResponse reports whether text is a Slack no-reply control
+// response: one or more exact tokens and nothing else. The holder already
+// drops token-only segments and terminates an all-token turn with a single
+// canonical token; accepting repeated tokens keeps older holders (which
+// concatenate segments) from posting "[[NO_REPLY]][[NO_REPLY]]". Exact
+// matching still prevents ordinary discussion of the token from suppressing a
+// reply.
 func isNoReplyResponse(text string) bool {
-	return strings.TrimSpace(text) == noReplyToken
+	return agent.IsNoReplyOnly(text)
 }
 
 // couldBeNoReplyResponse is used while text is still streaming. Holding a
@@ -217,8 +221,7 @@ func isNoReplyResponse(text string) bool {
 // normally. An exact token remains a candidate because a later delta may still
 // turn it into ordinary prose.
 func couldBeNoReplyResponse(text string) bool {
-	trimmed := strings.TrimSpace(text)
-	return strings.HasPrefix(noReplyToken, trimmed)
+	return agent.CouldBeNoReplyOnly(text)
 }
 
 // discardSuppressedStreams removes every Slack message artifact created before

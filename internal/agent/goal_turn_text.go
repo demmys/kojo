@@ -195,10 +195,15 @@ func filterSlackNoReplyEvents(in <-chan ChatEvent) <-chan ChatEvent {
 				f.finish(clean)
 				if ev.Message != nil {
 					msg := *ev.Message
-					if clean && f.silent() {
+					// Decide silence from the rewritten terminal body, not
+					// the stream alone: the authoritative body may carry
+					// text that never streamed (e.g. Claude prepending an
+					// earlier assistant turn), which must not be discarded.
+					body := f.rewrite(msg.Content)
+					if clean && f.silent() && (strings.TrimSpace(body) == "" || IsNoReplyOnly(body)) {
 						msg.Content = SlackNoReplyToken
 					} else {
-						msg.Content = f.rewrite(msg.Content)
+						msg.Content = body
 						if !clean && couldBeNoReplyOnly(msg.Content) {
 							msg.Content = ""
 						}

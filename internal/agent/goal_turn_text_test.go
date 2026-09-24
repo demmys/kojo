@@ -260,6 +260,16 @@ func TestFilterSlackNoReplyEvents(t *testing.T) {
 		t.Fatalf("unterminated partial leaked: %q", live)
 	}
 
+	// Terminal body carries text that never streamed (Claude merging an
+	// earlier assistant turn): silence must not discard it.
+	live, done = liveAndTerminal(collectFiltered(t, []ChatEvent{
+		{Type: "text", Delta: tok, textSegmentStart: true},
+		{Type: "done", Message: msg("先に調べた結果です\n\n" + tok)},
+	}))
+	if live != "" || done.Message.Content != "先に調べた結果です\n\n" {
+		t.Fatalf("merged terminal: live=%q done=%q", live, done.Message.Content)
+	}
+
 	// Ordinary prose is untouched, including the terminal body.
 	live, done = liveAndTerminal(collectFiltered(t, []ChatEvent{
 		{Type: "text", Delta: "Use " + tok},

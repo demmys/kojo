@@ -1095,6 +1095,38 @@ func (m *Manager) GetRemote(id string) *Agent {
 	return a
 }
 
+// GetRemoteHeld returns the persisted row of an agent whose runtime is not
+// in the local manager AND whose agent_locks row names a holder peer. It is
+// a lightweight sibling of GetRemote (no last-message preview, avatar, or
+// peer-registry lookups) intended for callers that only need identity /
+// configuration fields and may run under their own locks. The result is a
+// fresh copy that callers must not use to execute the agent locally.
+func (m *Manager) GetRemoteHeld(id string) (*Agent, bool) {
+	if m == nil || m.store == nil || id == "" {
+		return nil, false
+	}
+	m.mu.Lock()
+	_, inMem := m.agents[id]
+	m.mu.Unlock()
+	if inMem {
+		return nil, false
+	}
+	st := m.Store()
+	if st == nil {
+		return nil, false
+	}
+	lock, err := st.GetAgentLock(context.Background(), id)
+	if err != nil || lock == nil || lock.HolderPeer == "" {
+		return nil, false
+	}
+	a, err := m.store.LoadByID(id)
+	if err != nil || a == nil {
+		return nil, false
+	}
+	a.HolderPeer = lock.HolderPeer
+	return a, true
+}
+
 // GetAny returns an agent whether its runtime is local or held by a peer.
 // Hub-owned integrations use the persisted remote mirror for configuration;
 // execution paths must continue to use Get so they cannot run a remote agent.

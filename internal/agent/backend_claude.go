@@ -1133,6 +1133,9 @@ type turnAccumulator struct {
 	toolIDToName     map[string]string
 	subagents        map[string]*subagentState
 	subagentOwner    map[string]string
+	// textBlockStarted marks that the next main-turn text delta opens a new
+	// text content block (a no-reply filter segment boundary).
+	textBlockStarted bool
 }
 
 func newTurnAccumulator(logger *slog.Logger, send func(ChatEvent) bool) *turnAccumulator {
@@ -1280,6 +1283,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 			d.CacheReadInputTokens, d.CacheCreationInputTokens)
 
 	case "content_block_start":
+		if event.ContentBlock.Type == "text" && parentID == "" {
+			a.textBlockStarted = true
+		}
 		if event.ContentBlock.Type == "tool_use" {
 			if parentID != "" {
 				sub := getSubagent(parentID)
@@ -1321,7 +1327,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 			if event.Delta.Text != "" {
 				fullText.WriteString(event.Delta.Text)
 				res.lastAssistantIsLatestText = false
-				if !send(ChatEvent{Type: "text", Delta: event.Delta.Text}) {
+				segmentStart := a.textBlockStarted
+				a.textBlockStarted = false
+				if !send(ChatEvent{Type: "text", Delta: event.Delta.Text, textSegmentStart: segmentStart}) {
 					res.cancelled = true
 					return false
 				}

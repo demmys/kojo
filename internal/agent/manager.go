@@ -2899,6 +2899,10 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 		return nil, err
 	}
+	if isSlackConversationKey(agentID, opts.SessionKey) {
+		// Before any lossy forwarding: the filter must see every delta.
+		backendCh = filterSlackNoReplyEvents(backendCh)
+	}
 	backendCh = m.oneShotQuestionEvents(chatCtx, backendCh, questionTurn)
 	if responseAttachments != nil {
 		backendCh = m.captureOneShotResponseAttachments(chatCtx, agentID,

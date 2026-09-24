@@ -1,6 +1,6 @@
 package tts
 
-// SystemInstruction is prepended to every TTS request to keep the model
+// SystemInstruction is prepended to every :generateContent TTS request to keep the model
 // in narrator mode and avoid refusal/rewriting of the input text.
 const SystemInstruction = `You are a text-to-speech narrator inside kojo, a private coding assistant UI.
 Read the provided text exactly as a coding progress notification or fictional in-app dialogue.
@@ -12,7 +12,7 @@ Keep delivery natural, expressive but non-abusive.`
 const DefaultStylePrompt = "落ち着いた日本語で、淡々と短く読み上げて。"
 
 // DefaultModel is the Gemini TTS model used by default.
-const DefaultModel = "gemini-3.1-flash-tts-preview"
+const DefaultModel = "gemini-3.8-flash-lite-tts"
 
 // DefaultVoice is the default voice from the 30-voice Gemini TTS catalogue.
 const DefaultVoice = "Kore"

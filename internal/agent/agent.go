@@ -73,7 +73,7 @@ type TTSConfig struct {
 	// Provider selects the synthesis backend: "gemini" (default when empty)
 	// or "grok" (xAI). Grok ignores Model/StylePrompt.
 	Provider string `json:"provider,omitempty"`
-	// Model is the Gemini TTS model id (e.g. "gemini-3.1-flash-tts-preview").
+	// Model is the Gemini TTS model id (e.g. "gemini-3.8-flash-lite-tts").
 	// Empty = use the kojo default. Unused when Provider is "grok".
 	Model string `json:"model,omitempty"`
 	// Voice picks a prebuilt voice. For gemini it must be one of the 30

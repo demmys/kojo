@@ -1115,7 +1115,9 @@ func (m *Manager) GetRemoteHeld(id string) (*Agent, bool) {
 	if st == nil {
 		return nil, false
 	}
-	lock, err := st.GetAgentLock(context.Background(), id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	lock, err := st.GetAgentLock(ctx, id)
+	cancel()
 	if err != nil || lock == nil || lock.HolderPeer == "" {
 		return nil, false
 	}

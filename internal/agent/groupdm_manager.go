@@ -1540,7 +1540,7 @@ func threadAttachmentPrompt(stageDir string) string {
 }
 
 // runThreadTurn executes one temporary side-thread turn for a thread room
-// (kind "dm", single agent member). It resumes a per-thread Claude session so
+// (kind "thread", or a legacy single-member "dm"). It resumes a per-thread Claude session so
 // successive posts share context, but stays isolated from the agent's main
 // chat. Serialized per room so two rapid posts never --resume the same session
 // concurrently; the reply is posted daemon-authored on the agent's behalf,
@@ -2116,16 +2116,18 @@ func (m *GroupDMManager) postThreadReply(groupID, agentID, content, model, effor
 // messageID is allocated before the one-shot stream starts so attachment blob
 // ownership and the persisted group message use the same stable ID.
 func (m *GroupDMManager) postThreadReplyWithAttachments(groupID, agentID, content, model, effort string, usage *Usage, thinking string, toolUses []ToolUse, interrupted bool, messageID string, attachments []MessageAttachment, onPersisted func()) (*GroupMessage, error) {
+	// Resolve the display name before taking m.mu: for an agent held by
+	// another peer this reads the persisted row from the DB.
+	var senderName string
+	if a, ok := m.threadAgentInfo(agentID); ok {
+		senderName = a.Name
+	}
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
 	if err != nil {
 		m.mu.Unlock()
 		m.agentMgr.deleteIngestedAttachments(attachments)
 		return nil, err
-	}
-	var senderName string
-	if a, ok := m.threadAgentInfo(agentID); ok {
-		senderName = a.Name
 	}
 	memberIDs := make([]string, 0, len(g.Members))
 	for _, mem := range g.Members {
@@ -2189,6 +2191,11 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 	if title == "" {
 		return
 	}
+	// Resolved outside m.mu (may hit the DB for a remote-held agent).
+	agentName := ""
+	if a, ok := m.threadAgentInfo(agentID); ok {
+		agentName = a.Name
+	}
 
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(groupID)
@@ -2204,10 +2211,6 @@ func (m *GroupDMManager) maybeAutoTitleThread(groupID, agentID, firstUserMessage
 	// created with DefaultThreadName; a legacy single-agent "dm" room was
 	// created with the agent's display name. Accept either as "still
 	// default" so both shapes auto-title exactly once.
-	agentName := ""
-	if a, ok := m.threadAgentInfo(agentID); ok {
-		agentName = a.Name
-	}
 	isDefault := g.Name == DefaultThreadName || g.Name == agentName
 	if !isDefault || title == g.Name {
 		m.mu.Unlock()

@@ -157,7 +157,11 @@ func (f *noReplySegments) rewrite(content string) string {
 	case content == raw:
 		return f.kept.String()
 	case raw != "" && strings.Contains(content, raw):
-		return strings.Replace(content, raw, f.kept.String(), 1)
+		// Wrappers prepend earlier text (finalStreamText appends the
+		// streamed fullText last), and that earlier text may itself mention
+		// the token. Replace the last occurrence, which is the streamed one.
+		i := strings.LastIndex(content, raw)
+		return content[:i] + f.kept.String() + content[i+len(raw):]
 	case strings.TrimSpace(content) == strings.TrimSpace(raw):
 		return f.kept.String()
 	}
@@ -193,7 +197,11 @@ func filterSlackNoReplyEvents(in <-chan ChatEvent) <-chan ChatEvent {
 				terminal = true
 				clean := !failed && ev.ErrorMessage == ""
 				f.finish(clean)
-				if ev.Message != nil {
+				if ev.Message == nil && clean && f.silent() {
+					// Bare done: the withheld deltas were the only body, so
+					// carry the suppression signal explicitly.
+					ev.Message = &Message{Role: "assistant", Content: SlackNoReplyToken}
+				} else if ev.Message != nil {
 					msg := *ev.Message
 					// Decide silence from the rewritten terminal body, not
 					// the stream alone: the authoritative body may carry

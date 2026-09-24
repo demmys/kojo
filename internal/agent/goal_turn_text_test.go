@@ -270,6 +270,27 @@ func TestFilterSlackNoReplyEvents(t *testing.T) {
 		t.Fatalf("merged terminal: live=%q done=%q", live, done.Message.Content)
 	}
 
+	// Bare done after token-only segments still signals suppression.
+	live, done = liveAndTerminal(collectFiltered(t, []ChatEvent{
+		{Type: "text", Delta: tok, textSegmentStart: true},
+		{Type: "tool_use"}, {Type: "tool_result"},
+		{Type: "text", Delta: tok, textSegmentStart: true},
+		{Type: "done"},
+	}))
+	if live != "" || done == nil || done.Message == nil || done.Message.Content != tok {
+		t.Fatalf("bare done: live=%q done=%+v", live, done)
+	}
+
+	// Earlier merged prose mentioning the token keeps it; only the streamed
+	// (last) control token is removed.
+	live, done = liveAndTerminal(collectFiltered(t, []ChatEvent{
+		{Type: "text", Delta: tok, textSegmentStart: true},
+		{Type: "done", Message: msg("Use " + tok + " to stay silent\n\n" + tok)},
+	}))
+	if live != "" || done.Message.Content != "Use "+tok+" to stay silent\n\n" {
+		t.Fatalf("last occurrence: live=%q done=%q", live, done.Message.Content)
+	}
+
 	// Ordinary prose is untouched, including the terminal body.
 	live, done = liveAndTerminal(collectFiltered(t, []ChatEvent{
 		{Type: "text", Delta: "Use " + tok},

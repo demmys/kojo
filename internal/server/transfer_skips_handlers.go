@@ -20,7 +20,7 @@ type dismissTransferSkipsResponse struct {
 func (s *Server) handleDismissTransferSkips(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
+	if !p.HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "transfer notices are owner-only")
 		return
 	}

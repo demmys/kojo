@@ -242,7 +242,7 @@ func (s *Server) handleGoalHandoffStatus(w http.ResponseWriter, r *http.Request)
 		writeError(w, 500, "internal", "invalid journal")
 		return
 	}
-	if !p.IsOwner() {
+	if !p.HasOwnerAuthority() {
 		writeError(w, 403, "forbidden", "owner required")
 		return
 	}

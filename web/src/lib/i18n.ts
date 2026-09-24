@@ -714,8 +714,8 @@ const messages = {
     en: "Owner Deputy (stronger than Privileged)",
   },
   "settings.ownerDeputyDesc": {
-    ja: "このエージェントをオーナーの代理にする。特権エージェントの権限に加えて、他エージェントの作成 / フォーク / 完全な記録の読み取り / 設定の変更 / persona・user.md・status・MEMORY.md の編集 / チャットへの発言ができる。権限の付与だけはオーナー専用のまま。自分自身に対しては何も増えない。",
-    en: "Make this agent your deputy. On top of everything a privileged agent can do, it may create and fork agents, read their full record, change their settings, edit their persona / user.md / status / MEMORY.md, and post into their chat. Only granting privileges stays Owner-only, and the grant adds nothing over the agent itself.",
+    ja: "このエージェントをオーナーの代理にする。エージェントの作成 / フォーク / 設定変更 / persona・MEMORY.md の編集 / チャットへの発言、セッション・Git・ファイル・TTS・ピア管理・再起動など、オーナーとほぼ同じ API を使える。特権とオーナー代理の付与・解除だけはオーナー専用。",
+    en: "Make this agent your deputy. It can use almost the whole Owner API: create, fork and reconfigure agents, edit their persona / MEMORY.md, post into their chat, and use sessions, Git, files, TTS, peer management and restart. Only granting or revoking Privileged / Owner Deputy stays Owner-only.",
   },
 
   // ── AgentSettings: Schedule ──

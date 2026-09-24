@@ -143,6 +143,17 @@ func (p Principal) IsOwnerDeputy() bool {
 	return p.IsAgent() && p.OwnerDeputy
 }
 
+// HasOwnerAuthority reports whether the principal may use the Owner's
+// surface: the Owner itself, or an agent the Owner deputised. Handlers
+// with an owner-only gate call this instead of IsOwner unless the gate is
+// about the human operator's own state (read cursors, the no-agent
+// identity) or the inter-peer transport, where only the real Owner fits.
+// The grant-management routes stay behind CanSetOwnerDeputy /
+// CanSetPrivileged, which never admit a deputy.
+func (p Principal) HasOwnerAuthority() bool {
+	return p.IsOwner() || p.IsOwnerDeputy()
+}
+
 // IsOwnerDeputyOver reports whether the principal may act as the Owner's
 // proxy on targetID. The target must be someone ELSE: the grant exists
 // to manage other agents, and letting it apply to the holder would turn
@@ -185,12 +196,11 @@ func (p Principal) CanDeleteOrReset(targetID string) bool {
 	return p.IsAgent() && p.AgentID == targetID
 }
 
-// CanForkOrCreate returns true only for the Owner. It doubles as the
-// owner-only gate for a few unrelated global routes (TTS/STT), so it
-// deliberately did NOT grow a deputy case — the agent-scoped decisions
-// live in CanCreateAgent / CanFork.
+// CanForkOrCreate gates a few global owner routes (TTS/STT). An
+// owner-deputy holds the Owner's authority there too; the agent-scoped
+// decisions live in CanCreateAgent / CanFork.
 func (p Principal) CanForkOrCreate() bool {
-	return p.IsOwner()
+	return p.HasOwnerAuthority()
 }
 
 // CanCreateAgent gates POST /api/v1/agents: the Owner, and the agents
@@ -199,15 +209,11 @@ func (p Principal) CanCreateAgent() bool {
 	return p.IsOwner() || p.IsOwnerDeputy()
 }
 
-// CanFork gates POST /api/v1/agents/{id}/fork. Forking copies the
-// source's persona and memory, so it stays denied for a privileged
-// agent — but a deputy already reads those in full and may create
-// agents, so withholding fork would buy nothing. Self-fork is NOT
-// covered (IsOwnerDeputyOver excludes self): a deputy cloning itself
-// would hand its own memory to a second agent that the Owner never
-// deputised.
+// CanFork gates POST /api/v1/agents/{id}/fork: the Owner and its
+// deputies, on any agent including the deputy itself (the grant is not
+// copied onto the fork, so self-fork cannot spread it).
 func (p Principal) CanFork(targetID string) bool {
-	return p.IsOwner() || p.IsOwnerDeputyOver(targetID)
+	return p.HasOwnerAuthority()
 }
 
 // CanSetOwnerDeputy returns true only for the Owner. A deputy must
@@ -228,7 +234,7 @@ func (p Principal) CanSetPrivileged() bool {
 // privileged agents. Regular agents and peers are refused — a restart
 // quiesces every agent on this host, not just the caller.
 func (p Principal) CanRestartServer() bool {
-	return p.IsOwner() || p.Role == RolePrivAgent
+	return p.HasOwnerAuthority() || p.Role == RolePrivAgent
 }
 
 // Resolver maps a Bearer token to a Principal.

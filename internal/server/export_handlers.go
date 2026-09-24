@@ -54,7 +54,7 @@ const exportPaginationLimit = 500
 func (s *Server) handleExportAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() && !p.IsPeer() {
+	if !p.HasOwnerAuthority() && !p.IsPeer() {
 		writeError(w, http.StatusForbidden, "forbidden", "export is owner-only")
 		return
 	}

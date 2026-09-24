@@ -113,13 +113,11 @@ func EnforceMiddleware(next http.Handler) http.Handler {
 //  3. Privileged-cross-agent — delete / reset / checkin / unarchive /
 //     reset-session. Permitted for self by Agent, or for any target by
 //     PrivAgent.
-//  4. Owner-deputy-cross-agent — an agent the Owner deputised
-//     (Principal.OwnerDeputy) gets buckets 2 and 3's surface on OTHER
-//     agents, plus agent creation, fork and chat injection, so it can
-//     stand in for the Owner over the fleet. The grant-management
-//     routes (/privilege, /owner-deputy) and /handoff/switch stay
-//     Owner-only so it can neither propagate itself nor move someone
-//     else's runtime.
+//  4. Owner-deputy — an agent the Owner deputised (Principal.OwnerDeputy)
+//     is admitted to every route except the grant-management ones
+//     (/privilege, /owner-deputy), so it can stand in for the Owner
+//     without being able to propagate or revoke its own grant. See
+//     allowOwnerDeputy.
 //
 // Owner-only routes (sessions, git, files browser, embedding,
 // push, custom-models, group DM mutate-as-owner, /privilege,
@@ -142,6 +140,16 @@ func AllowNonOwner(p Principal, method, path string) bool {
 	// without falling through into the agent allowlist.
 	if p.IsExtension() {
 		return allowExtension(p, method, path)
+	}
+
+	// An owner-deputy holds the Owner's authority over the whole API —
+	// itself included — except the grant-management routes, so it can
+	// neither mint another deputy / privileged agent nor revoke its own
+	// grant. Handlers still apply their own checks (HasOwnerAuthority);
+	// the few that guard the human operator's own state or the
+	// inter-peer transport keep requiring the real Owner.
+	if p.IsOwnerDeputy() {
+		return allowOwnerDeputy(path)
 	}
 
 	// RolePeer is scoped to the inter-peer surface (status push
@@ -576,6 +584,18 @@ func SplitAgentIDPath(path string) (id, sub string, ok bool) {
 		return rest, "", true
 	}
 	return rest[:slash], rest[slash:], true
+}
+
+// allowOwnerDeputy is the gate for Principal.OwnerDeputy: everything but
+// POST /api/v1/agents/{id}/privilege and /owner-deputy (on any target).
+func allowOwnerDeputy(path string) bool {
+	if _, sub, ok := SplitAgentIDPath(path); ok {
+		switch sub {
+		case "/privilege", "/owner-deputy":
+			return false
+		}
+	}
+	return true
 }
 
 // matchAgentSubpath reports whether path is the bare GET /api/v1/agents/{id}

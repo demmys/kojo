@@ -86,6 +86,10 @@ type ChatOptions struct {
 	// killed with the process. Set by the Manager only when the backend is
 	// claude and a keyed handler is registered for the agent.
 	LingerBackgroundTasks bool
+	// KeyedSurface, when set, binds the keyed session to this response
+	// surface for its lifetime (remote holders: the Hub that dispatched the
+	// turn) instead of the agent-wide keyed handler resolution.
+	KeyedSurface KeyedSessionSurface
 
 	// FreshSessionContext is a bounded transcript supplied by the response
 	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends

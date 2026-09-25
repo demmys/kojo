@@ -482,7 +482,11 @@ type ClaudeBackend struct {
 	onKeyedBackgroundTurn KeyedBackgroundTurnFunc
 	// onKeyedTasksAbandoned is told when a keyed session dies while the CLI
 	// still reported pending background tasks (best-effort user notice).
-	onKeyedTasksAbandoned func(agentID, sessionKey string, pending int, reason string)
+	onKeyedTasksAbandoned KeyedTasksAbandonedFunc
+	// exitNotices counts, per agent, keyed sessions whose exit handling (the
+	// abandoned notice and the surface release) is still running.
+	exitNoticeMu sync.Mutex
+	exitNotices  map[string]int
 
 	// lingerSlots tracks, per agent, the keyed sessions currently lingering
 	// with background tasks pending (the only thing maxLingeringSessionsPerAgent
@@ -533,7 +537,13 @@ func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
 // session to the Manager. Same channel/answer/abort contract as
 // BackgroundTurnFunc; steer (nil for an absorbed, already-complete
 // notification) injects a user line into the running notification turn.
-type KeyedBackgroundTurnFunc func(agentID, sessionKey string, events <-chan ChatEvent, answer AnswerFunc, abort func(), steer SteerFunc)
+// surface is the session's bound KeyedSessionSurface (nil: resolve the
+// agent-wide handler).
+type KeyedBackgroundTurnFunc func(agentID, sessionKey string, events <-chan ChatEvent, answer AnswerFunc, abort func(), steer SteerFunc, surface KeyedSessionSurface)
+
+// KeyedTasksAbandonedFunc reports a keyed session that exited with background
+// tasks pending; surface is the session's bound surface (may be nil).
+type KeyedTasksAbandonedFunc func(agentID, sessionKey string, pending int, reason string, surface KeyedSessionSurface)
 
 // SetKeyedBackgroundTurnHandler registers the Manager callback for unsolicited
 // turns on keyed lingering sessions.
@@ -543,7 +553,7 @@ func (b *ClaudeBackend) SetKeyedBackgroundTurnHandler(fn KeyedBackgroundTurnFunc
 
 // SetKeyedTasksAbandonedHandler registers the Manager callback invoked when a
 // keyed session exits with background tasks still pending.
-func (b *ClaudeBackend) SetKeyedTasksAbandonedHandler(fn func(agentID, sessionKey string, pending int, reason string)) {
+func (b *ClaudeBackend) SetKeyedTasksAbandonedHandler(fn KeyedTasksAbandonedFunc) {
 	b.onKeyedTasksAbandoned = fn
 }
 

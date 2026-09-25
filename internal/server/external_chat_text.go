@@ -75,10 +75,15 @@ type externalChatTextRequest struct {
 	ResponseAttachmentMessageID string                    `json:"responseAttachmentMessageId,omitempty"`
 	HandoffCapability           string                    `json:"-"`
 	PreserveTerminalOnCancel    bool                      `json:"-"`
-	// LingerBackgroundTasks is honored only for a Hub-local dispatch: the
-	// keyed background handler lives on this process, so a remote holder
-	// (which never receives this field) keeps the close-at-result behaviour.
-	LingerBackgroundTasks bool `json:"-"`
+	// LingerBackgroundTasks keeps the holder's keyed claude process alive
+	// while run_in_background tasks are pending. It is relayed only to a
+	// holder advertising keyedBackgroundV1, and a holder honors it only from
+	// the agent's allowed Hub proxy (externalChatHubAddress), binding a
+	// Hub-bound keyed surface so completions come back to this Hub.
+	LingerBackgroundTasks bool `json:"lingerBackgroundTasks,omitempty"`
+	// AttachBackgroundToken (Hub -> holder) attaches this request's stream to
+	// the holder's buffered keyed background turn instead of starting a turn.
+	AttachBackgroundToken string `json:"attachBackgroundToken,omitempty"`
 }
 
 type externalChatSteerRequest struct {
@@ -183,6 +188,9 @@ type externalChatReadyResponse struct {
 	HolderPeer           string `json:"holderPeer,omitempty"`
 	Unavailable          string `json:"unavailable,omitempty"`
 	OriginAwareArrivalV1 bool   `json:"originAwareArrivalV1,omitempty"`
+	// KeyedBackgroundV1: the holder accepts lingerBackgroundTasks /
+	// attachBackgroundToken and reports keyed background turns to the Hub.
+	KeyedBackgroundV1 bool `json:"keyedBackgroundV1,omitempty"`
 }
 
 type externalChatDispatchState int
@@ -271,6 +279,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		ResponseAttachmentMessageID: opts.ResponseAttachmentMessageID,
 		PreserveTerminalOnCancel:    opts.PreserveTerminalOnCancel,
 		LingerBackgroundTasks:       opts.LingerBackgroundTasks,
+		AttachBackgroundToken:       opts.AttachBackgroundToken,
 	}
 	if opts.SessionKey != "" && opts.HandoffArrivalReservation != nil {
 		req.HandoffCapability = r.server.mintHandoffArrivalCapability(agentID, opts.SessionKey, opts.HandoffArrivalReservation)
@@ -659,6 +668,12 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 	}
 	if local || holder == "" {
+		if req.AttachBackgroundToken != "" {
+			// Attach targets a remote holder's buffered turn; a local keyed
+			// session delivers its background turns directly.
+			return externalChatDispatchResult{state: externalChatDispatchDone,
+				err: errors.New("keyed background attach requires a remote holder")}
+		}
 		ready := s.externalChatReadiness(routeCtx, agentID)
 		if !ready.Ready {
 			state := externalChatDispatchStale
@@ -714,6 +729,15 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 		}
 		return externalChatDispatchResult{state: state, nextHolder: ready.HolderPeer,
 			err: fmt.Errorf("holder %s is not ready: %s", holder, ready.Unavailable)}
+	}
+	if !ready.KeyedBackgroundV1 {
+		// An old holder rejects unknown fields; keep its close-at-result
+		// behaviour instead of failing the turn.
+		req.LingerBackgroundTasks = false
+		if req.AttachBackgroundToken != "" {
+			return externalChatDispatchResult{state: externalChatDispatchDone,
+				err: fmt.Errorf("holder %s does not support keyed background attach", holder)}
+		}
 	}
 
 	if req.Goal != nil || req.ForceFreshSession || (req.GoalUserID != "" && strings.HasPrefix(req.SessionKey, agentID+":slack:")) {
@@ -1018,6 +1042,7 @@ func (s *Server) handleExternalChatReady(w http.ResponseWriter, r *http.Request)
 	// lack this route or omit the field, so a new source can downgrade to the
 	// legacy main-WebUI arrival before it transfers the lock.
 	ready.OriginAwareArrivalV1 = true
+	ready.KeyedBackgroundV1 = true
 	writeJSONResponse(w, http.StatusOK, ready)
 }
 
@@ -1055,7 +1080,12 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	// Goal commands carry their intent separately from chat text. Only a
 	// validated goal request may omit the message; empty ordinary turns stay
 	// invalid. Do this before any backend or attachment work.
-	if strings.TrimSpace(req.Message) == "" && req.Goal == nil {
+	attach := req.AttachBackgroundToken != ""
+	if attach && (req.Goal != nil || strings.TrimSpace(req.SessionKey) == "" || len(req.Attachments) > 0 || req.ForceFreshSession) {
+		writeError(w, http.StatusBadRequest, "bad_request", "background attach carries only its session key and token")
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" && req.Goal == nil && !attach {
 		writeError(w, http.StatusBadRequest, "bad_request", "message is required")
 		return
 	}
@@ -1086,24 +1116,48 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 		releaseRelay = s.externalChatRelays.acquire(agentID, hubPeerID)
 	}
 	defer releaseRelay()
-	events, err := s.agents.ChatOneShot(r.Context(), agentID, req.Message, agent.OneShotOpts{
-		Goal:                              req.Goal,
-		GoalUserID:                        req.GoalUserID,
-		GoalRunID:                         req.GoalRunID,
-		SessionKey:                        req.SessionKey,
-		InteractiveQuestions:              r.Header.Get("X-Kojo-Interactive-Questions") == "v1",
-		FreshSessionContext:               req.FreshSessionContext,
-		ResumeSessionContext:              req.ResumeSessionContext,
-		SystemPromptExtra:                 req.SystemPromptExtra,
-		DisableKojoAttachmentInstructions: req.DisableAttachments,
-		Attachments:                       req.Attachments,
-		SlackMCPBaseURL:                   hubAddr,
-		OriginPeerID:                      hubPeerID,
-		ForceFreshSession:                 req.ForceFreshSession,
-		HandoffCapability:                 strings.TrimSpace(r.Header.Get("X-Kojo-Handoff-Capability")),
-		ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
-		ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
-	})
+	var attachEntry *keyedBgAttachEntry
+	var events <-chan agent.ChatEvent
+	var err error
+	if attach {
+		attachEntry = s.keyedBg.claim(req.AttachBackgroundToken, agentID, req.SessionKey, hubPeerID)
+		if attachEntry == nil {
+			writeError(w, http.StatusNotFound, "background_turn_not_found", "no pending keyed background turn for this token")
+			return
+		}
+		events = attachEntry.events
+		if gid := req.ResponseAttachmentGroupID; gid != "" && req.ResponseAttachmentMessageID != "" && req.SessionKey == "groupdm:"+gid {
+			events = s.agents.CaptureKeyedBackgroundAttachments(r.Context(), agentID, gid, req.ResponseAttachmentMessageID, events)
+		}
+	} else {
+		opts := agent.OneShotOpts{
+			Goal:                              req.Goal,
+			GoalUserID:                        req.GoalUserID,
+			GoalRunID:                         req.GoalRunID,
+			SessionKey:                        req.SessionKey,
+			InteractiveQuestions:              r.Header.Get("X-Kojo-Interactive-Questions") == "v1",
+			FreshSessionContext:               req.FreshSessionContext,
+			ResumeSessionContext:              req.ResumeSessionContext,
+			SystemPromptExtra:                 req.SystemPromptExtra,
+			DisableKojoAttachmentInstructions: req.DisableAttachments,
+			Attachments:                       req.Attachments,
+			SlackMCPBaseURL:                   hubAddr,
+			OriginPeerID:                      hubPeerID,
+			ForceFreshSession:                 req.ForceFreshSession,
+			HandoffCapability:                 strings.TrimSpace(r.Header.Get("X-Kojo-Handoff-Capability")),
+			ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
+			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
+		}
+		if req.LingerBackgroundTasks && strings.TrimSpace(req.SessionKey) != "" && s.peerID != nil && hubAddr != "" {
+			// The session may outlive this request (max linger); its surface
+			// holds its own relay reference and reports back to this Hub.
+			surface := s.newRemoteKeyedSurface(agentID, req.SessionKey, hubPeerID, hubAddr)
+			defer surface.Release()
+			opts.LingerBackgroundTasks = true
+			opts.KeyedSurface = surface
+		}
+		events, err = s.agents.ChatOneShot(r.Context(), agentID, req.Message, opts)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, agent.ErrGoalOwnerForbidden):
@@ -1144,6 +1198,12 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 	heartbeat := time.NewTicker(externalChatHeartbeat)
 	defer heartbeat.Stop()
 	terminal := false
+	if attachEntry != nil {
+		// Settle the claimed background turn however the stream ends: one
+		// that never reached its terminal event (Hub gone) is aborted, and
+		// the waiting surface is released either way.
+		defer func() { attachEntry.finish(terminal) }()
+	}
 	type pendingAttachmentAck struct {
 		event agent.ChatEvent
 		token string

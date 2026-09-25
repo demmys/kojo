@@ -131,7 +131,7 @@ func TestKeyedSessionLingersWhilePendingThenCloses(t *testing.T) {
 	b.onBackgroundTurn = func(string, <-chan ChatEvent, AnswerFunc, func()) {
 		t.Error("keyed unsolicited turn reached the main background handler")
 	}
-	b.onKeyedBackgroundTurn = func(agentID, key string, events <-chan ChatEvent, _ AnswerFunc, _ func(), _ SteerFunc) {
+	b.onKeyedBackgroundTurn = func(agentID, key string, events <-chan ChatEvent, _ AnswerFunc, _ func(), _ SteerFunc, _ KeyedSessionSurface) {
 		if key != "test-agent:slack:C1:1.0" {
 			t.Errorf("key = %q", key)
 		}
@@ -191,7 +191,7 @@ func TestKeyedSessionClosedByAgentLifecycle(t *testing.T) {
 	b := newKeyedTestBackend()
 	var mu sync.Mutex
 	var abandoned []int
-	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string) {
+	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string, _ KeyedSessionSurface) {
 		mu.Lock()
 		abandoned = append(abandoned, pending)
 		mu.Unlock()
@@ -257,7 +257,7 @@ func TestManagerRoutesKeyedBackgroundTurnToHandler(t *testing.T) {
 	events <- ChatEvent{Type: "text", Delta: "bg result"}
 	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "bg result"}}
 	close(events)
-	m.handleKeyedBackgroundTurn("ag1", "ag1:slack:C1:1.0", events, nil, nil, nil)
+	m.handleKeyedBackgroundTurn("ag1", "ag1:slack:C1:1.0", events, nil, nil, nil, nil)
 	evs := <-h.got
 	d := doneOf(t, evs)
 	if d.Message == nil || d.Message.Content != "bg result" {

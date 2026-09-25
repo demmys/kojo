@@ -131,6 +131,13 @@ type claudeSession struct {
 	// pendingAtClose is the pending task count when the close was claimed
 	// (reported as abandoned even if the CLI clears its list while exiting).
 	pendingAtClose int
+	// surface is the response surface bound to this keyed session (nil: the
+	// Manager resolves the agent-wide handler). surfaceMu is a leaf lock so
+	// it can be read with or without mu held; surfaceDone is set at exit so
+	// a late bind releases immediately instead of leaking a reference.
+	surfaceMu   sync.Mutex
+	surface     KeyedSessionSurface
+	surfaceDone bool
 	// tasks is the latest background_tasks_changed snapshot; taskSeen keeps
 	// each task's first-seen time across snapshots (background-session API).
 	tasks    []claudeBackgroundTask
@@ -1213,6 +1220,9 @@ func (s *claudeSession) onEOF() {
 	if s.keyed {
 		s.stopLingerTimersLocked()
 		s.releaseLingerSlotLocked()
+		// Counted under the same lock that publishes sessDead, so a sync
+		// close that observed the exit also observes the pending notice.
+		s.b.beginKeyedExitNotice(s.agentID)
 		if !procAborted {
 			abandoned = s.pendingTasks
 			if s.pendingAtClose > abandoned {
@@ -1280,10 +1290,28 @@ func (s *claudeSession) onEOF() {
 		}
 		s.logger.Warn("keyed claude session exited with background tasks pending",
 			"agent", s.agentID, "sessionKey", s.sessionKey, "pending", abandoned, "reason", closeReason)
-		if fn := s.b.onKeyedTasksAbandoned; fn != nil {
-			go fn(s.agentID, s.sessionKey, abandoned, closeReason)
-		}
 	}
+	// The bound surface is released only after the abandoned notice was handed
+	// to it, so its credentials (e.g. the Hub relay ref) outlive the notice.
+	if !s.keyed {
+		return
+	}
+	surface := s.takeSurfaceAtExit()
+	fn := s.b.onKeyedTasksAbandoned
+	finish := func() {
+		if surface != nil {
+			surface.Release()
+		}
+		s.b.endKeyedExitNotice(s.agentID)
+	}
+	if abandoned > 0 && fn != nil {
+		go func() {
+			defer finish()
+			fn(s.agentID, s.sessionKey, abandoned, closeReason, surface)
+		}()
+		return
+	}
+	finish()
 }
 
 // armReapLocked (re)starts the idle reap timer. Caller holds mu.

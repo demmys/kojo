@@ -127,8 +127,10 @@ func (b *ClaudeBackend) keyedSession(agentID, sessionKey string) *claudeSession 
 // notice (reason KeyedStopRequestedReason) informs the thread. A session in
 // the middle of a turn — possibly the very turn calling this API — is not
 // killed: its tasks are stopped via stop_task control requests and
-// notify(pending) is called so the caller can post the stop notice itself.
-func (b *ClaudeBackend) stopBackgroundSession(agentID, sessionKey string, notify func(pending int)) error {
+// notify(pending, surface) is called so the caller can post the stop notice
+// itself. surface is the session's bound surface with a reference the notify
+// callee must Release (nil when none is bound).
+func (b *ClaudeBackend) stopBackgroundSession(agentID, sessionKey string, notify func(pending int, surface KeyedSessionSurface)) error {
 	s := b.keyedSession(agentID, sessionKey)
 	if s == nil {
 		return ErrBackgroundSessionNotFound
@@ -152,7 +154,7 @@ func (b *ClaudeBackend) stopBackgroundSession(agentID, sessionKey string, notify
 			s.stopTask(id)
 		}
 		if notify != nil {
-			notify(len(ids))
+			notify(len(ids), s.retainSurface())
 		}
 		return nil
 	}
@@ -282,8 +284,13 @@ func (m *Manager) StopBackgroundSession(agentID, sessionKey string) error {
 	if cb == nil {
 		return ErrBackgroundSessionNotFound
 	}
-	return cb.stopBackgroundSession(agentID, sessionKey, func(pending int) {
-		go m.handleKeyedTasksAbandoned(agentID, sessionKey, pending, KeyedStopRequestedReason)
+	return cb.stopBackgroundSession(agentID, sessionKey, func(pending int, surface KeyedSessionSurface) {
+		go func() {
+			m.handleKeyedTasksAbandoned(agentID, sessionKey, pending, KeyedStopRequestedReason, surface)
+			if surface != nil {
+				surface.Release()
+			}
+		}()
 	})
 }
 

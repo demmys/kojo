@@ -2675,9 +2675,19 @@ type OneShotOpts struct {
 	// process alive after the result while run_in_background tasks are still
 	// pending, so their completion is delivered as a keyed background turn to
 	// the handler registered via RegisterKeyedBackgroundHandler. Ignored when
-	// SessionKey is empty, the backend is not claude, or no handler is
-	// registered for the agent. Holder-local: never relayed to remote peers.
+	// SessionKey is empty, the backend is not claude, or neither a handler is
+	// registered for the agent nor KeyedSurface is set. Relayed to a remote
+	// holder only when it advertises keyedBackgroundV1 (the holder then binds
+	// a Hub-bound KeyedSurface).
 	LingerBackgroundTasks bool
+	// KeyedSurface binds the lingering keyed session to this surface instead
+	// of the agent-wide handler (Go-only; set by the holder's external-chat
+	// handler for the dispatching Hub).
+	KeyedSurface KeyedSessionSurface
+	// AttachBackgroundToken makes the router attach to the holder's buffered
+	// keyed background turn identified by this one-time token instead of
+	// starting a new turn (Hub side of the remote background continuation).
+	AttachBackgroundToken string
 }
 
 type HandoffArrivalReservation interface {
@@ -2888,7 +2898,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
 		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
-			prep.backend.Name() == ToolClaude && m.hasKeyedBackgroundHandler(agentID, sessionKey),
+			prep.backend.Name() == ToolClaude &&
+			(opts.KeyedSurface != nil || m.hasKeyedBackgroundHandler(agentID, sessionKey)),
+	}
+	if chatOpts.LingerBackgroundTasks {
+		chatOpts.KeyedSurface = opts.KeyedSurface
 	}
 	if chatOpts.LingerBackgroundTasks {
 		// Cheap per-turn awareness: pending notes for this key (tasks that
@@ -3112,6 +3126,14 @@ func (m *Manager) SteerOneShotFromOrigin(agentID, sessionKey, originPeerID, text
 	// lifetime registry before the backend call (Codex may wait up to 25s for
 	// turn readiness/ack); a replacement turn cannot redirect this closure.
 	m.oneShotCancelsMu.Unlock()
+	if !ok || fn == nil {
+		// A remote WebUI thread's keyed background turn is tracked with the
+		// dispatching Hub as origin (validated above) and steers like the
+		// local one.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
 	if !ok {
 		return ErrAgentNotBusy
 	}

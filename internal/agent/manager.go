@@ -272,6 +272,12 @@ type Manager struct {
 	oneShotQuestions map[int64]*oneShotQuestionTurn // guarded by oneShotCancelsMu
 	oneShotSteersMu  sync.Mutex
 
+	// keyedBgHandlers routes unsolicited turns from keyed (Slack-thread)
+	// lingering claude sessions to the response surface that owns the key.
+	keyedBgMu       sync.Mutex
+	keyedBgHandlers map[string]keyedBgRegistration
+	keyedBgSeq      int64
+
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
 	// owned by the auth subsystem; agent.Manager only calls into the
@@ -532,6 +538,11 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		// (post-result usage windows) — the in-turn path already taps it via
 		// the turn sink; this covers the no-sink idle case.
 		cb.SetRateLimitHandler(m.recordRateLimit)
+		// Keyed (Slack-thread) lingering sessions: their notification turns
+		// go to the registered per-agent response surface, never the main
+		// transcript / busy slot.
+		cb.SetKeyedBackgroundTurnHandler(m.handleKeyedBackgroundTurn)
+		cb.SetKeyedTasksAbandonedHandler(m.handleKeyedTasksAbandoned)
 	}
 
 	m.cron = newCronScheduler(m, logger)
@@ -2653,6 +2664,14 @@ type OneShotOpts struct {
 	// Runtime peers use the canonical Hub URL so Slack credentials stay on the
 	// Hub while the agent backend itself runs on the holder.
 	SlackMCPBaseURL string
+
+	// LingerBackgroundTasks opts a keyed claude turn into keeping its CLI
+	// process alive after the result while run_in_background tasks are still
+	// pending, so their completion is delivered as a keyed background turn to
+	// the handler registered via RegisterKeyedBackgroundHandler. Ignored when
+	// SessionKey is empty, the backend is not claude, or no handler is
+	// registered for the agent. Holder-local: never relayed to remote peers.
+	LingerBackgroundTasks bool
 }
 
 type HandoffArrivalReservation interface {
@@ -2825,6 +2844,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		var resetErr error
 		switch prep.backend.Name() {
 		case ToolClaude, ToolCustomClaude:
+			// A lingering keyed process still holds the discarded context
+			// (and would re-create the JSONL): close it first.
+			if cb, ok := prep.backend.(*ClaudeBackend); ok {
+				cb.CloseKeyedSessionSync(agentID, sessionKey, "新しいセッションで再開")
+			}
 			resetErr = resetClaudeSessionFilesStrict(agentID, sessionKey)
 		case ToolCodex, ToolCustomCodex:
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
@@ -2857,6 +2881,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		MCPServers:           prep.mcpServers,
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
+		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
+			prep.backend.Name() == ToolClaude && m.hasKeyedBackgroundHandler(agentID),
 	}
 	chatOpts.FreshSessionContext = opts.FreshSessionContext
 	chatOpts.ResumeSessionContext = opts.ResumeSessionContext

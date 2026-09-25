@@ -476,6 +476,14 @@ type ClaudeBackend struct {
 	// at construction; nil disables background-turn surfacing.
 	onBackgroundTurn BackgroundTurnFunc
 
+	// onKeyedBackgroundTurn receives unsolicited turns produced by a keyed
+	// (per-conversation, e.g. Slack thread) lingering session. They must never
+	// reach onBackgroundTurn (main transcript / busy slot). nil drops them.
+	onKeyedBackgroundTurn KeyedBackgroundTurnFunc
+	// onKeyedTasksAbandoned is told when a keyed session dies while the CLI
+	// still reported pending background tasks (best-effort user notice).
+	onKeyedTasksAbandoned func(agentID, sessionKey string, pending int, reason string)
+
 	// onSubagentActivity is invoked by a session's subagent tailer when a
 	// background subagent (Task run_in_background) emits output after the
 	// spawning turn already finalized. The Manager durably attaches it to the
@@ -513,6 +521,23 @@ func NewClaudeBackend(logger *slog.Logger) *ClaudeBackend {
 // unsolicited (background subagent notification) turns.
 func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
 	b.onBackgroundTurn = fn
+}
+
+// KeyedBackgroundTurnFunc surfaces an unsolicited turn from a keyed lingering
+// session to the Manager. Same channel/answer/abort contract as
+// BackgroundTurnFunc.
+type KeyedBackgroundTurnFunc func(agentID, sessionKey string, events <-chan ChatEvent, answer AnswerFunc, abort func())
+
+// SetKeyedBackgroundTurnHandler registers the Manager callback for unsolicited
+// turns on keyed lingering sessions.
+func (b *ClaudeBackend) SetKeyedBackgroundTurnHandler(fn KeyedBackgroundTurnFunc) {
+	b.onKeyedBackgroundTurn = fn
+}
+
+// SetKeyedTasksAbandonedHandler registers the Manager callback invoked when a
+// keyed session exits with background tasks still pending.
+func (b *ClaudeBackend) SetKeyedTasksAbandonedHandler(fn func(agentID, sessionKey string, pending int, reason string)) {
+	b.onKeyedTasksAbandoned = fn
 }
 
 // SetSubagentActivityHandler registers the Manager callback used to surface
@@ -564,6 +589,15 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// turns. OneShot/thread turns keep the per-turn spawn model below.
 	if persistentSessionsEnabled() && !b.ephemeral && !opts.OneShot && opts.SessionKey == "" {
 		return b.chatViaSession(ctx, agent, userMessage, systemPrompt, opts)
+	}
+	// Keyed lingering session (Slack thread turns that opted in): runs on a
+	// live process that survives the turn's result only while background
+	// tasks are pending. handled=false (per-agent cap reached) falls through
+	// to the legacy per-turn spawn below.
+	if persistentSessionsEnabled() && !b.ephemeral && !opts.OneShot && opts.SessionKey != "" && opts.LingerBackgroundTasks {
+		if ch, handled, err := b.chatViaKeyedSession(ctx, agent, userMessage, systemPrompt, opts); handled {
+			return ch, err
+		}
 	}
 
 	claudePath, err := exec.LookPath("claude")
@@ -1594,6 +1628,29 @@ type claudeStreamEvent struct {
 	Origin *struct {
 		Kind string `json:"kind,omitempty"`
 	} `json:"origin,omitempty"`
+
+	// Tasks is the FULL set of still-running background tasks carried by a
+	// system/background_tasks_changed event (REPLACE semantics: an empty
+	// list means nothing is pending any more). Only meaningful on that
+	// subtype; see backgroundTaskCount.
+	Tasks []claudeBackgroundTask `json:"tasks,omitempty"`
+}
+
+// claudeBackgroundTask is one entry of a background_tasks_changed event.
+type claudeBackgroundTask struct {
+	TaskID      string `json:"task_id,omitempty"`
+	TaskType    string `json:"task_type,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// backgroundTaskCount reports the number of pending background tasks when e
+// is a system/background_tasks_changed event. The list replaces any earlier
+// snapshot wholesale, so the count is the new pending total (0 = none).
+func backgroundTaskCount(e claudeStreamEvent) (int, bool) {
+	if e.Type != "system" || e.Subtype != "background_tasks_changed" {
+		return 0, false
+	}
+	return len(e.Tasks), true
 }
 
 // claudeModelUsage is one entry of the "result" event's modelUsage map:

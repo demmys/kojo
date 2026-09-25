@@ -360,6 +360,8 @@ func (b *Bot) Run() {
 	}
 	b.botUserID = authResp.UserID
 	b.logger.Info("slack bot connected", "botUser", b.botUserID, "team", authResp.Team)
+	unregisterKeyed := b.registerKeyedBackground()
+	defer unregisterKeyed()
 
 	go func() {
 		if err := b.sm.RunContext(ctx); err != nil && ctx.Err() == nil {
@@ -1147,6 +1149,7 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		ExpectedHolderPeer:                expectedHolder,
 		HandoffArrivalReservation:         arrivalReservation,
 		PreserveTerminalOnCancel:          true,
+		LingerBackgroundTasks:             true,
 	})
 	if err != nil {
 		b.clearAssistantStatus(ctx, channel, threadTS)
@@ -1159,6 +1162,49 @@ func (b *Bot) sendToAgentTurnReserved(ctx context.Context, channel, origThreadTS
 		return
 	}
 
+	b.deliverAgentTurn(ctx, slackTurnDelivery{
+		channel:            channel,
+		threadTS:           threadTS,
+		messageTS:          messageTS,
+		text:               text,
+		displayName:        displayName,
+		userID:             userID,
+		sessionKey:         sessionKey,
+		turnCtx:            turnCtx,
+		turnCancel:         turnCancel,
+		active:             active,
+		arrivalReservation: arrivalReservation,
+		userTurn:           true,
+	}, events)
+}
+
+// slackTurnDelivery is the per-turn context deliverAgentTurn needs to stream,
+// finalize, and record an agent turn in a Slack thread.
+type slackTurnDelivery struct {
+	channel, threadTS   string
+	messageTS, text     string // triggering user message ("" for background turns)
+	displayName, userID string
+	sessionKey          string
+	turnCtx             context.Context
+	turnCancel          context.CancelFunc
+	active              *activeTurn
+	arrivalReservation  *slackHandoffReservation // nil for background turns
+	userTurn            bool                     // a user message triggered this turn (history bookkeeping)
+}
+
+// deliverAgentTurn consumes an agent event stream and delivers it into the
+// Slack thread: live streaming, NO_REPLY suppression, final chat.update /
+// batch post, dead-stream cleanup, and bot-reply history. Shared by ordinary
+// user turns and keyed background (task-notification) turns.
+func (b *Bot) deliverAgentTurn(ctx context.Context, d slackTurnDelivery, events <-chan agent.ChatEvent) {
+	channel, threadTS := d.channel, d.threadTS
+	messageTS, text, displayName, userID := d.messageTS, d.text, d.displayName, d.userID
+	sessionKey, turnCtx, active, arrivalReservation := d.sessionKey, d.turnCtx, d.active, d.arrivalReservation
+	turnCancel := d.turnCancel
+	_ = ctx
+	// backgroundPending is the number of run_in_background tasks still
+	// running when the turn ended on a lingering keyed session.
+	backgroundPending := 0
 	var response strings.Builder       // full response text
 	var pendingDelta strings.Builder   // text not yet flushed via AppendStream
 	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
@@ -1459,6 +1505,7 @@ streamLoop:
 			if evt.Message != nil {
 				terminalContent = evt.Message.Content
 			}
+			backgroundPending = evt.BackgroundTasksPending
 		}
 	}
 	// The model stream has ended. Remove the active entry before Slack
@@ -1524,7 +1571,9 @@ streamLoop:
 		failedSuperseded := append([]string(nil), failedSupersededStreams...)
 		failedSupersededMu.Unlock()
 		b.discardSuppressedStreams(channel, streamTS, append(deadStreams, failedSuperseded...))
-		b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		if d.userTurn {
+			b.ensureUserTurnInHistory(channel, threadTS, messageTS, text, displayName, userID)
+		}
 		clearCtx, clearCancel := context.WithTimeout(context.Background(), finalizeShortTimeout)
 		b.clearAssistantStatus(clearCtx, channel, threadTS)
 		clearCancel()
@@ -1537,6 +1586,20 @@ streamLoop:
 		response.Reset()
 		pendingDelta.Reset()
 		hasError = true
+	}
+
+	// The CLI process lingers for still-running background tasks: tell the
+	// thread a follow-up will be posted here when they finish.
+	if backgroundPending > 0 && completedCleanly && !hasError && !stopped {
+		note := backgroundPendingNote(backgroundPending)
+		sep := ""
+		if response.Len() > 0 {
+			sep = "\n\n"
+		}
+		response.WriteString(sep + note)
+		if streamTS != "" {
+			pendingDelta.WriteString(sep + note)
+		}
 	}
 
 	// Flush any remaining text delta before finalizing. If the final

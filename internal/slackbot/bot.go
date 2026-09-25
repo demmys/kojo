@@ -1569,7 +1569,7 @@ streamLoop:
 		if raw := rawResponse.String(); raw != "" && strings.HasPrefix(terminalContent, raw) {
 			tail := terminalContent[len(raw):]
 			separated := response.String()
-			if segmentBoundary {
+			if segmentBoundary && tail != "" {
 				// The segment after the last tool never streamed.
 				separated += textSegmentSeparator(separated, tail)
 			}

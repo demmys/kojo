@@ -1566,7 +1566,9 @@ streamLoop:
 	// matches what was streamed (optionally plus an undelivered tail), keep the
 	// separated form so segments written around tool calls stay readable.
 	if terminalContent != "" && terminalContent != response.String() {
-		if raw := rawResponse.String(); raw != "" && strings.HasPrefix(terminalContent, raw) {
+		raw := rawResponse.String()
+		switch {
+		case raw != "" && strings.HasPrefix(terminalContent, raw):
 			tail := terminalContent[len(raw):]
 			separated := response.String()
 			if segmentBoundary && tail != "" {
@@ -1576,7 +1578,13 @@ streamLoop:
 			separated += tail
 			response.Reset()
 			response.WriteString(separated)
-		} else {
+		case raw != "" && strings.HasSuffix(terminalContent, raw):
+			// The backend prepended text that never streamed (an earlier
+			// assistant message merged ahead of this turn's deltas).
+			separated := terminalContent[:len(terminalContent)-len(raw)] + response.String()
+			response.Reset()
+			response.WriteString(separated)
+		default:
 			response.Reset()
 			response.WriteString(terminalContent)
 		}

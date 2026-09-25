@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -22,6 +23,25 @@ type KeyedBackgroundHandler interface {
 	// while `pending` background tasks were still running (best-effort
 	// notice; their completion will never arrive).
 	KeyedBackgroundTasksAbandoned(agentID, sessionKey string, pending int, reason string)
+}
+
+// KeyedSessionSurface is a response surface bound to one keyed lingering
+// session for its lifetime, taking precedence over the agent-wide handler
+// resolution. A remote holder binds one per Hub dispatch so the session's
+// background turns and abandoned notices go back to that Hub. Retain/Release
+// refcount the surface's credentials (e.g. the Hub file relay): the session
+// holds a reference while bound and releases it after its exit notice.
+type KeyedSessionSurface interface {
+	// HandleKeyedSessionTurn is HandleKeyedBackgroundTurn with the turn's
+	// lifecycle context (cancelled by reset / delete / shutdown / handoff
+	// quiesce), so the surface can stop waiting on remote I/O promptly.
+	HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func())
+	KeyedBackgroundTasksAbandoned(agentID, sessionKey string, pending int, reason string)
+	// OriginPeerID is the peer allowed to steer the surface's background
+	// turns ("" for none / unsafe local mode).
+	OriginPeerID() string
+	Retain()
+	Release()
 }
 
 // keyedBackgroundCtxHandler is implemented by in-package handlers (the
@@ -122,13 +142,19 @@ func (m *Manager) keyedBgSteerFor(sessionKey string) SteerFunc {
 // the main transcript, the busy slot, or the broadcaster: the turn belongs to
 // the thread. It is tracked as a one-shot so reset/delete/shutdown
 // drains (cancelOneShots/waitOneShotClear) see and can cancel it.
-func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, _ AnswerFunc, abort func(), steer SteerFunc) {
+func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, _ AnswerFunc, abort func(), steer SteerFunc, surface KeyedSessionSurface) {
 	drain := func() {
 		for range events {
 		}
 	}
-	h := m.keyedBackgroundHandler(agentID, sessionKey)
-	if h == nil {
+	var h KeyedBackgroundHandler
+	origin := ""
+	if surface != nil {
+		origin = surface.OriginPeerID()
+	} else {
+		h = m.keyedBackgroundHandler(agentID, sessionKey)
+	}
+	if h == nil && surface == nil {
 		m.logger.Info("keyed background turn discarded: no handler", "agent", agentID, "sessionKey", sessionKey)
 		drain()
 		return
@@ -155,7 +181,7 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 		drain()
 		return
 	}
-	osID := m.trackOneShot(agentID, entryCancel, sessionKey, "", "")
+	osID := m.trackOneShot(agentID, entryCancel, sessionKey, origin, "")
 	m.busyMu.Unlock()
 	// Untracked only after the handler has finished posting, so a reset /
 	// delete drain (waitOneShotClear) cannot complete while a reply is still
@@ -177,7 +203,9 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 		defer cancel()
 		m.processOneShotEvents(ctx, agentID, backendCh, out, true)
 	}()
-	if hc, ok := h.(keyedBackgroundCtxHandler); ok {
+	if surface != nil {
+		surface.HandleKeyedSessionTurn(lifeCtx, agentID, sessionKey, out, entryCancel)
+	} else if hc, ok := h.(keyedBackgroundCtxHandler); ok {
 		hc.handleKeyedBackgroundTurnCtx(lifeCtx, agentID, sessionKey, out, entryCancel)
 	} else {
 		h.HandleKeyedBackgroundTurn(agentID, sessionKey, out, entryCancel)
@@ -192,15 +220,25 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 // to the owning surface and leaves a one-time note for the agent's next turn
 // on that key, so the agent learns its tasks never completed (an explicit
 // stop requested through the background-sessions API needs no note).
-func (m *Manager) handleKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string) {
+func (m *Manager) handleKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string, surface KeyedSessionSurface) {
 	if pending > 0 && reason != KeyedStopRequestedReason {
 		m.setKeyedNote(agentID, sessionKey, fmt.Sprintf(
 			"[kojo] 前回このスレッドのターン終了後も実行中だったバックグラウンドタスク%d件は、完了前に終了しました（%s）。その結果は届きません。必要なら再実行してください。",
 			pending, reason))
 	}
+	if surface != nil {
+		surface.KeyedBackgroundTasksAbandoned(agentID, sessionKey, pending, reason)
+		return
+	}
 	if h := m.keyedBackgroundHandler(agentID, sessionKey); h != nil {
 		h.KeyedBackgroundTasksAbandoned(agentID, sessionKey, pending, reason)
 	}
+}
+
+// SetKeyedBackgroundNote leaves a one-time note for the agent's next turn on
+// the key (e.g. a background turn whose result could not be delivered).
+func (m *Manager) SetKeyedBackgroundNote(agentID, sessionKey, note string) {
+	m.setKeyedNote(agentID, sessionKey, note)
 }
 
 func keyedNoteKey(agentID, sessionKey string) string {
@@ -223,4 +261,67 @@ func (m *Manager) popKeyedNote(agentID, sessionKey string) string {
 	note := m.keyedNotes[k]
 	delete(m.keyedNotes, k)
 	return note
+}
+
+// ErrNoKeyedBackgroundSurface: this node has no response surface for the key.
+var ErrNoKeyedBackgroundSurface = errors.New("no keyed background surface for the session key")
+
+// RemoteKeyedTurnOpener attaches to a remote holder's buffered keyed
+// background turn. responseGroupID/responseMessageID are set for WebUI
+// threads so the holder captures response attachments for the reply the Hub
+// posts; cancelling ctx aborts the holder's turn.
+type RemoteKeyedTurnOpener func(ctx context.Context, responseGroupID, responseMessageID string) (<-chan ChatEvent, error)
+
+// HasKeyedBackgroundSurface reports whether this node (the Hub) owns a
+// response surface for sessionKey: a live WebUI thread room of the agent or
+// the agent's registered keyed handler (the Slack bot).
+func (m *Manager) HasKeyedBackgroundSurface(agentID, sessionKey string) bool {
+	if groupID, ok := strings.CutPrefix(sessionKey, webUIThreadKeyPrefix); ok {
+		return groupID != "" && m.groupdms != nil && m.groupdms.liveAgentThread(groupID, agentID)
+	}
+	return m.hasKeyedBackgroundHandler(agentID, sessionKey)
+}
+
+// DeliverRemoteKeyedBackgroundTurn runs a remote holder's keyed background
+// turn through this node's response surface (the same surfaces and FIFOs a
+// Hub-local lingering session uses). It blocks until the turn was posted.
+func (m *Manager) DeliverRemoteKeyedBackgroundTurn(agentID, sessionKey string, open RemoteKeyedTurnOpener) error {
+	if isWebUIThreadKey(sessionKey) {
+		if m.groupdms == nil {
+			return ErrNoKeyedBackgroundSurface
+		}
+		return m.groupdms.deliverRemoteKeyedBackgroundTurn(agentID, sessionKey, open)
+	}
+	h := m.keyedBackgroundHandler(agentID, sessionKey)
+	if h == nil {
+		return ErrNoKeyedBackgroundSurface
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events, err := open(ctx, "", "")
+	if err != nil {
+		return err
+	}
+	h.HandleKeyedBackgroundTurn(agentID, sessionKey, events, cancel)
+	for range events {
+	}
+	return nil
+}
+
+// DeliverRemoteKeyedTasksAbandoned posts a remote holder's abandoned / stop
+// notice into this node's response surface for the key.
+func (m *Manager) DeliverRemoteKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string) {
+	if h := m.keyedBackgroundHandler(agentID, sessionKey); h != nil {
+		h.KeyedBackgroundTasksAbandoned(agentID, sessionKey, pending, reason)
+	}
+}
+
+// CaptureKeyedBackgroundAttachments wraps a keyed background turn stream
+// (holder side of a remote WebUI thread) with holder-local capture of the
+// files staged for the thread reply messageID, like a remote thread turn's
+// ResponseAttachmentGroupID/MessageID capture.
+func (m *Manager) CaptureKeyedBackgroundAttachments(ctx context.Context, agentID, groupID, messageID string, events <-chan ChatEvent) <-chan ChatEvent {
+	stageDir := threadAttachmentStageDir(agentID, groupID)
+	watcher := m.watchAndStreamAttachmentsFromDir(ctx, agentID, messageID, stageDir)
+	return m.captureOneShotResponseAttachments(ctx, agentID, messageID, stageDir, events, watcher)
 }

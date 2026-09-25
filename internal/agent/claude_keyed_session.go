@@ -90,8 +90,14 @@ func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, f
 			return nil
 		}
 		agentID, key := s.agentID, s.sessionKey
+		// Pin the bound surface (and its credentials) for the turn's duration:
+		// a racing exit must not revoke them while the turn is delivered.
+		surface := s.retainSurface()
 		return func(events <-chan ChatEvent, answer AnswerFunc, abort func(), steer SteerFunc) {
-			fn(agentID, key, events, answer, abort, steer)
+			if surface != nil {
+				defer surface.Release()
+			}
+			fn(agentID, key, events, answer, abort, steer, surface)
 		}
 	}
 	fn := s.b.onBackgroundTurn
@@ -102,6 +108,52 @@ func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, f
 	return func(events <-chan ChatEvent, answer AnswerFunc, abort func(), _ SteerFunc) {
 		fn(agentID, events, answer, abort)
 	}
+}
+
+// bindSurface binds sf (nil: agent-wide handler resolution) to the keyed
+// session, taking a reference for as long as it stays bound. The previously
+// bound surface is released. A session that already exited releases sf
+// right away.
+func (s *claudeSession) bindSurface(sf KeyedSessionSurface) {
+	if sf != nil {
+		sf.Retain()
+	}
+	s.surfaceMu.Lock()
+	if s.surfaceDone {
+		s.surfaceMu.Unlock()
+		if sf != nil {
+			sf.Release()
+		}
+		return
+	}
+	old := s.surface
+	s.surface = sf
+	s.surfaceMu.Unlock()
+	if old != nil {
+		old.Release()
+	}
+}
+
+// retainSurface returns the bound surface with an extra reference (the caller
+// must Release it), or nil.
+func (s *claudeSession) retainSurface() KeyedSessionSurface {
+	s.surfaceMu.Lock()
+	defer s.surfaceMu.Unlock()
+	if s.surface != nil {
+		s.surface.Retain()
+	}
+	return s.surface
+}
+
+// takeSurfaceAtExit detaches the bound surface at process exit. The caller
+// owns the session's reference and must Release it.
+func (s *claudeSession) takeSurfaceAtExit() KeyedSessionSurface {
+	s.surfaceMu.Lock()
+	defer s.surfaceMu.Unlock()
+	s.surfaceDone = true
+	sf := s.surface
+	s.surface = nil
+	return sf
 }
 
 // onBackgroundTasksChanged records a background_tasks_changed snapshot
@@ -497,6 +549,9 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 			msg = injectRecentMessagesContext(msg, opts.RecentMessagesContext)
 		}
 
+		// Bind before the turn starts so an exit racing a very short turn
+		// (e.g. the linger cap closing it) already reports to this surface.
+		sess.bindSurface(opts.KeyedSurface)
 		ch, err := sess.startTurn(ctx, agent, msg, canAnswer, opts.AutomatedTrigger)
 		if err == nil {
 			if opts.OnSteerReady != nil {
@@ -554,4 +609,59 @@ func (b *ClaudeBackend) HasKeyedSession(agentID, sessionKey string) bool {
 	defer b.sessMu.Unlock()
 	_, ok := b.sessions[keyedPoolKey(agentID, sessionKey)]
 	return ok
+}
+
+func (b *ClaudeBackend) beginKeyedExitNotice(agentID string) {
+	if b == nil {
+		return
+	}
+	b.exitNoticeMu.Lock()
+	if b.exitNotices == nil {
+		b.exitNotices = make(map[string]int)
+	}
+	b.exitNotices[agentID]++
+	b.exitNoticeMu.Unlock()
+}
+
+func (b *ClaudeBackend) endKeyedExitNotice(agentID string) {
+	if b == nil {
+		return
+	}
+	b.exitNoticeMu.Lock()
+	if b.exitNotices[agentID] <= 1 {
+		delete(b.exitNotices, agentID)
+	} else {
+		b.exitNotices[agentID]--
+	}
+	b.exitNoticeMu.Unlock()
+}
+
+// waitKeyedExitNotices waits (bounded) until every exited keyed session of
+// the agent finished its exit handling (abandoned notice delivered, surface
+// released). Returns false on timeout.
+func (b *ClaudeBackend) waitKeyedExitNotices(agentID string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		b.exitNoticeMu.Lock()
+		n := b.exitNotices[agentID]
+		b.exitNoticeMu.Unlock()
+		if n == 0 {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// WaitKeyedExitNotices is waitKeyedExitNotices for the agent's claude
+// backend. The device-switch source calls it after closing the sessions so
+// abandoned notices reach the Hub while this peer still holds the lock.
+func (m *Manager) WaitKeyedExitNotices(agentID string, timeout time.Duration) bool {
+	cb := m.claudeBackend()
+	if cb == nil {
+		return true
+	}
+	return cb.waitKeyedExitNotices(agentID, timeout)
 }

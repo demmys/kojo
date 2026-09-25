@@ -117,7 +117,7 @@ func TestLingerCapFullClosesAtTurnEndWithNotice(t *testing.T) {
 		reason  string
 	}
 	abandonedCh := make(chan abandonedCall, 4)
-	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string) {
+	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string, _ KeyedSessionSurface) {
 		abandonedCh <- abandonedCall{key, pending, reason}
 	}
 	fillLingerSlots(b, maxLingeringSessionsPerAgent)
@@ -179,7 +179,7 @@ func TestKeyedTurnNote(t *testing.T) {
 	if got := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); got != "" {
 		t.Fatalf("note with nothing lingering = %q", got)
 	}
-	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_1", 2, lingerCapReason())
+	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_1", 2, lingerCapReason(), nil)
 	fillLingerSlots(b, 3)
 	got := m.keyedTurnNote("test-agent", "groupdm:gd_1", b)
 	for _, want := range []string{"バックグラウンドタスク2件は、完了前に終了", lingerCapReason(), "スレッドが3件", "/api/v1/agents/test-agent/background-sessions"} {
@@ -199,7 +199,7 @@ func TestKeyedTurnNote(t *testing.T) {
 		t.Errorf("cap-full warning missing: %q", full)
 	}
 	// An explicit stop leaves no note.
-	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_2", 1, KeyedStopRequestedReason)
+	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_2", 1, KeyedStopRequestedReason, nil)
 	if note := m.popKeyedNote("test-agent", "groupdm:gd_2"); note != "" {
 		t.Errorf("stop request left a note: %q", note)
 	}
@@ -221,7 +221,7 @@ func TestListAndStopBackgroundSessions(t *testing.T) {
 	m, b := newBgSessionsTestManager(t)
 	var mu sync.Mutex
 	var abandoned []string
-	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string) {
+	b.onKeyedTasksAbandoned = func(agentID, key string, pending int, reason string, _ KeyedSessionSurface) {
 		mu.Lock()
 		abandoned = append(abandoned, fmt.Sprintf("%s|%d|%s", key, pending, reason))
 		mu.Unlock()
@@ -381,7 +381,7 @@ func TestWebUIThreadBackgroundTurnPostsIntoRoom(t *testing.T) {
 	events <- ChatEvent{Type: "text", Delta: "bg finished"}
 	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "bg finished"}}
 	close(events)
-	mgr.handleKeyedBackgroundTurn("ag_alice", key, events, nil, nil, nil)
+	mgr.handleKeyedBackgroundTurn("ag_alice", key, events, nil, nil, nil, nil)
 	msg := waitForMessage(t, gdm, groupID, "bg finished")
 	if msg.AgentID != "ag_alice" {
 		t.Fatalf("author = %q", msg.AgentID)
@@ -392,7 +392,7 @@ func TestWebUIThreadBackgroundTurnPostsIntoRoom(t *testing.T) {
 	events <- ChatEvent{Type: "text", Delta: "one done"}
 	events <- ChatEvent{Type: "done", BackgroundTasksPending: 1, Message: &Message{Role: "assistant", Content: "one done"}}
 	close(events)
-	mgr.handleKeyedBackgroundTurn("ag_alice", key, events, nil, nil, nil)
+	mgr.handleKeyedBackgroundTurn("ag_alice", key, events, nil, nil, nil, nil)
 	waitForMessage(t, gdm, groupID, "one done\n\n"+threadBackgroundPendingNote(1))
 }
 
@@ -464,12 +464,12 @@ func TestThreadTurnBackgroundPendingNoteAndSteer(t *testing.T) {
 
 func TestWebUIThreadAbandonedNotice(t *testing.T) {
 	gdm, mgr, groupID := setupBgThread(t)
-	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 2, lingerCapReason())
+	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 2, lingerCapReason(), nil)
 	waitForMessage(t, gdm, groupID, threadBackgroundAbandonedNote(2, lingerCapReason()))
 	if note := mgr.popKeyedNote("ag_alice", "groupdm:"+groupID); !strings.Contains(note, "2件") {
 		t.Fatalf("agent note = %q", note)
 	}
-	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 1, KeyedStopRequestedReason)
+	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 1, KeyedStopRequestedReason, nil)
 	waitForMessage(t, gdm, groupID, threadBackgroundAbandonedNote(1, KeyedStopRequestedReason))
 }
 
@@ -489,7 +489,7 @@ func TestWebUIThreadBackgroundTurnLifecycleCancelPostsNothing(t *testing.T) {
 			case aborted <- struct{}{}:
 			default:
 			}
-		}, nil)
+		}, nil, nil)
 	}()
 	events <- ChatEvent{Type: "text", Delta: "partial"}
 	waitFor(t, "background turn tracked", func() bool { return oneShotCount(mgr, "ag_alice") > 0 })

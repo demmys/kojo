@@ -64,6 +64,40 @@ func (m *GroupDMManager) handleKeyedBackgroundTurnCtx(parent context.Context, ag
 		abort()
 		return
 	}
+	// A lingering keyed session only exists on the node running the agent, so
+	// files the background turn stages are captured locally.
+	m.runKeyedBackgroundTurn(parent, agentID, groupID, events, abort, generateGroupMessageID(), false)
+}
+
+// deliverRemoteKeyedBackgroundTurn posts a remote holder's keyed background
+// turn into the thread (Hub side). The holder captures response attachments
+// for replyMessageID itself, exactly like a remote thread turn.
+func (m *GroupDMManager) deliverRemoteKeyedBackgroundTurn(agentID, sessionKey string, open RemoteKeyedTurnOpener) error {
+	groupID, ok := strings.CutPrefix(sessionKey, webUIThreadKeyPrefix)
+	if !ok || groupID == "" || !m.liveAgentThread(groupID, agentID) {
+		return ErrNoKeyedBackgroundSurface
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	replyMessageID := generateGroupMessageID()
+	// Attach before waiting for the thread FIFO: the holder's turn is already
+	// running and its stream must be drained promptly.
+	events, err := open(ctx, groupID, replyMessageID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for range events {
+		}
+	}()
+	m.runKeyedBackgroundTurn(context.Background(), agentID, groupID, events, cancel, replyMessageID, true)
+	return nil
+}
+
+// runKeyedBackgroundTurn waits for the thread FIFO and posts the background
+// turn's result. holderCapture: response attachments are captured by the
+// remote holder, so no local stage-dir watcher runs.
+func (m *GroupDMManager) runKeyedBackgroundTurn(parent context.Context, agentID, groupID string, events <-chan ChatEvent, abort func(), replyMessageID string, holderCapture bool) {
 	reservation := m.threadTurns.Reserve(groupID)
 	defer reservation.Release()
 	reservation.Wait()
@@ -100,11 +134,11 @@ func (m *GroupDMManager) handleKeyedBackgroundTurnCtx(parent context.Context, ag
 	m.startThreadLive(groupID, agentModel, agentEffort)
 	defer m.endThreadLive(groupID)
 
-	// A lingering keyed session only exists on the node running the agent, so
-	// files the background turn stages are captured locally.
-	replyMessageID := generateGroupMessageID()
 	attachmentStageDir := threadAttachmentStageDir(agentID, groupID)
-	attachmentWatcher := m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
+	var attachmentWatcher *attachWatcher
+	if !holderCapture {
+		attachmentWatcher = m.agentMgr.watchAndStreamAttachmentsFromDir(ctx, agentID, replyMessageID, attachmentStageDir)
+	}
 	m.consumeThreadTurn(ctx, events, threadTurnOutput{
 		agentID:            agentID,
 		groupID:            groupID,

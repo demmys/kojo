@@ -43,6 +43,13 @@ func (m *GroupDMManager) liveAgentThread(groupID, agentID string) bool {
 // rooms: it waits for the room's thread FIFO, exposes the turn as the room's
 // live/stoppable turn, and posts the result daemon-authored.
 func (m *GroupDMManager) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, cancel func()) {
+	m.handleKeyedBackgroundTurnCtx(context.Background(), agentID, sessionKey, events, cancel)
+}
+
+// handleKeyedBackgroundTurnCtx is HandleKeyedBackgroundTurn with the turn's
+// lifecycle context: when parent is cancelled (reset / delete / shutdown) the
+// turn is treated like an archive cancel — nothing is posted.
+func (m *GroupDMManager) handleKeyedBackgroundTurnCtx(parent context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func()) {
 	defer func() {
 		for range events {
 		}
@@ -65,7 +72,11 @@ func (m *GroupDMManager) HandleKeyedBackgroundTurn(agentID, sessionKey string, e
 		return
 	}
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
+	if parent.Err() != nil {
+		abort()
+		return
+	}
+	ctx, ctxCancel := context.WithCancel(parent)
 	defer ctxCancel()
 	m.threadCancelMu.Lock()
 	m.threadCancels[groupID] = func() {

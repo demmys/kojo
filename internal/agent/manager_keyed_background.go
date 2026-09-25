@@ -24,6 +24,14 @@ type KeyedBackgroundHandler interface {
 	KeyedBackgroundTasksAbandoned(agentID, sessionKey string, pending int, reason string)
 }
 
+// keyedBackgroundCtxHandler is implemented by in-package handlers (the
+// GroupDMManager) that also want the turn's lifecycle context: it is cancelled
+// when the tracked one-shot is cancelled (reset / delete / shutdown), so the
+// handler can discard instead of posting a partial reply.
+type keyedBackgroundCtxHandler interface {
+	handleKeyedBackgroundTurnCtx(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func())
+}
+
 type keyedBgRegistration struct {
 	id int64
 	h  KeyedBackgroundHandler
@@ -125,9 +133,14 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 		drain()
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	// lifeCtx is cancelled only by the tracked one-shot's cancel (reset /
+	// delete / shutdown / explicit abort), never by normal completion, so the
+	// handler can tell a lifecycle cancel from a finished stream.
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+	defer lifeCancel()
+	ctx, cancel := context.WithCancel(lifeCtx)
 	entryCancel := func() {
-		cancel()
+		lifeCancel()
 		if abort != nil {
 			// Async: cancelOneShots callers may hold locks; abort writes to
 			// the CLI stdin and is identity-guarded by the session.
@@ -144,6 +157,10 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	}
 	osID := m.trackOneShot(agentID, entryCancel, sessionKey, "", "")
 	m.busyMu.Unlock()
+	// Untracked only after the handler has finished posting, so a reset /
+	// delete drain (waitOneShotClear) cannot complete while a reply is still
+	// being written into the thread.
+	defer m.untrackOneShot(agentID, osID)
 	if steer != nil && isWebUIThreadKey(sessionKey) {
 		// A WebUI thread message typed while the notification turn streams is
 		// steered into it (Slack keeps its FIFO follow-up semantics).
@@ -158,10 +175,13 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	go func() {
 		defer close(out)
 		defer cancel()
-		defer m.untrackOneShot(agentID, osID)
 		m.processOneShotEvents(ctx, agentID, backendCh, out, true)
 	}()
-	h.HandleKeyedBackgroundTurn(agentID, sessionKey, out, entryCancel)
+	if hc, ok := h.(keyedBackgroundCtxHandler); ok {
+		hc.handleKeyedBackgroundTurnCtx(lifeCtx, agentID, sessionKey, out, entryCancel)
+	} else {
+		h.HandleKeyedBackgroundTurn(agentID, sessionKey, out, entryCancel)
+	}
 	// The handler contract is to consume until close; drain defensively so
 	// the relay goroutine (and the session's readLoop behind it) never wedge.
 	for range out {

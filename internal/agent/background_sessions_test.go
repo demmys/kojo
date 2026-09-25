@@ -472,3 +472,51 @@ func TestWebUIThreadAbandonedNotice(t *testing.T) {
 	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 1, KeyedStopRequestedReason)
 	waitForMessage(t, gdm, groupID, threadBackgroundAbandonedNote(1, KeyedStopRequestedReason))
 }
+
+// A lifecycle cancel (reset / delete / shutdown cancelling the tracked
+// one-shot) discards the background turn instead of posting its partial
+// output, and the one-shot stays tracked until the handler is done.
+func TestWebUIThreadBackgroundTurnLifecycleCancelPostsNothing(t *testing.T) {
+	gdm, mgr, groupID := setupBgThread(t)
+	key := "groupdm:" + groupID
+	events := make(chan ChatEvent, 4)
+	aborted := make(chan struct{}, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		mgr.handleKeyedBackgroundTurn("ag_alice", key, events, nil, func() {
+			select {
+			case aborted <- struct{}{}:
+			default:
+			}
+		}, nil)
+	}()
+	events <- ChatEvent{Type: "text", Delta: "partial"}
+	waitFor(t, "background turn tracked", func() bool { return oneShotCount(mgr, "ag_alice") > 0 })
+	mgr.cancelOneShots("ag_alice")
+	select {
+	case <-aborted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("lifecycle cancel did not abort the CLI turn")
+	}
+	// The CLI answers the interrupt with a terminal event.
+	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "partial"}}
+	close(events)
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("background turn did not finish")
+	}
+	if oneShotCount(mgr, "ag_alice") > 0 {
+		t.Fatal("one-shot still tracked after the handler returned")
+	}
+	if msgs := agentMessages(t, gdm, groupID); len(msgs) != 0 {
+		t.Fatalf("lifecycle-cancelled background turn posted %d messages: %q", len(msgs), msgs[0].Content)
+	}
+}
+
+func oneShotCount(m *Manager, agentID string) int {
+	m.oneShotCancelsMu.Lock()
+	defer m.oneShotCancelsMu.Unlock()
+	return len(m.oneShotCancels[agentID])
+}

@@ -123,6 +123,18 @@ type claudeSession struct {
 	closing       bool        // close initiated; a new turn must wait + respawn
 	closeReason   string      // why the keyed session was closed (for the abandoned notice)
 	procAborted   bool        // the solicited keyed turn's ctx was cancelled and the process killed
+	// lingerSlot: this session holds one of the agent's linger slots
+	// (ClaudeBackend.lingerSlots) because it outlived a turn with tasks
+	// pending. lingerSince is when the slot was taken.
+	lingerSlot  bool
+	lingerSince time.Time
+	// pendingAtClose is the pending task count when the close was claimed
+	// (reported as abandoned even if the CLI clears its list while exiting).
+	pendingAtClose int
+	// tasks is the latest background_tasks_changed snapshot; taskSeen keeps
+	// each task's first-seen time across snapshots (background-session API).
+	tasks    []claudeBackgroundTask
+	taskSeen map[string]time.Time
 }
 
 // sessionSend delivers e to the turn sink, but never blocks the shared
@@ -584,7 +596,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 				// including any background tasks (a stop is a stop).
 				s.mu.Lock()
 				s.procAborted = true
-				s.closing = true
+				s.setClosingLocked()
 				if s.closeReason == "" {
 					s.closeReason = "turn cancelled"
 				}
@@ -764,8 +776,8 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 		// notification result nonetheless arrives during a solicited turn.
 		notifResult := event.Type == "result" && event.Origin != nil && event.Origin.Kind == "task-notification"
 
-		if n, ok := backgroundTaskCount(event); ok {
-			s.onBackgroundTasksChanged(n)
+		if _, ok := backgroundTaskCount(event); ok {
+			s.onBackgroundTasksChanged(event.Tasks)
 		}
 
 		s.mu.Lock()
@@ -885,10 +897,12 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	s.turnSink = sink
 	s.turnCtx = context.Background()
 	s.turnDone = make(chan struct{})
+	var bgSteer SteerFunc
 	if s.keyed {
 		// Keyed sessions accept a user message arriving mid-notification-turn
 		// as a steer (see steerIntoUnsolicited); give the turn its own gate.
 		s.turnSteer = &claudeTurnSteer{stdinW: s.stdinW}
+		bgSteer = s.turnSteer.writeUserLine
 	}
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
@@ -949,7 +963,7 @@ func (s *claudeSession) openUnsolicitedLocked() {
 			abortWorker()
 		}
 	}
-	go handler(sink, s.qstate.answer, abort)
+	go handler(sink, s.qstate.answer, abort, bgSteer)
 	// Queued-steer reaper: this unsolicited turn is (within the deadline)
 	// the CLI auto-consuming a steer line queued behind an aborted turn.
 	// Interrupt it immediately — the operator already said stop. The
@@ -986,7 +1000,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	})
 	// nil abort: the absorbed notification is already complete — there is
 	// nothing running on the CLI to interrupt.
-	go handler(sink, s.qstate.answer, nil)
+	go handler(sink, s.qstate.answer, nil, nil)
 	acc.feed(event, rawParent)
 	res := acc.finalize()
 	turnUsage := s.turnUsageDelta(res)
@@ -1198,8 +1212,12 @@ func (s *claudeSession) onEOF() {
 	procAborted := s.procAborted
 	if s.keyed {
 		s.stopLingerTimersLocked()
+		s.releaseLingerSlotLocked()
 		if !procAborted {
 			abandoned = s.pendingTasks
+			if s.pendingAtClose > abandoned {
+				abandoned = s.pendingAtClose
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -1319,7 +1337,7 @@ func (s *claudeSession) close() {
 	}
 	grace := 2 * time.Second
 	if s.keyed {
-		s.closing = true
+		s.setClosingLocked()
 		s.stopLingerTimersLocked()
 		// A keyed session with nothing pending exits on its own at stdin EOF
 		// (exactly like today's per-turn close at result); give it time to

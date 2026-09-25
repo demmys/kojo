@@ -277,6 +277,12 @@ type Manager struct {
 	keyedBgMu       sync.Mutex
 	keyedBgHandlers map[string]keyedBgRegistration
 	keyedBgSeq      int64
+	// keyedBgSteers holds the steer handle of a running WebUI-thread keyed
+	// background turn (fallback of SteerOneShot); keyedNotes holds one-time
+	// agent-facing notes (tasks abandoned / not continued) injected into the
+	// key's next turn. Both guarded by keyedBgMu.
+	keyedBgSteers map[string]keyedBgSteer
+	keyedNotes    map[string]string
 
 	// tokenStore, if set, is kept in sync with agent lifecycle: a per-agent
 	// token is created on Create/Fork and removed on Delete. The store is
@@ -2882,7 +2888,15 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
 		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
-			prep.backend.Name() == ToolClaude && m.hasKeyedBackgroundHandler(agentID),
+			prep.backend.Name() == ToolClaude && m.hasKeyedBackgroundHandler(agentID, sessionKey),
+	}
+	if chatOpts.LingerBackgroundTasks {
+		// Cheap per-turn awareness: pending notes for this key (tasks that
+		// were abandoned / could not be continued) and the other threads
+		// still running background tasks.
+		if note := m.keyedTurnNote(agentID, sessionKey, prep.backend); note != "" {
+			effectiveMessage = injectRecentMessagesContext(effectiveMessage, note+"\n")
+		}
 	}
 	chatOpts.FreshSessionContext = opts.FreshSessionContext
 	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
@@ -3026,13 +3040,30 @@ func (m *Manager) SteerOneShot(sessionKey, text string) error {
 	m.oneShotSteersMu.Lock()
 	fn, ok := m.oneShotSteers[sessionKey]
 	m.oneShotSteersMu.Unlock()
+	if !ok || fn == nil {
+		// A WebUI thread's keyed background (notification) turn is not a
+		// ChatOneShot but accepts steering the same way.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
 	if !ok {
 		return ErrAgentNotBusy
 	}
 	if fn == nil {
 		return ErrSteerUnsupported
 	}
-	return fn(text)
+	err := fn(text)
+	if errors.Is(err, ErrAgentNotBusy) {
+		// The entry can be stale: the previous turn's steer gate has closed
+		// but its cleanup has not removed it yet, while a keyed background
+		// turn already runs on the same key. ErrAgentNotBusy means nothing
+		// was written, so the background turn may take the message.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
+	return err
 }
 
 // SteerOneShotForAgent is the holder-facing fenced variant of SteerOneShot.

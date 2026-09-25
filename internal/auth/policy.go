@@ -508,6 +508,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		return false
 	case "/tasks":
 		return method == http.MethodGet || method == http.MethodPost
+	case "/background-sessions":
+		// Agent lists its own thread sessions still running
+		// run_in_background tasks (keyed lingering sessions).
+		return method == http.MethodGet
 	case "/attention":
 		// Non-blocking "look at me" page: POST raises it, DELETE
 		// retracts it. Self only — an agent must not be able to
@@ -553,6 +557,10 @@ func isSelfScopedRoute(method, sub string) bool {
 		return method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
 	case strings.HasPrefix(sub, "/tasks/"):
 		return method == http.MethodPatch || method == http.MethodDelete
+	case strings.HasPrefix(sub, "/background-sessions/"):
+		// DELETE .../background-sessions/{key}[/tasks/{taskId}]: the
+		// agent stops its own lingering thread session / task.
+		return method == http.MethodDelete
 	case strings.HasPrefix(sub, "/credentials/"):
 		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete || method == http.MethodPost
 	}

@@ -484,6 +484,12 @@ type ClaudeBackend struct {
 	// still reported pending background tasks (best-effort user notice).
 	onKeyedTasksAbandoned func(agentID, sessionKey string, pending int, reason string)
 
+	// lingerSlots tracks, per agent, the keyed sessions currently lingering
+	// with background tasks pending (the only thing maxLingeringSessionsPerAgent
+	// caps). Guarded by lingerMu; lock order is claudeSession.mu → lingerMu.
+	lingerMu    sync.Mutex
+	lingerSlots map[string]map[*claudeSession]struct{}
+
 	// onSubagentActivity is invoked by a session's subagent tailer when a
 	// background subagent (Task run_in_background) emits output after the
 	// spawning turn already finalized. The Manager durably attaches it to the
@@ -525,8 +531,9 @@ func (b *ClaudeBackend) SetBackgroundTurnHandler(fn BackgroundTurnFunc) {
 
 // KeyedBackgroundTurnFunc surfaces an unsolicited turn from a keyed lingering
 // session to the Manager. Same channel/answer/abort contract as
-// BackgroundTurnFunc.
-type KeyedBackgroundTurnFunc func(agentID, sessionKey string, events <-chan ChatEvent, answer AnswerFunc, abort func())
+// BackgroundTurnFunc; steer (nil for an absorbed, already-complete
+// notification) injects a user line into the running notification turn.
+type KeyedBackgroundTurnFunc func(agentID, sessionKey string, events <-chan ChatEvent, answer AnswerFunc, abort func(), steer SteerFunc)
 
 // SetKeyedBackgroundTurnHandler registers the Manager callback for unsolicited
 // turns on keyed lingering sessions.

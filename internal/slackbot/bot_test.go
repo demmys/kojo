@@ -2878,6 +2878,40 @@ func TestSendToAgentSeparatesTextSegmentsAroundTools(t *testing.T) {
 		}
 	})
 
+	t.Run("unstreamed segment after a tool", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "first"},
+			{Type: "tool_use", ToolName: "Bash", ToolInput: `{"command":"true"}`},
+			{Type: "done", Message: &agent.Message{Content: "firstsecond"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "first\n\nsecond"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("subagent text is not part of the reply", func(t *testing.T) {
+		script := &streamScript{streamTSs: []string{"stream.1"}}
+		srv := newStreamServer(t, script)
+		mgr := &scriptedMgr{events: []agent.ChatEvent{
+			{Type: "text", Delta: "main"},
+			{Type: "text", Delta: " child", ParentToolUseID: "toolu_parent"},
+			{Type: "done", Message: &agent.Message{Content: "main"}},
+		}}
+		bot := newBotWithStream(t, mgr, srv)
+
+		bot.sendToAgent(context.Background(), "C1", "thread.123", "thread.123", "msg.456", "ping", "alice", "U123")
+
+		if got, want := finalSlackBody(script), "main"; got != want {
+			t.Fatalf("final body = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("diverging terminal stays authoritative", func(t *testing.T) {
 		script := &streamScript{streamTSs: []string{"stream.1"}}
 		srv := newStreamServer(t, script)

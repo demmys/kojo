@@ -1375,16 +1375,19 @@ streamLoop:
 				}
 			}
 		case "text":
-			if evt.ParentToolUseID == "" {
-				if segmentBoundary && evt.Delta != "" {
-					if sep := textSegmentSeparator(response.String(), evt.Delta); sep != "" {
-						response.WriteString(sep)
-						pendingDelta.WriteString(sep)
-					}
-					segmentBoundary = false
-				}
-				rawResponse.WriteString(evt.Delta)
+			// Subagent text belongs under its Task tool, not in the reply;
+			// the terminal body never contains it either.
+			if evt.ParentToolUseID != "" {
+				continue
 			}
+			if segmentBoundary && evt.Delta != "" {
+				if sep := textSegmentSeparator(response.String(), evt.Delta); sep != "" {
+					response.WriteString(sep)
+					pendingDelta.WriteString(sep)
+				}
+				segmentBoundary = false
+			}
+			rawResponse.WriteString(evt.Delta)
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
 
@@ -1563,9 +1566,14 @@ streamLoop:
 	// matches what was streamed (optionally plus an undelivered tail), keep the
 	// separated form so segments written around tool calls stay readable.
 	if terminalContent != "" && terminalContent != response.String() {
-		if raw := rawResponse.String(); raw != "" && raw != response.String() && strings.HasPrefix(terminalContent, raw) {
+		if raw := rawResponse.String(); raw != "" && strings.HasPrefix(terminalContent, raw) {
 			tail := terminalContent[len(raw):]
-			separated := response.String() + tail
+			separated := response.String()
+			if segmentBoundary {
+				// The segment after the last tool never streamed.
+				separated += textSegmentSeparator(separated, tail)
+			}
+			separated += tail
 			response.Reset()
 			response.WriteString(separated)
 		} else {

@@ -1205,7 +1205,13 @@ func (b *Bot) deliverAgentTurn(ctx context.Context, d slackTurnDelivery, events 
 	// backgroundPending is the number of run_in_background tasks still
 	// running when the turn ended on a lingering keyed session.
 	backgroundPending := 0
-	var response strings.Builder       // full response text
+	var response strings.Builder // full response text
+	// rawResponse is response without the separators inserted between text
+	// segments; it is what the backend's terminal Message.Content contains.
+	var rawResponse strings.Builder
+	// segmentBoundary is set by main-turn tool activity so the next text
+	// delta starts a new paragraph instead of running into the previous one.
+	segmentBoundary := false
 	var pendingDelta strings.Builder   // text not yet flushed via AppendStream
 	var streamTS string                // ts of the streaming message (empty = not started, dead, or fallback)
 	var deadStreams []string           // streamTS values that died mid-response (TTL/external stop); finalized best-effort at end
@@ -1369,6 +1375,16 @@ streamLoop:
 				}
 			}
 		case "text":
+			if evt.ParentToolUseID == "" {
+				if segmentBoundary && evt.Delta != "" {
+					if sep := textSegmentSeparator(response.String(), evt.Delta); sep != "" {
+						response.WriteString(sep)
+						pendingDelta.WriteString(sep)
+					}
+					segmentBoundary = false
+				}
+				rawResponse.WriteString(evt.Delta)
+			}
 			response.WriteString(evt.Delta)
 			pendingDelta.WriteString(evt.Delta)
 
@@ -1406,6 +1422,9 @@ streamLoop:
 			}
 
 		case "tool_use":
+			if evt.ParentToolUseID == "" {
+				segmentBoundary = true
+			}
 			// Surface what the agent is actually doing, not just which
 			// tool fired. Codex routes everything through "shell", so
 			// without the command detail every step would read the same
@@ -1475,6 +1494,9 @@ streamLoop:
 			lastAppend = time.Now()
 
 		case "tool_result":
+			if evt.ParentToolUseID == "" {
+				segmentBoundary = true
+			}
 			// Revert the assistant status to "Thinking…" while the agent
 			// processes the tool result and decides the next action.
 			b.setStatus(turnCtx, channel, threadTS, typingStatus)
@@ -1536,9 +1558,20 @@ streamLoop:
 	// before interpreting the control token or finalizing normal delivery. An
 	// empty terminal body is not authoritative because some test/custom
 	// backends emit a bare done event after otherwise valid text deltas.
+	//
+	// The terminal body has no separators between text segments. When it
+	// matches what was streamed (optionally plus an undelivered tail), keep the
+	// separated form so segments written around tool calls stay readable.
 	if terminalContent != "" && terminalContent != response.String() {
-		response.Reset()
-		response.WriteString(terminalContent)
+		if raw := rawResponse.String(); raw != "" && raw != response.String() && strings.HasPrefix(terminalContent, raw) {
+			tail := terminalContent[len(raw):]
+			separated := response.String() + tail
+			response.Reset()
+			response.WriteString(separated)
+		} else {
+			response.Reset()
+			response.WriteString(terminalContent)
+		}
 		// Do not append the authoritative full body onto a stream that may
 		// already contain most of it. chat.update below replaces the stream
 		// with response; the batch fallback also reads response directly.
@@ -1907,7 +1940,7 @@ func slackSessionKey(agentID, channel, threadTS string) string {
 func buildSlackSystemPromptExtra(channel, threadTS, displayName, userID string) string {
 	var sb strings.Builder
 	sb.WriteString("## Slack Conversation Context\n\n")
-	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
+	sb.WriteString("This message was received via Slack. Your text response will be automatically posted to the Slack thread — just respond normally. Every text you output during this turn is posted, not only the last one: text written before, between, or after tool calls is joined in order (separated by blank lines) into the Slack reply. If no Slack response should be posted, output exactly `" + noReplyToken + "` and nothing else. Kojo consumes that token as a control signal and posts no message; never explain that you are withholding a reply. Do NOT use Slack MCP tools (slack_post_message, slack_reply_to_thread, etc.) to reply to this conversation. Slack MCP tools remain available for OTHER actions: posting to a different channel, adding reactions, uploading files, listing channels/users.\n\n")
 	if threadTS != "" {
 		sb.WriteString(fmt.Sprintf("You are participating in Slack channel %s, thread %s.\n", channel, threadTS))
 	} else {
@@ -3047,4 +3080,20 @@ func (r *slackHandoffReservation) WaitSourceComplete(ctx context.Context) error 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sourceCompleteErr
+}
+
+// textSegmentSeparator returns the blank-line separator to insert between an
+// assistant text segment already in prev and the next segment starting with
+// next (segments are split by tool calls). Backends concatenate segments with
+// no delimiter, so without this "...ですか？次の文" runs together in Slack.
+func textSegmentSeparator(prev, next string) string {
+	if strings.TrimSpace(prev) == "" {
+		return ""
+	}
+	have := len(prev) - len(strings.TrimRight(prev, "\n"))
+	have += len(next) - len(strings.TrimLeft(next, "\n"))
+	if have >= 2 {
+		return ""
+	}
+	return strings.Repeat("\n", 2-have)
 }

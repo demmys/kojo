@@ -32,11 +32,20 @@ var (
 	// pending may take to exit on its own after stdin EOF before it is
 	// force-cancelled (today's per-turn path waits for a natural exit).
 	keyedCloseGrace = 30 * time.Second
-	// maxKeyedSessionsPerAgent caps concurrent keyed processes per agent.
-	// Over the cap a new keyed turn falls back to the per-turn spawn path
-	// (no lingering) instead of failing.
-	maxKeyedSessionsPerAgent = 4
+	// maxLingeringSessionsPerAgent caps how many keyed sessions of one agent
+	// may linger at once waiting for pending background tasks. Only lingering
+	// is capped: every keyed turn spawns lingering-capable and a normal turn
+	// is never blocked by the cap. A turn that ends with tasks pending while
+	// the cap is full closes (killing the tasks) and the response surface is
+	// told why via the abandoned notice (see lingerCapReason).
+	maxLingeringSessionsPerAgent = 50
 )
+
+// lingerCapReason is the close reason of a session whose tasks could not be
+// continued because the per-agent linger cap was full.
+func lingerCapReason() string {
+	return fmt.Sprintf("同時待機上限(%dスレッド)に達していたため継続できませんでした", maxLingeringSessionsPerAgent)
+}
 
 // keyedSpawn carries the spawn-time inputs of a keyed session.
 type keyedSpawn struct {
@@ -72,15 +81,17 @@ func cancelErrMessage(ctx context.Context) string {
 // session, or nil when none is registered (the turn is then dropped). Keyed
 // sessions route ONLY to the keyed handler so a Slack-thread notification
 // never reaches the main transcript or the busy slot.
-func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, func()) {
+// steer (keyed only, nil otherwise) injects a user line into the running
+// notification turn.
+func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, func(), SteerFunc) {
 	if s.keyed {
 		fn := s.b.onKeyedBackgroundTurn
 		if fn == nil {
 			return nil
 		}
 		agentID, key := s.agentID, s.sessionKey
-		return func(events <-chan ChatEvent, answer AnswerFunc, abort func()) {
-			fn(agentID, key, events, answer, abort)
+		return func(events <-chan ChatEvent, answer AnswerFunc, abort func(), steer SteerFunc) {
+			fn(agentID, key, events, answer, abort, steer)
 		}
 	}
 	fn := s.b.onBackgroundTurn
@@ -88,7 +99,7 @@ func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, f
 		return nil
 	}
 	agentID := s.agentID
-	return func(events <-chan ChatEvent, answer AnswerFunc, abort func()) {
+	return func(events <-chan ChatEvent, answer AnswerFunc, abort func(), _ SteerFunc) {
 		fn(agentID, events, answer, abort)
 	}
 }
@@ -96,22 +107,146 @@ func (s *claudeSession) backgroundHandler() func(<-chan ChatEvent, AnswerFunc, f
 // onBackgroundTasksChanged records a background_tasks_changed snapshot
 // (REPLACE semantics). While idle it also drives the linger lifetime: tasks
 // drained → start the grace; tasks pending again → cancel it.
-func (s *claudeSession) onBackgroundTasksChanged(n int) {
+func (s *claudeSession) onBackgroundTasksChanged(tasks []claudeBackgroundTask) {
 	if !s.keyed {
 		return
 	}
+	n := len(tasks)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.pendingTasks = n
+	s.recordTasksLocked(tasks)
+	if n == 0 {
+		// Nothing pending: the session no longer occupies a linger slot.
+		s.releaseLingerSlotLocked()
+	}
 	if s.state != sessIdle || s.closing {
+		s.mu.Unlock()
 		return
 	}
 	if n == 0 {
 		s.armGraceLocked()
+		s.mu.Unlock()
+		return
+	}
+	if !s.acquireLingerSlotLocked() {
+		// Tasks reappeared on an idle session that had released its slot and
+		// the cap is full meanwhile: it cannot keep waiting.
+		if s.closeReason == "" {
+			s.closeReason = lingerCapReason()
+		}
+		s.setClosingLocked()
+		s.mu.Unlock()
+		s.closeKeyed("")
 		return
 	}
 	s.stopGraceLocked()
 	s.armLingerMaxLocked()
+	s.mu.Unlock()
+}
+
+// recordTasksLocked stores the latest task snapshot for the background-session
+// API, keeping each task's first-seen time across REPLACE snapshots. Caller
+// holds mu.
+func (s *claudeSession) recordTasksLocked(tasks []claudeBackgroundTask) {
+	now := time.Now()
+	seen := make(map[string]time.Time, len(tasks))
+	for _, t := range tasks {
+		if at, ok := s.taskSeen[t.TaskID]; ok {
+			seen[t.TaskID] = at
+		} else {
+			seen[t.TaskID] = now
+		}
+	}
+	s.taskSeen = seen
+	s.tasks = append(s.tasks[:0:0], tasks...)
+}
+
+// setClosingLocked marks the session closing and frees its linger slot: a
+// closing session is exiting and must not keep another thread from lingering.
+// The pool entry itself stays until onEOF (same-key respawn waits for the exit,
+// see closeKeyed), so the slot and the pool entry are deliberately decoupled.
+// Caller holds mu.
+func (s *claudeSession) setClosingLocked() {
+	if !s.closing && s.pendingTasks > s.pendingAtClose {
+		// Snapshot what is being cut off: the CLI may report tasks=[] while
+		// shutting down, which would otherwise hide the abandoned tasks.
+		s.pendingAtClose = s.pendingTasks
+	}
+	s.closing = true
+	s.releaseLingerSlotLocked()
+}
+
+// acquireLingerSlotLocked reserves one of the agent's linger slots for this
+// session (idempotent). Returns false when the cap is full. Caller holds mu
+// (lock order: s.mu → b.lingerMu).
+func (s *claudeSession) acquireLingerSlotLocked() bool {
+	if s.lingerSlot {
+		return true
+	}
+	if s.b == nil || !s.b.tryAcquireLingerSlot(s) {
+		return false
+	}
+	s.lingerSlot = true
+	s.lingerSince = time.Now()
+	return true
+}
+
+// releaseLingerSlotLocked frees the session's linger slot, if held. Caller holds mu.
+func (s *claudeSession) releaseLingerSlotLocked() {
+	if !s.lingerSlot {
+		return
+	}
+	s.lingerSlot = false
+	s.lingerSince = time.Time{}
+	if s.b != nil {
+		s.b.releaseLingerSlot(s)
+	}
+}
+
+func (b *ClaudeBackend) tryAcquireLingerSlot(s *claudeSession) bool {
+	b.lingerMu.Lock()
+	defer b.lingerMu.Unlock()
+	set := b.lingerSlots[s.agentID]
+	if _, ok := set[s]; ok {
+		return true
+	}
+	if len(set) >= maxLingeringSessionsPerAgent {
+		return false
+	}
+	if set == nil {
+		if b.lingerSlots == nil {
+			b.lingerSlots = make(map[string]map[*claudeSession]struct{})
+		}
+		set = make(map[*claudeSession]struct{})
+		b.lingerSlots[s.agentID] = set
+	}
+	set[s] = struct{}{}
+	return true
+}
+
+func (b *ClaudeBackend) releaseLingerSlot(s *claudeSession) {
+	b.lingerMu.Lock()
+	defer b.lingerMu.Unlock()
+	set := b.lingerSlots[s.agentID]
+	delete(set, s)
+	if len(set) == 0 {
+		delete(b.lingerSlots, s.agentID)
+	}
+}
+
+// lingeringCount returns how many of the agent's keyed sessions currently hold
+// a linger slot, excluding the session for excludeKey (if non-empty).
+func (b *ClaudeBackend) lingeringCount(agentID, excludeKey string) int {
+	b.lingerMu.Lock()
+	defer b.lingerMu.Unlock()
+	n := 0
+	for s := range b.lingerSlots[agentID] {
+		if excludeKey != "" && s.sessionKey == excludeKey {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // afterKeyedTurnLocked decides a keyed session's fate at a turn's result.
@@ -125,10 +260,22 @@ func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, clo
 		if s.closeReason == "" {
 			s.closeReason = "待機上限(2時間)に到達"
 		}
-		s.closing = true
+		s.setClosingLocked()
 		return 0, true
 	}
 	if s.pendingTasks > 0 {
+		if !s.acquireLingerSlotLocked() {
+			// The per-agent linger cap is full. The turn itself already ran
+			// normally; only continuing its background tasks is refused. The
+			// close reports them via the abandoned notice (surface + agent).
+			if s.closeReason == "" {
+				s.closeReason = lingerCapReason()
+			}
+			s.logger.Warn("keyed claude session: linger cap full; closing with background tasks pending",
+				"agent", s.agentID, "sessionKey", s.sessionKey, "pending", s.pendingTasks, "cap", maxLingeringSessionsPerAgent)
+			s.setClosingLocked()
+			return 0, true
+		}
 		s.stopGraceLocked()
 		s.armLingerMaxLocked()
 		return s.pendingTasks, false
@@ -143,7 +290,7 @@ func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, clo
 	}
 	// Claim the close under the same lock that exposes sessIdle so a racing
 	// same-key startTurn sees closing instead of being killed mid-turn.
-	s.closing = true
+	s.setClosingLocked()
 	return 0, true
 }
 
@@ -158,7 +305,7 @@ func (s *claudeSession) armGraceLocked() {
 		}
 		// Claim the close under the same lock as the idle check so a racing
 		// startTurn either wins (state=inTurn first) or sees closing.
-		s.closing = true
+		s.setClosingLocked()
 		s.graceTimer = nil
 		s.mu.Unlock()
 		s.logger.Info("keyed claude session: linger grace elapsed; closing", "agent", s.agentID, "sessionKey", s.sessionKey)
@@ -192,7 +339,7 @@ func (s *claudeSession) armLingerMaxLocked() {
 			s.mu.Unlock()
 			return
 		}
-		s.closing = true
+		s.setClosingLocked()
 		if s.closeReason == "" {
 			s.closeReason = "待機上限(2時間)に到達"
 		}
@@ -256,20 +403,11 @@ func (s *claudeSession) steerIntoUnsolicited(userMessage string) (<-chan ChatEve
 		return nil, false
 	}
 	ch := make(chan ChatEvent, 1)
-	ch <- ChatEvent{Type: "done", Message: assembleAssistantMessage(SlackNoReplyToken, "", nil, nil)}
+	// SteeredIntoBackground tells surfaces without a NO_REPLY filter (WebUI
+	// threads) to post nothing for this turn.
+	ch <- ChatEvent{Type: "done", Message: assembleAssistantMessage(SlackNoReplyToken, "", nil, nil), SteeredIntoBackground: true}
 	close(ch)
 	return ch, true
-}
-
-// keyedCountLocked counts live keyed sessions for the agent. Caller holds sessMu.
-func (b *ClaudeBackend) keyedCountLocked(agentID string) int {
-	n := 0
-	for _, s := range b.sessions {
-		if s.keyed && s.agentID == agentID {
-			n++
-		}
-	}
-	return n
 }
 
 // awaitKeyedExit waits for a closing keyed session to exit (so a respawn on
@@ -285,7 +423,7 @@ func awaitKeyedExit(s *claudeSession) {
 
 // chatViaKeyedSession runs a keyed turn on a lingering-capable process.
 // handled=false means the caller must fall back to the per-turn spawn path
-// (per-agent cap reached or the pool kept racing).
+// (the pool kept racing).
 func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, userMessage, systemPrompt string, opts ChatOptions) (<-chan ChatEvent, bool, error) {
 	dir := agentDir(agent.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -301,8 +439,9 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 		b.sessMu.Lock()
 		sess := b.sessions[pk]
 		if sess != nil && sess.closingOrDead() {
-			// Leave the entry pooled (and counted against the cap) until its
-			// onEOF evicts it; just wait for the exit and re-evaluate.
+			// Leave the entry pooled until its onEOF evicts it (a respawn on the
+			// same deterministic session id would be rejected as "in use");
+			// just wait for the exit and re-evaluate.
 			b.sessMu.Unlock()
 			awaitKeyedExit(sess)
 			b.sessMu.Lock()
@@ -311,12 +450,6 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 			}
 			b.sessMu.Unlock()
 			continue
-		}
-		if sess == nil && b.keyedCountLocked(agent.ID) >= maxKeyedSessionsPerAgent {
-			b.sessMu.Unlock()
-			b.logger.Info("keyed claude session cap reached; using per-turn spawn (no background linger)",
-				"agent", agent.ID, "cap", maxKeyedSessionsPerAgent)
-			return nil, false, nil
 		}
 		b.sessMu.Unlock()
 
@@ -343,12 +476,8 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 		}
 		spawned := false
 		if sess == nil {
-			// Recheck the cap under the lock: concurrent keyed chats for
-			// different threads may all have passed the first check.
-			if b.keyedCountLocked(agent.ID) >= maxKeyedSessionsPerAgent {
-				b.sessMu.Unlock()
-				return nil, false, nil
-			}
+			// No spawn-time cap: a normal turn is never blocked or degraded.
+			// Only lingering past the result is capped (afterKeyedTurnLocked).
 			var err error
 			sess, err = b.spawnSession(agent.ID, dir, fingerprintArgs(inv.args), inv.args, &keyedSpawn{sessionKey: opts.SessionKey, opts: opts})
 			if err != nil {
@@ -389,7 +518,7 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 		// Closing/dead or a write failure: drop it and retry with a fresh
 		// process (a failed write on a just-spawned process is terminal).
 		sess.mu.Lock()
-		sess.closing = true
+		sess.setClosingLocked()
 		sess.mu.Unlock()
 		sess.closeKeyed("")
 		if spawned {

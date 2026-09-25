@@ -1152,6 +1152,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/v1/agents/{id}/tasks/{taskId}", s.handleUpdateTask)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/tasks/{taskId}", s.handleDeleteTask)
 
+	// Background sessions (thread sessions lingering for run_in_background
+	// tasks) — self-only; see guides/background-sessions.md.
+	mux.HandleFunc("GET /api/v1/agents/{id}/background-sessions", s.handleListBackgroundSessions)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}", s.handleStopBackgroundSession)
+	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}/tasks/{taskId}", s.handleStopBackgroundTask)
+
 	// Pre-compaction summary (called by Claude Code's PreCompact hook)
 	mux.HandleFunc("POST /api/v1/agents/{id}/pre-compact", s.handlePreCompact)
 

@@ -131,7 +131,7 @@ func TestKeyedSessionLingersWhilePendingThenCloses(t *testing.T) {
 	b.onBackgroundTurn = func(string, <-chan ChatEvent, AnswerFunc, func()) {
 		t.Error("keyed unsolicited turn reached the main background handler")
 	}
-	b.onKeyedBackgroundTurn = func(agentID, key string, events <-chan ChatEvent, _ AnswerFunc, _ func()) {
+	b.onKeyedBackgroundTurn = func(agentID, key string, events <-chan ChatEvent, _ AnswerFunc, _ func(), _ SteerFunc) {
 		if key != "test-agent:slack:C1:1.0" {
 			t.Errorf("key = %q", key)
 		}
@@ -250,14 +250,14 @@ func TestManagerRoutesKeyedBackgroundTurnToHandler(t *testing.T) {
 	h := &recordingKeyedHandler{got: make(chan []ChatEvent, 1)}
 	unregister := m.RegisterKeyedBackgroundHandler("ag1", h)
 	defer unregister()
-	if !m.hasKeyedBackgroundHandler("ag1") {
+	if !m.hasKeyedBackgroundHandler("ag1", "ag1:slack:C1:1.0") {
 		t.Fatal("handler not registered")
 	}
 	events := make(chan ChatEvent, 4)
 	events <- ChatEvent{Type: "text", Delta: "bg result"}
 	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "bg result"}}
 	close(events)
-	m.handleKeyedBackgroundTurn("ag1", "ag1:slack:C1:1.0", events, nil, nil)
+	m.handleKeyedBackgroundTurn("ag1", "ag1:slack:C1:1.0", events, nil, nil, nil)
 	evs := <-h.got
 	d := doneOf(t, evs)
 	if d.Message == nil || d.Message.Content != "bg result" {
@@ -270,7 +270,7 @@ func TestManagerRoutesKeyedBackgroundTurnToHandler(t *testing.T) {
 		t.Fatal("keyed background turn must not take the main busy slot")
 	}
 	unregister()
-	if m.hasKeyedBackgroundHandler("ag1") {
+	if m.hasKeyedBackgroundHandler("ag1", "ag1:slack:C1:1.0") {
 		t.Fatal("unregister did not remove handler")
 	}
 }

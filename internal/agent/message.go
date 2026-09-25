@@ -141,6 +141,11 @@ type ChatEvent struct {
 	// CLI process lingers because this many background tasks are still
 	// running; their completion arrives later as a keyed background turn.
 	BackgroundTasksPending int `json:"backgroundTasksPending,omitempty"`
+	// SteeredIntoBackground marks a keyed turn's synthetic "done" when its
+	// user message was steered into a running background notification turn
+	// instead (the reply arrives via the keyed background handler). Surfaces
+	// must post nothing for it.
+	SteeredIntoBackground bool `json:"steeredIntoBackground,omitempty"`
 }
 
 type attachmentOwnership struct {

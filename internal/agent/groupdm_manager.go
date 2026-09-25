@@ -1041,6 +1041,13 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	// Thread teardown: abort a running turn and remove its session artifact.
 	if isThread {
 		m.cancelThreadTurn(id)
+		// A lingering keyed process (background tasks) would otherwise keep
+		// running for a room that no longer exists and re-create the JSONL.
+		if m.agentMgr != nil {
+			if cb := m.agentMgr.claudeBackend(); cb != nil {
+				cb.CloseKeyedSessionSync(threadAgentID, "groupdm:"+id, "スレッドが削除されました")
+			}
+		}
 		removeClaudeSession(threadAgentID, "groupdm:"+id)
 	}
 
@@ -1779,6 +1786,10 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		ForceFreshSession:                 forceFresh,
 		ExpectedHolderPeer:                expectedHolder,
 		HandoffArrivalReservation:         arrivalReservation,
+		// Keep the thread's claude process alive while run_in_background
+		// tasks are pending; their completion turns come back through
+		// HandleKeyedBackgroundTurn. Honored only for a Hub-local dispatch.
+		LingerBackgroundTasks: true,
 	}
 	if captureOnHolder {
 		oneShotOpts.SystemPromptExtra = threadSystemPromptExtra
@@ -1814,6 +1825,41 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		return
 	}
 
+	m.consumeThreadTurn(ctx, events, threadTurnOutput{
+		agentID:            agentID,
+		groupID:            groupID,
+		payload:            payload,
+		agentModel:         agentModel,
+		agentEffort:        agentEffort,
+		replyMessageID:     replyMessageID,
+		attachmentStageDir: attachmentStageDir,
+		attachmentWatcher:  attachmentWatcher,
+		firstUserMessage:   firstUserMessage,
+	})
+}
+
+// threadTurnOutput carries the inputs consumeThreadTurn needs to post a
+// thread turn's reply.
+type threadTurnOutput struct {
+	agentID, groupID        string
+	payload                 string // dead-letter payload on failure
+	agentModel, agentEffort string
+	replyMessageID          string
+	attachmentStageDir      string
+	attachmentWatcher       *attachWatcher // nil when attachments are captured on the holder
+	firstUserMessage        string         // "" disables auto-titling
+}
+
+// consumeThreadTurn drains a thread turn's event stream into the live
+// snapshot and posts the resulting reply daemon-authored into the room: the
+// shared tail of a user-triggered thread turn and of a keyed background
+// (task-notification) turn. The caller registers the turn's cancel in
+// threadCancels (StopThreadTurn / archive) and the live snapshot.
+func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan ChatEvent, o threadTurnOutput) {
+	agentID, groupID, payload := o.agentID, o.groupID, o.payload
+	agentModel, agentEffort := o.agentModel, o.agentEffort
+	replyMessageID, attachmentStageDir := o.replyMessageID, o.attachmentStageDir
+	attachmentWatcher, firstUserMessage := o.attachmentWatcher, o.firstUserMessage
 	var reply strings.Builder
 	var doneText string
 	var streamErr string
@@ -1822,6 +1868,8 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	var toolUses []ToolUse
 	var replyAttachments []MessageAttachment
 	var attachmentClaims []ChatEvent
+	var backgroundPending int
+	var steeredIntoBackground bool
 	attachmentClaimsFinished := false
 	finishAttachmentClaims := func(accepted bool) {
 		if attachmentClaimsFinished {
@@ -1888,6 +1936,8 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 				thinking = ev.Message.Thinking
 				toolUses = ev.Message.ToolUses
 			}
+			backgroundPending = ev.BackgroundTasksPending
+			steeredIntoBackground = ev.SteeredIntoBackground
 		case "error":
 			if streamErr == "" {
 				streamErr = ev.ErrorMessage
@@ -1921,6 +1971,13 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	delete(m.threadCancels, groupID)
 	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()
+
+	if steeredIntoBackground && streamErr == "" {
+		// The message was steered into the thread's running background
+		// (notification) turn; that turn posts the answer. Nothing to post.
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		return
+	}
 
 	// Stop live capture only after unregistering the completed turn. A large
 	// attachment may take time to finish forwarding; a stop request during
@@ -1997,7 +2054,7 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		m.handleThreadTurnError(groupID, agentID, payload, errors.New(streamErr))
 		return
 	}
-	if text == "" && thinking == "" && len(toolUses) == 0 && len(replyAttachments) == 0 && !stopped {
+	if text == "" && thinking == "" && len(toolUses) == 0 && len(replyAttachments) == 0 && !stopped && backgroundPending == 0 {
 		// Nothing substantive to post. A stopped turn still posts an
 		// (empty) interrupted reply so the UI's "replying…" wait resolves
 		// with a visible outcome instead of hanging on the user's post.
@@ -2009,6 +2066,9 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	// the first rename; empty replies (above) still skip titling entirely.
 	if firstUserMessage != "" {
 		m.maybeAutoTitleThread(groupID, agentID, firstUserMessage)
+	}
+	if backgroundPending > 0 && !stopped {
+		text = strings.TrimSpace(text + "\n\n" + threadBackgroundPendingNote(backgroundPending))
 	}
 	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)

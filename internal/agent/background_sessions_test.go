@@ -520,3 +520,38 @@ func oneShotCount(m *Manager, agentID string) int {
 	defer m.oneShotCancelsMu.Unlock()
 	return len(m.oneShotCancels[agentID])
 }
+
+// SteerOneShot falls back to a WebUI thread's background-turn steer when no
+// one-shot turn is running, and when the one-shot entry is stale (its gate
+// already closed: ErrAgentNotBusy, nothing written).
+func TestSteerOneShotFallsBackToKeyedBackgroundTurn(t *testing.T) {
+	m := newTestManager(t)
+	initOneShotMaps(m)
+	key := "groupdm:gd_steer"
+	var mu sync.Mutex
+	var got []string
+	unregister := m.registerKeyedBgSteer(key, func(text string) error {
+		mu.Lock()
+		got = append(got, text)
+		mu.Unlock()
+		return nil
+	})
+	if err := m.SteerOneShot(key, "first"); err != nil {
+		t.Fatalf("steer without one-shot: %v", err)
+	}
+	m.oneShotSteersMu.Lock()
+	m.oneShotSteers[key] = func(string) error { return ErrAgentNotBusy }
+	m.oneShotSteersMu.Unlock()
+	if err := m.SteerOneShot(key, "second"); err != nil {
+		t.Fatalf("steer with stale one-shot entry: %v", err)
+	}
+	unregister()
+	if err := m.SteerOneShot(key, "third"); !errors.Is(err, ErrAgentNotBusy) {
+		t.Fatalf("steer after unregister err = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(got, ",") != "first,second" {
+		t.Fatalf("background steer got %v", got)
+	}
+}

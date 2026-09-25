@@ -2036,7 +2036,12 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 	archiveCancelled := archiveCtx.Err() != nil
 	m.threadCancelMu.Unlock()
 	archiveCancel()
-	if archiveCancelled {
+	// lifecycleCancelled: ctx was cancelled after the stream ended. Only a
+	// keyed background turn's lifecycle context (reset / delete / shutdown)
+	// can do that — a normal turn's cancel is unregistered above — so the
+	// partial result is discarded exactly like the archive path.
+	lifecycleCancelled := func() bool { return !stopped && ctx.Err() != nil }
+	if archiveCancelled || lifecycleCancelled() {
 		m.agentMgr.deleteIngestedAttachments(replyAttachments)
 		if stageDir, ok := safeStageDirAt(agentID, attachmentStageDir, m.logger); ok {
 			_ = os.RemoveAll(stageDir)
@@ -2069,6 +2074,10 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 	}
 	if backgroundPending > 0 && !stopped {
 		text = strings.TrimSpace(text + "\n\n" + threadBackgroundPendingNote(backgroundPending))
+	}
+	if lifecycleCancelled() {
+		m.agentMgr.deleteIngestedAttachments(replyAttachments)
+		return
 	}
 	if _, err := m.postThreadReplyWithAttachments(groupID, agentID, text, agentModel, agentEffort, usage, thinking, toolUses, stopped, replyMessageID, replyAttachments, func() { finishAttachmentClaims(true) }); err != nil {
 		m.logger.Warn("failed to post thread reply", "group", groupID, "agent", agentID, "err", err)

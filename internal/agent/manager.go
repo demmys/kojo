@@ -3053,7 +3053,17 @@ func (m *Manager) SteerOneShot(sessionKey, text string) error {
 	if fn == nil {
 		return ErrSteerUnsupported
 	}
-	return fn(text)
+	err := fn(text)
+	if errors.Is(err, ErrAgentNotBusy) {
+		// The entry can be stale: the previous turn's steer gate has closed
+		// but its cleanup has not removed it yet, while a keyed background
+		// turn already runs on the same key. ErrAgentNotBusy means nothing
+		// was written, so the background turn may take the message.
+		if bg := m.keyedBgSteerFor(sessionKey); bg != nil {
+			return bg(text)
+		}
+	}
+	return err
 }
 
 // SteerOneShotForAgent is the holder-facing fenced variant of SteerOneShot.

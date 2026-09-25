@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -424,5 +425,339 @@ func TestRemoteKeyedSurfaceRetriesThenStopsOnLifecycleCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("surface kept waiting for the claim after lifecycle cancel")
+	}
+}
+
+func TestRemoteKeyedSurfaceSurvivesHubOutageLongerThanNotifyBudget(t *testing.T) {
+	oldBackoff, oldWait, oldBudget, oldMax := keyedBgNotifyBackoff, keyedBgAttachWait, keyedBgTurnNotifyBudget, keyedBgAttachMax
+	keyedBgNotifyBackoff, keyedBgAttachWait, keyedBgTurnNotifyBudget, keyedBgAttachMax = 5*time.Millisecond, 40*time.Millisecond, 30*time.Millisecond, 10*time.Second
+	t.Cleanup(func() {
+		keyedBgNotifyBackoff, keyedBgAttachWait, keyedBgTurnNotifyBudget, keyedBgAttachMax = oldBackoff, oldWait, oldBudget, oldMax
+	})
+	var mu sync.Mutex
+	outage := true
+	var tokens []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req keyedBgNotifyRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		defer mu.Unlock()
+		if outage {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		tokens = append(tokens, req.Token)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer hub.Close()
+	srv, agentID := prepareKeyedHolder(t, hub.URL)
+	sf := srv.newRemoteKeyedSurface(agentID, "groupdm:g1", "hub", hub.URL)
+	defer sf.Release()
+	in := make(chan agent.ChatEvent, 1)
+	in <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "x"}}
+	close(in)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sf.HandleKeyedSessionTurn(ctx, agentID, "groupdm:g1", in, func() {})
+	}()
+	// Several whole notify budgets fail; the turn must stay registered.
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("transient Hub outage dropped the turn")
+	default:
+	}
+	srv.keyedBg.mu.Lock()
+	n := len(srv.keyedBg.attaches)
+	srv.keyedBg.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("attach entries during outage = %d, want 1", n)
+	}
+	mu.Lock()
+	outage = false
+	mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		got := len(tokens)
+		mu.Unlock()
+		if got > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no notify reached the Hub after it recovered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("surface kept waiting after lifecycle cancel")
+	}
+}
+
+func TestBufferKeyedBgEventsDecouplesAndCoalesces(t *testing.T) {
+	in := make(chan agent.ChatEvent)
+	out, discard := bufferKeyedBgEvents(in)
+	defer discard()
+	// Nobody reads out yet (the Hub has not claimed): the producer must
+	// never block, however long the turn is.
+	var want strings.Builder
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		for i := 0; i < 5000; i++ {
+			d := "x"
+			if i%100 == 0 {
+				d = "y"
+			}
+			want.WriteString(d)
+			in <- agent.ChatEvent{Type: "text", Delta: d}
+		}
+		for i := 0; i < maxKeyedBgBufferedEvents+500; i++ {
+			in <- agent.ChatEvent{Type: "tool_use", ToolName: "Bash"}
+		}
+		in <- agent.ChatEvent{Type: "attachment", Attachments: []agent.MessageAttachment{{Name: "a.txt"}}}
+		in <- agent.ChatEvent{Type: "text", Delta: "tail"}
+		in <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "final"}}
+		close(in)
+	}()
+	select {
+	case <-sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer blocked on an unclaimed turn")
+	}
+	var evs []agent.ChatEvent
+	for e := range out {
+		evs = append(evs, e)
+	}
+	if len(evs) == 0 || evs[0].Type != "text" || evs[0].Delta != want.String() {
+		t.Fatalf("text not coalesced losslessly: first=%#v", evs[0])
+	}
+	tools, sawAttach := 0, false
+	for _, e := range evs {
+		switch e.Type {
+		case "tool_use":
+			tools++
+		case "attachment":
+			sawAttach = true
+		}
+	}
+	if tools == 0 || tools > maxKeyedBgBufferedEvents {
+		t.Fatalf("tool events = %d, want capped at %d", tools, maxKeyedBgBufferedEvents)
+	}
+	n := len(evs)
+	if !sawAttach || evs[n-2].Delta != "tail" || evs[n-1].Type != "done" || evs[n-1].Message.Content != "final" {
+		t.Fatalf("attachment / tail text / terminal lost: %#v", evs[n-3:])
+	}
+}
+
+func TestBufferKeyedBgEventsDiscardDrains(t *testing.T) {
+	in := make(chan agent.ChatEvent)
+	out, discard := bufferKeyedBgEvents(in)
+	in <- agent.ChatEvent{Type: "text", Delta: "a"}
+	discard()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			in <- agent.ChatEvent{Type: "tool_use"}
+		}
+		close(in)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discarded buffer stopped draining the turn")
+	}
+	for e := range out {
+		t.Fatalf("discarded buffer replayed %#v", e)
+	}
+}
+
+func TestRemoteKeyedSurfaceRenotifiesUntilLingerBound(t *testing.T) {
+	oldWait, oldMax := keyedBgAttachWait, keyedBgAttachMax
+	keyedBgAttachWait, keyedBgAttachMax = 30*time.Millisecond, 400*time.Millisecond
+	t.Cleanup(func() { keyedBgAttachWait, keyedBgAttachMax = oldWait, oldMax })
+	var mu sync.Mutex
+	var reqs []keyedBgNotifyRequest
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req keyedBgNotifyRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		reqs = append(reqs, req)
+		mu.Unlock()
+		w.WriteHeader(http.StatusAccepted) // accepted, never attached
+	}))
+	defer hub.Close()
+	srv, agentID := prepareKeyedHolder(t, hub.URL)
+	sf := srv.newRemoteKeyedSurface(agentID, "groupdm:g1", "hub", hub.URL)
+	defer sf.Release()
+	in := make(chan agent.ChatEvent, 1)
+	in <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "x"}}
+	close(in)
+	start := time.Now()
+	sf.HandleKeyedSessionTurn(context.Background(), agentID, "groupdm:g1", in, func() {})
+	if el := time.Since(start); el < keyedBgAttachMax || el > keyedBgAttachMax+3*time.Second {
+		t.Fatalf("claim wait = %s, want bounded by %s", el, keyedBgAttachMax)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) < 3 {
+		t.Fatalf("notifies = %d, want periodic re-notify", len(reqs))
+	}
+	ids := map[string]bool{}
+	for _, r := range reqs {
+		if r.Token != reqs[0].Token || r.Kind != keyedBgNotifyKindTurn {
+			t.Fatalf("re-notify changed the token/kind: %#v", r)
+		}
+		ids[r.NotifyID] = true
+	}
+	if len(ids) != len(reqs) {
+		t.Fatal("re-notify reused a notifyId (the Hub would dedup it away)")
+	}
+	srv.keyedBg.mu.Lock()
+	left := len(srv.keyedBg.attaches)
+	srv.keyedBg.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d attach entries leaked past the bound", left)
+	}
+	if note := srv.agents.PeekKeyedBackgroundNote(agentID, "groupdm:g1"); !strings.Contains(note, "Hubへ届けられず") {
+		t.Fatalf("undelivered note = %q", note)
+	}
+}
+
+func TestKeyedBackgroundNotifyRenotifyKeepsOneDelivery(t *testing.T) {
+	token := mustToken(t)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	attaches := 0
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder", KeyedBackgroundV1: true})
+			return
+		}
+		mu.Lock()
+		attaches++
+		mu.Unlock()
+		<-release
+		writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "bg"}})
+	}))
+	defer holder.Close()
+	srv, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	srv.externalChat = router
+	h := newRecordingSlackSurface()
+	defer srv.agents.RegisterKeyedBackgroundHandler(agentID, h)()
+	key := agentID + ":slack:C1:1.0"
+	post := func() {
+		w := postKeyedBgNotify(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "holder"}, keyedBgNotifyRequest{
+			HolderID: "holder", AgentID: agentID, SessionKey: key, Kind: keyedBgNotifyKindTurn, Token: token, NotifyID: mustToken(t),
+		})
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	post()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := attaches
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first delivery never attached")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	post() // holder re-notify while the delivery is still in flight
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	select {
+	case <-h.turns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background turn not delivered")
+	}
+	mu.Lock()
+	n := attaches
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("attaches = %d, want 1 (re-notify must not start a second delivery)", n)
+	}
+	// Once it ended, the token is free again (a later re-notify retries).
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		if ok, _ := srv.keyedBg.beginDelivery(token); ok {
+			srv.keyedBg.endDelivery(token)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("delivery slot not released")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestBufferKeyedBgEventsBoundsMessages(t *testing.T) {
+	in := make(chan agent.ChatEvent)
+	out, discard := bufferKeyedBgEvents(in)
+	defer discard()
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		for i := 0; i < 3*maxKeyedBgBufferedEvents; i++ {
+			in <- agent.ChatEvent{Type: "message", Message: &agent.Message{Content: "m"}}
+		}
+		in <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "final"}}
+		close(in)
+	}()
+	// Nobody reads until the whole (unclaimed) turn is queued.
+	select {
+	case <-sent:
+	case <-time.After(5 * time.Second):
+		t.Fatal("producer blocked on an unclaimed turn")
+	}
+	msgs, sawDone := 0, false
+	for e := range out {
+		switch e.Type {
+		case "message":
+			msgs++
+		case "done":
+			sawDone = true
+		}
+	}
+	if msgs == 0 || msgs > 2*maxKeyedBgBufferedEvents || !sawDone {
+		t.Fatalf("messages=%d (cap %d) done=%v", msgs, 2*maxKeyedBgBufferedEvents, sawDone)
+	}
+}
+
+// A notify rejected at the in-flight delivery cap must not be remembered as
+// seen: the holder's retry of the same NotifyID has to be processed.
+func TestKeyedBgRejectedNotifyIsNotDeduped(t *testing.T) {
+	var rr keyedBgRegistry
+	for i := 0; i < maxKeyedBgInflight; i++ {
+		if ok, full := rr.beginDelivery("tok" + strconv.Itoa(i)); !ok || full {
+			t.Fatalf("beginDelivery %d = %v,%v", i, ok, full)
+		}
+	}
+	id := strings.Repeat("a", 64)
+	if !rr.firstNotify(id) {
+		t.Fatal("first notify deduped")
+	}
+	if _, full := rr.beginDelivery("next"); !full {
+		t.Fatal("cap not reached")
+	}
+	rr.forgetNotify(id)
+	rr.endDelivery("tok0")
+	if !rr.firstNotify(id) {
+		t.Fatal("retry of a rejected notify was deduped")
+	}
+	if ok, full := rr.beginDelivery("next"); !ok || full {
+		t.Fatalf("retry not admitted: %v,%v", ok, full)
 	}
 }

@@ -47,6 +47,11 @@ func lingerCapReason() string {
 	return fmt.Sprintf("同時待機上限(%dスレッド)に達していたため継続できませんでした", maxLingeringSessionsPerAgent)
 }
 
+// keyedInterruptKillReason is the close reason when a stopped keyed turn did
+// not answer the CLI interrupt and the process (with its background tasks)
+// had to be killed.
+const keyedInterruptKillReason = "停止要求に応答がなかったためプロセスを強制終了しました"
+
 // keyedSpawn carries the spawn-time inputs of a keyed session.
 type keyedSpawn struct {
 	sessionKey string
@@ -160,13 +165,16 @@ func (s *claudeSession) takeSurfaceAtExit() KeyedSessionSurface {
 // (REPLACE semantics). While idle it also drives the linger lifetime: tasks
 // drained → start the grace; tasks pending again → cancel it.
 func (s *claudeSession) onBackgroundTasksChanged(tasks []claudeBackgroundTask) {
-	if !s.keyed {
-		return
-	}
 	n := len(tasks)
 	s.mu.Lock()
 	s.pendingTasks = n
 	s.recordTasksLocked(tasks)
+	if !s.keyed {
+		// The main chat only records the snapshot (task lifecycle tracking
+		// for the queued-steer reaper); its lifetime is the idle reap.
+		s.mu.Unlock()
+		return
+	}
 	if n == 0 {
 		// Nothing pending: the session no longer occupies a linger slot.
 		s.releaseLingerSlotLocked()
@@ -197,20 +205,90 @@ func (s *claudeSession) onBackgroundTasksChanged(tasks []claudeBackgroundTask) {
 }
 
 // recordTasksLocked stores the latest task snapshot for the background-session
-// API, keeping each task's first-seen time across REPLACE snapshots. Caller
-// holds mu.
+// API. A task's start time is its task_started arrival (see taskLife), falling
+// back to the first snapshot that listed it. Caller holds mu.
 func (s *claudeSession) recordTasksLocked(tasks []claudeBackgroundTask) {
 	now := time.Now()
+	if s.taskLife == nil {
+		s.taskLife = make(map[string]taskLifeEntry)
+	}
 	seen := make(map[string]time.Time, len(tasks))
 	for _, t := range tasks {
-		if at, ok := s.taskSeen[t.TaskID]; ok {
-			seen[t.TaskID] = at
-		} else {
-			seen[t.TaskID] = now
+		e, ok := s.taskLife[t.TaskID]
+		if !ok {
+			e.startedAt = now
 		}
+		e.backgrounded = true
+		s.taskLife[t.TaskID] = e
+		seen[t.TaskID] = e.startedAt
 	}
 	s.taskSeen = seen
 	s.tasks = append(s.tasks[:0:0], tasks...)
+	for id := range s.stopRequested {
+		if _, live := seen[id]; !live {
+			delete(s.stopRequested, id)
+		}
+	}
+	s.pruneTaskLifeLocked()
+}
+
+// maxTaskLifeEntries bounds taskLife against tasks that never report a
+// task_notification.
+const maxTaskLifeEntries = 256
+
+// pruneTaskLifeLocked drops entries not in the current snapshot once the map
+// outgrows maxTaskLifeEntries. Caller holds mu.
+func (s *claudeSession) pruneTaskLifeLocked() {
+	if len(s.taskLife) <= maxTaskLifeEntries {
+		return
+	}
+	for id := range s.taskLife {
+		if _, live := s.taskSeen[id]; !live {
+			delete(s.taskLife, id)
+		}
+	}
+}
+
+// onTaskLifecycleEvent records the per-task lifecycle events:
+//   - task_started: the spawn time (the CLI reports no start timestamp; a
+//     foreground task backgrounded later only enters background_tasks_changed
+//     at that point, so the first snapshot is not its start).
+//   - task_notification: the task finished. For a background task arriving
+//     while idle it announces the CLI's notification turn (notificationNext).
+func (s *claudeSession) onTaskLifecycleEvent(e claudeStreamEvent) {
+	if e.Type != "system" || e.TaskID == "" {
+		return
+	}
+	switch e.Subtype {
+	case "task_started":
+		now := time.Now()
+		s.mu.Lock()
+		if s.taskLife == nil {
+			s.taskLife = make(map[string]taskLifeEntry)
+		}
+		// A snapshot may list the task a moment before task_started arrives
+		// (observed ordering); keep the earlier of the two.
+		ent, ok := s.taskLife[e.TaskID]
+		if !ok {
+			ent.startedAt = now
+		}
+		if e.IsBackgrounded != nil && *e.IsBackgrounded {
+			ent.backgrounded = true
+		}
+		s.taskLife[e.TaskID] = ent
+		s.pruneTaskLifeLocked()
+		s.mu.Unlock()
+	case "task_notification":
+		s.mu.Lock()
+		ent, ok := s.taskLife[e.TaskID]
+		delete(s.taskLife, e.TaskID)
+		// A background task finishing while idle is followed by the CLI's
+		// notification turn; a stop_task'ed one ("stopped") is not.
+		if ok && ent.backgrounded && s.state != sessInTurn && string(e.TaskStatus) != `"stopped"` {
+			s.notificationNext = true
+		}
+		s.mu.Unlock()
+	}
 }
 
 // setClosingLocked marks the session closing and frees its linger slot: a
@@ -219,13 +297,28 @@ func (s *claudeSession) recordTasksLocked(tasks []claudeBackgroundTask) {
 // see closeKeyed), so the slot and the pool entry are deliberately decoupled.
 // Caller holds mu.
 func (s *claudeSession) setClosingLocked() {
-	if !s.closing && s.pendingTasks > s.pendingAtClose {
+	if n := s.unrequestedTasksLocked(); !s.closing && n > s.pendingAtClose {
 		// Snapshot what is being cut off: the CLI may report tasks=[] while
 		// shutting down, which would otherwise hide the abandoned tasks.
-		s.pendingAtClose = s.pendingTasks
+		s.pendingAtClose = n
 	}
 	s.closing = true
 	s.releaseLingerSlotLocked()
+}
+
+// unrequestedTasksLocked counts the pending tasks not already sent a
+// stop_task (those were reported when stopped). Caller holds mu.
+func (s *claudeSession) unrequestedTasksLocked() int {
+	if len(s.stopRequested) == 0 {
+		return s.pendingTasks
+	}
+	n := 0
+	for _, t := range s.tasks {
+		if _, ok := s.stopRequested[t.TaskID]; !ok {
+			n++
+		}
+	}
+	return n
 }
 
 // acquireLingerSlotLocked reserves one of the agent's linger slots for this
@@ -305,6 +398,8 @@ func (b *ClaudeBackend) lingeringCount(agentID, excludeKey string) int {
 // Returns the pending task count to advertise on the done event (0 when not
 // lingering) and whether the session must be closed now. Caller holds mu.
 func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, closeNow bool) {
+	stopAll := s.stopAllAtTurnEnd
+	s.stopAllAtTurnEnd = false
 	if s.closing {
 		return 0, false
 	}
@@ -313,6 +408,22 @@ func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, clo
 			s.closeReason = "待機上限(2時間)に到達"
 		}
 		s.setClosingLocked()
+		return 0, true
+	}
+	if stopAll && s.unrequestedTasksLocked() > 0 {
+		// A `!stop all` stopped this turn's tasks while it was running; a
+		// task spawned after that stop's snapshot must not outlive it.
+		if s.closeReason == "" {
+			s.closeReason = KeyedUserStopReason
+		}
+		s.setClosingLocked()
+		if s.closeReason == KeyedUserStopReason && s.b != nil && s.b.onKeyedNoteLocked != nil {
+			// Store the note now, before this result lets the thread's
+			// next turn start and peek it (the exit notice is asynchronous);
+			// the exit path then only posts the thread notice.
+			s.b.onKeyedNoteLocked(s.agentID, s.sessionKey, s.pendingAtClose, KeyedUserStopReason)
+			s.closeReason = keyedUserStopNotedReason
+		}
 		return 0, true
 	}
 	if s.pendingTasks > 0 {
@@ -462,6 +573,43 @@ func (s *claudeSession) steerIntoUnsolicited(userMessage string) (<-chan ChatEve
 	return ch, true
 }
 
+// maxKeyedBusyWaits bounds how many times one keyed turn queues behind a
+// running turn of the same thread before giving up with ErrAgentBusy.
+const maxKeyedBusyWaits = 8
+
+// awaitTurnOver blocks until the turn running on the session (if any) is over:
+// the session left sessInTurn or a different turn replaced it. Returns ctx's
+// error if ctx ends first.
+func (s *claudeSession) awaitTurnOver(ctx context.Context) error {
+	s.mu.Lock()
+	done := s.turnDone
+	inTurn := s.state == sessInTurn
+	s.mu.Unlock()
+	if !inTurn {
+		return nil
+	}
+	// completeTurn publishes sessIdle before it emits the terminal event
+	// (turnDone closes after that send), so poll the state too: this turn
+	// may start as soon as the session is idle.
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done: // nil done blocks forever; the ticker covers it
+			return nil
+		case <-t.C:
+			s.mu.Lock()
+			over := s.state != sessInTurn || s.turnDone != done
+			s.mu.Unlock()
+			if over {
+				return nil
+			}
+		}
+	}
+}
+
 // awaitKeyedExit waits for a closing keyed session to exit (so a respawn on
 // the same deterministic session id is not rejected as "in use"), escalating
 // to a group kill past the close grace.
@@ -487,6 +635,7 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 	pk := keyedPoolKey(agent.ID, opts.SessionKey)
 	canAnswer := opts.OnQuestionReady != nil
 
+	busyWaits := 0
 	for attempt := 0; attempt < 3; attempt++ {
 		b.sessMu.Lock()
 		sess := b.sessions[pk]
@@ -568,7 +717,20 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 			if sch, ok := sess.steerIntoUnsolicited(msg); ok {
 				return sch, true, nil
 			}
-			return nil, true, err
+			// Not steerable: the running turn is a stopped turn still
+			// winding down (a stop now interrupts instead of killing, so a
+			// quick follow-up can overlap it), or a notification turn right
+			// at its result boundary / closing. Queue behind it: wait for
+			// that turn to end, then run this turn normally.
+			if busyWaits >= maxKeyedBusyWaits {
+				return nil, true, err
+			}
+			busyWaits++
+			if werr := sess.awaitTurnOver(ctx); werr != nil {
+				return nil, true, werr
+			}
+			attempt--
+			continue
 		}
 		// Closing/dead or a write failure: drop it and retry with a fresh
 		// process (a failed write on a just-spawned process is terminal).

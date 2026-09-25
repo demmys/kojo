@@ -150,3 +150,221 @@ func TestBackgroundPendingNoteNotAppendedToNoReply(t *testing.T) {
 }
 
 func urlEncode(s string) string { return url.QueryEscape(s) }
+
+func TestIsStopAllCommand(t *testing.T) {
+	for text, want := range map[string]bool{
+		"!stop all": true, "!STOP  All": true, "!cancel all": true,
+		"!stop": false, "!stop everything": false, "!stop all now": false, "stop all": false,
+	} {
+		if got := isStopAllCommand(text); got != want {
+			t.Errorf("isStopAllCommand(%q) = %v, want %v", text, got, want)
+		}
+		if want && isStopCommand(text) {
+			t.Errorf("%q also matched the plain !stop", text)
+		}
+	}
+}
+
+func TestKeyedAbandonedNoticeWording(t *testing.T) {
+	if got := keyedAbandonedNotice(2, agent.KeyedUserStopReason); !strings.Contains(got, "2件 を停止しました（ユーザーの依頼）") {
+		t.Fatal(got)
+	}
+	if got := keyedAbandonedNotice(1, agent.KeyedStopRequestedReason); !strings.Contains(got, "エージェントの依頼") {
+		t.Fatal(got)
+	}
+	if got := keyedAbandonedNotice(3, "idle"); !strings.Contains(got, "3件 が完了前に終了しました（idle）") {
+		t.Fatal(got)
+	}
+}
+
+// A background (task-notification) turn has no owner: anyone in the thread may
+// !stop it, while an ordinary user turn stays owner-only.
+func TestBackgroundTurnAnyoneMayStop(t *testing.T) {
+	bot, _ := newRecordingBot(t)
+	stoppedBg := false
+	bg := bot.registerBackgroundActiveTurn("C1", "1.0", func() { stoppedBg = true })
+	defer bot.unregisterActiveTurn("C1", "1.0", bg)
+	if _, _, denied := bot.cancelActiveTurnInternal("C1", "1.0", false, "USOMEONE", true); denied || !stoppedBg {
+		t.Fatalf("background turn stop denied=%v stopped=%v", denied, stoppedBg)
+	}
+	if !bg.stopAllRequested() {
+		t.Fatal("!stop all not recorded on the turn")
+	}
+	user := bot.registerActiveTurnForUser("C1", "2.0", "UOWNER", func() {})
+	defer bot.unregisterActiveTurn("C1", "2.0", user)
+	if _, _, denied := bot.cancelActiveTurnForCommand("C1", "2.0", "UOTHER"); !denied {
+		t.Fatal("a non-owner stopped a user turn")
+	}
+}
+
+// A Slack message arriving while a background turn streams is steered into it
+// (whoever sends it), not queued as a separate turn.
+func TestSlackMessageSteersBackgroundTurn(t *testing.T) {
+	b := newTestBot(t, agent.SlackBotConfig{})
+	defer b.cancel()
+	m := &userSteerMgr{steerTestMgr: steerTestMgr{calls: make(chan steerCall, 1)}, users: make(chan string, 1)}
+	b.mgr = m
+	b.userCache["U777"] = "Bob"
+	turn := b.registerBackgroundActiveTurn("C", "T", func() {})
+	defer b.unregisterActiveTurn("C", "T", turn)
+	b.processIncoming(context.Background(), "C", "T", "M", "also check the logs", "U777")
+	select {
+	case call := <-m.calls:
+		if call.sessionKey != slackSessionKey(b.agentID, "C", "T") || !strings.Contains(call.content, "also check the logs") {
+			t.Fatalf("steer = %+v", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message was not steered into the background turn")
+	}
+	if u := <-m.users; u != "U777" {
+		t.Fatal(u)
+	}
+	waitSteerQueue(t, turn)
+	if m.oneShots.Load() != 0 {
+		t.Fatal("steered message also queued a turn")
+	}
+}
+
+// A stopped turn ends only itself: its reply (or the stop notice) says the
+// thread's background tasks keep running — unless the stop was `!stop all`.
+func TestStoppedTurnSaysBackgroundContinues(t *testing.T) {
+	run := func(t *testing.T, thread, partial string, stopAll bool) string {
+		bot, calls := newRecordingBot(t)
+		events := make(chan agent.ChatEvent, 3)
+		if partial != "" {
+			events <- agent.ChatEvent{Type: "text", Delta: partial}
+		}
+		events <- agent.ChatEvent{Type: "done", ErrorMessage: agent.ErrMsgCancelled, Message: &agent.Message{Role: "assistant", Content: partial}, BackgroundTasksPending: 2}
+		close(events)
+		turnCtx, turnCancel := context.WithCancel(context.Background())
+		defer turnCancel()
+		active := bot.registerActiveTurn("C1", thread, turnCancel)
+		if stopAll {
+			active.markStopAll()
+		}
+		bot.deliverAgentTurn(turnCtx, slackTurnDelivery{channel: "C1", threadTS: thread, sessionKey: slackSessionKey("test-agent", "C1", thread), turnCtx: turnCtx, turnCancel: turnCancel, active: active}, events)
+		return postedText(calls())
+	}
+	note := urlEncode("2件 は継続中です")
+	if got := run(t, "3.0", "partial answer", false); !strings.Contains(got, note) {
+		t.Fatalf("partial reply lacks the continuing note: %s", got)
+	}
+	if got := run(t, "3.1", "", false); !strings.Contains(got, note) {
+		t.Fatalf("stop notice lacks the continuing note: %s", got)
+	}
+	if got := run(t, "3.2", "partial answer", true); strings.Contains(got, note) {
+		t.Fatalf("!stop all reply claims the tasks continue: %s", got)
+	}
+}
+
+type stopAllMgr struct {
+	mockMgr
+	keys chan string
+	err  error
+}
+
+func (m *stopAllMgr) StopThreadBackgroundTasks(_ context.Context, agentID, sessionKey string) error {
+	m.keys <- agentID + "|" + sessionKey
+	return m.err
+}
+
+func TestStopAllCommandStopsThreadBackgroundTasks(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		notice string
+	}{
+		{name: "stopped"},
+		{name: "nothing", err: agent.ErrBackgroundSessionNotFound, notice: stopAllNothing},
+		{name: "failed", err: fmt.Errorf("peer down"), notice: "peer down"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bot, calls := newRecordingBot(t)
+			m := &stopAllMgr{keys: make(chan string, 1), err: tc.err}
+			bot.mgr = m
+			if !bot.handleSlackCommand(context.Background(), "C1", "5.0", "5.1", "U1", "!stop all") {
+				t.Fatal("!stop all not handled")
+			}
+			select {
+			case k := <-m.keys:
+				if k != "test-agent|"+slackSessionKey("test-agent", "C1", "5.0") {
+					t.Fatal(k)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("background tasks were not stopped")
+			}
+			if tc.notice == "" {
+				time.Sleep(50 * time.Millisecond)
+				if got := postedText(calls()); got != "" {
+					t.Fatalf("success posted %s (the abandoned notice reports it)", got)
+				}
+				return
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for !strings.Contains(postedText(calls()), urlEncode(tc.notice)) {
+				if time.Now().After(deadline) {
+					t.Fatalf("notice %q missing: %s", tc.notice, postedText(calls()))
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+type repeatStopAllMgr struct {
+	mockMgr
+	mu    sync.Mutex
+	calls int
+	keys  chan string
+	first error // outcome of the first stop (nil: it took the tasks)
+}
+
+func (m *repeatStopAllMgr) StopThreadBackgroundTasks(_ context.Context, agentID, sessionKey string) error {
+	m.mu.Lock()
+	m.calls++
+	n := m.calls
+	m.mu.Unlock()
+	m.keys <- sessionKey
+	if n == 1 {
+		return m.first // the first stop takes the tasks
+	}
+	return agent.ErrBackgroundSessionNotFound
+}
+
+func TestRepeatedStopAllDoesNotSayNothingToStop(t *testing.T) {
+	t.Run("succeeded", func(t *testing.T) { testRepeatedStopAll(t, nil) })
+	// A relayed stop whose response was lost may still have stopped them.
+	t.Run("uncertain", func(t *testing.T) { testRepeatedStopAll(t, agent.ErrSteerDeliveryUncertain) })
+}
+
+func testRepeatedStopAll(t *testing.T, first error) {
+	bot, calls := newRecordingBot(t)
+	m := &repeatStopAllMgr{keys: make(chan string, 2), first: first}
+	bot.mgr = m
+	for i := 0; i < 2; i++ {
+		if !bot.handleSlackCommand(context.Background(), "C1", "6.0", "6.1", "U1", "!stop all") {
+			t.Fatal("!stop all not handled")
+		}
+		select {
+		case <-m.keys:
+		case <-time.After(2 * time.Second):
+			t.Fatal("background tasks were not stopped")
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := postedText(calls()); strings.Contains(got, urlEncode(stopAllNothing)) {
+		t.Fatalf("repeat !stop all answered nothing-to-stop after a successful stop: %s", got)
+	}
+	// Another thread is unaffected.
+	if !bot.handleSlackCommand(context.Background(), "C1", "7.0", "7.1", "U1", "!stop all") {
+		t.Fatal("!stop all not handled")
+	}
+	<-m.keys
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(postedText(calls()), urlEncode(stopAllNothing)) {
+		if time.Now().After(deadline) {
+			t.Fatalf("other thread missing nothing-to-stop: %s", postedText(calls()))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

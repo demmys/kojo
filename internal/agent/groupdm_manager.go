@@ -1045,8 +1045,10 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 		// running for a room that no longer exists and re-create the JSONL.
 		if m.agentMgr != nil {
 			if cb := m.agentMgr.claudeBackend(); cb != nil {
-				cb.CloseKeyedSessionSync(threadAgentID, "groupdm:"+id, "スレッドが削除されました")
+				cb.CloseKeyedSessionSync(threadAgentID, "groupdm:"+id, keyedThreadDeletedReason)
 			}
+			// One-time notes for the room can never be delivered now.
+			m.agentMgr.dropKeyedNotesAfterExitNotices(threadAgentID, "groupdm:"+id)
 		}
 		removeClaudeSession(threadAgentID, "groupdm:"+id)
 	}
@@ -1838,6 +1840,11 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 	})
 }
 
+// threadFinalizeHook is a test seam: consumeThreadTurn calls it after the
+// attachment scan ("scanned") and after auto-titling ("titled"), the windows
+// in which a lifecycle cancel must still discard the reply.
+var threadFinalizeHook func(stage string)
+
 // threadTurnOutput carries the inputs consumeThreadTurn needs to post a
 // thread turn's reply.
 type threadTurnOutput struct {
@@ -1971,6 +1978,12 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 	delete(m.threadCancels, groupID)
 	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()
+	if stopped && backgroundPending == 0 && m.agentMgr != nil {
+		// A stopped turn's terminal event is dropped by the one-shot relay,
+		// so ask the (Hub-local) keyed session directly how many of its
+		// background tasks survive the stop.
+		backgroundPending = m.agentMgr.keyedBackgroundPending(agentID, webUIThreadKeyPrefix+groupID)
+	}
 
 	if steeredIntoBackground && streamErr == "" {
 		// The message was steered into the thread's running background
@@ -2025,6 +2038,9 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 			m.agentMgr.scanAndIngestAttachmentsFromDirReserved(scanCtx, agentID, replyMessageID, attachmentStageDir, replyAttachments)...)
 		scanCancel()
 	}
+	if threadFinalizeHook != nil {
+		threadFinalizeHook("scanned")
+	}
 	// The generic scan keeps an already-empty directory for the next normal
 	// chat turn. Thread directories are per-room and must not accumulate after
 	// successful turns, including replies that attached no files.
@@ -2072,8 +2088,17 @@ func (m *GroupDMManager) consumeThreadTurn(ctx context.Context, events <-chan Ch
 	if firstUserMessage != "" {
 		m.maybeAutoTitleThread(groupID, agentID, firstUserMessage)
 	}
-	if backgroundPending > 0 && !stopped {
-		text = strings.TrimSpace(text + "\n\n" + threadBackgroundPendingNote(backgroundPending))
+	if backgroundPending > 0 {
+		// A stop ends only the turn: its background tasks keep running on
+		// the lingering process and report back here when done.
+		note := threadBackgroundPendingNote(backgroundPending)
+		if stopped {
+			note = threadStoppedBackgroundNote(backgroundPending)
+		}
+		text = strings.TrimSpace(text + "\n\n" + note)
+	}
+	if threadFinalizeHook != nil {
+		threadFinalizeHook("titled")
 	}
 	if lifecycleCancelled() {
 		m.agentMgr.deleteIngestedAttachments(replyAttachments)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // KeyedBackgroundHandler is implemented by a response surface (the Slack bot,
@@ -106,21 +107,23 @@ func (m *Manager) hasKeyedBackgroundHandler(agentID, sessionKey string) bool {
 }
 
 type keyedBgSteer struct {
-	id int64
-	fn SteerFunc
+	id     int64
+	fn     SteerFunc
+	origin string // the dispatching Hub of a remote thread's turn ("" local)
 }
 
-// registerKeyedBgSteer exposes a running WebUI-thread background turn to
-// SteerOneShot (the thread UI steers while ThreadLive is active). Returns an
-// identity-guarded unregister.
-func (m *Manager) registerKeyedBgSteer(sessionKey string, fn SteerFunc) func() {
+// registerKeyedBgSteer exposes a running keyed background turn to SteerOneShot
+// (a WebUI thread steers while ThreadLive is active, a Slack thread while its
+// active turn is registered). origin is the turn's dispatching Hub, checked by
+// the inter-peer fallback. Returns an identity-guarded unregister.
+func (m *Manager) registerKeyedBgSteer(sessionKey, origin string, fn SteerFunc) func() {
 	m.keyedBgMu.Lock()
 	if m.keyedBgSteers == nil {
 		m.keyedBgSteers = make(map[string]keyedBgSteer)
 	}
 	m.keyedBgSeq++
 	id := m.keyedBgSeq
-	m.keyedBgSteers[sessionKey] = keyedBgSteer{id: id, fn: fn}
+	m.keyedBgSteers[sessionKey] = keyedBgSteer{id: id, fn: fn, origin: origin}
 	m.keyedBgMu.Unlock()
 	return func() {
 		m.keyedBgMu.Lock()
@@ -135,6 +138,20 @@ func (m *Manager) keyedBgSteerFor(sessionKey string) SteerFunc {
 	m.keyedBgMu.Lock()
 	defer m.keyedBgMu.Unlock()
 	return m.keyedBgSteers[sessionKey].fn
+}
+
+// keyedBgSteerFromOrigin is keyedBgSteerFor for an inter-peer steer: the
+// registered turn must have been dispatched by originPeerID, checked against
+// the very registration whose closure is returned (a turn from another Hub
+// registered after the caller validated a different turn is refused).
+func (m *Manager) keyedBgSteerFromOrigin(sessionKey, originPeerID string) SteerFunc {
+	m.keyedBgMu.Lock()
+	defer m.keyedBgMu.Unlock()
+	cur := m.keyedBgSteers[sessionKey]
+	if originPeerID == "" || cur.origin != originPeerID {
+		return nil
+	}
+	return cur.fn
 }
 
 // handleKeyedBackgroundTurn routes an unsolicited turn from a keyed lingering
@@ -187,10 +204,11 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	// delete drain (waitOneShotClear) cannot complete while a reply is still
 	// being written into the thread.
 	defer m.untrackOneShot(agentID, osID)
-	if steer != nil && isWebUIThreadKey(sessionKey) {
-		// A WebUI thread message typed while the notification turn streams is
-		// steered into it (Slack keeps its FIFO follow-up semantics).
-		defer m.registerKeyedBgSteer(sessionKey, steer)()
+	if steer != nil {
+		// A thread message (WebUI or Slack, local or via the dispatching Hub)
+		// sent while the notification turn streams is steered into it: the
+		// reply is merged into this turn's post, with no separate reply.
+		defer m.registerKeyedBgSteer(sessionKey, origin, steer)()
 	}
 
 	var backendCh <-chan ChatEvent = events
@@ -221,11 +239,59 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 // on that key, so the agent learns its tasks never completed (an explicit
 // stop requested through the background-sessions API needs no note).
 func (m *Manager) handleKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string, surface KeyedSessionSurface) {
-	if pending > 0 && reason != KeyedStopRequestedReason {
-		m.setKeyedNote(agentID, sessionKey, fmt.Sprintf(
-			"[kojo] 前回このスレッドのターン終了後も実行中だったバックグラウンドタスク%d件は、完了前に終了しました（%s）。その結果は届きません。必要なら再実行してください。",
-			pending, reason))
+	if reason == keyedUserStopNotedReason {
+		// The stop already stored the note (see stopBackgroundSessionReason).
+		m.deliverKeyedTasksAbandoned(agentID, sessionKey, pending, KeyedUserStopReason, surface)
+		return
 	}
+	m.noteKeyedTasksAbandoned(agentID, sessionKey, pending, reason)
+	m.deliverKeyedTasksAbandoned(agentID, sessionKey, pending, reason, surface)
+}
+
+// noteKeyedTasksAbandoned leaves the agent's one-time note for an abandoned
+// notice (see handleKeyedTasksAbandoned).
+func (m *Manager) noteKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string) {
+	if _, agentLive := m.Get(agentID); !agentLive {
+		// No later turn can ever read it; a note here would only leak.
+		return
+	}
+	if note := keyedAbandonedNote(pending, reason); note != "" {
+		m.setKeyedNote(agentID, sessionKey, note)
+	}
+}
+
+// storeKeyedNoteLocked is the backend's under-session-lock note hook: only the
+// leaf keyedBgMu is taken (no liveness lookup; a racing deletion re-drops).
+func (m *Manager) storeKeyedNoteLocked(agentID, sessionKey string, pending int, reason string) {
+	if note := keyedAbandonedNote(pending, reason); note != "" {
+		m.setKeyedNote(agentID, sessionKey, note)
+	}
+}
+
+// keyedAbandonedNote is the agent's one-time note for pending tasks that ended
+// for reason, or "" when there is nothing to tell it.
+func keyedAbandonedNote(pending int, reason string) string {
+	switch {
+	case pending <= 0 || reason == KeyedStopRequestedReason:
+		// The agent asked for the stop itself: nothing to tell it.
+		return ""
+	case reason == keyedThreadDeletedReason:
+		// No later turn can ever read it (thread room deleted).
+		return ""
+	case reason == KeyedUserStopReason:
+		return fmt.Sprintf(
+			"[kojo] このスレッドで実行中だったバックグラウンドタスク%d件は、ユーザーの依頼（!stop all）で停止されました。その結果は届きません。",
+			pending)
+	default:
+		return fmt.Sprintf(
+			"[kojo] 前回このスレッドのターン終了後も実行中だったバックグラウンドタスク%d件は、完了前に終了しました（%s）。その結果は届きません。必要なら再実行してください。",
+			pending, reason)
+	}
+}
+
+// deliverKeyedTasksAbandoned posts the abandoned notice to the owning surface
+// (or the agent-wide handler).
+func (m *Manager) deliverKeyedTasksAbandoned(agentID, sessionKey string, pending int, reason string, surface KeyedSessionSurface) {
 	if surface != nil {
 		surface.KeyedBackgroundTasksAbandoned(agentID, sessionKey, pending, reason)
 		return
@@ -241,26 +307,131 @@ func (m *Manager) SetKeyedBackgroundNote(agentID, sessionKey, note string) {
 	m.setKeyedNote(agentID, sessionKey, note)
 }
 
+// PeekKeyedBackgroundNote returns the pending one-time note for the key
+// without consuming it.
+func (m *Manager) PeekKeyedBackgroundNote(agentID, sessionKey string) string {
+	return m.peekKeyedNote(agentID, sessionKey)
+}
+
+// keyedThreadDeletedReason closes a WebUI thread's keyed session when its room
+// is deleted.
+const keyedThreadDeletedReason = "スレッドが削除されました"
+
 func keyedNoteKey(agentID, sessionKey string) string {
 	return agentID + "\x00" + sessionKey
 }
+
+// keyedNote is a pending one-time note and when it was left.
+type keyedNote struct {
+	text string
+	at   time.Time
+}
+
+// Notes of threads that never get another turn (a Slack thread nobody posts
+// in again) would otherwise live forever: they expire, and the map is capped.
+const (
+	keyedNoteTTL  = 7 * 24 * time.Hour
+	maxKeyedNotes = 1024
+	// maxKeyedNoteBytes bounds one key's combined pending notes; beyond it
+	// the newest note replaces the older ones.
+	maxKeyedNoteBytes = 4096
+)
 
 func (m *Manager) setKeyedNote(agentID, sessionKey, note string) {
 	m.keyedBgMu.Lock()
 	defer m.keyedBgMu.Unlock()
 	if m.keyedNotes == nil {
-		m.keyedNotes = make(map[string]string)
+		m.keyedNotes = make(map[string]keyedNote)
 	}
-	m.keyedNotes[keyedNoteKey(agentID, sessionKey)] = note
+	now := time.Now()
+	k := keyedNoteKey(agentID, sessionKey)
+	if prev, ok := m.keyedNotes[k]; ok && prev.text != "" && now.Sub(prev.at) <= keyedNoteTTL &&
+		len(prev.text)+1+len(note) <= maxKeyedNoteBytes {
+		// Not delivered yet: keep it and add the new one (e.g. an in-turn
+		// `!stop all` note followed by the turn-end kill of later tasks).
+		note = prev.text + "\n" + note
+	}
+	m.keyedNotes[k] = keyedNote{text: note, at: now}
+	if len(m.keyedNotes) <= maxKeyedNotes/2 {
+		return
+	}
+	oldestK, oldestAt := "", now
+	for k, n := range m.keyedNotes {
+		if now.Sub(n.at) > keyedNoteTTL {
+			delete(m.keyedNotes, k)
+		} else if n.at.Before(oldestAt) {
+			oldestK, oldestAt = k, n.at
+		}
+	}
+	if len(m.keyedNotes) > maxKeyedNotes && oldestK != "" {
+		delete(m.keyedNotes, oldestK)
+	}
 }
 
-func (m *Manager) popKeyedNote(agentID, sessionKey string) string {
+func (m *Manager) peekKeyedNote(agentID, sessionKey string) string {
 	m.keyedBgMu.Lock()
 	defer m.keyedBgMu.Unlock()
 	k := keyedNoteKey(agentID, sessionKey)
-	note := m.keyedNotes[k]
-	delete(m.keyedNotes, k)
-	return note
+	n, ok := m.keyedNotes[k]
+	if ok && time.Since(n.at) > keyedNoteTTL {
+		delete(m.keyedNotes, k)
+		return ""
+	}
+	return n.text
+}
+
+// commitKeyedNote consumes the one-time note delivered to a started turn. A
+// note replaced in the meantime (a newer abandoned notice) is kept.
+func (m *Manager) commitKeyedNote(agentID, sessionKey, delivered string) {
+	if delivered == "" {
+		return
+	}
+	m.keyedBgMu.Lock()
+	defer m.keyedBgMu.Unlock()
+	k := keyedNoteKey(agentID, sessionKey)
+	n := m.keyedNotes[k]
+	switch {
+	case n.text == delivered:
+		delete(m.keyedNotes, k)
+	case strings.HasPrefix(n.text, delivered+"\n"):
+		// A newer note was appended meanwhile: keep only that part.
+		n.text = strings.TrimPrefix(n.text, delivered+"\n")
+		m.keyedNotes[k] = n
+	}
+}
+
+// keyedNoteRedropWait bounds how long a deletion waits for the agent's
+// in-flight keyed exit notices before dropping the notes a second time.
+var keyedNoteRedropWait = 5 * time.Minute
+
+// dropKeyedNotesAfterExitNotices drops the notes now and once more after the
+// agent's in-flight keyed exit notices have run (bounded, in the background):
+// an exit notice that captured its close reason before the deletion may still
+// store a note after the first drop.
+func (m *Manager) dropKeyedNotesAfterExitNotices(agentID, sessionKey string) {
+	m.dropKeyedNotes(agentID, sessionKey)
+	go func() {
+		m.WaitKeyedExitNotices(agentID, keyedNoteRedropWait)
+		m.dropKeyedNotes(agentID, sessionKey)
+	}()
+}
+
+// dropKeyedNotes forgets the one-time notes of an agent (sessionKey "") or of
+// one of its keys: their thread (or the whole agent) is gone, so no later
+// turn could ever deliver them.
+func (m *Manager) dropKeyedNotes(agentID, sessionKey string) {
+	m.keyedBgMu.Lock()
+	defer m.keyedBgMu.Unlock()
+	if sessionKey != "" {
+		delete(m.keyedNotes, keyedNoteKey(agentID, sessionKey))
+		return
+	}
+	prefix := agentID + "\x00"
+	for k := range m.keyedNotes {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.keyedNotes, k)
+		}
+	}
 }
 
 // ErrNoKeyedBackgroundSurface: this node has no response surface for the key.

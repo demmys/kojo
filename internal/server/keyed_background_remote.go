@@ -37,11 +37,16 @@ import (
 //     buffered turn back as NDJSON (attachment ACKs included).
 //
 // Abandoned / stop notices use the same notify route (kind "abandoned").
-// Failure policy: bounded buffer (the per-turn 64-event relay plus the
-// terminal event) and bounded retry. A turn the Hub cannot take within the
-// budget is dropped: it runs to completion unobserved, is logged, and leaves
-// a note for the agent's next turn on that key. An abandoned notice is
-// retried within its budget, then logged and dropped.
+// Failure policy: while the turn waits for the claim, the surface drains it
+// into its own capped buffer (bufferKeyedBgEvents), so the session's readLoop
+// never stalls on a slow Hub FIFO. The claim wait is bounded by the session's
+// linger lifetime (keyedBgAttachMax); every keyedBgAttachWait the holder
+// re-notifies with the same token (the Hub keeps one delivery in flight per
+// token), so a Hub restart or a lost delivery is requeued rather than lost. A
+// turn the Hub rejects or never takes within that bound is dropped: it runs
+// to completion unobserved, is logged, and leaves a note for the agent's next
+// turn on that key. An abandoned notice is retried within its budget, then
+// logged and dropped.
 
 const keyedBgNotifyPath = "/api/v1/peers/keyed-background/notify"
 
@@ -51,12 +56,24 @@ const (
 	keyedBgPlaceholderMessage  = "[background task notification]"
 	maxKeyedBgAttaches         = 256
 	maxKeyedBgSeen             = 4096
+	maxKeyedBgInflight         = 4096
 	keyedBgSeenTTL             = 10 * time.Minute
+	// Holder-side buffer for a turn waiting on the Hub's claim. Text deltas
+	// coalesce into the queued tail, so only non-text events count against
+	// maxKeyedBgBufferedEvents; beyond it they are dropped (terminal and
+	// attachment events are always kept; message events are allowed up to
+	// twice the cap). maxKeyedBgBufferedBytes bounds the queued text.
+	maxKeyedBgBufferedEvents = 2048
+	maxKeyedBgBufferedBytes  = 16 << 20
 )
 
 // Test seams.
 var (
+	// keyedBgAttachWait is the re-notify interval while the Hub has not
+	// claimed; keyedBgAttachMax bounds the whole wait (the keyed session's
+	// max linger: a turn the Hub still has not taken by then is dropped).
 	keyedBgAttachWait          = 2 * time.Minute
+	keyedBgAttachMax           = 2 * time.Hour
 	keyedBgTurnNotifyBudget    = 30 * time.Second
 	keyedBgAbandonNotifyBudget = 2 * time.Minute
 	keyedBgNotifyBackoff       = 250 * time.Millisecond
@@ -86,6 +103,9 @@ type keyedBgRegistry struct {
 	mu       sync.Mutex
 	attaches map[string]*keyedBgAttachEntry
 	seen     map[string]time.Time
+	// inflight (Hub side) holds the attach tokens with a delivery running,
+	// so a holder's periodic re-notify never starts a second one.
+	inflight map[string]struct{}
 }
 
 type keyedBgAttachEntry struct {
@@ -177,6 +197,119 @@ func (rr *keyedBgRegistry) firstNotify(id string) bool {
 	return true
 }
 
+// forgetNotify undoes firstNotify for a notify the Hub did not admit, so the
+// holder's retry of the same NotifyID is processed instead of deduped.
+func (rr *keyedBgRegistry) forgetNotify(id string) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	delete(rr.seen, id)
+}
+
+// beginDelivery (Hub) reserves the one delivery for token. ok=false with
+// full=false means one is already running (a re-notify: nothing to do).
+func (rr *keyedBgRegistry) beginDelivery(token string) (ok, full bool) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	if rr.inflight == nil {
+		rr.inflight = make(map[string]struct{})
+	}
+	if _, running := rr.inflight[token]; running {
+		return false, false
+	}
+	if len(rr.inflight) >= maxKeyedBgInflight {
+		return false, true
+	}
+	rr.inflight[token] = struct{}{}
+	return true, false
+}
+
+func (rr *keyedBgRegistry) endDelivery(token string) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	delete(rr.inflight, token)
+}
+
+// bufferKeyedBgEvents drains in eagerly into a capped queue and replays it on
+// the returned channel, so a turn waiting for the Hub's claim never
+// backpressures the session. discard drops the queue and drains in to its
+// close (the turn then finishes unobserved). The returned channel closes once
+// in is closed and the queue is replayed, or right after discard.
+func bufferKeyedBgEvents(in <-chan agent.ChatEvent) (<-chan agent.ChatEvent, func()) {
+	out := make(chan agent.ChatEvent)
+	discardCh := make(chan struct{})
+	var discardOnce sync.Once
+	discard := func() { discardOnce.Do(func() { close(discardCh) }) }
+	go func() {
+		defer close(out)
+		var queue []agent.ChatEvent
+		textBytes := 0
+		nonText := 0
+		discarding := false
+		push := func(e agent.ChatEvent) {
+			if e.Type == "text" && e.Message == nil && len(e.Attachments) == 0 {
+				if textBytes+len(e.Delta) > maxKeyedBgBufferedBytes {
+					return
+				}
+				textBytes += len(e.Delta)
+				if n := len(queue); n > 0 {
+					tail := &queue[n-1]
+					if tail.Type == "text" && tail.Message == nil && len(tail.Attachments) == 0 && tail.ParentToolUseID == e.ParentToolUseID {
+						tail.Delta += e.Delta
+						return
+					}
+				}
+				queue = append(queue, e)
+				return
+			}
+			switch e.Type {
+			case "done", "error", "attachment":
+				// Terminal events and the turn's (single, post-scan)
+				// attachment event are always kept.
+			case "message":
+				// Transcript messages (steered user lines) get headroom
+				// beyond the tool-event cap but are still bounded.
+				if nonText >= 2*maxKeyedBgBufferedEvents {
+					return
+				}
+			default:
+				if nonText >= maxKeyedBgBufferedEvents {
+					return
+				}
+			}
+			nonText++
+			queue = append(queue, e)
+		}
+		for in != nil || (len(queue) > 0 && !discarding) {
+			var send chan<- agent.ChatEvent
+			var head agent.ChatEvent
+			if len(queue) > 0 && !discarding {
+				send, head = out, queue[0]
+			}
+			select {
+			case e, ok := <-in:
+				if !ok {
+					in = nil
+					continue
+				}
+				if !discarding {
+					push(e)
+				}
+			case send <- head:
+				if head.Type == "text" && head.Message == nil && len(head.Attachments) == 0 {
+					textBytes -= len(head.Delta)
+				} else {
+					nonText--
+				}
+				queue[0] = agent.ChatEvent{}
+				queue = queue[1:]
+			case <-discardCh:
+				discarding, queue, discardCh = true, nil, nil
+			}
+		}
+	}()
+	return out, discard
+}
+
 // finish settles a claimed entry once the attach stream ends: without a
 // terminal event the Hub is gone, so the turn is aborted.
 func (e *keyedBgAttachEntry) finish(terminal bool) {
@@ -245,9 +378,12 @@ func (sf *remoteKeyedSurface) holderID() string {
 // Returning leaves any unconsumed events to the caller's drain (the turn then
 // finishes unobserved; it is not aborted).
 func (sf *remoteKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan agent.ChatEvent, cancel func()) {
+	buffered, discard := bufferKeyedBgEvents(events)
+	// However this returns, the rest of the turn is drained (never replayed).
+	defer discard()
 	e := &keyedBgAttachEntry{
 		agentID: agentID, sessionKey: sessionKey, hubPeerID: sf.hubPeerID,
-		events: events, cancel: cancel,
+		events: buffered, cancel: cancel,
 		claimed: make(chan struct{}), finished: make(chan struct{}),
 	}
 	token, err := sf.s.keyedBg.register(e)
@@ -255,31 +391,61 @@ func (sf *remoteKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, agentI
 		sf.undelivered(err)
 		return
 	}
-	notifyID, err := randomKeyedBgToken()
-	if err == nil {
-		err = sf.notify(ctx, keyedBgNotifyRequest{Kind: keyedBgNotifyKindTurn, Token: token, NotifyID: notifyID}, keyedBgTurnNotifyBudget)
-	}
-	if err != nil && sf.s.keyedBg.unregister(token, e) {
-		sf.undelivered(err)
-		return
-	}
-	// Notified (or claimed although the 202 was lost): wait for the claim.
-	timer := time.NewTimer(keyedBgAttachWait)
-	defer timer.Stop()
-	select {
-	case <-e.claimed:
-	case <-ctx.Done():
-		// Lifecycle cancel (reset / delete / shutdown / handoff quiesce).
-		if sf.s.keyedBg.unregister(token, e) {
+	deadline := time.Now().Add(keyedBgAttachMax)
+	for {
+		notifyID, err := randomKeyedBgToken()
+		permanent := err != nil
+		if err == nil {
+			err = sf.notify(ctx, keyedBgNotifyRequest{Kind: keyedBgNotifyKindTurn, Token: token, NotifyID: notifyID}, keyedBgTurnNotifyBudget)
+			var perm keyedBgPermanentError
+			permanent = errors.As(err, &perm)
+		}
+		// Only a permanent rejection or a lifecycle cancel gives up early. A
+		// transient failure (Hub unreachable past the notify budget) keeps
+		// the token registered and retries at the next re-notify interval,
+		// so an outage shorter than keyedBgAttachMax does not lose the turn.
+		if err != nil && (permanent || ctx.Err() != nil) && sf.s.keyedBg.unregister(token, e) {
+			if ctx.Err() == nil {
+				sf.undelivered(err)
+			}
 			return
 		}
-	case <-timer.C:
-		if sf.s.keyedBg.unregister(token, e) {
-			sf.undelivered(errors.New("Hub did not attach within " + keyedBgAttachWait.String()))
+		if err != nil && !permanent && ctx.Err() == nil {
+			sf.s.logger.Warn("keyed background turn notify failed; will re-notify",
+				"agent", sf.agentID, "sessionKey", sf.sessionKey, "hub", sf.hubPeerID, "err", err)
+		}
+		// Notified (or claimed although the 202 was lost): wait for the
+		// claim, re-notifying (same token) each keyedBgAttachWait so a lost
+		// Hub delivery is requeued, up to the linger lifetime.
+		wait := keyedBgAttachWait
+		if left := time.Until(deadline); left < wait {
+			wait = left
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-e.claimed:
+			timer.Stop()
+			<-e.finished
+			return
+		case <-ctx.Done():
+			timer.Stop()
+			// Lifecycle cancel (reset / delete / shutdown / handoff quiesce).
+			if sf.s.keyedBg.unregister(token, e) {
+				return
+			}
+			<-e.finished
+			return
+		case <-timer.C:
+		}
+		if !time.Now().Before(deadline) {
+			if sf.s.keyedBg.unregister(token, e) {
+				sf.undelivered(errors.New("Hub did not attach within " + keyedBgAttachMax.String()))
+				return
+			}
+			<-e.finished
 			return
 		}
 	}
-	<-e.finished
 }
 
 func (sf *remoteKeyedSurface) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan agent.ChatEvent, cancel func()) {
@@ -456,7 +622,19 @@ func (s *Server) handlePeerKeyedBackgroundNotify(w http.ResponseWriter, r *http.
 		routeCtx := context.WithValue(r.Context(), externalChatRouteVersionKey{}, externalChatRouteVersion{AgentID: agentID, Version: store.AgentLockVersion{Token: lock.FencingToken, Holder: lock.HolderPeer}})
 		s.externalChat.rememberRouteFrom(routeCtx, agentID, holder)
 		token := req.Token
+		ok, full := s.keyedBg.beginDelivery(token)
+		if full {
+			s.keyedBg.forgetNotify(req.NotifyID)
+			writeError(w, http.StatusServiceUnavailable, "busy", "too many keyed background deliveries in flight")
+			return
+		}
+		if !ok {
+			// A holder re-notify while the delivery still waits in the
+			// surface FIFO: it is already queued.
+			break
+		}
 		go func() {
+			defer s.keyedBg.endDelivery(token)
 			err := s.agents.DeliverRemoteKeyedBackgroundTurn(agentID, key, func(ctx context.Context, groupID, messageID string) (<-chan agent.ChatEvent, error) {
 				return s.externalChat.ChatOneShot(ctx, agentID, keyedBgPlaceholderMessage, agent.OneShotOpts{
 					SessionKey:                  key,

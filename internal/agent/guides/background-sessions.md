@@ -5,7 +5,14 @@ Agent tool call started with `run_in_background` keeps running after your
 reply. kojo keeps that thread's CLI process alive ("lingering") until the
 tasks finish; when one completes, its notification starts a new turn in the
 SAME thread and your reply is posted there. A message someone sends to the
-thread meanwhile goes to the same process.
+thread meanwhile goes to the same process; sent while such a notification turn
+runs, it is steered into that turn and answered in its reply.
+
+Stopping: when a user stops your turn (Slack `!stop`, the WebUI stop button),
+only the current turn ends — your background tasks keep running and still
+report back in the thread. Slack `!stop all` also stops every background task
+of the thread; you are told on your next turn there. To stop tasks yourself, use
+the API below.
 
 Limits:
 - At most 50 threads per agent can linger with tasks pending at once. A normal
@@ -28,7 +35,7 @@ curl {CURL_FLAGS} '{API_BASE}/api/v1/agents/{AGENT_ID}/background-sessions'
 ```
 
 Response: `{"sessions":[{"sessionKey","surface":"webui_thread|slack|other","threadId","threadName","state":"lingering|turn|closing","lingeringSince","pendingCount","tasks":[{"id","type","description","startedAt","elapsedSeconds"}]}],"lingering":N,"cap":50}`.
-`startedAt` is when kojo first saw the task.
+`startedAt` is when the task was started (the CLI's task start event).
 
 Stop every background task of one thread (a stop notice is posted to that
 thread). URL-encode the `sessionKey` (it contains `:`):
@@ -37,7 +44,7 @@ thread). URL-encode the `sessionKey` (it contains `:`):
 curl {CURL_FLAGS} -X DELETE '{API_BASE}/api/v1/agents/{AGENT_ID}/background-sessions/SESSION_KEY'
 ```
 
-Stop a single task (no thread notice):
+Stop a single task (a stop notice is posted to the thread):
 
 ```bash
 curl {CURL_FLAGS} -X DELETE '{API_BASE}/api/v1/agents/{AGENT_ID}/background-sessions/SESSION_KEY/tasks/TASK_ID'

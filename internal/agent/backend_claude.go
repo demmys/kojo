@@ -483,6 +483,10 @@ type ClaudeBackend struct {
 	// onKeyedTasksAbandoned is told when a keyed session dies while the CLI
 	// still reported pending background tasks (best-effort user notice).
 	onKeyedTasksAbandoned KeyedTasksAbandonedFunc
+	// onKeyedNoteLocked stores the agent's one-time note for tasks a keyed
+	// session is about to kill, called under that session's mu (it may only
+	// take leaf locks) so a follow-up turn admitted afterwards sees it.
+	onKeyedNoteLocked func(agentID, sessionKey string, pending int, reason string)
 	// exitNotices counts, per agent, keyed sessions whose exit handling (the
 	// abandoned notice and the surface release) is still running.
 	exitNoticeMu sync.Mutex
@@ -555,6 +559,12 @@ func (b *ClaudeBackend) SetKeyedBackgroundTurnHandler(fn KeyedBackgroundTurnFunc
 // keyed session exits with background tasks still pending.
 func (b *ClaudeBackend) SetKeyedTasksAbandonedHandler(fn KeyedTasksAbandonedFunc) {
 	b.onKeyedTasksAbandoned = fn
+}
+
+// SetKeyedNoteLockedHandler registers the Manager callback that stores a
+// keyed session's one-time agent note under the session lock (leaf locks only).
+func (b *ClaudeBackend) SetKeyedNoteLockedHandler(fn func(agentID, sessionKey string, pending int, reason string)) {
+	b.onKeyedNoteLocked = fn
 }
 
 // SetSubagentActivityHandler registers the Manager callback used to surface
@@ -1651,6 +1661,19 @@ type claudeStreamEvent struct {
 	// list means nothing is pending any more). Only meaningful on that
 	// subtype; see backgroundTaskCount.
 	Tasks []claudeBackgroundTask `json:"tasks,omitempty"`
+
+	// TaskID / IsBackgrounded are carried by the per-task lifecycle system
+	// events (task_started, task_notification). task_started is emitted when
+	// the task is spawned — also for a foreground task that is backgrounded
+	// later, which only then enters background_tasks_changed — and neither
+	// event carries a timestamp, so its arrival is the task's start time.
+	TaskID         string `json:"task_id,omitempty"`
+	IsBackgrounded *bool  `json:"is_backgrounded,omitempty"`
+	// TaskStatus is task_notification's final status ("completed", "failed",
+	// "stopped", ...). A stopped task gets no follow-up notification turn.
+	// Raw because other system subtypes reuse "status" with other shapes and
+	// a type mismatch must not fail decoding the whole event.
+	TaskStatus json.RawMessage `json:"status,omitempty"`
 }
 
 // claudeBackgroundTask is one entry of a background_tasks_changed event.

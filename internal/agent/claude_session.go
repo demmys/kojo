@@ -122,7 +122,7 @@ type claudeSession struct {
 	lingerExpired bool        // hard cap fired mid-turn: close at the turn's end
 	closing       bool        // close initiated; a new turn must wait + respawn
 	closeReason   string      // why the keyed session was closed (for the abandoned notice)
-	procAborted   bool        // the solicited keyed turn's ctx was cancelled and the process killed
+	procAborted   bool        // the solicited keyed turn's interrupt went unanswered and the process was killed
 	// lingerSlot: this session holds one of the agent's linger slots
 	// (ClaudeBackend.lingerSlots) because it outlived a turn with tasks
 	// pending. lingerSince is when the slot was taken.
@@ -138,11 +138,37 @@ type claudeSession struct {
 	surfaceMu   sync.Mutex
 	surface     KeyedSessionSurface
 	surfaceDone bool
-	// tasks is the latest background_tasks_changed snapshot; taskSeen keeps
-	// each task's first-seen time across snapshots (background-session API).
+	// tasks is the latest background_tasks_changed snapshot; taskSeen maps
+	// each of its tasks to its start time (background-session API).
 	tasks    []claudeBackgroundTask
 	taskSeen map[string]time.Time
+	// taskLife tracks every task the CLI reported (task_started or a
+	// snapshot) until its task_notification: the start time, and whether it
+	// ran in the background (guarded by mu).
+	taskLife map[string]taskLifeEntry
+	// stopRequested holds the task ids already sent a stop_task (their stop
+	// notice is posted), pruned to the live snapshot: they are neither
+	// stopped twice nor reported again as abandoned. stopAllAtTurnEnd: a
+	// `!stop all` hit a running turn, so at its result any task not covered
+	// by that stop (spawned after its snapshot) is killed too (guarded by mu).
+	stopRequested    map[string]struct{}
+	stopAllAtTurnEnd bool
+	// notificationNext: a background task's task_notification arrived while
+	// idle, so the next unsolicited turn is the CLI's notification turn for
+	// it — never a queued steer line — and the queued-steer reaper must
+	// spare it (guarded by mu).
+	notificationNext bool
 }
+
+// taskLifeEntry is one taskLife record.
+type taskLifeEntry struct {
+	startedAt    time.Time
+	backgrounded bool
+}
+
+// claudeInterruptEscalation is how long a stopped turn may take to answer the
+// interrupt before the process is killed (test seam).
+var claudeInterruptEscalation = 10 * time.Second
 
 // sessionSend delivers e to the turn sink, but never blocks the shared
 // readLoop indefinitely: it aborts if the turn context is cancelled or a
@@ -562,6 +588,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	// queued has either been consumed already or will be answered within
 	// this turn the user just started — killing it would eat their turn.
 	s.killQueuedSteerTurns = 0
+	s.notificationNext = false
 	s.lastActivity = time.Now()
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(ctx, sink, e)
@@ -580,6 +607,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 	// Watch the turn context: on abort, interrupt the running turn (the
 	// process stays alive). The turn ends normally via the ensuing
 	// result/error_during_execution event.
+	escalation := claudeInterruptEscalation // read once, before the watcher outlives the call
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -597,20 +625,12 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 			if isStale() {
 				return
 			}
-			if s.keyed {
-				// Keyed (Slack thread) turns keep today's per-turn
-				// semantics: cancelling the turn kills the process,
-				// including any background tasks (a stop is a stop).
-				s.mu.Lock()
-				s.procAborted = true
-				s.setClosingLocked()
-				if s.closeReason == "" {
-					s.closeReason = "turn cancelled"
-				}
-				s.mu.Unlock()
-				s.forceKill()
-				return
-			}
+			// Keyed (Slack/WebUI thread) turns share the main chat's stop
+			// semantics: the interrupt ends only the running turn (and its
+			// foreground tool); run_in_background tasks keep running on the
+			// live process (verified against claude 2.1.280), so the session
+			// lingers for them exactly like a turn that ended normally.
+			// Explicit task stops go through the background-session API.
 			// Start the escalation timer BEFORE the control writes and fire them
 			// in their own goroutine: a wedged stdin pipe must not delay
 			// escalation. Without this the session could sit in sessInTurn
@@ -629,7 +649,7 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 					return
 				}
 				s.qstate.denyAllPending("turn aborted")
-				s.interrupt()
+				s.interruptIfCurrent(done)
 			}()
 			select {
 			case <-done:
@@ -664,7 +684,23 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 					}
 					s.mu.Unlock()
 				}
-			case <-time.After(10 * time.Second):
+			case <-time.After(escalation):
+				if s.keyed {
+					// The kill takes the background tasks with it; unlike an
+					// answered interrupt this is not what the stop asked for,
+					// so report them as abandoned (onEOF) with the reason.
+					s.mu.Lock()
+					if s.turnDone != done || s.state != sessInTurn {
+						s.mu.Unlock()
+						return
+					}
+					s.procAborted = true
+					if s.closeReason == "" {
+						s.closeReason = keyedInterruptKillReason
+					}
+					s.setClosingLocked()
+					s.mu.Unlock()
+				}
 				s.logger.Warn("claude interrupt unanswered; killing session process", "agent", s.agentID)
 				// Kill the process group directly — close() funnels through
 				// the stdin mutex, which a wedged interrupt write may hold.
@@ -703,6 +739,29 @@ func (s *claudeSession) markTurnSteerOver() {
 
 // interrupt sends the CLI interrupt control request to abort the running turn
 // without killing the process.
+// interruptIfCurrent writes the interrupt only while the turn identified by
+// done is still the running one. The identity check and the write both happen
+// under the stdin mutex, which a successor turn's first user line also takes,
+// so a late abort either lands on stdin ahead of that line (the CLI applies it
+// to the finished turn — a no-op once its result is out) or is skipped; it can
+// never interrupt the successor. Lock order: stdinW.mu → s.mu (no path takes
+// the stdin mutex while holding s.mu).
+func (s *claudeSession) interruptIfCurrent(done chan struct{}) {
+	line, _ := json.Marshal(map[string]any{
+		"type":       "control_request",
+		"request_id": "kojo-interrupt-" + generateMessageID(),
+		"request":    map[string]any{"subtype": "interrupt"},
+	})
+	s.stdinW.mu.Lock()
+	defer s.stdinW.mu.Unlock()
+	s.mu.Lock()
+	current := s.turnDone == done && s.state == sessInTurn
+	s.mu.Unlock()
+	if current && !s.stdinW.closed {
+		_, _ = s.stdinW.w.Write(append(line, '\n'))
+	}
+}
+
 func (s *claudeSession) interrupt() {
 	line, _ := json.Marshal(map[string]any{
 		"type":       "control_request",
@@ -786,6 +845,7 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 		if _, ok := backgroundTaskCount(event); ok {
 			s.onBackgroundTasksChanged(event.Tasks)
 		}
+		s.onTaskLifecycleEvent(event)
 
 		s.mu.Lock()
 		if s.state == sessInTurn && !s.unsolicited && notifResult {
@@ -918,6 +978,7 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	// turnDone identity pins it to THIS turn: a late abort (user mashing stop
 	// around the turn boundary) must never interrupt a successor turn.
 	abortTurn := s.turnDone
+	abortEscalation := claudeInterruptEscalation
 	abortWorker := func() {
 		// Fully async: callers include Manager.Abort (WS main loop) — a
 		// deny/interrupt write to a wedged stdin, or the 10s escalation
@@ -937,16 +998,27 @@ func (s *claudeSession) openUnsolicitedLocked() {
 			// without the escalation a wedged CLI would leave the busy
 			// slot stuck until a kojo restart.
 			s.qstate.denyAllPending("turn aborted")
-			s.interrupt()
+			// Identity-checked under the stdin mutex: a late worker must
+			// not interrupt a successor turn.
+			s.interruptIfCurrent(abortTurn)
 			select {
 			case <-abortTurn:
-			case <-time.After(10 * time.Second):
+			case <-time.After(abortEscalation):
 				// Re-check identity before the kill: when the timer and
 				// the turn's completion race, select picks arbitrarily —
 				// a process-group kill must never land after the turn
 				// already ended (it would take out a successor turn).
 				s.mu.Lock()
 				stale := s.turnDone != abortTurn || s.state != sessInTurn
+				if !stale && s.keyed {
+					// Closing in the same critical section: no successor
+					// turn can start on the process about to be killed,
+					// and its pending tasks are reported with the reason.
+					if s.closeReason == "" {
+						s.closeReason = keyedInterruptKillReason
+					}
+					s.setClosingLocked()
+				}
 				s.mu.Unlock()
 				if stale {
 					return
@@ -976,8 +1048,16 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	// Interrupt it immediately — the operator already said stop. The
 	// interrupt is sent from a goroutine so the shared readLoop (our
 	// caller) never blocks behind the stdin mutex.
+	notification := s.notificationNext
+	s.notificationNext = false
 	if s.killQueuedSteerTurns > 0 {
-		if time.Now().Before(s.killQueuedSteerUntil) {
+		if notification && time.Now().Before(s.killQueuedSteerUntil) {
+			// A background task finished right after the stop: this is the
+			// CLI's notification turn, not a queued steer line. A turn stop
+			// must not cost the task's result, so spare it; the counter stays
+			// armed for a queued-steer turn that may still follow.
+			s.logger.Info("sparing background notification turn from the queued-steer reaper", "agent", s.agentID)
+		} else if time.Now().Before(s.killQueuedSteerUntil) {
 			s.killQueuedSteerTurns--
 			s.turnAborted = true // caller holds s.mu
 			s.logger.Info("interrupting queued-steer auto-turn after abort", "agent", s.agentID, "remaining", s.killQueuedSteerTurns)
@@ -1096,11 +1176,25 @@ func (s *claudeSession) completeTurn() {
 	if !turnAborted && (turnCtx == nil || turnCtx.Err() == nil) {
 		turnError = res.resultError
 	}
-	if s.keyed && !unsolicited && turnCtx != nil && turnCtx.Err() != nil {
+	// A stopped keyed turn ends here (the interrupt's result) with its
+	// partial content and the cancel/timeout marker, like the per-turn
+	// path's emitCancelDone. Its terminal event must survive the cancelled
+	// turn ctx (the consumer drains until the terminal), so it is sent on a
+	// background ctx (still bounded by sessionSend's ceiling).
+	keyedCancelled := s.keyed && !unsolicited && turnCtx != nil && turnCtx.Err() != nil
+	sendCtx := turnCtx
+	if keyedCancelled {
 		turnError = cancelErrMessage(turnCtx)
+		sendCtx = context.Background()
 	}
 	finalText := finalStreamText(res, turnError != "")
-	if finalText == "" {
+	if keyedCancelled {
+		// Partial content as streamed (emitCancelDone parity).
+		finalText = mergeStreamTexts(res)
+	}
+	// Session recovery re-reads the JSONL's last assistant text; for a
+	// stopped turn that is the PREVIOUS turn's reply, never this one's.
+	if finalText == "" && !keyedCancelled {
 		recoverID := res.streamSessionID
 		if recoverID == "" {
 			recoverID = s.sessionID
@@ -1112,10 +1206,10 @@ func (s *claudeSession) completeTurn() {
 		}
 	}
 	if finalText != "" && res.fullText == "" {
-		sessionSend(turnCtx, sink, ChatEvent{Type: "text", Delta: finalText})
+		sessionSend(sendCtx, sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError, BackgroundTasksPending: lingerPending})
+	sessionSend(sendCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError, BackgroundTasksPending: lingerPending})
 	close(sink)
 	if done != nil {
 		close(done)
@@ -1223,11 +1317,12 @@ func (s *claudeSession) onEOF() {
 		// Counted under the same lock that publishes sessDead, so a sync
 		// close that observed the exit also observes the pending notice.
 		s.b.beginKeyedExitNotice(s.agentID)
-		if !procAborted {
-			abandoned = s.pendingTasks
-			if s.pendingAtClose > abandoned {
-				abandoned = s.pendingAtClose
-			}
+		// Every exit with tasks still pending is reported — including an
+		// unanswered-interrupt kill (procAborted): a turn stop is meant to
+		// leave the background tasks running, so losing them is news.
+		abandoned = s.unrequestedTasksLocked()
+		if s.pendingAtClose > abandoned {
+			abandoned = s.pendingAtClose
 		}
 	}
 	s.mu.Unlock()

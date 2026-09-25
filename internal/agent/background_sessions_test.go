@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -174,14 +175,14 @@ func TestLingerCapHasRoomLingers(t *testing.T) {
 }
 
 func TestKeyedTurnNote(t *testing.T) {
-	m := newTestManager(t)
+	m, _ := newBgSessionsTestManager(t)
 	b := newKeyedTestBackend()
-	if got := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); got != "" {
+	if got, _ := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); got != "" {
 		t.Fatalf("note with nothing lingering = %q", got)
 	}
 	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_1", 2, lingerCapReason(), nil)
 	fillLingerSlots(b, 3)
-	got := m.keyedTurnNote("test-agent", "groupdm:gd_1", b)
+	got, oneTime := m.keyedTurnNote("test-agent", "groupdm:gd_1", b)
 	for _, want := range []string{"バックグラウンドタスク2件は、完了前に終了", lingerCapReason(), "スレッドが3件", "/api/v1/agents/test-agent/background-sessions"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("note %q missing %q", got, want)
@@ -190,17 +191,22 @@ func TestKeyedTurnNote(t *testing.T) {
 	if strings.Contains(got, "待機上限50件に到達") {
 		t.Errorf("cap warning shown below the cap: %q", got)
 	}
-	// One-time: the abandoned note is popped.
-	if again := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); strings.Contains(again, "完了前に終了") {
+	// Only peeked until the turn started: a failed start keeps it.
+	if again, _ := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); !strings.Contains(again, "完了前に終了") {
+		t.Errorf("uncommitted note lost: %q", again)
+	}
+	// One-time: committed after a started turn, it is gone.
+	m.commitKeyedNote("test-agent", "groupdm:gd_1", oneTime)
+	if again, _ := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); strings.Contains(again, "完了前に終了") {
 		t.Errorf("abandoned note repeated: %q", again)
 	}
 	fillLingerSlots(b, maxLingeringSessionsPerAgent)
-	if full := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); !strings.Contains(full, "待機上限50件に到達") {
+	if full, _ := m.keyedTurnNote("test-agent", "groupdm:gd_1", b); !strings.Contains(full, "待機上限50件に到達") {
 		t.Errorf("cap-full warning missing: %q", full)
 	}
 	// An explicit stop leaves no note.
 	m.handleKeyedTasksAbandoned("test-agent", "groupdm:gd_2", 1, KeyedStopRequestedReason, nil)
-	if note := m.popKeyedNote("test-agent", "groupdm:gd_2"); note != "" {
+	if note := m.peekKeyedNote("test-agent", "groupdm:gd_2"); note != "" {
 		t.Errorf("stop request left a note: %q", note)
 	}
 }
@@ -335,7 +341,8 @@ func TestStopBackgroundSessionInTurnSendsStopTask(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	out := rec.String()
-	if strings.Count(out, `"subtype":"stop_task"`) != 3 || !strings.Contains(out, `"task_id":"x1"`) || !strings.Contains(out, `"task_id":"x2"`) {
+	// x1 is already stopping: the session stop only adds x2.
+	if strings.Count(out, `"subtype":"stop_task"`) != 2 || strings.Count(out, `"task_id":"x1"`) != 1 || !strings.Contains(out, `"task_id":"x2"`) {
 		t.Fatalf("stdin = %s", out)
 	}
 }
@@ -466,7 +473,7 @@ func TestWebUIThreadAbandonedNotice(t *testing.T) {
 	gdm, mgr, groupID := setupBgThread(t)
 	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 2, lingerCapReason(), nil)
 	waitForMessage(t, gdm, groupID, threadBackgroundAbandonedNote(2, lingerCapReason()))
-	if note := mgr.popKeyedNote("ag_alice", "groupdm:"+groupID); !strings.Contains(note, "2件") {
+	if note := mgr.peekKeyedNote("ag_alice", "groupdm:"+groupID); !strings.Contains(note, "2件") {
 		t.Fatalf("agent note = %q", note)
 	}
 	mgr.handleKeyedTasksAbandoned("ag_alice", "groupdm:"+groupID, 1, KeyedStopRequestedReason, nil)
@@ -530,7 +537,7 @@ func TestSteerOneShotFallsBackToKeyedBackgroundTurn(t *testing.T) {
 	key := "groupdm:gd_steer"
 	var mu sync.Mutex
 	var got []string
-	unregister := m.registerKeyedBgSteer(key, func(text string) error {
+	unregister := m.registerKeyedBgSteer(key, "", func(text string) error {
 		mu.Lock()
 		got = append(got, text)
 		mu.Unlock()
@@ -553,5 +560,81 @@ func TestSteerOneShotFallsBackToKeyedBackgroundTurn(t *testing.T) {
 	defer mu.Unlock()
 	if strings.Join(got, ",") != "first,second" {
 		t.Fatalf("background steer got %v", got)
+	}
+}
+
+// A lifecycle cancel landing while the finished turn is being finalized (the
+// attachment scan, or auto-titling) still discards the reply and its staged
+// files: deterministic via threadFinalizeHook.
+func TestThreadTurnLifecycleCancelDuringFinalize(t *testing.T) {
+	for _, stage := range []string{"scanned", "titled"} {
+		t.Run(stage, func(t *testing.T) {
+			gdm, _, groupID := setupBgThread(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			hits := 0
+			threadFinalizeHook = func(s string) {
+				if s == stage {
+					hits++
+					cancel()
+				}
+			}
+			t.Cleanup(func() { threadFinalizeHook = nil })
+			stageDir := threadAttachmentStageDir("ag_alice", groupID)
+			if err := os.MkdirAll(stageDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			events := make(chan ChatEvent, 2)
+			events <- ChatEvent{Type: "text", Delta: "late reply"}
+			events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "late reply"}}
+			close(events)
+			gdm.consumeThreadTurn(ctx, events, threadTurnOutput{
+				agentID: "ag_alice", groupID: groupID, replyMessageID: "m_finalize",
+				attachmentStageDir: stageDir, firstUserMessage: "hello there",
+			})
+			if hits != 1 {
+				t.Fatalf("finalize hook %q hit %d times", stage, hits)
+			}
+			if msgs := agentMessages(t, gdm, groupID); len(msgs) != 0 {
+				t.Fatalf("cancel during %s posted %q", stage, msgs[0].Content)
+			}
+			if _, err := os.Stat(stageDir); !os.IsNotExist(err) {
+				t.Fatalf("stage dir survived the discarded turn: %v", err)
+			}
+		})
+	}
+	// Control: without a cancel the same turn posts.
+	gdm, _, groupID := setupBgThread(t)
+	events := make(chan ChatEvent, 1)
+	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "posted"}}
+	close(events)
+	gdm.consumeThreadTurn(context.Background(), events, threadTurnOutput{agentID: "ag_alice", groupID: groupID, replyMessageID: "m_ok"})
+	if msgs := agentMessages(t, gdm, groupID); len(msgs) != 1 || msgs[0].Content != "posted" {
+		t.Fatalf("control turn not posted: %v", msgs)
+	}
+}
+
+// A stopped WebUI thread turn ends only itself: its reply says the thread's
+// background tasks keep running (instead of dropping the note).
+func TestThreadStoppedTurnSaysBackgroundContinues(t *testing.T) {
+	gdm, _, groupID := setupBgThread(t)
+	gdm.threadCancelMu.Lock()
+	if gdm.threadStopped == nil {
+		gdm.threadStopped = make(map[string]bool)
+	}
+	gdm.threadStopped[groupID] = true
+	gdm.threadCancelMu.Unlock()
+	events := make(chan ChatEvent, 2)
+	events <- ChatEvent{Type: "text", Delta: "partial"}
+	events <- ChatEvent{Type: "done", ErrorMessage: ErrMsgCancelled, BackgroundTasksPending: 2}
+	close(events)
+	gdm.consumeThreadTurn(context.Background(), events, threadTurnOutput{agentID: "ag_alice", groupID: groupID, replyMessageID: "m_stopped"})
+	msgs := agentMessages(t, gdm, groupID)
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, threadStoppedBackgroundNote(2)) {
+		var got []string
+		for _, m := range msgs {
+			got = append(got, m.Content)
+		}
+		t.Fatalf("stopped reply = %q", got)
 	}
 }

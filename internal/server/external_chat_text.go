@@ -91,6 +91,9 @@ type externalChatSteerRequest struct {
 	SessionKey string                `json:"sessionKey"`
 	Content    string                `json:"content,omitempty"`
 	Question   *agent.QuestionAnswer `json:"question,omitempty"`
+	// StopBackground relays a thread's `!stop all`: stop every background
+	// task of the keyed session instead of steering text into a turn.
+	StopBackground bool `json:"stopBackground,omitempty"`
 }
 
 type externalChatTextEnvelope struct {
@@ -464,6 +467,13 @@ func (r *externalChatRouter) SteerOneShotAsUser(ctx context.Context, agentID, se
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Content: content, GoalUserID: userID})
 }
 
+// StopThreadBackgroundTasks follows the thread's holder like a steer and stops
+// every background task of its keyed session (Slack `!stop all`). It returns
+// agent.ErrBackgroundSessionNotFound when the thread has none.
+func (r *externalChatRouter) StopThreadBackgroundTasks(ctx context.Context, agentID, sessionKey string) error {
+	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, StopBackground: true})
+}
+
 func (r *externalChatRouter) AnswerOneShotQuestion(ctx context.Context, agentID, sessionKey string, answer agent.QuestionAnswer) error {
 	return r.sendOneShotInput(ctx, agentID, externalChatSteerRequest{SessionKey: sessionKey, Question: &answer})
 }
@@ -501,6 +511,9 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 				return fmt.Errorf("agent thread holder is unavailable: %s", ready.Unavailable)
 			}
 			return steerOneShotWithContext(ctx, r.localSteerSem, localSteerAdmissionWait, func() error {
+				if input.StopBackground {
+					return r.server.agents.StopThreadBackgroundTasks(agentID, input.SessionKey)
+				}
 				if input.Question != nil {
 					q := input.Question
 					return r.server.agents.AnswerOneShotQuestion(agentID, input.SessionKey, r.selfPeerID(), q.RequestID, q.Answers, q.Deny, q.DenyMessage)
@@ -558,6 +571,8 @@ func (r *externalChatRouter) sendOneShotInput(ctx context.Context, agentID strin
 			return agent.ErrInvalidQuestionAnswer
 		case "not_busy":
 			return fmt.Errorf("%w: %s", agent.ErrAgentNotBusy, msg)
+		case "background_session_not_found":
+			return fmt.Errorf("%w: %s", agent.ErrBackgroundSessionNotFound, msg)
 		case "unsupported":
 			return fmt.Errorf("%w: %s", agent.ErrSteerUnsupported, msg)
 		case "delivery_uncertain":
@@ -1348,6 +1363,28 @@ func (s *Server) handleExternalChatSteer(w http.ResponseWriter, r *http.Request)
 	var req externalChatSteerRequest
 	if err := dec.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "invalid external steer request: "+err.Error())
+		return
+	}
+	if req.StopBackground {
+		if strings.TrimSpace(req.SessionKey) == "" || req.Content != "" || req.Question != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", "stopBackground takes only sessionKey")
+			return
+		}
+		origin := auth.FromContext(r.Context()).PeerID
+		if s.unsafePeer && auth.FromContext(r.Context()).IsOwner() {
+			origin = ""
+		}
+		err := s.agents.StopThreadBackgroundTasksFromOrigin(agentID, req.SessionKey, origin)
+		switch {
+		case err == nil:
+			writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+		case errors.Is(err, agent.ErrBackgroundSessionNotFound):
+			writeError(w, http.StatusNotFound, "background_session_not_found", err.Error())
+		case errors.Is(err, agent.ErrSteerOriginForbidden):
+			writeError(w, http.StatusForbidden, "forbidden", "caller does not own this thread session")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
 		return
 	}
 	if strings.TrimSpace(req.SessionKey) == "" || (req.Question == nil && strings.TrimSpace(req.Content) == "") || (req.Question != nil && (req.Question.RequestID == "" || req.Content != "")) {

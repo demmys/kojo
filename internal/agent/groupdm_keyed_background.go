@@ -18,11 +18,20 @@ func threadBackgroundPendingNote(n int) string {
 	return fmt.Sprintf("_バックグラウンド処理 %d件 実行中。完了したらこのスレッドで続きを投稿します_", n)
 }
 
+// threadStoppedBackgroundNote is appended to a stopped thread reply whose
+// background tasks keep running (a stop ends only the turn).
+func threadStoppedBackgroundNote(n int) string {
+	return fmt.Sprintf("_バックグラウンド処理 %d件 は継続中です。完了したらこのスレッドで続きを投稿します（止めるにはエージェントに停止を依頼してください）_", n)
+}
+
 // threadBackgroundAbandonedNote is the notice posted when a lingering thread
 // session ended with background tasks still pending.
 func threadBackgroundAbandonedNote(pending int, reason string) string {
-	if reason == KeyedStopRequestedReason {
+	switch reason {
+	case KeyedStopRequestedReason:
 		return fmt.Sprintf("_バックグラウンド処理 %d件 を停止しました（エージェントの依頼）_", pending)
+	case KeyedUserStopReason:
+		return fmt.Sprintf("_バックグラウンド処理 %d件 を停止しました（ユーザーの依頼）_", pending)
 	}
 	msg := fmt.Sprintf("_バックグラウンド処理 %d件 が完了前に終了しました", pending)
 	if reason != "" {

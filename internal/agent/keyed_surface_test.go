@@ -16,6 +16,7 @@ type fakeKeyedSurface struct {
 	ctxs      chan context.Context
 	abandoned chan int
 	onTurn    func()
+	reason    string
 }
 
 func newFakeKeyedSurface(origin string) *fakeKeyedSurface {
@@ -34,8 +35,17 @@ func (f *fakeKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, _, _ stri
 	f.turns <- evs
 }
 
-func (f *fakeKeyedSurface) KeyedBackgroundTasksAbandoned(_, _ string, pending int, _ string) {
+func (f *fakeKeyedSurface) KeyedBackgroundTasksAbandoned(_, _ string, pending int, reason string) {
+	f.mu.Lock()
+	f.reason = reason
+	f.mu.Unlock()
 	f.abandoned <- pending
+}
+
+func (f *fakeKeyedSurface) lastReason() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reason
 }
 func (f *fakeKeyedSurface) OriginPeerID() string { return f.origin }
 func (f *fakeKeyedSurface) Retain()              { f.mu.Lock(); f.refs++; f.mu.Unlock() }
@@ -79,6 +89,9 @@ func TestKeyedSurfaceTakesPrecedenceForBackgroundTurn(t *testing.T) {
 
 func TestKeyedSurfaceReceivesAbandonedNotice(t *testing.T) {
 	m := newTestManager(t)
+	m.mu.Lock()
+	m.agents["ag1"] = &Agent{ID: "ag1", Name: "A", Tool: "claude"}
+	m.mu.Unlock()
 	h := &recordingKeyedHandler{got: make(chan []ChatEvent, 1)}
 	defer m.RegisterKeyedBackgroundHandler("ag1", h)()
 	sf := newFakeKeyedSurface("hub")
@@ -86,7 +99,7 @@ func TestKeyedSurfaceReceivesAbandonedNotice(t *testing.T) {
 	if got := <-sf.abandoned; got != 3 {
 		t.Fatalf("pending = %d", got)
 	}
-	if note := m.popKeyedNote("ag1", "ag1:slack:C1:1.0"); note == "" {
+	if note := m.peekKeyedNote("ag1", "ag1:slack:C1:1.0"); note == "" {
 		t.Fatal("abandoned note not recorded for the next turn")
 	}
 }

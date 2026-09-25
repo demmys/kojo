@@ -75,6 +75,10 @@ type externalChatTextRequest struct {
 	ResponseAttachmentMessageID string                    `json:"responseAttachmentMessageId,omitempty"`
 	HandoffCapability           string                    `json:"-"`
 	PreserveTerminalOnCancel    bool                      `json:"-"`
+	// LingerBackgroundTasks is honored only for a Hub-local dispatch: the
+	// keyed background handler lives on this process, so a remote holder
+	// (which never receives this field) keeps the close-at-result behaviour.
+	LingerBackgroundTasks bool `json:"-"`
 }
 
 type externalChatSteerRequest struct {
@@ -266,6 +270,7 @@ func (r *externalChatRouter) ChatOneShot(ctx context.Context, agentID, message s
 		ResponseAttachmentGroupID:   opts.ResponseAttachmentGroupID,
 		ResponseAttachmentMessageID: opts.ResponseAttachmentMessageID,
 		PreserveTerminalOnCancel:    opts.PreserveTerminalOnCancel,
+		LingerBackgroundTasks:       opts.LingerBackgroundTasks,
 	}
 	if opts.SessionKey != "" && opts.HandoffArrivalReservation != nil {
 		req.HandoffCapability = r.server.mintHandoffArrivalCapability(agentID, opts.SessionKey, opts.HandoffArrivalReservation)
@@ -682,6 +687,7 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
 			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
 			PreserveTerminalOnCancel:          req.PreserveTerminalOnCancel,
+			LingerBackgroundTasks:             req.LingerBackgroundTasks,
 		})
 		if err != nil {
 			if errors.Is(err, agent.ErrAgentBusy) && s.agents.IsSwitching(agentID) {
@@ -1497,4 +1503,14 @@ func sendExternalChatEvent(ctx context.Context, out chan<- agent.ChatEvent, evt 
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// RegisterKeyedBackgroundHandler lets the Slack bot receive keyed background
+// turns from agents running on this process. Lingering only happens for
+// Hub-local dispatch, so delegating to the local Manager is complete.
+func (r *externalChatRouter) RegisterKeyedBackgroundHandler(agentID string, h agent.KeyedBackgroundHandler) func() {
+	if r == nil || r.server == nil || r.server.agents == nil {
+		return func() {}
+	}
+	return r.server.agents.RegisterKeyedBackgroundHandler(agentID, h)
 }

@@ -79,6 +79,14 @@ type ChatOptions struct {
 	// Backends must not use it for resume decisions.
 	ConversationKey string
 
+	// LingerBackgroundTasks lets a keyed (SessionKey) claude turn keep its CLI
+	// process alive past the result while the CLI reports pending
+	// run_in_background tasks, so their completion notification is still
+	// delivered (via the Manager's keyed background handler) instead of being
+	// killed with the process. Set by the Manager only when the backend is
+	// claude and a keyed handler is registered for the agent.
+	LingerBackgroundTasks bool
+
 	// FreshSessionContext is a bounded transcript supplied by the response
 	// surface (WebUI main, WebUI thread, Slack, ...). Every backend prepends
 	// it only when no native session can be resumed and a fresh session is

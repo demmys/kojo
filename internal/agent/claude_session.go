@@ -103,6 +103,26 @@ type claudeSession struct {
 	// new turn would be worse than letting a stale steer reply through).
 	killQueuedSteerTurns int
 	killQueuedSteerUntil time.Time
+
+	// poolKey is this session's key in ClaudeBackend.sessions: the agent ID
+	// for the main chat, keyedPoolKey(agentID, sessionKey) for keyed ones.
+	poolKey string
+	// keyed marks a per-conversation (Slack thread) lingering session. Its
+	// process survives a turn's result only while background tasks are
+	// pending (see claude_keyed_session.go). sessionKey is fixed for the
+	// process lifetime.
+	keyed      bool
+	sessionKey string
+
+	// Keyed-session linger state (guarded by mu).
+	pendingTasks  int         // latest background_tasks_changed count (REPLACE semantics)
+	lingerTimer   *time.Timer // hard cap from the first linger
+	graceGen      uint64      // bumped on every grace stop/re-arm; stale callbacks no-op
+	graceTimer    *time.Timer // idle grace after pending drops to 0
+	lingerExpired bool        // hard cap fired mid-turn: close at the turn's end
+	closing       bool        // close initiated; a new turn must wait + respawn
+	closeReason   string      // why the keyed session was closed (for the abandoned notice)
+	procAborted   bool        // the solicited keyed turn's ctx was cancelled and the process killed
 }
 
 // sessionSend delivers e to the turn sink, but never blocks the shared
@@ -112,6 +132,14 @@ type claudeSession struct {
 func sessionSend(ctx context.Context, sink chan<- ChatEvent, e ChatEvent) bool {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Prefer a free buffer slot over an already-cancelled ctx: select picks
+	// randomly among ready cases, which would otherwise drop a terminal event
+	// a live consumer can still read.
+	select {
+	case sink <- e:
+		return true
+	default:
 	}
 	t := time.NewTimer(60 * time.Second)
 	defer t.Stop()
@@ -209,7 +237,7 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 	spawned := false
 	if sess == nil {
 		var err error
-		sess, err = b.spawnSession(agent.ID, dir, fp, args)
+		sess, err = b.spawnSession(agent.ID, dir, fp, args, nil)
 		if err != nil {
 			b.sessMu.Unlock()
 			return nil, err
@@ -250,7 +278,7 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 			inv = b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 			args = inv.args
 			fp = fingerprintArgs(args)
-			newSess, err := b.spawnSession(agent.ID, dir, fp, args)
+			newSess, err := b.spawnSession(agent.ID, dir, fp, args, nil)
 			if err != nil {
 				if b.sessions[agent.ID] == sess {
 					delete(b.sessions, agent.ID)
@@ -330,8 +358,9 @@ func (b *ClaudeBackend) sessionDiedInUse(s *claudeSession, within time.Duration)
 }
 
 // spawnSession starts a new persistent CLI process and its readLoop. Caller
-// holds sessMu.
-func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*claudeSession, error) {
+// holds sessMu. keyed is nil for the agent's main chat; for a keyed lingering
+// session it carries the conversation key and the turn env options.
+func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string, keyed *keyedSpawn) (*claudeSession, error) {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return nil, err
@@ -343,6 +372,11 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
 	}
 	cmd.Env = filterEnv(removeEnv, agentID, dir)
+	if keyed != nil {
+		// Same per-turn env as the one-shot path (KOJO_SESSION_KEY): the key
+		// is stable for the conversation, so fixing it at spawn is exact.
+		cmd.Env = appendKojoTurnEnv(cmd.Env, keyed.opts)
+	}
 	cmd.Env = append(cmd.Env, claudeProcessEnv...)
 	if b.proxyURL != "" {
 		cmd.Env = appendCustomProxyEnv(cmd.Env, b.proxyURL)
@@ -395,18 +429,26 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string) (*c
 		stderr:       &stderrBuf,
 		state:        sessIdle,
 		lastActivity: time.Now(),
+		poolKey:      agentID,
+	}
+	if keyed != nil {
+		s.keyed = true
+		s.sessionKey = keyed.sessionKey
+		s.poolKey = keyedPoolKey(agentID, keyed.sessionKey)
 	}
 	s.qstate = newClaudeQuestionState(s.stdinW)
 	s.qstate.onWriteFailure = func() { _ = cmd.Process.Kill() }
 	// Background-subagent tailer: surfaces Task(run_in_background) output that
 	// outlives the spawning turn. Tied to procCtx so the poll loop dies with
 	// the process. Only started when a handler is registered.
-	if b.onSubagentActivity != nil {
+	// Keyed sessions never start it: the tailer attaches output to the MAIN
+	// transcript, which a Slack-thread session must not touch.
+	if b.onSubagentActivity != nil && keyed == nil {
 		s.tailer = newSubagentTailer(agentID, dir, b.logger, s.currentSessionID, b.onSubagentActivity)
 		go s.tailer.run(procCtx)
 	}
 	go s.readLoop(stdout)
-	b.logger.Info("claude persistent session spawned", "agent", agentID)
+	b.logger.Info("claude persistent session spawned", "agent", agentID, "keyed", keyed != nil)
 	return s, nil
 }
 
@@ -419,6 +461,9 @@ func (s *claudeSession) currentSessionID() string {
 	s.mu.Unlock()
 	if sid != "" {
 		return sid
+	}
+	if s.keyed {
+		return expectedClaudeSessionID(s.agentID, s.sessionKey, false)
 	}
 	return agentIDToUUID(s.agentID)
 }
@@ -470,7 +515,7 @@ func (s *claudeSession) healthy(fp string) bool {
 // streaming events and a terminal done/error, then closes.
 func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage string, canAnswer, automated bool) (<-chan ChatEvent, error) {
 	s.mu.Lock()
-	if s.state == sessDead {
+	if s.state == sessDead || s.closing {
 		s.mu.Unlock()
 		return nil, ErrAgentNotBusy
 	}
@@ -531,6 +576,20 @@ func (s *claudeSession) startTurn(ctx context.Context, agent *Agent, userMessage
 				return s.turnDone != done || s.state != sessInTurn
 			}
 			if isStale() {
+				return
+			}
+			if s.keyed {
+				// Keyed (Slack thread) turns keep today's per-turn
+				// semantics: cancelling the turn kills the process,
+				// including any background tasks (a stop is a stop).
+				s.mu.Lock()
+				s.procAborted = true
+				s.closing = true
+				if s.closeReason == "" {
+					s.closeReason = "turn cancelled"
+				}
+				s.mu.Unlock()
+				s.forceKill()
 				return
 			}
 			// Start the escalation timer BEFORE the control writes and fire them
@@ -705,6 +764,10 @@ func (s *claudeSession) readLoop(stdout interface{ Read([]byte) (int, error) }) 
 		// notification result nonetheless arrives during a solicited turn.
 		notifResult := event.Type == "result" && event.Origin != nil && event.Origin.Kind == "task-notification"
 
+		if n, ok := backgroundTaskCount(event); ok {
+			s.onBackgroundTasksChanged(n)
+		}
+
 		s.mu.Lock()
 		if s.state == sessInTurn && !s.unsolicited && notifResult {
 			// Route the racing notification to a SEPARATE unsolicited
@@ -799,8 +862,14 @@ func isTurnOpeningEvent(e claudeStreamEvent) bool {
 // mu. If no background handler is registered, acc stays nil and the events are
 // dropped.
 func (s *claudeSession) openUnsolicitedLocked() {
-	if s.b.onBackgroundTurn == nil {
+	handler := s.backgroundHandler()
+	if handler == nil {
 		return
+	}
+	if s.keyed {
+		// A notification turn is activity: the idle grace must not close
+		// the process under it.
+		s.stopGraceLocked()
 	}
 	sink := make(chan ChatEvent, 64)
 	s.state = sessInTurn
@@ -809,11 +878,18 @@ func (s *claudeSession) openUnsolicitedLocked() {
 	// AskUserQuestion it raises — the answer func is handed to the background
 	// turn handler below, and turnCanAnswer lets handleControlRequest surface the
 	// card (held with a timeout since unsolicited turns count as automated).
-	s.turnCanAnswer = true
+	// Keyed (Slack-thread) notification turns have no answer surface: deny
+	// questions inline instead of holding them.
+	s.turnCanAnswer = !s.keyed
 	s.turnAborted = false
 	s.turnSink = sink
 	s.turnCtx = context.Background()
 	s.turnDone = make(chan struct{})
+	if s.keyed {
+		// Keyed sessions accept a user message arriving mid-notification-turn
+		// as a steer (see steerIntoUnsolicited); give the turn its own gate.
+		s.turnSteer = &claudeTurnSteer{stdinW: s.stdinW}
+	}
 	s.acc = newTurnAccumulator(s.logger, func(e ChatEvent) bool {
 		return sessionSend(context.Background(), sink, e)
 	})
@@ -873,7 +949,7 @@ func (s *claudeSession) openUnsolicitedLocked() {
 			abortWorker()
 		}
 	}
-	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer, abort)
+	go handler(sink, s.qstate.answer, abort)
 	// Queued-steer reaper: this unsolicited turn is (within the deadline)
 	// the CLI auto-consuming a steer line queued behind an aborted turn.
 	// Interrupt it immediately — the operator already said stop. The
@@ -900,7 +976,8 @@ func (s *claudeSession) openUnsolicitedLocked() {
 // turn's accumulator and completion. If no background handler is registered the
 // notification is dropped.
 func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent string) {
-	if s.b.onBackgroundTurn == nil {
+	handler := s.backgroundHandler()
+	if handler == nil {
 		return
 	}
 	sink := make(chan ChatEvent, 32)
@@ -909,7 +986,7 @@ func (s *claudeSession) absorbNotification(event claudeStreamEvent, rawParent st
 	})
 	// nil abort: the absorbed notification is already complete — there is
 	// nothing running on the CLI to interrupt.
-	go s.b.onBackgroundTurn(s.agentID, sink, s.qstate.answer, nil)
+	go handler(sink, s.qstate.answer, nil)
 	acc.feed(event, rawParent)
 	res := acc.finalize()
 	turnUsage := s.turnUsageDelta(res)
@@ -947,7 +1024,16 @@ func (s *claudeSession) completeTurn() {
 	s.turnAborted = false
 	s.turnDone = nil
 	s.armReapLocked()
+	// Keyed sessions decide here whether to linger (tasks pending) or close.
+	lingerPending := 0
+	closeKeyed := false
+	if s.keyed {
+		lingerPending, closeKeyed = s.afterKeyedTurnLocked(unsolicited)
+	}
 	s.mu.Unlock()
+	if closeKeyed {
+		defer s.closeKeyed("")
+	}
 
 	// Backfill (Option C): a turn just ended, so any background subagent it
 	// spawned may have flushed transcript lines the poll loop hasn't picked up
@@ -989,6 +1075,9 @@ func (s *claudeSession) completeTurn() {
 	if !turnAborted && (turnCtx == nil || turnCtx.Err() == nil) {
 		turnError = res.resultError
 	}
+	if s.keyed && !unsolicited && turnCtx != nil && turnCtx.Err() != nil {
+		turnError = cancelErrMessage(turnCtx)
+	}
 	finalText := finalStreamText(res, turnError != "")
 	if finalText == "" {
 		recoverID := res.streamSessionID
@@ -1005,7 +1094,7 @@ func (s *claudeSession) completeTurn() {
 		sessionSend(turnCtx, sink, ChatEvent{Type: "text", Delta: finalText})
 	}
 	msg := assembleAssistantMessage(finalText, res.thinking, res.toolUses, turnUsage)
-	sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError})
+	sessionSend(turnCtx, sink, ChatEvent{Type: "done", Message: msg, Usage: turnUsage, ErrorMessage: turnError, BackgroundTasksPending: lingerPending})
 	close(sink)
 	if done != nil {
 		close(done)
@@ -1076,12 +1165,24 @@ func (s *claudeSession) onEOF() {
 		"agent", s.agentID,
 		"stderr", headRunes(stderr, 300))
 
+	if s.keyed {
+		// Match the per-turn path: drop known-benign CLI stderr noise.
+		processError = filterClaudeStderrNoise(stderr)
+		if processError == "" && waitErr != nil {
+			processError = waitErr.Error()
+		}
+		if processError == "" {
+			processError = "claude process exited"
+		}
+	}
+
 	s.mu.Lock()
 	acc := s.acc
 	sink := s.turnSink
 	done := s.turnDone
 	turnCtx := s.turnCtx
 	turnAborted := s.turnAborted
+	unsolicitedTurn := s.unsolicited
 	s.acc = nil
 	s.turnSink = nil
 	s.turnCtx = nil
@@ -1092,7 +1193,33 @@ func (s *claudeSession) onEOF() {
 		s.reapTimer.Stop()
 		s.reapTimer = nil
 	}
+	abandoned := 0
+	closeReason := s.closeReason
+	procAborted := s.procAborted
+	if s.keyed {
+		s.stopLingerTimersLocked()
+		if !procAborted {
+			abandoned = s.pendingTasks
+		}
+	}
 	s.mu.Unlock()
+
+	// A cancelled keyed solicited turn mirrors the per-turn path's
+	// emitCancelDone: deliver the partial content with the cancel/timeout
+	// marker so the response surface finalizes instead of reporting a crash.
+	if s.keyed && procAborted && !unsolicitedTurn && sink != nil && turnCtx != nil && turnCtx.Err() != nil {
+		var content, thinking string
+		var toolUses []ToolUse
+		var usage *Usage
+		if acc != nil {
+			res := acc.finalize()
+			content, thinking, toolUses, usage = mergeStreamTexts(res), res.thinking, res.toolUses, res.usage
+		}
+		msg := assembleAssistantMessage(content, thinking, toolUses, usage)
+		sessionSend(context.Background(), sink, ChatEvent{Type: "done", Message: msg, Usage: usage, ErrorMessage: cancelErrMessage(turnCtx)})
+		close(sink)
+		sink = nil
+	}
 
 	// The process is gone: refuse any steer still racing this turn's end.
 	s.markTurnSteerOver()
@@ -1124,16 +1251,33 @@ func (s *claudeSession) onEOF() {
 
 	// Evict from the pool so a later turn spawns fresh.
 	s.b.sessMu.Lock()
-	if s.b.sessions[s.agentID] == s {
-		delete(s.b.sessions, s.agentID)
+	if s.b.sessions[s.pk()] == s {
+		delete(s.b.sessions, s.pk())
 	}
 	s.b.sessMu.Unlock()
+
+	if abandoned > 0 {
+		if closeReason == "" {
+			closeReason = "process exited"
+		}
+		s.logger.Warn("keyed claude session exited with background tasks pending",
+			"agent", s.agentID, "sessionKey", s.sessionKey, "pending", abandoned, "reason", closeReason)
+		if fn := s.b.onKeyedTasksAbandoned; fn != nil {
+			go fn(s.agentID, s.sessionKey, abandoned, closeReason)
+		}
+	}
 }
 
 // armReapLocked (re)starts the idle reap timer. Caller holds mu.
 func (s *claudeSession) armReapLocked() {
 	if s.reapTimer != nil {
 		s.reapTimer.Stop()
+		s.reapTimer = nil
+	}
+	if s.keyed {
+		// Keyed sessions have their own linger/grace lifetime; the 30-min
+		// main-chat idle reap does not apply.
+		return
 	}
 	s.reapTimer = time.AfterFunc(sessionIdleTimeout, func() {
 		// Mark dead UNDER the lock so a startTurn that races the timer either
@@ -1155,8 +1299,8 @@ func (s *claudeSession) armReapLocked() {
 			s.procCancel()
 		}
 		s.b.sessMu.Lock()
-		if s.b.sessions[s.agentID] == s {
-			delete(s.b.sessions, s.agentID)
+		if s.b.sessions[s.pk()] == s {
+			delete(s.b.sessions, s.pk())
 		}
 		s.b.sessMu.Unlock()
 	})
@@ -1173,13 +1317,27 @@ func (s *claudeSession) close() {
 		s.reapTimer.Stop()
 		s.reapTimer = nil
 	}
+	grace := 2 * time.Second
+	if s.keyed {
+		s.closing = true
+		s.stopLingerTimersLocked()
+		// A keyed session with nothing pending exits on its own at stdin EOF
+		// (exactly like today's per-turn close at result); give it time to
+		// flush its session JSONL before force-cancelling.
+		if s.pendingTasks == 0 && s.state == sessIdle {
+			grace = keyedCloseGrace
+		}
+	}
 	s.mu.Unlock()
 	s.stdinW.close()
 	// Give the process a brief chance to exit on its own after stdin EOF,
 	// then force-cancel. The readLoop's onEOF marks the session dead.
 	if s.procCancel != nil {
 		go func() {
-			time.Sleep(2 * time.Second)
+			select {
+			case <-time.After(grace):
+			case <-s.procCtx.Done():
+			}
 			s.procCancel()
 		}()
 	}
@@ -1232,14 +1390,53 @@ func (m *Manager) claudeSessionInTurn(agentID string) bool {
 
 // CloseSession terminates any persistent process for the agent. Used by the
 // Manager on reset, restart drain, device-switch quiesce, and archive/delete.
+// Keyed (per-conversation) lingering sessions of the agent are closed too.
 func (b *ClaudeBackend) CloseSession(agentID string) {
-	b.sessMu.Lock()
-	sess := b.sessions[agentID]
-	delete(b.sessions, agentID)
-	b.sessMu.Unlock()
-	if sess != nil {
+	for _, sess := range b.takeAgentSessions(agentID) {
+		sess.markCloseReason("session closed")
 		sess.close()
 	}
+}
+
+// takeAgentSessions removes and returns every pooled session (main + keyed)
+// owned by agentID.
+func (b *ClaudeBackend) takeAgentSessions(agentID string) []*claudeSession {
+	b.sessMu.Lock()
+	defer b.sessMu.Unlock()
+	var out []*claudeSession
+	for k, s := range b.sessions {
+		if s.agentID == agentID {
+			out = append(out, s)
+			delete(b.sessions, k)
+		}
+	}
+	return out
+}
+
+// closeSessionsSync closes the given sessions in parallel and waits (bounded)
+// for each to exit, escalating to a group SIGKILL past the grace.
+func closeSessionsSync(sessions []*claudeSession) {
+	var wg sync.WaitGroup
+	for _, sess := range sessions {
+		wg.Add(1)
+		go func(sess *claudeSession) {
+			defer wg.Done()
+			// close() funnels through the stdin mutex, which a wedged write can
+			// hold indefinitely — run it async so the grace clock starts NOW and
+			// the escalation below can never be postponed by a stuck pipe.
+			go sess.close()
+			sess.awaitDead(5 * time.Second)
+			// The caller is about to delete/transfer session files — a process
+			// that outlived the grace would race those destructive writes.
+			// Escalate to an immediate group SIGKILL and wait once more (bounded).
+			if !sess.isDead() {
+				sess.logger.Warn("claude session survived sync close grace; force-killing", "agent", sess.agentID)
+				sess.forceKill()
+				sess.awaitDead(3 * time.Second)
+			}
+		}(sess)
+	}
+	wg.Wait()
 }
 
 // CloseSessionSync terminates the agent's persistent process AND waits
@@ -1248,26 +1445,16 @@ func (b *ClaudeBackend) CloseSession(agentID string) {
 // transfer the session JSONL immediately afterward and must not race the old
 // process re-creating files during its async close grace. The restart drain,
 // which only needs the process gone eventually, keeps the async CloseSession.
+//
+// Every session of the agent is closed — the main chat AND all keyed
+// (Slack-thread) lingering sessions — because the destructive callers
+// (reset, delete/archive, truncate_memory, device switch) invalidate them all.
 func (b *ClaudeBackend) CloseSessionSync(agentID string) {
-	b.sessMu.Lock()
-	sess := b.sessions[agentID]
-	delete(b.sessions, agentID)
-	b.sessMu.Unlock()
-	if sess != nil {
-		// close() funnels through the stdin mutex, which a wedged write can
-		// hold indefinitely — run it async so the grace clock starts NOW and
-		// the escalation below can never be postponed by a stuck pipe.
-		go sess.close()
-		sess.awaitDead(5 * time.Second)
-		// The caller is about to delete/transfer session files — a process
-		// that outlived the grace would race those destructive writes.
-		// Escalate to an immediate group SIGKILL and wait once more (bounded).
-		if !sess.isDead() {
-			sess.logger.Warn("claude session survived sync close grace; force-killing", "agent", sess.agentID)
-			sess.forceKill()
-			sess.awaitDead(3 * time.Second)
-		}
+	sessions := b.takeAgentSessions(agentID)
+	for _, s := range sessions {
+		s.markCloseReason("agent session reset")
 	}
+	closeSessionsSync(sessions)
 }
 
 // CloseAllSessions terminates every live persistent process. Used by the
@@ -1281,6 +1468,7 @@ func (b *ClaudeBackend) CloseAllSessions() {
 	}
 	b.sessMu.Unlock()
 	for _, s := range sessions {
+		s.markCloseReason("kojo shutting down")
 		s.close()
 	}
 }
@@ -1305,8 +1493,12 @@ func (m *Manager) CloseAllClaudeSessions() {
 func (b *ClaudeBackend) HasLiveSession(agentID string) bool {
 	b.sessMu.Lock()
 	defer b.sessMu.Unlock()
-	_, ok := b.sessions[agentID]
-	return ok
+	for _, s := range b.sessions {
+		if s.agentID == agentID {
+			return true
+		}
+	}
+	return false
 }
 
 // SessionInTurn reports whether the agent's persistent session is actively

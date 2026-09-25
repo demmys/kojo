@@ -137,6 +137,10 @@ type ChatEvent struct {
 	// backend stream. Populated only on "rate_limit" events, which arrive
 	// mid-turn whenever the Claude CLI reports a usage threshold crossing.
 	RateLimit *RateLimitInfo `json:"rateLimit,omitempty"`
+	// BackgroundTasksPending is set on a keyed turn's terminal "done" when the
+	// CLI process lingers because this many background tasks are still
+	// running; their completion arrives later as a keyed background turn.
+	BackgroundTasksPending int `json:"backgroundTasksPending,omitempty"`
 }
 
 type attachmentOwnership struct {

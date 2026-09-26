@@ -694,7 +694,7 @@ func New(cfg Config) *Server {
 	if s.agents != nil {
 		st = s.agents.Store()
 	}
-	publicHandler := s.idempotencyMiddleware(mux)
+	publicHandler := s.idempotencyMiddleware(gzipAPIMiddleware(mux))
 	publicHandler = s.remoteAgentProxyMiddleware(publicHandler)
 	if s.peerID != nil && st != nil {
 		publicHandler = s.sessionPeerProxyMiddleware(publicHandler)
@@ -1218,6 +1218,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 
 func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 	fileServer := http.FileServer(http.FS(staticFS))
+	gzCache := newStaticGzipCache(staticFS)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if path == "/" {
@@ -1232,6 +1233,9 @@ func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 			} else {
 				w.Header().Set("Cache-Control", "no-cache")
 			}
+			if gzCache.serve(w, r, path) {
+				return
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -1240,6 +1244,9 @@ func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-cache")
+		if gzCache.serve(w, r, "index.html") {
+			return
+		}
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
@@ -1322,7 +1329,7 @@ func (s *Server) buildAuthHandler(resolver *auth.Resolver) http.Handler {
 	// Fencing's 409 responses stamp X-Kojo-No-Idempotency-Cache so
 	// they aren't saved — a retry after the lock comes back must
 	// re-check rather than replay the stale 409.
-	handler := http.Handler(s.mux)
+	handler := gzipAPIMiddleware(s.mux)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 		handler = auth.AgentFencingMiddleware(
 			s.agents.Store(), s.peerID.DeviceID, s.logger)(handler)

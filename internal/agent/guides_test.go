@@ -58,7 +58,7 @@ func TestBuildSystemPrompt_GuidesIndex(t *testing.T) {
 	apiBase := "http://127.0.0.1:8080"
 
 	t.Run("without credentials", func(t *testing.T) {
-		prompt := buildSystemPrompt(a, testLogger(), apiBase, nil, false)
+		prompt := buildSystemPrompt(a, testLogger(), apiBase, nil, false, "")
 		if strings.Contains(prompt, "credentials.md") {
 			t.Errorf("credentials pointer shown without stored credentials")
 		}
@@ -86,7 +86,7 @@ func TestBuildSystemPrompt_GuidesIndex(t *testing.T) {
 	})
 
 	t.Run("with credentials", func(t *testing.T) {
-		prompt := buildSystemPrompt(a, testLogger(), apiBase, nil, true)
+		prompt := buildSystemPrompt(a, testLogger(), apiBase, nil, true, "")
 		if !strings.Contains(prompt, filepath.Join(GuideDir(), "credentials.md")) {
 			t.Errorf("credentials pointer missing despite stored credentials")
 		}
@@ -120,7 +120,7 @@ func TestBuildSystemPrompt_DisabledInjections(t *testing.T) {
 	}
 
 	enabled := &Agent{ID: id}
-	base := buildSystemPrompt(enabled, testLogger(), apiBase, nil, true)
+	base := buildSystemPrompt(enabled, testLogger(), apiBase, nil, true, "")
 	for _, want := range []string{"USER_CANARY", "MEMORY_CANARY", "STATUS_CANARY", "## Group DM", "todos.md", "credentials.md", "attachments.md"} {
 		if !strings.Contains(base, want) {
 			t.Fatalf("baseline prompt missing %q", want)
@@ -132,7 +132,7 @@ func TestBuildSystemPrompt_DisabledInjections(t *testing.T) {
 		InjectionGroupDM, InjectionTodoAPI, InjectionCredentials,
 		InjectionAttachments,
 	}}
-	prompt := buildSystemPrompt(disabled, testLogger(), apiBase, nil, true)
+	prompt := buildSystemPrompt(disabled, testLogger(), apiBase, nil, true, "")
 	for _, gone := range []string{"USER_CANARY", "MEMORY_CANARY", "STATUS_CANARY", "## Group DM", "todos.md", "credentials.md", "attachments.md"} {
 		if strings.Contains(prompt, gone) {
 			t.Errorf("disabled section still present: %q", gone)
@@ -199,14 +199,14 @@ func TestBuildSystemPrompt_BackgroundSessionsGuide(t *testing.T) {
 	want := filepath.Join(GuideDir(), "background-sessions.md")
 
 	claude := &Agent{ID: "ag_bg", Tool: ToolClaude}
-	if p := buildSystemPrompt(claude, testLogger(), apiBase, nil, false); !strings.Contains(p, want) {
+	if p := buildSystemPrompt(claude, testLogger(), apiBase, nil, false, ""); !strings.Contains(p, want) {
 		t.Errorf("claude prompt missing background-sessions guide pointer")
 	}
 	codex := &Agent{ID: "ag_bg", Tool: ToolCodex}
-	if p := buildSystemPrompt(codex, testLogger(), apiBase, nil, false); strings.Contains(p, want) {
+	if p := buildSystemPrompt(codex, testLogger(), apiBase, nil, false, ""); strings.Contains(p, want) {
 		t.Errorf("codex prompt must not point at background-sessions guide")
 	}
-	if p := buildSystemPrompt(claude, testLogger(), "", nil, false); strings.Contains(p, want) {
+	if p := buildSystemPrompt(claude, testLogger(), "", nil, false, ""); strings.Contains(p, want) {
 		t.Errorf("prompt without API base must not point at background-sessions guide")
 	}
 }

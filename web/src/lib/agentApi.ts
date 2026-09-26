@@ -1083,6 +1083,13 @@ export const agentApi = {
       get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
 
+  responseLanguage: {
+    get: () =>
+      get<{ language: string }>(`/api/v1/response-language`).then((r) => r.language ?? ""),
+    set: (language: string) =>
+      put<{ ok: boolean; language: string }>(`/api/v1/response-language`, { language }),
+  },
+
   slackBot: {
     get: (agentId: string) =>
       get<SlackBotStatus>(`/api/v1/agents/${agentId}/slackbot`),

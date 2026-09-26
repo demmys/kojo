@@ -85,7 +85,7 @@ func TestInjectionToolGating_MatchesWebToolOnlyList(t *testing.T) {
 
 	build := func(tool string, disabled ...string) string {
 		a := &Agent{ID: id, Tool: tool, DisabledInjections: disabled}
-		return buildSystemPrompt(a, testLogger(), apiBase, nil, true)
+		return buildSystemPrompt(a, testLogger(), apiBase, nil, true, "")
 	}
 
 	var inertForBare []string

@@ -257,3 +257,46 @@ func fetchGeminiEmbeddingModels(ctx context.Context, apiKey string) ([]string, e
 	slices.Sort(models)
 	return models, nil
 }
+
+// handleGetResponseLanguage returns the global agent response language
+// setting ("" = auto).
+func (s *Server) handleGetResponseLanguage(w http.ResponseWriter, r *http.Request) {
+	lang := ""
+	if s.agents.HasCredentials() {
+		lang = s.agents.Credentials().GetSetting(agent.ResponseLanguageSettingKey)
+		if !agent.ValidResponseLanguage(lang) {
+			lang = ""
+		}
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"language": lang})
+}
+
+// handleSetResponseLanguage saves the global agent response language
+// setting. The value must be "" (auto) or one of the allowed tags.
+func (s *Server) handleSetResponseLanguage(w http.ResponseWriter, r *http.Request) {
+	if !s.agents.HasCredentials() {
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store not available")
+		return
+	}
+	var req struct {
+		Language *string `json:"language"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+		return
+	}
+	if req.Language == nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "language is required (use \"\" for auto)")
+		return
+	}
+	lang := strings.TrimSpace(*req.Language)
+	if !agent.ValidResponseLanguage(lang) {
+		writeError(w, http.StatusBadRequest, "bad_request", "unsupported language")
+		return
+	}
+	if err := s.agents.Credentials().SetSetting(agent.ResponseLanguageSettingKey, lang); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "failed to save: "+err.Error())
+		return
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true, "language": lang})
+}

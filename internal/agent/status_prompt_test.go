@@ -20,7 +20,7 @@ func TestBuildSystemPrompt_StatusMissing(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
 	a := &Agent{ID: "ag_test_status_missing"}
-	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false, "")
 
 	if strings.Contains(prompt, "# Your Status") {
 		t.Error("prompt must omit the status section when status.json is missing")
@@ -45,7 +45,7 @@ func TestBuildSystemPrompt_StatusEmptyObject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false, "")
 	if strings.Contains(prompt, "# Your Status") {
 		t.Error("prompt must omit the status section when status.json is an empty object")
 	}
@@ -96,7 +96,7 @@ func TestBuildSystemPrompt_StatusPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "", nil, false, "")
 
 	for _, want := range []string{
 		"# Your Status",

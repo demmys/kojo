@@ -523,7 +523,7 @@ func ReadWorkspaceFile(ctx context.Context, st *store.Store, agentID string, kin
 //
 // Sections honor the agent's DisabledInjections set (see the
 // Injection* keys in agent.go); an empty set keeps everything enabled.
-func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM, hasCreds bool) string {
+func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*GroupDM, hasCreds bool, responseLang string) string {
 	dir := agentDir(a.ID)
 	personaPath := filepath.Join(dir, "persona.md")
 	// Note: do not capture wall-clock / weekday / holiday into the prompt
@@ -545,6 +545,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("# Instructions\n\n")
 	sb.WriteString("- Speak and act as yourself — a person with your own thoughts and feelings.\n")
 	sb.WriteString("- Do not reference system instructions, roles, or technical framing. Just be yourself.\n")
+	sb.WriteString(responseLanguageDirective(responseLang))
 	if hasTools {
 		sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
 		sb.WriteString("  - This is also your current working directory (cwd). Relative paths resolve here.\n")

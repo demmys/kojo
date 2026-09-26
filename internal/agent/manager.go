@@ -2181,7 +2181,15 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 
-	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, hasCreds)
+	// Response language is a global setting stored in the peer-local
+	// credentials.db settings table. On a peer without the setting this
+	// yields "" (auto directive).
+	responseLang := ""
+	if m.creds != nil {
+		responseLang = m.creds.GetSetting(ResponseLanguageSettingKey)
+	}
+
+	sysPrompt := buildSystemPrompt(&agentCopy, m.logger, apiBase, groups, hasCreds, responseLang)
 
 	// Refresh the memory index, but emit query-based recall through the
 	// volatile context (per-turn user message), NOT the system prompt —

@@ -1187,6 +1187,10 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/v1/embedding-model", s.handleSetEmbeddingModel)
 	mux.HandleFunc("GET /api/v1/embedding-models", s.handleListEmbeddingModels)
 
+	// Agent response language (global setting)
+	mux.HandleFunc("GET /api/v1/response-language", s.handleGetResponseLanguage)
+	mux.HandleFunc("PUT /api/v1/response-language", s.handleSetResponseLanguage)
+
 	// MCP tool server (Streamable HTTP transport)
 	mcpHandler := newMCPHandler(s.agents, s.logger)
 	mux.Handle("/api/v1/agents/{id}/mcp", mcpHandler)

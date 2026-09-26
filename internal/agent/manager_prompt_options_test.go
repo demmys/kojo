@@ -17,7 +17,7 @@ func TestPrepareChatOptionsDisableKojoAttachmentInstructions(t *testing.T) {
 
 	prompt := buildSystemPrompt(&a,
 		slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		"", nil, false)
+		"", nil, false, "")
 	for _, forbidden := range []string{
 		"Sending file attachments to the user",
 		"attachments.md",

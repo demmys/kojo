@@ -39,7 +39,7 @@ func TestBuildSystemPrompt_ToollessOmitsToolInstructions(t *testing.T) {
 	a := &Agent{ID: "ag_test_toolless", Tool: ToolCustomBare, Persona: "You are terse."}
 	seedToollessAgentFiles(t, a.ID)
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true, "")
 
 	banned := []string{
 		"## Sending file attachments to the user", // needs a file write
@@ -70,7 +70,7 @@ func TestBuildSystemPrompt_ToollessKeepsInjectedContent(t *testing.T) {
 	a := &Agent{ID: "ag_test_toolless_content", Tool: ToolCustomBare, Persona: "You are terse."}
 	seedToollessAgentFiles(t, a.ID)
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true, "")
 
 	required := []string{
 		"the user prefers short answers", // MEMORY.md body
@@ -95,7 +95,7 @@ func TestBuildSystemPrompt_ToolBackedKeepsToolInstructions(t *testing.T) {
 	a := &Agent{ID: "ag_test_toolful", Tool: ToolClaude, Persona: "You are terse."}
 	seedToollessAgentFiles(t, a.ID)
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true, "")
 
 	required := []string{
 		"## Sending file attachments to the user",
@@ -123,7 +123,7 @@ func TestBuildSystemPrompt_LegacyToolNameIsToolless(t *testing.T) {
 	a := &Agent{ID: "ag_test_legacy_toolless", Tool: "llama.cpp"}
 	seedToollessAgentFiles(t, a.ID)
 
-	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true)
+	prompt := buildSystemPrompt(a, newQuietLogger(), "http://127.0.0.1:8080", nil, true, "")
 	if strings.Contains(prompt, "## Calling the user") {
 		t.Error("legacy llama.cpp tool name must still get the tool-less prompt")
 	}

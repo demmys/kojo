@@ -458,6 +458,12 @@ const messages = {
     ja: "この端末の表示言語。ブラウザに保存される。",
     en: "Display language for this device. Saved in your browser.",
   },
+  "gs.responseLanguage": { ja: "エージェントの応答言語", en: "Agent Response Language" },
+  "gs.responseLanguageHelp": {
+    ja: "このピアで動作する全エージェント共通。エージェントが返答や作業報告に使う言語。「自動」はユーザーが書いた言語に合わせる。他のピアで動作中のエージェントには反映されない（そのピアの設定、未設定なら「自動」が使われる）。",
+    en: "Applies to all agents running on this peer. The language agents use for replies and work reports. \"Auto\" matches the language the user writes in. Agents currently running on other peers use that peer's setting (Auto if unset).",
+  },
+  "gs.responseLanguageAuto": { ja: "自動", en: "Auto" },
 
   // ── AgentSettings: sections ──
   "settings.sec.identity": { ja: "アイデンティティ", en: "Identity" },

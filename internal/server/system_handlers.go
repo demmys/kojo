@@ -313,10 +313,10 @@ func (s *Server) validateRestartWake(w http.ResponseWriter, p auth.Principal, wa
 	if p.IsAgent() {
 		// Agents may only wake themselves — waking someone else
 		// would drop an unexpected system turn into that agent's
-		// transcript.
+		// transcript. An owner-deputy may wake anyone, like the Owner.
 		if wakeID == "" {
 			wakeID = p.AgentID
-		} else if wakeID != p.AgentID {
+		} else if wakeID != p.AgentID && !p.IsOwnerDeputy() {
 			writeError(w, http.StatusForbidden, "forbidden",
 				"agents may only wake themselves")
 			return "", false

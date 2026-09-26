@@ -121,7 +121,7 @@ const peerNameMaxBytes = 255
 // false (after writing a 403) when the caller is not the Owner
 // principal.
 func (s *Server) requireOwnerForPeers(w http.ResponseWriter, r *http.Request) bool {
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "peers API is owner-only")
 		return false
 	}

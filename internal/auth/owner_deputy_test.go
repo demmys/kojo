@@ -12,9 +12,9 @@ var (
 	plainP      = Principal{Role: RoleAgent, AgentID: "ag_x"}
 )
 
-// The grant is defined as power over OTHERS. Applying it to the holder
-// would let a deputy lift its own restrictions, so it must read false
-// for its own ID.
+// IsOwnerDeputyOver still reads false for the holder's own ID: the
+// handler checks built on it (disabledInjections) keep a deputy from
+// lifting restrictions on itself.
 func TestIsOwnerDeputyOver_SelfIsNotCovered(t *testing.T) {
 	if !deputyP.IsOwnerDeputyOver("ag_y") {
 		t.Error("deputy is not deputy over another agent")
@@ -45,19 +45,19 @@ func TestOwnerDeputy_Capabilities(t *testing.T) {
 	if plainP.CanCreateAgent() {
 		t.Error("plain agent can create agents")
 	}
-	// The grant-management routes must not be self-propagating, and
-	// CanForkOrCreate stays owner-only because unrelated global routes
-	// reuse it as their owner gate.
-	if deputyP.CanForkOrCreate() || deputyP.CanSetPrivileged() || deputyP.CanSetOwnerDeputy() {
+	// The grant-management routes must not be self-propagating.
+	if deputyP.CanSetPrivileged() || deputyP.CanSetOwnerDeputy() {
 		t.Error("deputy reached an owner-only grant gate")
 	}
-	// Fork follows the same self-exclusion as everything else: allowed
-	// on another agent, denied on the deputy itself.
-	if !deputyP.CanFork("ag_y") {
-		t.Error("deputy cannot fork another agent")
+	if !deputyP.HasOwnerAuthority() || plainP.HasOwnerAuthority() || !(Principal{Role: RoleOwner}).HasOwnerAuthority() {
+		t.Error("HasOwnerAuthority does not track Owner + deputy")
 	}
-	if deputyP.CanFork("ag_x") {
-		t.Error("deputy can fork itself")
+	if !deputyP.CanForkOrCreate() || plainP.CanForkOrCreate() {
+		t.Error("global owner gate (TTS/STT) does not admit exactly the deputy")
+	}
+	// The grant is not copied onto a fork, so self-fork is allowed too.
+	if !deputyP.CanFork("ag_y") || !deputyP.CanFork("ag_x") {
+		t.Error("deputy cannot fork")
 	}
 	if plainP.CanFork("ag_y") || (Principal{Role: RolePrivAgent, AgentID: "ag_x"}).CanFork("ag_y") {
 		t.Error("a non-deputy agent can fork")
@@ -71,9 +71,11 @@ func TestOwnerDeputy_Capabilities(t *testing.T) {
 	if plainP.CanReadFull("ag_y") || plainP.CanMutateSelf("ag_y") || plainP.CanDeleteOrReset("ag_y") {
 		t.Error("plain agent allowed on another agent")
 	}
-	// The destructive grant is unchanged by the new one.
-	if !deputyPrivP.CanRestartServer() || deputyP.CanRestartServer() {
-		t.Error("restart gate no longer tracks Privileged alone")
+	if !deputyPrivP.CanRestartServer() || !deputyP.CanRestartServer() {
+		t.Error("deputy cannot restart the server")
+	}
+	if plainP.CanRestartServer() || !(Principal{Role: RolePrivAgent, AgentID: "ag_x"}).CanRestartServer() {
+		t.Error("restart gate for non-deputies changed")
 	}
 }
 
@@ -100,22 +102,32 @@ func TestAllowNonOwner_OwnerDeputy(t *testing.T) {
 		// Talking to another agent without a DM.
 		{http.MethodPost, "/api/v1/agents/ag_y/messages", deputyP, true},
 		{http.MethodGet, "/api/v1/agents/ag_y/messages", deputyP, true},
-		// Grant management stays owner-only, so the grant
-		// cannot spread; handoff/switch stays with the agent itself.
+		// Grant management stays owner-only on every target, so the
+		// grant can neither spread nor be revoked by its holder.
 		{http.MethodPost, "/api/v1/agents/ag_y/privilege", deputyP, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/privilege", deputyP, false},
 		{http.MethodPost, "/api/v1/agents/ag_y/owner-deputy", deputyP, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/owner-deputy", deputyP, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/owner-deputy", deputyPrivP, false},
+		// Everything else the Owner has, itself included.
 		{http.MethodPost, "/api/v1/agents/ag_y/fork", deputyP, true},
-		{http.MethodPost, "/api/v1/agents/ag_x/fork", deputyP, false},
-		{http.MethodPost, "/api/v1/agents/ag_y/handoff/switch", deputyP, false},
-		// Owner-only surfaces outside the agent tree are unaffected.
-		{http.MethodGet, "/api/v1/sessions", deputyP, false},
-		{http.MethodGet, "/api/v1/git/status", deputyP, false},
-		{http.MethodPost, "/api/v1/system/restart", deputyP, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/fork", deputyP, true},
+		{http.MethodPost, "/api/v1/agents/ag_y/handoff/switch", deputyP, true},
+		{http.MethodGet, "/api/v1/sessions", deputyP, true},
+		{http.MethodGet, "/api/v1/git/status", deputyP, true},
+		{http.MethodPost, "/api/v1/system/restart", deputyP, true},
 		{http.MethodPost, "/api/v1/system/restart", deputyPrivP, true},
-		// Nothing new over itself: the same routes a plain agent gets.
-		{http.MethodPost, "/api/v1/agents/ag_x/messages", deputyP, false},
-		{http.MethodGet, "/api/v1/agents/ag_x/queued-messages", deputyP, false},
+		{http.MethodPost, "/api/v1/tts/preview", deputyP, true},
+		{http.MethodGet, "/api/v1/tts/capability", deputyP, true},
+		{http.MethodPost, "/api/v1/agents/generate-persona", deputyP, true},
+		{http.MethodPost, "/api/v1/agents/ag_x/tts/synthesize", deputyP, true},
+		{http.MethodPost, "/api/v1/agents/ag_x/messages", deputyP, true},
+		{http.MethodGet, "/api/v1/agents/ag_x/queued-messages", deputyP, true},
+		// None of it leaks to a plain agent.
+		{http.MethodGet, "/api/v1/sessions", plainP, false},
+		{http.MethodPost, "/api/v1/tts/preview", plainP, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/tts/synthesize", plainP, false},
+		{http.MethodPost, "/api/v1/system/restart", plainP, false},
 		// A plain agent is untouched by any of this.
 		{http.MethodPatch, "/api/v1/agents/ag_y", plainP, false},
 		{http.MethodPost, "/api/v1/agents/ag_y/messages", plainP, false},

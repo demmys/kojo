@@ -125,7 +125,7 @@ func (s *Server) handleCustomModels(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	p := auth.FromContext(r.Context())
 	if id == "" {
-		if !p.IsOwner() {
+		if !p.HasOwnerAuthority() {
 			writeError(w, http.StatusForbidden, "forbidden", "owner access required")
 			return
 		}

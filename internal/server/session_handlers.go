@@ -32,7 +32,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	// untrusted RolePeer (and every other non-Owner principal) still
 	// falls through to the version-only reduced view.
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() && !p.IsPeer() {
+	if !p.HasOwnerAuthority() && !p.IsPeer() {
 		writeJSONResponse(w, http.StatusOK, map[string]any{"version": s.version})
 		return
 	}

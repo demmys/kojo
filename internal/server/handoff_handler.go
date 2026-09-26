@@ -145,7 +145,7 @@ func (s *Server) handleAgentHandoffOp(w http.ResponseWriter, r *http.Request, op
 	if _, ok := s.requireAgentStore(w, "handoff requires agent store"); !ok {
 		return
 	}
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "owner-only")
 		return
 	}

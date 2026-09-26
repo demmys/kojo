@@ -60,7 +60,7 @@ func (s *Server) handleDeleteAgentAttachCache(w http.ResponseWriter, r *http.Req
 	// surface, and this route is exempt from proxying, so without an
 	// explicit check a paired peer could wipe THIS device's blobs through a
 	// route that never forwards anywhere.
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "attachment cache purge is owner-only")
 		return
 	}

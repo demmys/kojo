@@ -6,7 +6,6 @@ import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection"
 import { ExtensionsSection } from "./globalsettings/ExtensionsSection";
 import { PeersSection } from "./globalsettings/PeersSection";
 import { PersonaTemplatesSection } from "./globalsettings/PersonaTemplatesSection";
-import { ResponseLanguageSection } from "./globalsettings/ResponseLanguageSection";
 import { SystemSection } from "./globalsettings/SystemSection";
 import { useEmbeddingModel } from "./globalsettings/useEmbeddingModel";
 import { useGeminiApiKey } from "./globalsettings/useGeminiApiKey";
@@ -68,7 +67,6 @@ export function GlobalSettings() {
             </Select>
           </Field>
         </SectionCard>
-        <ResponseLanguageSection setError={setError} />
         <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} typesafe={typesafe} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />

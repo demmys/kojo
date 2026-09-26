@@ -1449,6 +1449,14 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
 		return "", false, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 	}
+	if cfg.ResponseLanguage != nil {
+		v, ok := NormalizeResponseLanguage(*cfg.ResponseLanguage)
+		if !ok {
+			return "", false, fmt.Errorf("invalid responseLanguage: must be a single line of at most %d characters", ResponseLanguageMaxRunes)
+		}
+		// Normalize in place so the apply step stores the trimmed value.
+		cfg.ResponseLanguage = &v
+	}
 	if cfg.TTS != nil {
 		if verr := ValidateTTS(cfg.TTS); verr != nil {
 			return "", false, verr
@@ -1786,6 +1794,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ThinkingMode != nil {
 		// Validated upstream.
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
+	}
+	if cfg.ResponseLanguage != nil {
+		// Validated + normalized upstream (validateUpdateConfigPure).
+		a.ResponseLanguage = *cfg.ResponseLanguage
 	}
 	if cronMessageDirty {
 		a.CronMessage = nextCronMessage

@@ -616,6 +616,12 @@ const messages = {
     ja: "毎ターンの文脈末尾に注入される2〜3行の人格要約 (一人称・口調・態度)。空なら何も注入されない。長文はトークン税になるので短く。",
     en: "A 2-3 line persona summary (first person, tone, attitude) appended to the per-turn context tail. Nothing is injected when empty. Keep it short — long text costs tokens.",
   },
+  "settings.responseLanguage": { ja: "応答言語", en: "Response Language" },
+  "settings.responseLanguageHelp": {
+    ja: "このエージェントが返答や作業報告に使う言語。「日本語」「English」「関西弁の日本語」など自由に書ける。空欄なら自動（ユーザーが書いた言語に合わせる）。",
+    en: "The language this agent uses for replies and work reports. Free text, e.g. \"日本語\", \"English\", \"関西弁の日本語\". Leave empty for auto (match the language the user writes in).",
+  },
+  "settings.responseLanguagePlaceholder": { ja: "空欄で自動（例: 日本語）", en: "Empty = auto (e.g. English)" },
   "settings.publicProfile": { ja: "公開プロフィール", en: "Public Profile" },
   "settings.override": { ja: "上書き", en: "Override" },
   "settings.publicProfileHelpOverride": {

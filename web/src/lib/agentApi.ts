@@ -94,6 +94,8 @@ export interface AgentInfo {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  // Free-text reply language ("" / absent = auto: match the user).
+  responseLanguage?: string;
   lastMessage?: {
     content: string;
     role: string;
@@ -303,6 +305,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  responseLanguage?: string;
   tts?: TTSConfig | null;
   disabledInjections?: string[];
   autoEffort?: boolean;

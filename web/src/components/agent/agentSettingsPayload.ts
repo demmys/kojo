@@ -19,6 +19,7 @@ export interface AgentSettingsFormState {
   tool: string;
   customBaseURL: string;
   thinkingMode: string;
+  responseLanguage: string;
   workDir: string;
   cronExpr: string;
   timeoutMinutes: number;
@@ -72,6 +73,7 @@ export function needsCustomURLFor(tool: string): boolean {
  *   - customBaseURL: trimmed and included only for tools that need
  *     it; otherwise undefined so the server clears the field.
  *   - thinkingMode: only emitted for custom-bare.
+ *   - responseLanguage: always sent, trimmed ("" = auto).
  *   - allowedTools: only emitted for custom-claude (where the
  *     operator picks per-tool permissions).
  *   - allowProtectedPaths: only emitted for claude / custom-claude — those
@@ -101,6 +103,7 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     tool: trimmed.tool,
     customBaseURL: needsCustomURLFor(state.tool) ? state.customBaseURL.trim() : undefined,
     thinkingMode: state.tool === "custom-bare" ? state.thinkingMode : undefined,
+    responseLanguage: state.responseLanguage.trim(),
     workDir: trimmed.workDir,
     cronExpr: state.cronExpr,
     timeoutMinutes: state.timeoutMinutes,

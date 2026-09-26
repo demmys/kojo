@@ -41,6 +41,10 @@ import (
 // keep the proxy + switching lock):
 //   - persona               (persona.md on holder disk)
 //   - model / tool / customBaseURL / thinkingMode (live backend session)
+//   - responseLanguage      (rendered into the system prompt the holder
+//     builds every turn; the offline-holder override is only re-applied
+//     when the row syncs back to the hub, so the holder would keep
+//     replying in the old language while the hub reported success)
 //   - workDir               (holder filesystem)
 //   - cronExpr              (holder cron scheduler reschedule)
 //   - timeoutMinutes / resumeIdleMinutes (live session watchdogs)
@@ -95,6 +99,7 @@ func (cfg *AgentUpdateConfig) HubLocalOnly() bool {
 		cfg.ResumeIdleMinutes == nil &&
 		cfg.CustomBaseURL == nil &&
 		cfg.ThinkingMode == nil &&
+		cfg.ResponseLanguage == nil &&
 		cfg.AllowedTools == nil &&
 		cfg.AllowProtectedPaths == nil &&
 		cfg.TTS == nil &&

@@ -18,6 +18,7 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     tool: "claude",
     customBaseURL: " http://x ",
     thinkingMode: "auto",
+    responseLanguage: "",
     workDir: " /tmp ",
     cronExpr: "0 * * * *",
     timeoutMinutes: 10,
@@ -96,6 +97,13 @@ describe("buildAgentSavePayload", () => {
       buildAgentSavePayload(baseState({ tool: "custom-bare", customBaseURL: " http://y " }))
         .customBaseURL,
     ).toBe("http://y");
+  });
+
+  it("always emits responseLanguage trimmed (empty = auto)", () => {
+    expect(buildAgentSavePayload(baseState()).responseLanguage).toBe("");
+    expect(
+      buildAgentSavePayload(baseState({ responseLanguage: "  関西弁の日本語 " })).responseLanguage,
+    ).toBe("関西弁の日本語");
   });
 
   it("emits thinkingMode ONLY for custom-bare", () => {

@@ -322,7 +322,7 @@ func TestHubLocalOnlyClassification(t *testing.T) {
 	}
 	holderOnly := []AgentUpdateConfig{
 		{Persona: &s}, {CronMessage: &s}, {Model: &s}, {Tool: &s}, {WorkDir: &s},
-		{CronExpr: &s}, {CustomBaseURL: &s}, {ThinkingMode: &s},
+		{CronExpr: &s}, {CustomBaseURL: &s}, {ThinkingMode: &s}, {ResponseLanguage: &s},
 		{DeviceSwitchEnabled: &b}, {TTS: &TTSConfig{}},
 		{AllowedTools: []string{"Bash"}}, {AllowProtectedPaths: &[]string{"/x"}},
 	}

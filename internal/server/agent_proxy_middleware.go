@@ -155,7 +155,7 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		//   HOLDER-ONLY — everything that mutates holder disk or the
 		//   live session and therefore keeps the proxy (and its
 		//   peer_offline failure): persona, model/tool/customBaseURL/
-		//   thinkingMode, workDir, cronExpr, cronMessage (persists via
+		//   thinkingMode, responseLanguage, workDir, cronExpr, cronMessage (persists via
 		//   agent_workspace_files, not the agents row), timeout/resumeIdle,
 		//   allowedTools/allowProtectedPaths, tts, deviceSwitchEnabled,
 		//   plus the non-PATCH routes (avatar upload, persona/status/

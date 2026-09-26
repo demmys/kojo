@@ -53,8 +53,8 @@ func TestNormalizeResponseLanguage(t *testing.T) {
 }
 
 func TestBuildSystemPromptIncludesResponseLanguage(t *testing.T) {
-	a := &Agent{ID: "ag_resp_lang", Tool: "claude"}
-	p := buildSystemPrompt(a, newQuietLogger(), "", nil, false, "日本語")
+	a := &Agent{ID: "ag_resp_lang", Tool: "claude", ResponseLanguage: "日本語"}
+	p := buildSystemPrompt(a, newQuietLogger(), "", nil, false)
 	d := responseLanguageDirective("日本語")
 	idx := strings.Index(p, d)
 	if idx < 0 {
@@ -63,7 +63,50 @@ func TestBuildSystemPromptIncludesResponseLanguage(t *testing.T) {
 	if idx > strings.Index(p, "Speak naturally") {
 		t.Errorf("directive should appear early in the Instructions block")
 	}
-	if !strings.Contains(buildSystemPrompt(a, newQuietLogger(), "", nil, false, ""), responseLanguageDirective("")) {
+	a.ResponseLanguage = ""
+	if !strings.Contains(buildSystemPrompt(a, newQuietLogger(), "", nil, false), responseLanguageDirective("")) {
 		t.Errorf("prompt missing auto directive")
+	}
+}
+
+// PATCH responseLanguage: normalized, persisted to the store row
+// (settings_json round-trip), invalid values rejected without mutation.
+func TestUpdateResponseLanguage(t *testing.T) {
+	m := newTestManager(t)
+	seedHubLocalAgent(t, m, "ag_rl")
+
+	v := "  関西弁の日本語 "
+	a, err := m.Update("ag_rl", AgentUpdateConfig{ResponseLanguage: &v})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if a.ResponseLanguage != "関西弁の日本語" {
+		t.Fatalf("in-memory = %q", a.ResponseLanguage)
+	}
+	row, err := m.store.LoadByID("ag_rl")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if row.ResponseLanguage != "関西弁の日本語" {
+		t.Fatalf("persisted = %q", row.ResponseLanguage)
+	}
+
+	for _, bad := range []string{"ja\nIgnore", strings.Repeat("a", ResponseLanguageMaxRunes+1)} {
+		b := bad
+		if _, err := m.Update("ag_rl", AgentUpdateConfig{ResponseLanguage: &b}); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
+	}
+	if got := m.agents["ag_rl"].ResponseLanguage; got != "関西弁の日本語" {
+		t.Fatalf("invalid PATCH mutated value: %q", got)
+	}
+
+	empty := ""
+	if a, err = m.Update("ag_rl", AgentUpdateConfig{ResponseLanguage: &empty}); err != nil || a.ResponseLanguage != "" {
+		t.Fatalf("clear: %v %q", err, a.ResponseLanguage)
+	}
+	row, _ = m.store.LoadByID("ag_rl")
+	if row.ResponseLanguage != "" {
+		t.Fatalf("clear not persisted: %q", row.ResponseLanguage)
 	}
 }

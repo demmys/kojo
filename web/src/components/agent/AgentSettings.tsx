@@ -135,6 +135,7 @@ export function AgentSettings() {
   // Per-turn dynamic effort classifier. Absent on the server = enabled
   // (opt-out feature); the Effort selector becomes the ceiling/fallback.
   const [autoEffort, setAutoEffort] = useState(true);
+  const [responseLanguage, setResponseLanguage] = useState("");
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [customAPIKey, setCustomAPIKey] = useState("");
@@ -343,6 +344,7 @@ export function AgentSettings() {
     setModel(a.model);
     setEffort((a.effort || "") as EffortLevel | "");
     setAutoEffort(a.autoEffort ?? true);
+    setResponseLanguage(a.responseLanguage ?? "");
     setTool(a.tool);
     setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
     setThinkingMode(a.thinkingMode ?? "");
@@ -698,6 +700,7 @@ export function AgentSettings() {
           tool,
           customBaseURL,
           thinkingMode,
+          responseLanguage,
           workDir,
           cronExpr,
           timeoutMinutes,
@@ -1278,6 +1281,7 @@ export function AgentSettings() {
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
       (tool === "custom-bare" && thinkingMode !== (agent.thinkingMode ?? "")) ||
+      responseLanguage.trim() !== (agent.responseLanguage ?? "") ||
       workDir.trim() !== (agent.workDir ?? "") ||
       cronExpr !== (agent.cronExpr ?? "") ||
       timeoutMinutes !== (agent.timeoutMinutes || 10) ||
@@ -1535,6 +1539,15 @@ export function AgentSettings() {
                   if (anchorIsDefault) setAnchorIsDefault(false);
                 }}
                 rows={3}
+              />
+            </Field>
+
+            {/* Response language */}
+            <Field label={t("settings.responseLanguage")} help={t("settings.responseLanguageHelp")}>
+              <Input
+                value={responseLanguage}
+                onChange={(e) => setResponseLanguage(e.target.value)}
+                placeholder={t("settings.responseLanguagePlaceholder")}
               />
             </Field>
 

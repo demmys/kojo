@@ -7,10 +7,6 @@ import (
 	"unicode/utf8"
 )
 
-// ResponseLanguageSettingKey is the global settings key (CredentialStore
-// settings table) holding the agent response language. "" means auto.
-const ResponseLanguageSettingKey = "response_language"
-
 // ResponseLanguageMaxRunes caps the free-text language value. A language
 // name ("日本語", "Brazilian Portuguese", "関西弁の日本語") fits easily; the
 // cap keeps the operator-set value from turning into an arbitrary prompt.

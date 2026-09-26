@@ -246,7 +246,7 @@ func TestBuildSystemPrompt_MemoryWriteDirective(t *testing.T) {
 
 	a := &Agent{ID: "ag_test_prompt"}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+	prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 	today := time.Now().In(jst).Format("2006-01-02")
 	dir := agentDir(a.ID)
@@ -295,7 +295,7 @@ func TestBuildSystemPrompt_AttachCleanupContract(t *testing.T) {
 
 	a := &Agent{ID: "ag_test_attach_prompt"}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+	prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 	mustContain := []string{
 		"Sending file attachments to the user",
@@ -335,7 +335,7 @@ func TestBuildSystemPrompt_MemoryInject(t *testing.T) {
 
 	t.Run("missing MEMORY.md keeps the Read instruction", func(t *testing.T) {
 		_, a := setup(t)
-		prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+		prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 		memPath := agentDir(a.ID) + "/MEMORY.md"
 		readDirective := "Read " + memPath + " — your index"
@@ -355,7 +355,7 @@ func TestBuildSystemPrompt_MemoryInject(t *testing.T) {
 			t.Fatalf("write MEMORY.md: %v", err)
 		}
 
-		prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+		prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 		if !strings.Contains(prompt, "Current MEMORY.md (injected)") {
 			t.Errorf("expected injection block header")
@@ -391,7 +391,7 @@ func TestBuildSystemPrompt_MemoryInject(t *testing.T) {
 			t.Fatalf("write MEMORY.md: %v", err)
 		}
 
-		prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+		prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 		// The outer fence must be strictly longer than the longest
 		// backtick run inside the body (4 backticks here), so at
@@ -418,7 +418,7 @@ func TestBuildSystemPrompt_MemoryInject(t *testing.T) {
 			t.Fatalf("write oversized MEMORY.md: %v", err)
 		}
 
-		prompt := buildSystemPrompt(a, logger, "", nil, false, "")
+		prompt := buildSystemPrompt(a, logger, "", nil, false)
 
 		if !strings.Contains(prompt, "MEMORY.md is over the injection budget") {
 			t.Errorf("expected oversize warning header")

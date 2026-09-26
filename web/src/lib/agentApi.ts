@@ -94,6 +94,8 @@ export interface AgentInfo {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  // Free-text reply language ("" / absent = auto: match the user).
+  responseLanguage?: string;
   lastMessage?: {
     content: string;
     role: string;
@@ -303,6 +305,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  responseLanguage?: string;
   tts?: TTSConfig | null;
   disabledInjections?: string[];
   autoEffort?: boolean;
@@ -1081,13 +1084,6 @@ export const agentApi = {
       put<{ ok: boolean; model: string; embeddingsCleared: boolean }>(`/api/v1/embedding-model`, { model }),
     list: () =>
       get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
-  },
-
-  responseLanguage: {
-    get: () =>
-      get<{ language: string }>(`/api/v1/response-language`).then((r) => r.language ?? ""),
-    set: (language: string) =>
-      put<{ ok: boolean; language: string }>(`/api/v1/response-language`, { language }),
   },
 
   slackBot: {

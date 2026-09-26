@@ -68,7 +68,7 @@ export function GlobalSettings() {
             </Select>
           </Field>
         </SectionCard>
-        <ResponseLanguageSection setError={setError} flashSuccess={flashSuccess} />
+        <ResponseLanguageSection setError={setError} />
         <ApiKeysSection gemini={gemini} embedding={embedding} openai={openai} xai={xai} typesafe={typesafe} />
         <ChatPreferencesSection enterSends={enterSends} setEnterSends={setEnterSends} />
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />

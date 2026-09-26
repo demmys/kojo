@@ -429,6 +429,14 @@ type Agent struct {
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
 
+	// ResponseLanguage is the free-text language the agent replies in
+	// ("日本語", "English", "関西弁の日本語", ...). "" = auto (match the
+	// user's language). Validated/normalized by NormalizeResponseLanguage
+	// and rendered into the system prompt by responseLanguageDirective.
+	// Lives in settings_json so it travels with the agent row on
+	// peer_agent_sync; the holder that builds the prompt always sees it.
+	ResponseLanguage string `json:"responseLanguage,omitempty"`
+
 	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
 
@@ -726,9 +734,13 @@ type AgentUpdateConfig struct {
 	// CronMessage follows the standard *string PATCH convention used by every
 	// other field on this struct: nil/omitted = leave unchanged, "" = clear
 	// back to the built-in default trailing instruction.
-	CronMessage         *string   `json:"cronMessage"`
-	CustomBaseURL       *string   `json:"customBaseURL"`
-	ThinkingMode        *string   `json:"thinkingMode"`
+	CronMessage   *string `json:"cronMessage"`
+	CustomBaseURL *string `json:"customBaseURL"`
+	ThinkingMode  *string `json:"thinkingMode"`
+	// ResponseLanguage: nil = leave as-is, "" = auto, otherwise a
+	// free-text language name (NormalizeResponseLanguage). Holder-only:
+	// see hub_local_update.go.
+	ResponseLanguage    *string   `json:"responseLanguage"`
 	AllowedTools        []string  `json:"allowedTools"`
 	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
 	// TTS replaces the entire TTSConfig when non-nil. Pass an explicit

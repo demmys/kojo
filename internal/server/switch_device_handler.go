@@ -203,7 +203,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	}
 
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() && !(p.IsAgent() && p.AgentID == agentID) {
+	if !p.HasOwnerAuthority() && !(p.IsAgent() && p.AgentID == agentID) {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"owner or self-agent only")
 		return

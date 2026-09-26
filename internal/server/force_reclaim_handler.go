@@ -108,7 +108,7 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 // force-reclaim path is dangerous (it stomps the previous
 // holder's fencing token) so it must run only as Owner.
 func (s *Server) requireOwnerForAgents(w http.ResponseWriter, r *http.Request) bool {
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "owner-only operation")
 		return false
 	}

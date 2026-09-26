@@ -248,10 +248,9 @@ func TestOwnerDeputySurvivesManagerReload(t *testing.T) {
 	}
 }
 
-// A deputy may fork someone ELSE, and is refused on itself — forking
-// itself would hand its own memory to an agent the Owner never
-// deputised. A plain or merely privileged agent is refused outright.
-func TestForkAgent_DeputyOverOthersOnly(t *testing.T) {
+// A deputy may fork any agent, itself included (the grant is not copied
+// onto the fork). A plain or merely privileged agent is refused outright.
+func TestForkAgent_Deputy(t *testing.T) {
 	srv := newChunkedSyncTestServer(t)
 	src, err := srv.agents.Create(agent.AgentConfig{Name: "fork-source"})
 	if err != nil {
@@ -272,8 +271,9 @@ func TestForkAgent_DeputyOverOthersOnly(t *testing.T) {
 	if w := fork(src.ID, auth.Principal{Role: auth.RolePrivAgent, AgentID: "ag_p"}, "nope"); w.Code != http.StatusForbidden {
 		t.Fatalf("priv agent fork status = %d, want 403 (body %s)", w.Code, w.Body.String())
 	}
-	if w := fork("ag_deputy", deputy, "self-clone"); w.Code != http.StatusForbidden {
-		t.Fatalf("self-fork status = %d, want 403 (body %s)", w.Code, w.Body.String())
+	selfDeputy := auth.Principal{Role: auth.RoleAgent, AgentID: src.ID, OwnerDeputy: true}
+	if w := fork(src.ID, selfDeputy, "self-clone"); w.Code != http.StatusOK && w.Code != http.StatusCreated {
+		t.Fatalf("self-fork status = %d, body %s", w.Code, w.Body.String())
 	}
 	w := fork(src.ID, deputy, "forked-by-deputy")
 	if w.Code != http.StatusOK && w.Code != http.StatusCreated {

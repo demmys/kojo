@@ -68,6 +68,7 @@ func (s *Server) groupdmIfMatchPrecheck(w http.ResponseWriter, r *http.Request, 
 // the request Principal:
 //
 //   - Owner: passes through whatever the body says (admin-style call).
+//   - Owner-deputy: may name any agent; with none it acts as itself.
 //   - Agent / PrivAgent: the value must be empty or match the
 //     Principal's AgentID. Mismatched / impersonating bodies get a
 //     hard 403 instead of silently being rewritten — silent rewrite
@@ -79,6 +80,11 @@ func (s *Server) groupdmIfMatchPrecheck(w http.ResponseWriter, r *http.Request, 
 func (s *Server) bindAgentIdentity(w http.ResponseWriter, r *http.Request, supplied string) (string, bool) {
 	p := auth.FromContext(r.Context())
 	if p.IsOwner() {
+		return supplied, true
+	}
+	// A deputy may act as any agent it names, like the Owner, but never
+	// as the human operator: with no agentId it acts as itself.
+	if p.IsOwnerDeputy() && supplied != "" {
 		return supplied, true
 	}
 	if !p.IsAgent() {
@@ -98,7 +104,7 @@ func (s *Server) bindAgentIdentity(w http.ResponseWriter, r *http.Request, suppl
 // false after writing the error response — caller should return.
 func (s *Server) requireMemberOrOwner(w http.ResponseWriter, r *http.Request, groupID string) bool {
 	p := auth.FromContext(r.Context())
-	if p.IsOwner() {
+	if p.HasOwnerAuthority() {
 		return true
 	}
 	if !p.IsAgent() {
@@ -142,7 +148,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 	// Agents may only create groups they themselves belong to, so a stray
 	// agent can't conjure a room it has no business being in. Owners can
 	// create on anyone's behalf.
-	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+	if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() {
 		if !p.IsAgent() {
 			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
 			return
@@ -166,7 +172,7 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 		// Don't leak whether a memberId names an unknown / archived agent
 		// to non-Owners — that would let an agent enumerate hidden or
 		// archived peers via the create endpoint.
-		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+		if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() &&
 			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid memberIds")
 			return
@@ -274,7 +280,7 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 	// the caller is Owner, who is authorized to rename any group.
 	if req.Name != "" && req.AgentID == "" {
 		p := auth.FromContext(r.Context())
-		if !p.IsOwner() {
+		if !p.HasOwnerAuthority() {
 			writeError(w, http.StatusBadRequest, "bad_request", "agentId is required for name changes")
 			return
 		}
@@ -315,7 +321,7 @@ func (s *Server) handleRenameGroupDM(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusPreconditionFailed, "precondition_failed", "If-Match does not match current ETag")
 		case errors.Is(err, agent.ErrGroupNotMember):
 			p := auth.FromContext(r.Context())
-			if p.IsOwner() {
+			if p.HasOwnerAuthority() {
 				writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 			} else {
 				writeError(w, http.StatusForbidden, "forbidden", "caller is not a member of this group")
@@ -735,7 +741,7 @@ func (s *Server) handleSetGroupMemberSettings(w http.ResponseWriter, r *http.Req
 	// not in it". The original error reaches the daemon log for
 	// triage but the wire stays opaque.
 	p := auth.FromContext(r.Context())
-	if req.CallerAgentID != "" && !p.IsOwner() {
+	if req.CallerAgentID != "" && !p.HasOwnerAuthority() {
 		if err := s.groupdms.CheckMembership(id, req.CallerAgentID); err != nil {
 			s.logger.Debug("groupdm member-settings: membership check failed",
 				"group", id, "agent", req.CallerAgentID, "err", err)
@@ -780,7 +786,7 @@ func (s *Server) handleLeaveGroup(w http.ResponseWriter, r *http.Request) {
 	// Path agentId must match the calling Principal for non-Owner —
 	// nobody but the Owner gets to evict another member.
 	p := auth.FromContext(r.Context())
-	if !p.IsOwner() {
+	if !p.HasOwnerAuthority() {
 		if !p.IsAgent() || p.AgentID != agentID {
 			writeError(w, http.StatusForbidden, "forbidden", "agents may only leave on behalf of themselves")
 			return
@@ -848,7 +854,7 @@ func (s *Server) handleFindOrCreateDM(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "agentId or 1-2 memberIds required")
 		return
 	}
-	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+	if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() {
 		if !p.IsAgent() {
 			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
 			return
@@ -867,7 +873,7 @@ func (s *Server) handleFindOrCreateDM(w http.ResponseWriter, r *http.Request) {
 	}
 	g, created, err := s.groupdms.FindOrCreateDM(memberIDs)
 	if err != nil {
-		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+		if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() &&
 			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid memberIds")
 			return
@@ -902,7 +908,7 @@ func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
 	}
 	// Agents may only open threads with themselves; owners may open on
 	// anyone's behalf. Mirrors handleFindOrCreateDM's authorization.
-	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+	if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() {
 		if !p.IsAgent() {
 			writeError(w, http.StatusForbidden, "forbidden", "agent identity required")
 			return
@@ -914,7 +920,7 @@ func (s *Server) handleCreateThread(w http.ResponseWriter, r *http.Request) {
 	}
 	g, err := s.groupdms.CreateThread(req.AgentID)
 	if err != nil {
-		if p := auth.FromContext(r.Context()); !p.IsOwner() &&
+		if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() &&
 			(errors.Is(err, agent.ErrAgentNotFound) || errors.Is(err, agent.ErrAgentArchived)) {
 			writeError(w, http.StatusBadRequest, "bad_request", "invalid agentId")
 			return
@@ -1015,7 +1021,7 @@ func (s *Server) handleGetGroupDMLive(w http.ResponseWriter, r *http.Request) {
 // notification payloads that may span other members' messages.
 func (s *Server) handleGetGroupDeadLetters(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if p := auth.FromContext(r.Context()); !p.IsOwner() {
+	if p := auth.FromContext(r.Context()); !p.HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden", "owner access required")
 		return
 	}

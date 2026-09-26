@@ -64,8 +64,9 @@ func NewService(geminiKeyFn, xaiKeyFn func() (string, error)) *Service {
 // Synthesize is the main entry point. The flow is:
 //  1. Sanitize and validate input.
 //  2. Hash the request and return the cached file if present.
-//  3. Call Gemini :generateContent with safetySettings=OFF.
-//  4. Decode the inline-data audio (raw 24 kHz LE16 PCM).
+//  3. Call Gemini: the Interactions API for 3.8 models, otherwise
+//     :generateContent with safetySettings=OFF.
+//  4. Decode the returned audio (raw 24 kHz LE16 PCM).
 //  5. Encode to the requested container (ffmpeg for opus/mp3, in-process
 //     WAV header for wav).
 //  6. Persist to cache and return.
@@ -241,12 +242,22 @@ func (s *Service) LookupCached(hash, format string) ([]byte, bool) {
 	return cacheGet(hash, format)
 }
 
+// geminiAPIBase is the Gemini Developer API root. Tests point it at an
+// httptest stub.
+var geminiAPIBase = "https://generativelanguage.googleapis.com"
+
 // callGemini posts a single :generateContent request with safetySettings
 // fully disabled, parses the inline_data audio block, and returns raw PCM.
 func (s *Service) callGemini(ctx context.Context, model, voice, style, text string) ([]byte, error) {
+	if s.getAPIKey == nil {
+		return nil, errors.New("gemini api key: not configured")
+	}
 	apiKey, err := s.getAPIKey()
 	if err != nil {
 		return nil, fmt.Errorf("gemini api key: %w", err)
+	}
+	if usesInteractionsAPI(model) {
+		return s.callGeminiInteractions(ctx, model, apiKey, voice, style, text)
 	}
 
 	// All four adjustable categories set to OFF, plus BLOCK_NONE as the
@@ -353,7 +364,7 @@ func (s *Service) doGemini(ctx context.Context, model, apiKey string, payload an
 	if err != nil {
 		return nil, err
 	}
-	url := "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+	url := geminiAPIBase + "/v1beta/models/" + model + ":generateContent"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
@@ -369,26 +380,7 @@ func (s *Service) doGemini(ctx context.Context, model, apiKey string, payload an
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32 MiB cap
 	if resp.StatusCode != http.StatusOK {
-		// Parse the structured Google API error envelope so callers can
-		// branch on the canonical `status` field. Fall back to the raw
-		// body in the message when the envelope is absent/unparseable.
-		var errEnvelope struct {
-			Error struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-				Status  string `json:"status"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(body, &errEnvelope)
-		msg := errEnvelope.Error.Message
-		if msg == "" {
-			msg = string(body)
-		}
-		return nil, &apiError{
-			HTTPStatus: resp.StatusCode,
-			Status:     errEnvelope.Error.Status,
-			Message:    msg,
-		}
+		return nil, parseAPIError(resp.StatusCode, body)
 	}
 
 	type respPart struct {
@@ -431,6 +423,150 @@ func (s *Service) doGemini(ctx context.Context, model, apiKey string, payload an
 	}
 	if reason := parsed.Candidates[0].FinishReason; reason != "" && reason != "STOP" {
 		return nil, fmt.Errorf("gemini finish=%s without audio", reason)
+	}
+	return nil, errors.New("gemini returned no audio data")
+}
+
+// parseAPIError turns a non-200 Gemini response into an *apiError.
+// :generateContent returns the google.rpc envelope
+// ({"error":{"code":400,"message":...,"status":"INVALID_ARGUMENT"}}); the
+// Interactions API returns {"error":{"code":"invalid_request","message":...}}
+// with a string code and no status. Both decode here; the raw body is the
+// fallback message when neither shape parses.
+func parseAPIError(httpStatus int, body []byte) *apiError {
+	var env struct {
+		Error struct {
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+			Status  string          `json:"status"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &env)
+	status := env.Error.Status
+	if status == "" {
+		var code string
+		if json.Unmarshal(env.Error.Code, &code) == nil {
+			status = code
+		}
+	}
+	msg := env.Error.Message
+	if msg == "" {
+		msg = string(body)
+	}
+	return &apiError{HTTPStatus: httpStatus, Status: status, Message: msg}
+}
+
+// callGeminiInteractions synthesizes via POST /v1beta/interactions, the
+// surface Gemini 3.8 TTS is documented on. The text goes in verbatim and
+// the style prompt rides in a speech_metadata annotation so it steers the
+// delivery without being spoken. The narrator SystemInstruction is not
+// sent: 3.8 never rewrites or answers the transcript, and system
+// instructions are rejected ("Developer instruction is not enabled"). The
+// Gemini API does not accept safety_settings on this surface either.
+// Headerless 24 kHz LE16 PCM is requested explicitly because the unary
+// default is a RIFF WAV.
+func (s *Service) callGeminiInteractions(ctx context.Context, model, apiKey, voice, style, text string) ([]byte, error) {
+	type annotation struct {
+		Type  string `json:"type"`
+		Style string `json:"style,omitempty"`
+	}
+	type textPart struct {
+		Type        string       `json:"type"`
+		Text        string       `json:"text"`
+		Annotations []annotation `json:"annotations,omitempty"`
+	}
+	type turn struct {
+		Type    string     `json:"type"`
+		Content []textPart `json:"content"`
+	}
+	type respFormat struct {
+		Type       string `json:"type"`
+		MimeType   string `json:"mime_type"`
+		SampleRate int    `json:"sample_rate"`
+	}
+	type speechCfg struct {
+		Voice string `json:"voice"`
+	}
+	type genCfg struct {
+		SpeechConfig []speechCfg `json:"speech_config"`
+	}
+	type body struct {
+		Model            string     `json:"model"`
+		Input            []turn     `json:"input"`
+		ResponseFormat   respFormat `json:"response_format"`
+		GenerationConfig genCfg     `json:"generation_config"`
+	}
+	part := textPart{Type: "text", Text: text}
+	if style != "" {
+		part.Annotations = []annotation{{Type: "speech_metadata", Style: style}}
+	}
+	payload := body{
+		Model:            model,
+		Input:            []turn{{Type: "user_input", Content: []textPart{part}}},
+		ResponseFormat:   respFormat{Type: "audio", MimeType: "audio/l16", SampleRate: 24000},
+		GenerationConfig: genCfg{SpeechConfig: []speechCfg{{Voice: voice}}},
+	}
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, geminiAPIBase+"/v1beta/interactions", bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", apiKey)
+
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gemini request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // 32 MiB cap
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseAPIError(resp.StatusCode, respBody)
+	}
+
+	var parsed struct {
+		Status string `json:"status"`
+		Steps  []struct {
+			Content []struct {
+				Type       string `json:"type"`
+				MimeType   string `json:"mime_type"`
+				SampleRate int    `json:"sample_rate"`
+				Data       string `json:"data"`
+			} `json:"content"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("gemini decode: %w (body=%s)", err, truncate(string(respBody), 200))
+	}
+	// Reject anything but a completed interaction up front: an
+	// "incomplete" response can still carry truncated audio, which must
+	// not be served or cached as a success.
+	if parsed.Status != "" && parsed.Status != "completed" {
+		return nil, fmt.Errorf("gemini interaction status=%s", parsed.Status)
+	}
+	// The convenience output_audio is the *last* audio block; mirror that.
+	for i := len(parsed.Steps) - 1; i >= 0; i-- {
+		content := parsed.Steps[i].Content
+		for j := len(content) - 1; j >= 0; j-- {
+			c := content[j]
+			if c.Type != "audio" || c.Data == "" {
+				continue
+			}
+			if !strings.HasPrefix(c.MimeType, "audio/l16") {
+				return nil, fmt.Errorf("gemini returned unexpected audio mime %q", c.MimeType)
+			}
+			if c.SampleRate != 0 && c.SampleRate != 24000 {
+				return nil, fmt.Errorf("gemini returned unexpected sample rate %d", c.SampleRate)
+			}
+			pcm, err := base64.StdEncoding.DecodeString(c.Data)
+			if err != nil {
+				return nil, fmt.Errorf("base64 decode: %w", err)
+			}
+			return pcm, nil
+		}
 	}
 	return nil, errors.New("gemini returned no audio data")
 }

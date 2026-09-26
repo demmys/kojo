@@ -102,7 +102,7 @@ func toKVResponse(rec *store.KVRecord) kvResponse {
 // scope is decoration. auth.allowExtension already confines the path,
 // so this is the second of the two checks, not the only one.
 func kvNamespaceAllowed(p auth.Principal, ns string) bool {
-	if p.IsOwner() {
+	if p.HasOwnerAuthority() {
 		return true
 	}
 	if p.IsExtension() && p.HasScope("kv:own") {

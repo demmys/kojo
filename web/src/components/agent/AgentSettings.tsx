@@ -1914,7 +1914,7 @@ export function AgentSettings() {
               {ttsProvider === "gemini" && (
                 <Field label={t("settings.model")}>
                   <Select value={ttsModel} onChange={(e) => setTTSModel(e.target.value)}>
-                    <option value="">{t("settings.default")} ({ttsCapability?.defaults.model ?? "gemini-3.1-flash-tts-preview"})</option>
+                    <option value="">{t("settings.default")} ({ttsCapability?.defaults.model ?? "gemini-3.8-flash-lite-tts"})</option>
                     {(ttsCapability?.models ?? []).map((m) => (
                       <option key={m} value={m}>{m}</option>
                     ))}

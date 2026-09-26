@@ -1,5 +1,7 @@
 package tts
 
+import "strings"
+
 // VoiceInfo pairs a voice id with the descriptive trait Google publishes
 // in the Gemini TTS docs and the gender label Google publishes for the
 // matching Cloud Text-to-Speech Chirp3-HD voice. Both are "official";
@@ -76,9 +78,21 @@ func IsValidVoice(name string) bool {
 
 // Models is the set of TTS models we accept from clients.
 var Models = []string{
+	"gemini-3.8-flash-lite-tts",
+	"gemini-3.8-flash-tts",
 	"gemini-3.1-flash-tts-preview",
 	"gemini-2.5-flash-preview-tts",
 	"gemini-2.5-pro-preview-tts",
+}
+
+// usesInteractionsAPI reports whether the model must be driven through
+// the Interactions API (POST /v1beta/interactions) instead of
+// :generateContent. Gemini 3.8 TTS treats the text strictly as a verbatim
+// transcript, so the style prompt has to travel in
+// speech_metadata.style — :generateContent has no such field and would
+// read the narrator framing and style prompt aloud.
+func usesInteractionsAPI(model string) bool {
+	return strings.HasPrefix(model, "gemini-3.8-")
 }
 
 // IsValidModel reports whether the given model id is in the accepted list.

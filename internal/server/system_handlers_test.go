@@ -289,6 +289,8 @@ func TestSystemRestart_WakeValidation(t *testing.T) {
 		{"owner wake without agentId", auth.Principal{Role: auth.RoleOwner}, `{"wake":true}`, http.StatusBadRequest},
 		{"agent wakes someone else", auth.Principal{Role: auth.RolePrivAgent, AgentID: "ag_self"}, `{"wake":true,"agentId":"ag_other"}`, http.StatusForbidden},
 		{"unknown wake agent", auth.Principal{Role: auth.RoleOwner}, `{"wake":true,"agentId":"ag_nope"}`, http.StatusNotFound},
+		// A deputy passes the self-only rule and reaches the target lookup.
+		{"deputy wakes someone else", auth.Principal{Role: auth.RoleAgent, AgentID: "ag_self", OwnerDeputy: true}, `{"wake":true,"agentId":"ag_nope"}`, http.StatusNotFound},
 		{"malformed body", auth.Principal{Role: auth.RoleOwner}, `{"wake":`, http.StatusBadRequest},
 	}
 	for _, c := range cases {

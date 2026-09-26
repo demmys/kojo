@@ -494,7 +494,7 @@ type peerPendingListResponse struct {
 
 // handleListPeerPending returns every pending row. Owner-only.
 func (s *Server) handleListPeerPending(w http.ResponseWriter, r *http.Request) {
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"pending peer requests are owner-only")
 		return
@@ -529,7 +529,7 @@ func (s *Server) handleListPeerPending(w http.ResponseWriter, r *http.Request) {
 // path. The peer authenticates on its next inter-peer request via
 // tsnet WhoIs.
 func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request) {
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"approve is owner-only")
 		return
@@ -561,7 +561,7 @@ func (s *Server) handleApprovePeerPending(w http.ResponseWriter, r *http.Request
 // handleRejectPeerPending drops a pending row without promoting.
 // Owner-only. Idempotent.
 func (s *Server) handleRejectPeerPending(w http.ResponseWriter, r *http.Request) {
-	if !auth.FromContext(r.Context()).IsOwner() {
+	if !auth.FromContext(r.Context()).HasOwnerAuthority() {
 		writeError(w, http.StatusForbidden, "forbidden",
 			"reject is owner-only")
 		return

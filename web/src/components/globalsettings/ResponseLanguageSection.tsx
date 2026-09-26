@@ -12,9 +12,6 @@ interface Props {
   flashSuccess: () => void;
 }
 
-// Keep in sync with agent.ResponseLanguageMaxRunes on the server.
-const MAX_CHARS = 64;
-
 /**
  * Server-backed, kojo-wide agent response language. Free text so any
  * language (or variant, e.g. "関西弁の日本語") can be set; empty = auto.
@@ -67,7 +64,6 @@ export function ResponseLanguageSection({ setError, flashSuccess }: Props) {
         <div className="space-y-2">
           <Input
             value={input}
-            maxLength={MAX_CHARS}
             disabled={saved === null || saving}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {

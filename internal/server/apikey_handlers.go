@@ -264,7 +264,9 @@ func (s *Server) handleGetResponseLanguage(w http.ResponseWriter, r *http.Reques
 	lang := ""
 	if s.agents.HasCredentials() {
 		lang = s.agents.Credentials().GetSetting(agent.ResponseLanguageSettingKey)
-		if !agent.ValidResponseLanguage(lang) {
+		if norm, ok := agent.NormalizeResponseLanguage(lang); ok {
+			lang = norm
+		} else {
 			lang = ""
 		}
 	}
@@ -272,7 +274,8 @@ func (s *Server) handleGetResponseLanguage(w http.ResponseWriter, r *http.Reques
 }
 
 // handleSetResponseLanguage saves the global agent response language
-// setting. The value must be "" (auto) or one of the allowed tags.
+// setting. The value is "" (auto) or a free-text language name (single
+// line, at most agent.ResponseLanguageMaxRunes runes).
 func (s *Server) handleSetResponseLanguage(w http.ResponseWriter, r *http.Request) {
 	if !s.agents.HasCredentials() {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "credential store not available")
@@ -289,9 +292,9 @@ func (s *Server) handleSetResponseLanguage(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "bad_request", "language is required (use \"\" for auto)")
 		return
 	}
-	lang := strings.TrimSpace(*req.Language)
-	if !agent.ValidResponseLanguage(lang) {
-		writeError(w, http.StatusBadRequest, "bad_request", "unsupported language")
+	lang, ok := agent.NormalizeResponseLanguage(*req.Language)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("language must be a single line of at most %d characters", agent.ResponseLanguageMaxRunes))
 		return
 	}
 	if err := s.agents.Credentials().SetSetting(agent.ResponseLanguageSettingKey, lang); err != nil {

@@ -1,38 +1,49 @@
 package agent
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // ResponseLanguageSettingKey is the global settings key (CredentialStore
 // settings table) holding the agent response language. "" means auto.
 const ResponseLanguageSettingKey = "response_language"
 
-// responseLanguageNames maps the allowed setting values to the English
-// display name used in the system prompt. Keep in sync with the Web UI
-// select options (GlobalSettings).
-var responseLanguageNames = map[string]string{
-	"ja": "Japanese",
-	"en": "English",
-	"zh": "Chinese",
-	"ko": "Korean",
-}
+// ResponseLanguageMaxRunes caps the free-text language value. A language
+// name ("日本語", "Brazilian Portuguese", "関西弁の日本語") fits easily; the
+// cap keeps the operator-set value from turning into an arbitrary prompt.
+const ResponseLanguageMaxRunes = 64
 
-// ValidResponseLanguage reports whether v is an accepted setting value
-// ("" = auto, or one of responseLanguageNames).
-func ValidResponseLanguage(v string) bool {
+// NormalizeResponseLanguage trims v and reports whether it is an accepted
+// setting value: "" (auto) or a single-line free-text language name of at
+// most ResponseLanguageMaxRunes runes with no control characters.
+func NormalizeResponseLanguage(v string) (string, bool) {
+	v = strings.TrimSpace(v)
 	if v == "" {
-		return true
+		return "", true
 	}
-	_, ok := responseLanguageNames[v]
-	return ok
+	if !utf8.ValidString(v) || utf8.RuneCountInString(v) > ResponseLanguageMaxRunes {
+		return "", false
+	}
+	for _, r := range v {
+		if unicode.IsControl(r) || r == ' ' || r == ' ' {
+			return "", false
+		}
+	}
+	return v, true
 }
 
 // responseLanguageDirective returns the system-prompt bullet(s) telling the
 // agent which language to reply in. Output is deterministic for a given
-// value (prompt cache stability). Unknown values fall back to auto.
+// value (prompt cache stability). Invalid values fall back to auto.
 func responseLanguageDirective(lang string) string {
 	var sb strings.Builder
-	if name, ok := responseLanguageNames[strings.TrimSpace(lang)]; ok {
-		sb.WriteString("- Reply in " + name + " by default. If the user clearly writes in a different language, reply in that language instead.\n")
+	if name, ok := NormalizeResponseLanguage(lang); ok && name != "" {
+		// Quoted so the value reads as a language name, not as an
+		// instruction sentence.
+		sb.WriteString("- Reply in this language by default: " + strconv.Quote(name) + ". If the user clearly writes in a different language, reply in that language instead.\n")
 	} else {
 		sb.WriteString("- Reply in the language the user is writing in.\n")
 	}

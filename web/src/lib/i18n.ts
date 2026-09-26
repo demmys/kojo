@@ -460,10 +460,10 @@ const messages = {
   },
   "gs.responseLanguage": { ja: "エージェントの応答言語", en: "Agent Response Language" },
   "gs.responseLanguageHelp": {
-    ja: "このピアで動作する全エージェント共通。エージェントが返答や作業報告に使う言語。「自動」はユーザーが書いた言語に合わせる。他のピアで動作中のエージェントには反映されない（そのピアの設定、未設定なら「自動」が使われる）。",
-    en: "Applies to all agents running on this peer. The language agents use for replies and work reports. \"Auto\" matches the language the user writes in. Agents currently running on other peers use that peer's setting (Auto if unset).",
+    ja: "このピアで動作する全エージェントが返答や作業報告に使う言語。「日本語」「English」「関西弁の日本語」など自由に書ける。空欄なら自動（ユーザーが書いた言語に合わせる）。他のピアで動作中のエージェントには反映されない（そのピアの設定、未設定なら自動が使われる）。",
+    en: "The language all agents on this peer use for replies and work reports. Free text, e.g. \"English\", \"日本語\", \"Brazilian Portuguese\". Leave empty for auto (match the language the user writes in). Agents currently running on other peers use that peer's setting (auto if unset).",
   },
-  "gs.responseLanguageAuto": { ja: "自動", en: "Auto" },
+  "gs.responseLanguagePlaceholder": { ja: "空欄で自動（例: 日本語）", en: "Empty = auto (e.g. English)" },
 
   // ── AgentSettings: sections ──
   "settings.sec.identity": { ja: "アイデンティティ", en: "Identity" },

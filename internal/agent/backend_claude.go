@@ -660,7 +660,20 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// thread's file, causing cross-thread text contamination.
 	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	execArgs, cleanupSystemPrompt, err := materializeClaudeSystemPrompt(args)
+	if err != nil {
+		return nil, err
+	}
+	// Removed once the process has been reaped: on every early-return path
+	// below, and by the stream goroutine (deferred) otherwise.
+	started := false
+	defer func() {
+		if !started {
+			cleanupSystemPrompt()
+		}
+	}()
+
+	cmd := exec.CommandContext(ctx, claudePath, execArgs...)
 	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
 	if b.proxyURL != "" {
 		// A custom endpoint must not inherit the daemon's Anthropic cloud
@@ -745,8 +758,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	ch := make(chan ChatEvent, 64)
 
+	started = true
 	go func() {
 		defer close(ch)
+		// Runs after every cmd.Wait below (defers are LIFO).
+		defer cleanupSystemPrompt()
 		// Ensure the pipe is always closed so the process can exit even on
 		// an early-return path (cancelled stream, process error, etc.)
 		// that never reaches the "result" event below.

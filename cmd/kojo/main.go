@@ -324,6 +324,12 @@ func main() {
 		}
 	}
 
+	// Drop system prompt files orphaned by a previous daemon that died
+	// without reaping its CLI processes. Must run before any agent spawns.
+	if err := agent.SweepSystemPromptFiles(); err != nil {
+		logger.Warn("failed to sweep stale system prompt files", "err", err)
+	}
+
 	agentMgr, err := agent.NewManager(logger)
 	if err != nil {
 		logger.Error("failed to initialize agent manager", "err", err)

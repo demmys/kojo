@@ -56,7 +56,10 @@ type claudeSession struct {
 	procCancel context.CancelFunc
 	cmd        *exec.Cmd
 	stdinW     *claudeStdinWriter
-	stderr     *bytes.Buffer
+	// cleanupSystemPrompt removes the --system-prompt-file backing this
+	// process. Called from onEOF once cmd.Wait has returned.
+	cleanupSystemPrompt func()
+	stderr              *bytes.Buffer
 	// qstate answers interactive AskUserQuestion control_requests. Shared
 	// across turns on this process (requestIDs are unique per prompt).
 	qstate *claudeQuestionState
@@ -410,8 +413,17 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string, key
 	if err != nil {
 		return nil, err
 	}
+	execArgs, cleanupSystemPrompt, err := materializeClaudeSystemPrompt(args)
+	if err != nil {
+		return nil, err
+	}
 	procCtx, procCancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(procCtx, claudePath, args...)
+	fail := func(err error) (*claudeSession, error) {
+		procCancel()
+		cleanupSystemPrompt()
+		return nil, err
+	}
+	cmd := exec.CommandContext(procCtx, claudePath, execArgs...)
 	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
 	if b.proxyURL != "" {
 		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
@@ -448,33 +460,31 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string, key
 	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 	if err := cmd.Start(); err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 
 	s := &claudeSession{
-		b:            b,
-		agentID:      agentID,
-		dir:          dir,
-		logger:       b.logger,
-		fingerprint:  fp,
-		procCtx:      procCtx,
-		procCancel:   procCancel,
-		cmd:          cmd,
-		stdinW:       &claudeStdinWriter{w: stdinPipe},
-		stderr:       &stderrBuf,
-		state:        sessIdle,
-		lastActivity: time.Now(),
-		poolKey:      agentID,
+		cleanupSystemPrompt: cleanupSystemPrompt,
+		b:                   b,
+		agentID:             agentID,
+		dir:                 dir,
+		logger:              b.logger,
+		fingerprint:         fp,
+		procCtx:             procCtx,
+		procCancel:          procCancel,
+		cmd:                 cmd,
+		stdinW:              &claudeStdinWriter{w: stdinPipe},
+		stderr:              &stderrBuf,
+		state:               sessIdle,
+		lastActivity:        time.Now(),
+		poolKey:             agentID,
 	}
 	if keyed != nil {
 		s.keyed = true
@@ -1264,6 +1274,11 @@ func (s *claudeSession) onEOF() {
 	// reap/forceKill already cancelled it.
 	if s.procCancel != nil {
 		s.procCancel()
+	}
+	// The CLI is gone (Wait returned), so its system prompt file is no
+	// longer needed.
+	if s.cleanupSystemPrompt != nil {
+		s.cleanupSystemPrompt()
 	}
 	stderr := ""
 	if s.stderr != nil {

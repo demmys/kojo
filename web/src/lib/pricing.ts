@@ -14,9 +14,12 @@
 //   claude-opus-4-8  :  5 / 25
 //   claude-opus-4-7  :  5 / 25
 //   claude-opus-4-6  :  5 / 25
-//   claude-sonnet-5  :  3 / 15   (standard rate; an intro $2/$10 runs
-//                                 through 2026-08-31 — we bill the standard
-//                                 rate so the figure is stable past that date)
+//   claude-sonnet-5-5:  2 / 10
+//   claude-sonnet-5  :  2 / 10   (launched as a $2/$10 intro price with a
+//                                 $3/$15 step-up on 2026-09-01; the pricing
+//                                 page (fetched 2026-09-29, footnote 3) says
+//                                 the increase was cancelled and $2/$10 is
+//                                 now the standard rate)
 //   claude-sonnet-4-6:  3 / 15
 //   claude-haiku-4-5 :  1 /  5
 //
@@ -113,7 +116,10 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
   "claude-opus-4-8": pricedAnthropic(5, 25),
   "claude-opus-4-7": pricedAnthropic(5, 25),
   "claude-opus-4-6": pricedAnthropic(5, 25),
-  "claude-sonnet-5": pricedAnthropic(3, 15),
+  // https://platform.claude.com/docs/en/models/sonnet-5-5/overview (fetched
+  // 2026-09-29): $2 / $10, 5m cache write $2.50, cache read $0.20 (0.1x).
+  "claude-sonnet-5-5": pricedAnthropic(2, 10),
+  "claude-sonnet-5": pricedAnthropic(2, 10),
   "claude-sonnet-4-6": pricedAnthropic(3, 15),
   "claude-haiku-4-5": pricedAnthropic(1, 5),
   // xAI — https://docs.x.ai/developers/pricing (grok-4.7 2026-09-22, rest 2026-08-13)
@@ -128,6 +134,9 @@ const CANONICAL_PRICING: Record<string, ModelPricing> = {
 // The "opus" alias follows what the installed claude CLI resolves it to:
 // 2.1.276 still maps it to claude-opus-5 (its binary carries no opus-5-5
 // id at all), so it stays on Opus 5 pricing until the CLI moves.
+// "sonnet" resolves to claude-sonnet-5 up to CLI 2.1.282 and to
+// claude-sonnet-5-5 from 2.1.284 (Anthropic API); both bill $2/$10, so the
+// estimate is right on either side of that update.
 const ALIASES: Record<string, string> = {
   opus: "claude-opus-5",
   sonnet: "claude-sonnet-5",

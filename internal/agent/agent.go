@@ -158,11 +158,13 @@ func NormalizeThinkingMode(mode string) string {
 
 // xhighModels lists models that support the "xhigh" effort level.
 // Anthropic: https://platform.claude.com/docs/en/build-with-claude/effort
-// (fetched 2026-09-23) lists xhigh for Fable 5.1 / Fable 5 / Opus 5.5 /
-// Opus 5 / Opus 4.8 / Opus 4.7 / Sonnet 5; Opus 5.5 supports all five
-// levels like Opus 5.
+// (fetched 2026-09-29) lists xhigh for Fable 5.1 / Fable 5 / Opus 5.5 /
+// Opus 5 / Opus 4.8 / Opus 4.7 / Sonnet 5.5 / Sonnet 5; Opus 5.5 and
+// Sonnet 5.5 support all five levels like Opus 5. The "sonnet" alias
+// resolves to Sonnet 5 (claude CLI up to 2.1.282) or Sonnet 5.5 (2.1.284+)
+// on the Anthropic API, both xhigh-capable.
 var xhighModels = map[string]bool{
-	"opus": true, "claude-sonnet-5": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
+	"opus": true, "sonnet": true, "claude-sonnet-5-5": true, "claude-sonnet-5": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-fable-5-1": true, "claude-fable-5": true, "claude-opus-4-8": true, "claude-opus-4-7": true,
 	// grok CLI 1.0.40's models_cache.json advertises xhigh for grok-4.7,
 	// grok-4.7-build-fast and grok-4.6 but only low/medium/high for
 	// grok-4.5; none offers max. Keep this in sync with

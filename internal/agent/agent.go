@@ -307,6 +307,19 @@ func ValidResumeIdle(minutes int) bool {
 	return minutes >= 0 && minutes <= maxScheduleMinutes
 }
 
+// maxBackgroundMaxMinutes caps backgroundMaxMinutes at one day. The value
+// bounds how long a thread's CLI process (and its linger slot) may stay up
+// waiting for run_in_background tasks, so it is a resource guard rather than
+// a free schedule knob.
+const maxBackgroundMaxMinutes = 24 * 60
+
+// ValidBackgroundMax reports whether minutes is an acceptable
+// backgroundMaxMinutes value: 0 = "use default" (2 hours at runtime), or any
+// positive minute count up to one day.
+func ValidBackgroundMax(minutes int) bool {
+	return minutes >= 0 && minutes <= maxBackgroundMaxMinutes
+}
+
 // defaultResumeIdleDuration is the fallback window when ResumeIdleMinutes
 // is 0 (unset). 30 minutes: generous enough that a typical interactive
 // lull doesn't reset an over-token-threshold session (token saving beats
@@ -331,9 +344,13 @@ type Agent struct {
 	// which kojo keeps an over-token-threshold claude session via --resume
 	// instead of resetting. 0 = use defaultResumeIdleDuration (30 min).
 	// claude-only; ignored by other backends.
-	ResumeIdleMinutes int    `json:"resumeIdleMinutes,omitempty"`
-	SilentStart       string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
-	SilentEnd         string `json:"silentEnd,omitempty"`   // HH:MM — end of silent window (empty = no restriction)
+	ResumeIdleMinutes int `json:"resumeIdleMinutes,omitempty"`
+	// BackgroundMaxMinutes bounds how long a thread's session may keep
+	// waiting for run_in_background tasks, measured from the end of the
+	// thread's latest turn. 0 = default (2 hours).
+	BackgroundMaxMinutes int    `json:"backgroundMaxMinutes,omitempty"`
+	SilentStart          string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
+	SilentEnd            string `json:"silentEnd,omitempty"`   // HH:MM — end of silent window (empty = no restriction)
 	// NotifyDuringSilent controls whether the agent receives DM notifications
 	// during silent hours. Existing agents default to true (backward compat);
 	// new agents default to false.
@@ -639,6 +656,15 @@ func (a *Agent) ResumeIdleDuration() time.Duration {
 	return time.Duration(a.ResumeIdleMinutes) * time.Minute
 }
 
+// BackgroundLingerMax returns the per-agent cap on waiting for background
+// tasks, or 0 when unset/invalid (the caller then applies its default).
+func (a *Agent) BackgroundLingerMax() time.Duration {
+	if a == nil || !ValidBackgroundMax(a.BackgroundMaxMinutes) || a.BackgroundMaxMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(a.BackgroundMaxMinutes) * time.Minute
+}
+
 // MessagePreview is a short summary for agent list display.
 type MessagePreview struct {
 	Content   string `json:"content"`
@@ -699,11 +725,14 @@ type AgentConfig struct {
 	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil/-1 = no timeout (default for new agents), 0 = legacy 10-min default
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (30 min).
-	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`
-	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
-	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
-	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
-	CronMessage        *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
+	ResumeIdleMinutes *int `json:"resumeIdleMinutes"`
+	// BackgroundMaxMinutes overrides the background-task wait cap.
+	// nil/0 = default (2 hours).
+	BackgroundMaxMinutes *int    `json:"backgroundMaxMinutes"`
+	SilentStart          *string `json:"silentStart"`        // HH:MM or empty
+	SilentEnd            *string `json:"silentEnd"`          // HH:MM or empty
+	NotifyDuringSilent   *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
+	CronMessage          *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
 	// DeviceSwitchEnabled gates the kojo-switch-device skill. nil =
 	// default (true). Persisted into Agent.DeviceSwitchEnabled with
 	// no normalization so the "default" semantic survives schema
@@ -728,6 +757,7 @@ type AgentUpdateConfig struct {
 	LegacyIntervalMinutes *int    `json:"intervalMinutes,omitempty"`
 	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
+	BackgroundMaxMinutes  *int    `json:"backgroundMaxMinutes"`
 	SilentStart           *string `json:"silentStart"`
 	SilentEnd             *string `json:"silentEnd"`
 	NotifyDuringSilent    *bool   `json:"notifyDuringSilent"`
@@ -892,6 +922,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidResumeIdle(resumeIdleMin) {
 		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", resumeIdleMin)
 	}
+	bgMaxMin := 0 // default (= 2 hours at runtime)
+	if cfg.BackgroundMaxMinutes != nil {
+		bgMaxMin = *cfg.BackgroundMaxMinutes
+	}
+	if !ValidBackgroundMax(bgMaxMin) {
+		return nil, fmt.Errorf("unsupported backgroundMax: %d minutes", bgMaxMin)
+	}
 	var silentStart, silentEnd string
 	if cfg.SilentStart != nil {
 		silentStart = *cfg.SilentStart
@@ -947,23 +984,24 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		}
 	}
 	a := &Agent{
-		ID:                 id,
-		Name:               cfg.Name,
-		Persona:            cfg.Persona,
-		Mission:            strings.TrimSpace(cfg.Mission),
-		Model:              cfg.Model,
-		Effort:             cfg.Effort,
-		Tool:               cfg.Tool,
-		CustomBaseURL:      cfg.CustomBaseURL,
-		ThinkingMode:       NormalizeThinkingMode(cfg.ThinkingMode),
-		WorkDir:            cfg.WorkDir,
-		CronExpr:           cronExpr,
-		TimeoutMinutes:     timeoutMin,
-		ResumeIdleMinutes:  resumeIdleMin,
-		SilentStart:        silentStart,
-		SilentEnd:          silentEnd,
-		NotifyDuringSilent: notifyDuringSilent,
-		CronMessage:        cronMessage,
+		ID:                   id,
+		Name:                 cfg.Name,
+		Persona:              cfg.Persona,
+		Mission:              strings.TrimSpace(cfg.Mission),
+		Model:                cfg.Model,
+		Effort:               cfg.Effort,
+		Tool:                 cfg.Tool,
+		CustomBaseURL:        cfg.CustomBaseURL,
+		ThinkingMode:         NormalizeThinkingMode(cfg.ThinkingMode),
+		WorkDir:              cfg.WorkDir,
+		CronExpr:             cronExpr,
+		TimeoutMinutes:       timeoutMin,
+		ResumeIdleMinutes:    resumeIdleMin,
+		BackgroundMaxMinutes: bgMaxMin,
+		SilentStart:          silentStart,
+		SilentEnd:            silentEnd,
+		NotifyDuringSilent:   notifyDuringSilent,
+		CronMessage:          cronMessage,
 		// DeviceSwitchEnabled stays nil here when the caller didn't
 		// provide one — IsDeviceSwitchEnabled() returns true for nil
 		// so a fresh agent gets the skill auto-installed without

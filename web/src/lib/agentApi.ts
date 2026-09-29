@@ -32,6 +32,10 @@ export const INTERVAL_DAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7] as const;
 // resumeIdleMinutes) at one week. Mirrors backend maxScheduleMinutes.
 export const MAX_SCHEDULE_MINUTES = 7 * 24 * 60;
 
+// MAX_BACKGROUND_MAX_MINUTES caps backgroundMaxMinutes at one day. Mirrors
+// backend maxBackgroundMaxMinutes.
+export const MAX_BACKGROUND_MAX_MINUTES = 24 * 60;
+
 // DEFAULT_TIMEOUT_MINUTES mirrors the backend's cronTimeout — what the
 // legacy timeoutMinutes=0 sentinel resolves to at runtime. The editor
 // renders 0 as this value. (The resume-window default lives only in the
@@ -67,6 +71,7 @@ export interface AgentInfo {
   cronExpr?: string;
   timeoutMinutes: number;
   resumeIdleMinutes?: number;
+  backgroundMaxMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
@@ -293,6 +298,7 @@ export interface AgentConfig {
   cronExpr?: string;
   timeoutMinutes?: number;
   resumeIdleMinutes?: number;
+  backgroundMaxMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;

@@ -149,6 +149,7 @@ export function AgentSettings() {
   const [cronExpr, setCronExpr] = useState("");
   const [timeoutMinutes, setTimeoutMinutes] = useState(-1);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
+  const [backgroundMaxMinutes, setBackgroundMaxMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
@@ -352,6 +353,7 @@ export function AgentSettings() {
     setCronExpr(a.cronExpr ?? "");
     setTimeoutMinutes(a.timeoutMinutes || 10);
     setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
+    setBackgroundMaxMinutes(a.backgroundMaxMinutes ?? 0);
     setSilentStart(a.silentStart ?? "");
     setSilentEnd(a.silentEnd ?? "");
     setNotifyDuringSilent(a.notifyDuringSilent ?? true);
@@ -705,6 +707,7 @@ export function AgentSettings() {
           cronExpr,
           timeoutMinutes,
           resumeIdleMinutes,
+          backgroundMaxMinutes,
           silentStart,
           silentEnd,
           notifyDuringSilent,
@@ -1286,6 +1289,7 @@ export function AgentSettings() {
       cronExpr !== (agent.cronExpr ?? "") ||
       timeoutMinutes !== (agent.timeoutMinutes || 10) ||
       resumeIdleMinutes !== (agent.resumeIdleMinutes ?? 0) ||
+      backgroundMaxMinutes !== (agent.backgroundMaxMinutes ?? 0) ||
       silentStart !== (agent.silentStart ?? "") ||
       silentEnd !== (agent.silentEnd ?? "") ||
       notifyDuringSilent !== (agent.notifyDuringSilent ?? true) ||
@@ -1855,6 +1859,8 @@ export function AgentSettings() {
             onTimeoutChange={setTimeoutMinutes}
             resumeIdleMinutes={resumeIdleMinutes}
             onResumeIdleChange={setResumeIdleMinutes}
+            backgroundMaxMinutes={backgroundMaxMinutes}
+            onBackgroundMaxChange={setBackgroundMaxMinutes}
             tool={tool}
             silentStart={silentStart}
             silentEnd={silentEnd}

@@ -47,7 +47,8 @@ import (
 //     replying in the old language while the hub reported success)
 //   - workDir               (holder filesystem)
 //   - cronExpr              (holder cron scheduler reschedule)
-//   - timeoutMinutes / resumeIdleMinutes (live session watchdogs)
+//   - timeoutMinutes / resumeIdleMinutes / backgroundMaxMinutes
+//     (live session watchdogs)
 //   - allowedTools / allowProtectedPaths (live session permissions)
 //   - tts                   (holder-side synthesis config)
 //   - deviceSwitchEnabled   (installs/removes SKILL.md on holder disk)
@@ -97,6 +98,7 @@ func (cfg *AgentUpdateConfig) HubLocalOnly() bool {
 		cfg.LegacyIntervalMinutes == nil &&
 		cfg.TimeoutMinutes == nil &&
 		cfg.ResumeIdleMinutes == nil &&
+		cfg.BackgroundMaxMinutes == nil &&
 		cfg.CustomBaseURL == nil &&
 		cfg.ThinkingMode == nil &&
 		cfg.ResponseLanguage == nil &&

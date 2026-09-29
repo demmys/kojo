@@ -1420,6 +1420,9 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
 		return "", false, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
 	}
+	if cfg.BackgroundMaxMinutes != nil && !ValidBackgroundMax(*cfg.BackgroundMaxMinutes) {
+		return "", false, fmt.Errorf("unsupported backgroundMax: %d minutes", *cfg.BackgroundMaxMinutes)
+	}
 	// Empty CronExpr is a valid value (= disable scheduling); only non-empty
 	// values are run through the parser.
 	if cfg.CronExpr != nil && *cfg.CronExpr != "" {
@@ -1482,7 +1485,18 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 // persona write to disk + DB, then fail on Effort, leaving the
 // caller with a half-applied PATCH whose visible state diverges
 // from the response code.
-func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
+func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retErr error) {
+	if cfg.BackgroundMaxMinutes != nil {
+		// Live keyed sessions capture the cap at each solicited turn start;
+		// push the new value so a notification turn re-arms with it too.
+		defer func() {
+			if retErr == nil && updated != nil {
+				if cb := m.claudeBackend(); cb != nil {
+					cb.setKeyedLingerMax(updated)
+				}
+			}
+		}()
+	}
 	// Reject pre-CronExpr clients up front (parallel with newAgent) so an
 	// old mobile build can't accidentally clobber a freshly-set cronExpr by
 	// re-PATCHing an intervalMinutes value the server now ignores.
@@ -1733,7 +1747,8 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		// Already validated upstream (abs path + IsDir).
 		a.WorkDir = *cfg.WorkDir
 	}
-	// CronExpr / TimeoutMinutes / ResumeIdleMinutes / SilentHours
+	// CronExpr / TimeoutMinutes / ResumeIdleMinutes / BackgroundMaxMinutes /
+	// SilentHours
 	// validated up-front (before any I/O / mutation).
 	{
 		s, e := a.SilentStart, a.SilentEnd
@@ -1761,6 +1776,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	}
 	if cfg.ResumeIdleMinutes != nil {
 		a.ResumeIdleMinutes = *cfg.ResumeIdleMinutes
+	}
+	if cfg.BackgroundMaxMinutes != nil {
+		a.BackgroundMaxMinutes = *cfg.BackgroundMaxMinutes
 	}
 	if cfg.SilentStart != nil {
 		a.SilentStart = *cfg.SilentStart

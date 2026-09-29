@@ -23,6 +23,7 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     cronExpr: "0 * * * *",
     timeoutMinutes: 10,
     resumeIdleMinutes: 30,
+    backgroundMaxMinutes: 0,
     silentStart: "22:00",
     silentEnd: "07:00",
     notifyDuringSilent: false,
@@ -161,6 +162,7 @@ describe("buildAgentSavePayload", () => {
         notifyDuringSilent: true,
         timeoutMinutes: 25,
         resumeIdleMinutes: 0,
+        backgroundMaxMinutes: 180,
         silentStart: "23:00",
         silentEnd: "08:00",
         cronExpr: "*/5 * * * *",
@@ -169,6 +171,7 @@ describe("buildAgentSavePayload", () => {
     expect(out.notifyDuringSilent).toBe(true);
     expect(out.timeoutMinutes).toBe(25);
     expect(out.resumeIdleMinutes).toBe(0);
+    expect(out.backgroundMaxMinutes).toBe(180);
     expect(out.silentStart).toBe("23:00");
     expect(out.silentEnd).toBe("08:00");
     expect(out.cronExpr).toBe("*/5 * * * *");

@@ -1086,6 +1086,11 @@ func (st *agentStore) normalizeAgent(a *Agent) {
 			"agent", a.ID, "value", a.ResumeIdleMinutes)
 		a.ResumeIdleMinutes = 0
 	}
+	if !ValidBackgroundMax(a.BackgroundMaxMinutes) {
+		st.logger.Warn("invalid backgroundMaxMinutes in stored data, resetting to default",
+			"agent", a.ID, "value", a.BackgroundMaxMinutes)
+		a.BackgroundMaxMinutes = 0
+	}
 	// Same defence for timeoutMinutes: cronRunContext treats any negative
 	// value as "no timeout", so a hand-edited -5 would silently mean
 	// unbounded. Normalize out-of-range values to 0 (= runtime default).

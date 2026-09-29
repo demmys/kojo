@@ -118,14 +118,16 @@ type claudeSession struct {
 	sessionKey string
 
 	// Keyed-session linger state (guarded by mu).
-	pendingTasks  int         // latest background_tasks_changed count (REPLACE semantics)
-	lingerTimer   *time.Timer // hard cap from the first linger
-	graceGen      uint64      // bumped on every grace stop/re-arm; stale callbacks no-op
-	graceTimer    *time.Timer // idle grace after pending drops to 0
-	lingerExpired bool        // hard cap fired mid-turn: close at the turn's end
-	closing       bool        // close initiated; a new turn must wait + respawn
-	closeReason   string      // why the keyed session was closed (for the abandoned notice)
-	procAborted   bool        // the solicited keyed turn's interrupt went unanswered and the process was killed
+	pendingTasks int         // latest background_tasks_changed count (REPLACE semantics)
+	lingerTimer  *time.Timer // linger cap since the latest turn with tasks pending; non-nil once lingered
+	lingerGen    uint64      // bumped on every cap re-arm/stop; stale callbacks no-op
+	lingerBase   time.Time   // latest keyed turn end: the cap counts from here
+	lingerArmed  bool        // a linger cap timer is running (not yet fired/stopped)
+	graceGen     uint64      // bumped on every grace stop/re-arm; stale callbacks no-op
+	graceTimer   *time.Timer // idle grace after pending drops to 0
+	closing      bool        // close initiated; a new turn must wait + respawn
+	closeReason  string      // why the keyed session was closed (for the abandoned notice)
+	procAborted  bool        // the solicited keyed turn's interrupt went unanswered and the process was killed
 	// lingerSlot: this session holds one of the agent's linger slots
 	// (ClaudeBackend.lingerSlots) because it outlived a turn with tasks
 	// pending. lingerSince is when the slot was taken.

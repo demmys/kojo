@@ -24,6 +24,7 @@ export interface AgentSettingsFormState {
   cronExpr: string;
   timeoutMinutes: number;
   resumeIdleMinutes: number;
+  backgroundMaxMinutes: number;
   silentStart: string;
   silentEnd: string;
   notifyDuringSilent: boolean;
@@ -108,6 +109,7 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     cronExpr: state.cronExpr,
     timeoutMinutes: state.timeoutMinutes,
     resumeIdleMinutes: state.resumeIdleMinutes,
+    backgroundMaxMinutes: state.backgroundMaxMinutes,
     silentStart: state.silentStart,
     silentEnd: state.silentEnd,
     notifyDuringSilent: state.notifyDuringSilent,

@@ -487,6 +487,9 @@ type ClaudeBackend struct {
 	// session is about to kill, called under that session's mu (it may only
 	// take leaf locks) so a follow-up turn admitted afterwards sees it.
 	onKeyedNoteLocked func(agentID, sessionKey string, pending int, reason string)
+	// Per-agent background wait cap overrides (see keyedLingerMaxFor).
+	lingerMaxMu      sync.Mutex
+	lingerMaxByAgent map[string]keyedLingerMaxEntry
 	// exitNotices counts, per agent, keyed sessions whose exit handling (the
 	// abandoned notice and the surface release) is still running.
 	exitNoticeMu sync.Mutex

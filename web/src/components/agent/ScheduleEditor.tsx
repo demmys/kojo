@@ -3,6 +3,7 @@ import {
   INTERVAL_MINUTE_OPTIONS,
   INTERVAL_HOUR_OPTIONS,
   INTERVAL_DAY_OPTIONS,
+  MAX_BACKGROUND_MAX_MINUTES,
   MAX_SCHEDULE_MINUTES,
   DEFAULT_TIMEOUT_MINUTES,
 } from "../../lib/agentApi";
@@ -33,12 +34,14 @@ function MinutesField({
   emptyLabel,
   onChange,
   ariaLabel,
+  max = MAX_SCHEDULE_MINUTES,
 }: {
   value: number;
   emptyValue: number;
   emptyLabel: string;
   onChange: (v: number) => void;
   ariaLabel: string;
+  max?: number;
 }) {
   const t = useT();
   return (
@@ -47,7 +50,7 @@ function MinutesField({
         <Input
           type="number"
           min={1}
-          max={MAX_SCHEDULE_MINUTES}
+          max={max}
           value={value > 0 ? String(value) : ""}
           placeholder={emptyLabel}
           aria-label={ariaLabel}
@@ -58,7 +61,7 @@ function MinutesField({
             if (!Number.isFinite(v) || v < 1) {
               onChange(emptyValue);
             } else {
-              onChange(Math.min(v, MAX_SCHEDULE_MINUTES));
+              onChange(Math.min(v, max));
             }
           }}
         />
@@ -79,6 +82,10 @@ interface Props {
   // so we hide the control for non-claude backends where it has no effect.
   resumeIdleMinutes?: number;
   onResumeIdleChange?: (v: number) => void;
+  // claude-only: how long a thread keeps waiting for run_in_background tasks
+  // after its latest turn. 0 = server default (2h).
+  backgroundMaxMinutes?: number;
+  onBackgroundMaxChange?: (v: number) => void;
   tool?: string;
   silentStart: string;
   silentEnd: string;
@@ -228,6 +235,8 @@ export function ScheduleEditor({
   onTimeoutChange,
   resumeIdleMinutes,
   onResumeIdleChange,
+  backgroundMaxMinutes,
+  onBackgroundMaxChange,
   tool,
   silentStart,
   silentEnd,
@@ -244,6 +253,8 @@ export function ScheduleEditor({
   const t = useT();
   const showResumeIdle =
     onResumeIdleChange !== undefined && (tool === undefined || tool === "claude");
+  const showBackgroundMax =
+    onBackgroundMaxChange !== undefined && (tool === undefined || tool === "claude");
 
   // Live-tick the relative "in 12m" / "2h ago" label. Skip while dirty —
   // the value is hidden behind a "save to update" notice in that case.
@@ -387,6 +398,21 @@ export function ScheduleEditor({
             emptyLabel={t("sched.resumeDefault")}
             onChange={(v) => onResumeIdleChange?.(v)}
             ariaLabel={t("sched.resumeWindow")}
+          />
+        </Field>
+      )}
+
+      {/* Background task wait cap (claude only) — empty = server default
+          (0 sentinel, 2 hours at runtime). */}
+      {showBackgroundMax && (
+        <Field label={t("sched.backgroundMax")} help={t("sched.backgroundMaxHelp")}>
+          <MinutesField
+            value={backgroundMaxMinutes ?? 0}
+            emptyValue={0}
+            emptyLabel={t("sched.backgroundMaxDefault")}
+            onChange={(v) => onBackgroundMaxChange?.(v)}
+            ariaLabel={t("sched.backgroundMax")}
+            max={MAX_BACKGROUND_MAX_MINUTES}
           />
         </Field>
       )}

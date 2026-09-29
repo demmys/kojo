@@ -1138,6 +1138,12 @@ const messages = {
     ja: "コンテキスト超過のセッションを、最後の対話ターンからどれだけの間 resume し続けるか。短いほど早くリセットし、長いほど長い休止をまたいでコンテキストを保つ。空欄で既定 (30分)。",
     en: "How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Leave blank for the default (30 min).",
   },
+  "sched.backgroundMax": { ja: "バックグラウンド待機上限", en: "Background Wait Limit" },
+  "sched.backgroundMaxHelp": {
+    ja: "スレッドの最後のターン終了後、run_in_background のタスク完了をどれだけ待つか。超えると残ったタスクは停止される。最大1日。空欄で既定 (2時間)。",
+    en: "How long a thread keeps waiting for run_in_background tasks after its latest turn ends. Tasks still running past this are stopped. Max 1 day. Leave blank for the default (2 hours).",
+  },
+  "sched.backgroundMaxDefault": { ja: "2時間", en: "2 hours" },
   "sched.silentHours": { ja: "静音時間", en: "Silent Hours" },
   "sched.from": { ja: "開始", en: "From" },
   "sched.to": { ja: "終了", en: "To" },

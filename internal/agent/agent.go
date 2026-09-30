@@ -170,28 +170,29 @@ var xhighModels = map[string]bool{
 	// grok-4.5; none offers max. Keep this in sync with
 	// web/src/lib/toolModels.ts xhighModels / grokXhighModels.
 	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true,
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 var codexEffortModels = map[string]bool{
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 // codexMaxEffortModels lists codex models that support the "max" effort
-// level. codex CLI 0.155.0 models_cache.json advertises
-// low/medium/high/xhigh/max for the gpt-6 family (sol, astra, luna) and
-// the gpt-5.6 family (sol, terra, luna). Within those, gpt-6-sol and
-// gpt-6-astra, plus gpt-5.6-sol and gpt-5.6-terra, also list "ultra",
-// which kojo's effort scale doesn't model. Older gpt-5.x models stop at
-// xhigh. Keep in sync with web/src/lib/toolModels.ts codexMaxModels.
+// level. codex CLI 0.159.2 models_cache.json advertises
+// low/medium/high/xhigh/max for gpt-6.1-sol, the gpt-6 family (sol, astra,
+// luna) and the gpt-5.6 family (sol, terra, luna). Within those,
+// gpt-6.1-sol, gpt-6-sol and gpt-6-astra, plus gpt-5.6-sol and
+// gpt-5.6-terra, also list "ultra", which kojo's effort scale doesn't
+// model. Older gpt-5.x models stop at xhigh. Keep in sync with
+// web/src/lib/toolModels.ts codexMaxModels.
 var codexMaxEffortModels = map[string]bool{
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 

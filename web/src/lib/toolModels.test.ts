@@ -117,10 +117,13 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("claude-sonnet-4-6")).toBe("high");
   });
 
-  it("codex models before gpt-5.6 support xhigh, default to medium, and omit max", () => {
+  it("codex models before gpt-5.6 support xhigh and omit max; gpt-5.5 defaults to xhigh", () => {
+    // codex CLI 0.159.2 models_cache.json: gpt-5.5 default_reasoning_level
+    // is xhigh; gpt-5.4 and older are no longer in the cache.
     expect(effortLevelsForModel("gpt-5.5")).toContain("xhigh");
     expect(effortLevelsForModel("gpt-5.5")).not.toContain("max");
-    expect(defaultEffortForModel("gpt-5.5")).toBe("medium");
+    expect(defaultEffortForModel("gpt-5.5")).toBe("xhigh");
+    expect(defaultEffortForModel("gpt-5.4")).toBe("medium");
   });
 
   it("lists exactly the public codex models, newest first, and defaults to gpt-6-astra", () => {

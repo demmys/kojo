@@ -81,9 +81,11 @@ const codexMaxModels = new Set(["gpt-6.1-sol", "gpt-6-sol", "gpt-6-astra", "gpt-
 // codex CLI 0.159.2 models_cache.json default_reasoning_level: gpt-6-astra
 // is the only listed model that defaults to "low" (this has flipped between
 // gpt-6-astra and gpt-5.6-sol across CLI releases; re-check the cache on
-// each update). Every other codex model, including gpt-6.1-sol, defaults
-// to "medium".
+// each update). gpt-5.5 is the one codex model that defaults to "xhigh".
+// Every other codex model, including gpt-6.1-sol, defaults to "medium".
+// Models missing from the cache (gpt-5.4 and older) keep "medium".
 const codexLowDefaultModels = new Set(["gpt-6-astra"]);
+const codexXhighDefaultModels = new Set(["gpt-5.5"]);
 // Claude models whose API default effort is "medium" rather than "high":
 // https://platform.claude.com/docs/en/models/opus-5-5/overview (fetched
 // 2026-09-23) — Opus 5.5 is the first Claude model to default to medium.
@@ -146,6 +148,7 @@ export function effortLevelsForModel(model: string): readonly EffortLevel[] {
 /** Return the default effort level label for a given model. */
 export function defaultEffortForModel(model: string): string {
   if (codexLowDefaultModels.has(model)) return "low";
+  if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";
   if (claudeMediumDefaultModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";

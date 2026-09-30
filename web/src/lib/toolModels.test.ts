@@ -77,9 +77,24 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(defaultEffortForModel("opus")).toBe("high");
   });
 
-  it("sonnet has no xhigh and defaults to high", () => {
-    expect(effortLevelsForModel("sonnet")).not.toContain("xhigh");
+  it("sonnet supports xhigh and defaults to high", () => {
+    // The alias resolves to Sonnet 5 / Sonnet 5.5, both xhigh-capable.
+    expect(effortLevelsForModel("sonnet")).toContain("xhigh");
     expect(defaultEffortForModel("sonnet")).toBe("high");
+  });
+
+  it("lists claude-sonnet-5-5 directly below the sonnet alias", () => {
+    const models = modelsForTool("claude");
+    expect(models.indexOf("claude-sonnet-5-5")).toBe(models.indexOf("sonnet") + 1);
+    expect(models.indexOf("claude-sonnet-5-5")).toBe(models.indexOf("claude-sonnet-5") - 1);
+  });
+
+  it("Sonnet 5.5 supports all five levels and defaults to high", () => {
+    // https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+    // (fetched 2026-09-29): default effort high; the effort doc lists
+    // xhigh and max for Sonnet 5.5.
+    expect(effortLevelsForModel("claude-sonnet-5-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(defaultEffortForModel("claude-sonnet-5-5")).toBe("high");
   });
 
   it("lists claude-sonnet-5 as a claude model", () => {

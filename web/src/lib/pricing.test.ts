@@ -30,6 +30,20 @@ describe("priceModel", () => {
     expect(priceModel("claude-sonnet-4-6")?.output).toBe(15);
   });
 
+  it("prices Sonnet 5.5 and Sonnet 5 at $2/$10 with a 0.1x cache read", () => {
+    // https://platform.claude.com/docs/en/about-claude/pricing (fetched
+    // 2026-09-29): both rows list $2 input, $2.50 5m write, $0.20 read,
+    // $10 output; Sonnet 5's $3/$15 step-up was cancelled.
+    for (const m of ["claude-sonnet-5-5", "claude-sonnet-5", "sonnet"]) {
+      expect(priceModel(m)).toEqual({
+        input: 2,
+        output: 10,
+        cacheRead: 0.2,
+        cacheWrite: 2.5,
+      });
+    }
+  });
+
   it("prices Opus 5.5 at $4/$20 with a 0.05x cache read", () => {
     // https://platform.claude.com/docs/en/models/opus-5-5/overview: input $4,
     // output $20, 5m cache write $5, cache read $0.20.
@@ -103,12 +117,12 @@ describe("estimateTurnCost", () => {
   });
 
   it("handles missing cache fields as zero", () => {
-    // Sonnet 5: input 3, output 15 per 1M. 100k in, 200k out.
+    // Sonnet 5: input 2, output 10 per 1M. 100k in, 200k out.
     const cost = estimateTurnCost("claude-sonnet-5", {
       inputTokens: 100_000,
       outputTokens: 200_000,
     });
-    expect(cost).toBeCloseTo(0.3 + 3.0, 6);
+    expect(cost).toBeCloseTo(0.2 + 2.0, 6);
   });
 
   it("estimates grok-4.6 with xAI cache rates", () => {

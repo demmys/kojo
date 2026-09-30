@@ -157,14 +157,14 @@ func TestValidEffort(t *testing.T) {
 }
 
 func TestValidModelEffort(t *testing.T) {
-	// xhigh is valid for opus models, the Fable family, and Sonnet 5
-	for _, m := range []string{"opus", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
+	// xhigh is valid for opus models, the Fable family, and Sonnet 5.5 / 5
+	for _, m := range []string{"opus", "sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
 	}
-	// Opus 5.5 and Opus 5 support max effort (full ladder: low … max)
-	for _, m := range []string{"claude-opus-5-5", "claude-opus-5"} {
+	// Opus 5.5, Opus 5 and Sonnet 5.5 support max effort (full ladder: low … max)
+	for _, m := range []string{"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"} {
 		if !ValidModelEffort(m, "max") {
 			t.Errorf("expected max to be valid for %q", m)
 		}
@@ -194,7 +194,7 @@ func TestValidModelEffort(t *testing.T) {
 		}
 	}
 	// xhigh is invalid for non-opus/non-codex models
-	for _, m := range []string{"sonnet", "claude-opus-4-6", "haiku", ""} {
+	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-6", "haiku", ""} {
 		if ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be invalid for %q", m)
 		}

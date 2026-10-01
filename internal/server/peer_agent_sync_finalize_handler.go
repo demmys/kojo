@@ -84,6 +84,11 @@ type peerAgentSyncFinalizeRequest struct {
 	// response adapter that initiated the switch. Nil preserves the legacy main
 	// WebUI arrival chat.
 	Continuation *handoffContinuation `json:"continuation,omitempty"`
+	// ThreadArrivalUnavailable is set (with a nil Continuation) when the switch
+	// was requested from a Slack/WebUI thread whose continuation could not be
+	// bound. The target then records a main-transcript error and starts NO
+	// arrival turn: resuming thread work from main risks doing it twice.
+	ThreadArrivalUnavailable string `json:"thread_arrival_unavailable,omitempty"`
 }
 
 type handoffContinuation struct {
@@ -378,6 +383,8 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 					return
 				}
 			}
+		} else if req.Continuation == nil && req.ThreadArrivalUnavailable != "" {
+			s.agents.NotifyDeviceSwitchArrivalUnavailable(req.AgentID, sourceName, req.OpID, req.ThreadArrivalUnavailable)
 		} else if req.Continuation == nil {
 			s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
 		} else if entry.ArrivalUncertain {
@@ -395,8 +402,11 @@ func (s *Server) handlePeerAgentSyncFinalize(w http.ResponseWriter, r *http.Requ
 				SessionKey: req.Continuation.SessionKey, SourceDeviceID: req.SourceDeviceID,
 				Notes: notes, Capability: req.Continuation.Capability,
 			}
+			// The origin thread is definitely unreachable. Do not resume its
+			// work from main (duplicate-execution risk); leave a visible error.
 			fallback := func() {
-				s.agents.NotifyDeviceSwitchArrival(req.AgentID, sourceName, req.OpID, notes)
+				s.agents.NotifyDeviceSwitchArrivalUnavailable(req.AgentID, sourceName, req.OpID,
+					"origin conversation unavailable")
 			}
 			// Write intent BEFORE the external side effect. A target crash after
 			// origin admission but before persisting the outcome must not replay

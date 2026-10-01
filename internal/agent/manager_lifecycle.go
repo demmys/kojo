@@ -1215,6 +1215,50 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 	}()
 }
 
+// NotifyDeviceSwitchArrivalUnavailable records, in the main transcript, that
+// a device switch requested from a Slack/WebUI thread arrived but could not be
+// handed back to that thread. Unlike NotifyDeviceSwitchArrival it never starts
+// an agent turn: resuming the thread's work from the main conversation risks
+// running the same task twice (the thread may still be answered by its own
+// next turn), so the operator gets a visible error instead.
+// Deduplicated per op_id together with NotifyDeviceSwitchArrival so a finalize
+// retry neither repeats the note nor adds an arrival chat on top of it.
+func (m *Manager) NotifyDeviceSwitchArrivalUnavailable(agentID, sourcePeerName, opID, reason string) {
+	if m == nil || agentID == "" {
+		return
+	}
+	key := arrivalDedupKey{agentID: agentID, opID: opID}
+	if _, dup := arrivalNotified.LoadOrStore(key, struct{}{}); dup {
+		return
+	}
+	content := "⚠️ デバイス移動"
+	if sourcePeerName != "" {
+		content += "（" + sourcePeerName + " から）"
+	}
+	content += "は完了しましたが、移動を依頼したスレッドの会話を引き継げませんでした。二重処理を避けるため、エージェントへの自動再開メッセージは送っていません。必要なら元のスレッドで続きを依頼してください。"
+	if reason != "" {
+		content += "\n理由: " + reason
+	}
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = m.AppendSystemNote(agentID, content); err == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	if err != nil {
+		arrivalNotified.Delete(key)
+		if m.logger != nil {
+			m.logger.Warn("device-switch arrival-unavailable note failed", "agent", agentID, "op_id", opID, "err", err)
+		}
+		return
+	}
+	if m.logger != nil {
+		m.logger.Warn("device-switch thread continuation unavailable; arrival chat suppressed",
+			"agent", agentID, "op_id", opID, "reason", reason)
+	}
+}
+
 // arrivalChatRetryAttempts × arrivalChatRetryBackoff bounds the total
 // wait the arrival prompt accepts before giving up. ActivateAgentRuntime
 // schedules the cron side channel right before the arrival fires; if a

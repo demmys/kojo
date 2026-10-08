@@ -1531,6 +1531,7 @@ func main() {
 				logger.Warn("peer discovery: init failed; auto-onboarding disabled",
 					"err", derr)
 			} else {
+				srv.SetHubDeviceIDFunc(disco.HubDeviceID)
 				go disco.Run(ctx)
 			}
 		}

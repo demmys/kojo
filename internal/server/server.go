@@ -113,7 +113,14 @@ type Server struct {
 	blobMaxPutBytes int64          // per-PUT body cap; 0 = defaultBlobMaxPutBytes
 	events          *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
 	peerID          *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
-	peerEvents      *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
+	// peerOnly mirrors Config.PeerOnly so read handlers can tell a
+	// Hub (false) from a daemon peer (true) — e.g. to stamp the
+	// role field on GET /api/v1/peers rows.
+	peerOnly bool
+	// hubDeviceID resolves the Hub's device_id on a PeerOnly daemon
+	// (wired from peer.Discovery). Nil or "" means not yet known.
+	hubDeviceID atomic.Pointer[func() string]
+	peerEvents  *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
 	// peerPresence tracks which paired peers currently hold a live
 	// /api/v1/peers/events WS against this daemon. handlePeerEventsWS
 	// Add/Removes the deviceID; OfflineSweeper consults it so a peer
@@ -499,6 +506,7 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
+		peerOnly:             cfg.PeerOnly,
 		sessions:             sessMgr,
 		agents:               cfg.AgentManager,
 		groupdms:             cfg.GroupDMManager,

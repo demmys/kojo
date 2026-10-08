@@ -39,6 +39,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/store"
@@ -126,6 +127,19 @@ type Discovery struct {
 	// Written only from maybeAutoUpdate, which refreshLoop calls on
 	// its single ticker goroutine — no mutex required.
 	attemptedHubVersions map[string]bool
+	// hubDeviceID is the device_id of the Hub last written into
+	// peer_registry. Read concurrently by HTTP handlers.
+	hubDeviceID atomic.Value // string
+}
+
+// HubDeviceID returns the device_id of the Hub this peer paired with,
+// or "" before the first successful hub-info round.
+func (d *Discovery) HubDeviceID() string {
+	if d == nil {
+		return ""
+	}
+	v, _ := d.hubDeviceID.Load().(string)
+	return v
 }
 
 // NewDiscovery wires a Discovery.
@@ -225,6 +239,7 @@ func (d *Discovery) Run(ctx context.Context) {
 				"hub", hubURL,
 				"hub_protocol_version", hub.ProtocolVersion,
 				"peer_protocol_version", PairingProtocolVersion)
+			d.hubDeviceID.Store("")
 			if hub.DeviceID != "" {
 				if derr := d.store.DeletePeer(ctx, hub.DeviceID); derr != nil {
 					d.logger.Warn("peer discovery: wipe stale Hub row failed",
@@ -347,6 +362,7 @@ func (d *Discovery) refreshLoop(ctx context.Context, hubURL string) {
 				"hub", hubURL,
 				"hub_protocol_version", hub.ProtocolVersion,
 				"peer_protocol_version", PairingProtocolVersion)
+			d.hubDeviceID.Store("")
 			if hub.DeviceID != "" {
 				if derr := d.store.DeletePeer(ctx, hub.DeviceID); derr != nil {
 					d.logger.Warn("peer discovery: wipe stale Hub row failed",
@@ -364,7 +380,10 @@ func (d *Discovery) refreshLoop(ctx context.Context, hubURL string) {
 		}
 		existing, err := d.store.GetPeer(ctx, hub.DeviceID)
 		if err == nil && existing != nil && existing.NodeKey == hub.NodeKey {
-			// No change — skip the upsert.
+			// No change — skip the upsert, but still record which
+			// device answered: the resolved Hub URL may now point at
+			// a different (already-registered) Hub than last time.
+			d.hubDeviceID.Store(hub.DeviceID)
 			continue
 		}
 		if err := d.upsertHubIntoRegistry(ctx, hub, hubURL); err != nil {
@@ -529,6 +548,9 @@ func (d *Discovery) upsertHubIntoRegistry(ctx context.Context, hub *HubInfo, fal
 		URL:      rowURL,
 		NodeKey:  hub.NodeKey,
 	})
+	if err == nil && hub.DeviceID != "" {
+		d.hubDeviceID.Store(hub.DeviceID)
+	}
 	return err
 }
 

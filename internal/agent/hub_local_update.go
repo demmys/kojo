@@ -52,6 +52,7 @@ import (
 //   - allowedTools / allowProtectedPaths (live session permissions)
 //   - tts                   (holder-side synthesis config)
 //   - deviceSwitchEnabled   (installs/removes SKILL.md on holder disk)
+//   - codexApps             (codex app-server launch flags on the holder)
 //   - cronMessage           (persisted via agent_workspace_files
 //     kind=checkin — NOT in the agents settings_json row, so a
 //     hub-row-only write would silently no-op)
@@ -105,7 +106,8 @@ func (cfg *AgentUpdateConfig) HubLocalOnly() bool {
 		cfg.AllowedTools == nil &&
 		cfg.AllowProtectedPaths == nil &&
 		cfg.TTS == nil &&
-		cfg.DeviceSwitchEnabled == nil
+		cfg.DeviceSwitchEnabled == nil &&
+		cfg.CodexApps == nil
 }
 
 // UpdateRemoteHubRow applies a hub-local-safe PATCH to the hub's own

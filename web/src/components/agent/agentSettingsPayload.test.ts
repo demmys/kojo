@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentSavePayload,
+  defaultCodexApps,
+  isCodexCLITool,
   needsCustomURLFor,
   type AgentSettingsFormState,
 } from "./agentSettingsPayload";
@@ -77,6 +79,22 @@ describe("buildAgentSavePayload", () => {
   it("omits effort for tools that don't support an effort selector", () => {
     const out = buildAgentSavePayload(baseState({ tool: "custom-bare" }));
     expect(out.effort).toBeUndefined();
+  });
+
+  it("forwards codexApps only for codex-CLI tools", () => {
+    expect(buildAgentSavePayload(baseState({ tool: "codex", codexApps: false })).codexApps).toBe(false);
+    expect(buildAgentSavePayload(baseState({ tool: "custom-codex", codexApps: true })).codexApps).toBe(true);
+    expect(buildAgentSavePayload(baseState({ tool: "codex" })).codexApps).toBeUndefined();
+    expect(buildAgentSavePayload(baseState({ tool: "claude", codexApps: false })).codexApps).toBeUndefined();
+  });
+
+  it("codexApps defaults: on for codex, off for custom-codex", () => {
+    expect(defaultCodexApps("codex")).toBe(true);
+    expect(defaultCodexApps("custom-codex")).toBe(false);
+    expect(isCodexCLITool("codex")).toBe(true);
+    expect(isCodexCLITool("custom-codex")).toBe(true);
+    expect(isCodexCLITool("custom")).toBe(false);
+    expect(isCodexCLITool("claude")).toBe(false);
   });
 
   it("forwards autoEffort as-is", () => {

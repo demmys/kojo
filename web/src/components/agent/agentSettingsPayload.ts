@@ -40,6 +40,21 @@ export interface AgentSettingsFormState {
   };
   disabledInjections: string[];
   autoEffort: boolean;
+  /**
+   * Explicit codex "apps" choice to send, or undefined to leave the
+   * stored value (and the per-tool default) untouched.
+   */
+  codexApps?: boolean;
+}
+
+/** True for the backends driven by the codex CLI (codexApps applies). */
+export function isCodexCLITool(tool: string): boolean {
+  return tool === "codex" || tool === "custom-codex";
+}
+
+/** Effective codexApps when the agent has no explicit value. */
+export function defaultCodexApps(tool: string): boolean {
+  return tool === "codex";
 }
 
 /**
@@ -128,5 +143,6 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     },
     disabledInjections: state.disabledInjections,
     autoEffort: state.autoEffort,
+    codexApps: isCodexCLITool(state.tool) ? state.codexApps : undefined,
   };
 }

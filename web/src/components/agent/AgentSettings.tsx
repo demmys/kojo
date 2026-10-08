@@ -25,7 +25,12 @@ import { EffortPicker } from "./fields/EffortPicker";
 import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
 import { useAvatarImageProviders } from "./useAvatarImageProviders";
-import { buildAgentSavePayload, needsCustomURLFor } from "./agentSettingsPayload";
+import {
+  buildAgentSavePayload,
+  defaultCodexApps,
+  isCodexCLITool,
+  needsCustomURLFor,
+} from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -135,6 +140,8 @@ export function AgentSettings() {
   // Per-turn dynamic effort classifier. Absent on the server = enabled
   // (opt-out feature); the Effort selector becomes the ceiling/fallback.
   const [autoEffort, setAutoEffort] = useState(true);
+  // Explicit codexApps choice; null = follow the per-tool default.
+  const [codexAppsOverride, setCodexAppsOverride] = useState<boolean | null>(null);
   const [responseLanguage, setResponseLanguage] = useState("");
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
@@ -345,6 +352,7 @@ export function AgentSettings() {
     setModel(a.model);
     setEffort((a.effort || "") as EffortLevel | "");
     setAutoEffort(a.autoEffort ?? true);
+    setCodexAppsOverride(a.codexApps ?? null);
     setResponseLanguage(a.responseLanguage ?? "");
     setTool(a.tool);
     setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
@@ -699,6 +707,10 @@ export function AgentSettings() {
           model,
           effort,
           autoEffort,
+          codexApps:
+            codexAppsOverride !== null && codexAppsOverride !== agent?.codexApps
+              ? codexAppsOverride
+              : undefined,
           tool,
           customBaseURL,
           thinkingMode,
@@ -1280,6 +1292,7 @@ export function AgentSettings() {
       model.trim() !== agent.model ||
       (supportsEffort(tool) && effort !== ((agent.effort || "") as EffortLevel | "")) ||
       autoEffort !== (agent.autoEffort ?? true) ||
+      (isCodexCLITool(tool) && codexAppsOverride !== (agent.codexApps ?? null)) ||
       tool.trim() !== agent.tool ||
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
@@ -1730,6 +1743,22 @@ export function AgentSettings() {
                 onChange={setAutoEffort}
                 title={t("settings.autoEffort")}
                 desc={t("settings.autoEffortDesc")}
+              />
+            )}
+
+            {isCodexCLITool(tool) && (
+              <ToggleRow
+                checked={codexAppsOverride ?? defaultCodexApps(tool)}
+                onChange={(v) =>
+                  // Toggling back to the default on an agent with no
+                  // stored value returns to "follow the per-tool default"
+                  // instead of pinning an explicit boolean.
+                  setCodexAppsOverride(
+                    agent?.codexApps === undefined && v === defaultCodexApps(tool) ? null : v,
+                  )
+                }
+                title={t("settings.codexApps")}
+                desc={t("settings.codexAppsDesc")}
               />
             )}
 

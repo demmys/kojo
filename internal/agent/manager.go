@@ -1799,6 +1799,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	if cfg.AutoEffort != nil {
 		a.AutoEffort = cfg.AutoEffort
 	}
+	if cfg.CodexApps != nil {
+		a.CodexApps = cfg.CodexApps
+	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
 		a.CustomBaseURL = *cfg.CustomBaseURL
@@ -5008,6 +5011,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.AutoEffort != nil {
 		v := *a.AutoEffort
 		cp.AutoEffort = &v
+	}
+	if a.CodexApps != nil {
+		v := *a.CodexApps
+		cp.CodexApps = &v
 	}
 	if a.SlackBot != nil {
 		sb := *a.SlackBot

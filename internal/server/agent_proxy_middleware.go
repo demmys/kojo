@@ -157,7 +157,7 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		//   peer_offline failure): persona, model/tool/customBaseURL/
 		//   thinkingMode, responseLanguage, workDir, cronExpr, cronMessage (persists via
 		//   agent_workspace_files, not the agents row), timeout/resumeIdle,
-		//   allowedTools/allowProtectedPaths, tts, deviceSwitchEnabled,
+		//   allowedTools/allowProtectedPaths, tts, deviceSwitchEnabled, codexApps,
 		//   plus the non-PATCH routes (avatar upload, persona/status/
 		//   memory/workspace-file writes, transcript edits, credentials,
 		//   tasks, sessions).

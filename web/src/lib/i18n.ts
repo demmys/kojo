@@ -647,6 +647,11 @@ const messages = {
     ja: "タスクの難易度に応じて毎ターンの effort を自動で選ぶ。Effort 設定は上限 / フォールバックになる。",
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
   },
+  "settings.codexApps": { ja: "Codex apps（ChatGPT コネクタ）", en: "Codex apps (ChatGPT connectors)" },
+  "settings.codexAppsDesc": {
+    ja: "ChatGPT アカウントで連携したコネクタ（GitHub / Slack / Gmail / Drive など）を Codex のツールとして読み込む。カスタムエンドポイントでは全ツール定義が毎リクエストに載りコンテキストを大量に消費するため、既定は codex で ON、custom-codex で OFF。",
+    en: "Load the connectors linked to your ChatGPT account (GitHub, Slack, Gmail, Drive, ...) as Codex tools. With a custom endpoint every tool definition is inlined into each request and eats the context window, so the default is on for codex and off for custom-codex.",
+  },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
   "settings.customBaseUrlHelp": {
     ja: "Anthropic/OpenAI互換API。localhostまたはTailscaleホストを指定",

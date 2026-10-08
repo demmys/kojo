@@ -523,6 +523,16 @@ type Agent struct {
 	// regardless of this flag because there's nothing to switch to.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled,omitempty"`
 
+	// CodexApps gates the codex CLI's "apps" feature (ChatGPT connectors /
+	// remote plugins surfaced as the codex_apps MCP) for the codex and
+	// custom-codex backends. Nil = per-tool default (see
+	// IsCodexAppsEnabled): on for codex, off for custom-codex — a custom
+	// endpoint gets every connector tool definition inlined into each
+	// request (no deferred loading), which alone can exhaust a local
+	// model's context window, and the connectors would route data to the
+	// operator's ChatGPT account from an agent meant to stay local.
+	CodexApps *bool `json:"codexApps,omitempty"`
+
 	// LastTransferSkips records the session files the most recent
 	// inbound §3.7 device-switch transfer skipped (oversized JSONL,
 	// unreadable codex ref, …). Stamped into settings_json by the
@@ -636,6 +646,21 @@ func (a *Agent) IsDeviceSwitchEnabled() bool {
 	return *a.DeviceSwitchEnabled
 }
 
+// IsCodexAppsEnabled reports whether the codex CLI's "apps" feature
+// (ChatGPT connectors) should stay enabled for this agent. An explicit
+// CodexApps wins; nil falls back to the per-tool default: enabled for the
+// stock codex backend (CLI default, unchanged behaviour), disabled for
+// custom-codex. Meaningless for non-codex tools.
+func (a *Agent) IsCodexAppsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if a.CodexApps != nil {
+		return *a.CodexApps
+	}
+	return NormalizeToolName(a.Tool) == ToolCodex
+}
+
 // IsAutoEffortEnabled reports whether the per-turn dynamic effort
 // classifier is enabled for this agent. Nil pointer = default true
 // (opt-out feature) so agents predating the field participate.
@@ -741,6 +766,9 @@ type AgentConfig struct {
 	// no normalization so the "default" semantic survives schema
 	// evolution.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
+	// CodexApps toggles the codex CLI "apps" feature. nil = per-tool
+	// default (see Agent.IsCodexAppsEnabled).
+	CodexApps *bool `json:"codexApps"`
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -796,6 +824,11 @@ type AgentUpdateConfig struct {
 	// Plain self-PATCHable field (like deviceSwitchEnabled) — not
 	// owner-only.
 	AutoEffort *bool `json:"autoEffort"`
+	// CodexApps toggles the codex CLI "apps" feature (ChatGPT
+	// connectors) for codex / custom-codex. nil = "not provided; leave
+	// as-is"; explicit true/false overwrites. Holder-only: it changes
+	// the app-server launch flags of the live backend.
+	CodexApps *bool `json:"codexApps"`
 }
 
 // Context-injection section keys togglable via Agent.DisabledInjections.
@@ -1010,6 +1043,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		// so a fresh agent gets the skill auto-installed without
 		// stamping a sentinel into the row.
 		DeviceSwitchEnabled: cfg.DeviceSwitchEnabled,
+		CodexApps:           cfg.CodexApps,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}

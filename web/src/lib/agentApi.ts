@@ -171,6 +171,10 @@ export interface AgentInfo {
   // enabled (the feature is opt-out); the configured effort acts as the
   // ceiling/fallback while enabled. claude / grok tools only.
   autoEffort?: boolean;
+  // codexApps gates the codex CLI "apps" feature (ChatGPT connectors).
+  // Absent = per-tool default: on for codex, off for custom-codex.
+  // codex / custom-codex tools only.
+  codexApps?: boolean;
   // busy is a runtime-only flag: true while the agent has an in-flight
   // interactive/cron chat (server-side Manager.IsBusy). The dashboard
   // folds it into the "N running" figure so a chatting agent counts even
@@ -285,6 +289,8 @@ export interface TTSConfig {
 export interface AgentConfig {
   name: string;
   persona: string;
+  // Optional codexApps override; omitted = per-tool default.
+  codexApps?: boolean;
   // Task description from the task-first create flow. Seeded into the
   // new agent's MEMORY.md as a "## Mission" section server-side.
   mission?: string;
@@ -315,6 +321,7 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   tts?: TTSConfig | null;
   disabledInjections?: string[];
   autoEffort?: boolean;
+  codexApps?: boolean;
 }
 
 export interface AgentMessageAttachment {

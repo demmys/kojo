@@ -2,6 +2,7 @@ package extpkg
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -534,4 +535,44 @@ func (c captureHandler) Handle(ctx context.Context, r slog.Record) error {
 		return true
 	})
 	return nil
+}
+
+// A package that ships a compiled MCP server names one binary per
+// platform, the same way a service does.
+func TestMCPServerExecPerPlatform(t *testing.T) {
+	m := newManager(t)
+	key := runtime.GOOS + "/" + runtime.GOARCH
+	manifest := `{
+  "id": "demo", "name": "Demo", "version": "1.0.0",
+  "contributes": {"mcpServers": [
+    {"name": "api", "exec": {"` + key + `": "bin/native/srv", "plan9/mips": "bin/other/srv"}, "args": ["mcp"]}
+  ]}
+}`
+	install(t, m, manifest, map[string]string{"bin/native/srv": "#!/bin/sh\n", "bin/other/srv": "x"})
+	if _, err := m.SetAgentBinding("demo", "ag_1", AgentBinding{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := m.MCPServersForAgent("ag_1")
+	if len(got) != 1 {
+		t.Fatalf("MCPServersForAgent = %+v", got)
+	}
+	if want := filepath.Join(m.Dir("demo"), "bin", "native", "srv"); got[0].Command != want {
+		t.Fatalf("command = %q, want %q", got[0].Command, want)
+	}
+
+	for name, body := range map[string]string{
+		"both":         `{"name":"a","command":"npx","exec":{"linux/amd64":"bin/a"}}`,
+		"neither":      `{"name":"a"}`,
+		"bad platform": `{"name":"a","exec":{"linux":"bin/a"}}`,
+		"escaping":     `{"name":"a","exec":{"linux/amd64":"../a"}}`,
+	} {
+		var mf Manifest
+		raw := `{"id":"demo","name":"Demo","version":"1.0.0","contributes":{"mcpServers":[` + body + `]}}`
+		if err := json.Unmarshal([]byte(raw), &mf); err != nil {
+			t.Fatal(err)
+		}
+		if err := mf.Validate(); err == nil {
+			t.Errorf("%s: manifest accepted", name)
+		}
+	}
 }

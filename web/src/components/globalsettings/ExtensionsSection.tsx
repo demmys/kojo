@@ -660,6 +660,16 @@ function ExtensionConfigForm({
     (agentId ? ext.agents?.[agentId]?.config : ext.config) ?? {},
   );
   const [saving, setSaving] = useState(false);
+  // Which secrets the server holds. Tracked here as well as read from
+  // the row: the list this section was rendered from is not refetched
+  // on save, and without the update a just-saved secret would offer no
+  // way to remove it until the page was reloaded.
+  const rowSecrets = agentId ? ext.agents?.[agentId]?.secrets : ext.secrets;
+  const [storedSecrets, setStoredSecrets] = useState<string[]>(rowSecrets ?? []);
+  useEffect(() => {
+    setStoredSecrets(rowSecrets ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [(rowSecrets ?? []).join("\n")]);
 
   useEffect(() => {
     let live = true;
@@ -679,16 +689,36 @@ function ExtensionConfigForm({
     setSaving(true);
     setError("");
     try {
+      // The form shows a schema default for anything left unset, so
+      // save what is shown: a package must not get "no value" for a
+      // control the operator saw filled in. Secrets have no default.
+      const config: Record<string, unknown> = { ...draft };
+      for (const [key, prop] of Object.entries(schema.properties ?? {})) {
+        if (config[key] === undefined && prop.default !== undefined && prop.format !== "password") {
+          config[key] = prop.default;
+        }
+      }
+      let saved: InstalledExtension;
       if (agentId) {
         // The binding carries the config, so it has to be resent with
         // enabled:true — a bare config write would unbind the agent.
-        await setExtensionAgentBinding(ext.id, agentId, {
+        saved = await setExtensionAgentBinding(ext.id, agentId, {
           enabled: true,
-          config: draft,
+          config,
         });
       } else {
-        await setExtensionConfig(ext.id, draft);
+        saved = await setExtensionConfig(ext.id, config);
       }
+      setStoredSecrets((agentId ? saved.agents?.[agentId]?.secrets : saved.secrets) ?? []);
+      // Secrets are write-only: once saved, drop them from the draft so
+      // the field goes back to "saved" instead of holding the value.
+      setDraft((d) => {
+        const next = { ...d };
+        for (const [key, prop] of Object.entries(schema.properties ?? {})) {
+          if (prop.type === "string" && prop.format === "password") delete next[key];
+        }
+        return next;
+      });
       flashSuccess();
     } catch (err) {
       setError(errMsg(err));
@@ -704,6 +734,7 @@ function ExtensionConfigForm({
         value={draft}
         onChange={setDraft}
         disabled={saving}
+        secretsSet={storedSecrets}
         idPrefix={`ext-${ext.id}${agentId ? `-${agentId}` : ""}`}
       />
       <Button onClick={() => void save()} disabled={saving}>

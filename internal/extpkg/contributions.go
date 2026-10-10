@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -56,10 +57,22 @@ func (m *Manager) MCPServersForAgent(agentID string) []MCPContribution {
 			continue
 		}
 		for _, srv := range row.Manifest.Contributes.MCPServers {
+			command := resolveCommand(pkgPath(m.root, id), srv.Command)
+			if len(srv.Exec) > 0 {
+				rel, ok := srv.Exec[runtime.GOOS+"/"+runtime.GOARCH]
+				if !ok {
+					// Install-time validation rejects this, so reaching
+					// it means the checkout was swapped underneath us.
+					m.logger.Warn("extension mcp server has no executable for this platform",
+						"extension", id, "server", srv.Name)
+					continue
+				}
+				command = filepath.Join(pkgPath(m.root, id), filepath.FromSlash(rel))
+			}
 			out = append(out, MCPContribution{
 				ExtensionID: id,
 				Name:        qualifyMCPName(id, srv.Name),
-				Command:     resolveCommand(pkgPath(m.root, id), srv.Command),
+				Command:     command,
 				Args:        append([]string(nil), srv.Args...),
 				Env:         m.mcpEnvLocked(row, agentID, srv.Env),
 			})

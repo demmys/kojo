@@ -30,6 +30,10 @@ const (
 type AgentBinding struct {
 	Enabled bool           `json:"enabled"`
 	Config  map[string]any `json:"config,omitempty"`
+	// Secrets names the secret settings stored for this agent. Only
+	// the names live here; the values are in the credential store
+	// (see secrets.go).
+	Secrets []string `json:"secrets,omitempty"`
 }
 
 // Installed is one registry row: where the package came from, which
@@ -52,8 +56,11 @@ type Installed struct {
 	// persisted but never leaves the process through clone(), so the
 	// HTTP handlers — which serialize clones — cannot leak it into a
 	// list response. Read it deliberately via Manager.Token.
-	Token    string                  `json:"token,omitempty"`
-	Config   map[string]any          `json:"config,omitempty"`
+	Token  string         `json:"token,omitempty"`
+	Config map[string]any `json:"config,omitempty"`
+	// Secrets names the global secret settings that are set. Values
+	// are kept in the credential store, never here (see secrets.go).
+	Secrets  []string                `json:"secrets,omitempty"`
 	Agents   map[string]AgentBinding `json:"agents,omitempty"`
 	Manifest Manifest                `json:"manifest"`
 }
@@ -75,10 +82,15 @@ func (i *Installed) snapshot() Installed {
 	out := *i
 	out.GrantedScopes = append([]string(nil), i.GrantedScopes...)
 	out.Config = cloneMap(i.Config)
+	out.Secrets = append([]string(nil), i.Secrets...)
 	if i.Agents != nil {
 		out.Agents = make(map[string]AgentBinding, len(i.Agents))
 		for k, v := range i.Agents {
-			out.Agents[k] = AgentBinding{Enabled: v.Enabled, Config: cloneMap(v.Config)}
+			out.Agents[k] = AgentBinding{
+				Enabled: v.Enabled,
+				Config:  cloneMap(v.Config),
+				Secrets: append([]string(nil), v.Secrets...),
+			}
 		}
 	}
 	out.Manifest = i.Manifest.clone()
@@ -98,6 +110,7 @@ func (m Manifest) clone() Manifest {
 		for _, srv := range m.Contributes.MCPServers {
 			srv.Args = append([]string(nil), srv.Args...)
 			srv.Env = cloneStringMap(srv.Env)
+			srv.Exec = cloneStringMap(srv.Exec)
 			servers = append(servers, srv)
 		}
 		out.Contributes.MCPServers = servers

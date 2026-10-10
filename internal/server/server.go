@@ -106,6 +106,7 @@ type Server struct {
 	// extSupervisor owns the extension service processes. Nil until
 	// StartExtensions runs (i.e. until the API listener is bound).
 	extSupervisor   *extpkg.Supervisor
+	extensionChats  extensionChatSessions
 	files           *filebrowser.Browser
 	git             *gitpkg.Manager
 	notify          *notify.Manager
@@ -586,6 +587,11 @@ func New(cfg Config) *Server {
 			logger.Error("extension registry unavailable", "root", extRoot, "error", err)
 		} else {
 			s.extensions = extMgr
+			if s.agents != nil {
+				if creds := s.agents.Credentials(); creds != nil {
+					extMgr.SetSecretStore(creds)
+				}
+			}
 		}
 	}
 
@@ -814,6 +820,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("POST /api/v1/extensions/{id}/token", s.handleRotateExtensionToken)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/config", s.handlePutExtensionConfig)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/agents/{agentId}", s.handlePutExtensionAgentBinding)
+	// Routes an extension calls on itself with its own token.
+	mux.HandleFunc("GET /api/v1/extension/secrets", s.handleExtensionSecrets)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat", s.handleExtensionChat)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/steer", s.handleExtensionChatSteer)
 	// UI languages contributed by extensions. Separate from
 	// /api/v1/extensions because they are a property of the browser
 	// rather than of any one package: the frontend asks "what

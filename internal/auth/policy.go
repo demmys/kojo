@@ -634,6 +634,14 @@ func allowExtension(p Principal, method, path string) bool {
 		return true
 	}
 
+	// A package's own secret settings. Like /info this needs no scope:
+	// the values are ones the operator typed into this package's own
+	// settings form. The handler derives the package from the token
+	// and checks the agent binding for an agent-addressed read.
+	if method == http.MethodGet && path == "/api/v1/extension/secrets" {
+		return true
+	}
+
 	// KV, scoped to the package's own namespace. The namespace is
 	// derived from the extension ID rather than accepted from the
 	// request, so one package can never read another's rows.
@@ -695,6 +703,8 @@ func allowExtension(p Principal, method, path string) bool {
 		switch sub {
 		case "/messages", "/steer", "/answer":
 			return p.HasScope("chat:send")
+		case "/ext-chat", "/ext-chat/steer":
+			return p.HasScope("chat:session")
 		case "/attention":
 			// Paging the operator is a notification, not a config
 			// change; it rides on the same scope as sending chat.

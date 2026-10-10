@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 	"io"
 	"log/slog"
 	"os"
@@ -598,6 +599,18 @@ func (s *Supervisor) spec(row Installed, svc *Service, bin, token, agentID strin
 		s.logger.Warn("write extension token file failed",
 			"extension", row.ID, "path", tokenFile, "error", err)
 	}
+	// Secrets ride in the environment for the same reason the token
+	// does. Keys are sorted by json.Marshal, so an unchanged set
+	// produces an unchanged string and Reconcile leaves the process
+	// alone; a changed secret restarts it.
+	secretsJSON := "{}"
+	if secrets, err := s.mgr.Secrets(row.ID, agentID); err != nil {
+		s.logger.Warn("read extension secrets failed", "extension", row.ID, "error", err)
+	} else if len(secrets) > 0 {
+		if data, err := json.Marshal(secrets); err == nil {
+			secretsJSON = string(data)
+		}
+	}
 	env := baseServiceEnv()
 	env = append(env,
 		"KOJO_API_BASE="+s.mgr.APIBase(),
@@ -608,6 +621,10 @@ func (s *Supervisor) spec(row Installed, svc *Service, bin, token, agentID strin
 		"KOJO_EXT_DATA_DIR="+dataDir,
 		"KOJO_EXT_DIR="+s.mgr.Dir(row.ID),
 		"KOJO_EXT_CONFIG="+cfgJSON,
+		"KOJO_EXT_SECRETS="+secretsJSON,
+		// Where a package drops files it wants to hand an agent as
+		// chat attachments; the API accepts paths under here only.
+		"KOJO_UPLOAD_DIR="+uploadpath.Dir(),
 	)
 	if agentID != "" {
 		env = append(env, "KOJO_EXT_AGENT_ID="+agentID)

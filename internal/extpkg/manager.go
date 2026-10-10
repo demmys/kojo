@@ -62,6 +62,12 @@ type Manager struct {
 	// only known once the listener is bound, so it arrives after
 	// construction via SetAPIBase.
 	apiBase string
+	// secrets is the encrypted store secret settings are filed in
+	// (see secrets.go). Nil until the server wires one in.
+	secrets SecretStore
+	// undoSecrets is set by a mutate callback that wrote to the
+	// credential store; see mutate. Guarded by mu.
+	undoSecrets func()
 }
 
 // bumpGen stamps a package ID with a fresh serial, marking every
@@ -351,6 +357,13 @@ func (m *Manager) Update(ctx context.Context, id string, req UpdateRequest) (Ins
 	// code — lands last and wins.
 	m.bumpGen(id)
 	_ = os.RemoveAll(backup)
+	// The new schema may mark a setting secret that the old one kept
+	// in the clear; move any such value out of the registry.
+	if m.migrateSecretsLocked() {
+		if err := m.save(); err != nil {
+			m.logger.Warn("saving the registry after secret migration failed", "id", id, "error", err)
+		}
+	}
 	m.logger.Info("extension updated", "id", id, "version", mf.Version, "commit", commit)
 	return row.clone(), nil
 }
@@ -382,6 +395,10 @@ func (m *Manager) Remove(id string) error {
 	if err := os.RemoveAll(filepath.Join(m.root, dataDirName, id)); err != nil {
 		m.logger.Warn("remove extension data directory failed", "id", id, "error", err)
 	}
+	m.dropSecretsLocked(id, "")
+	for agentID := range row.Agents {
+		m.dropSecretsLocked(id, agentID)
+	}
 	m.logger.Info("extension removed", "id", id)
 	return nil
 }
@@ -400,7 +417,13 @@ func (m *Manager) SetConfig(id string, cfg map[string]any) (Installed, error) {
 		if st := row.Manifest.Contributes.Settings; st == nil || st.Scope != ScopeGlobal {
 			return fmt.Errorf("extension %s has no global settings", id)
 		}
+		names, undo, err := m.splitSecretsLocked(row, "", cfg, row.Secrets)
+		if err != nil {
+			return err
+		}
+		m.undoSecrets = undo
 		row.Config = cfg
+		row.Secrets = names
 		return nil
 	})
 }
@@ -417,6 +440,14 @@ func (m *Manager) SetAgentBinding(id, agentID string, b AgentBinding) (Installed
 		if row.Agents == nil {
 			row.Agents = map[string]AgentBinding{}
 		}
+		// The caller cannot name secrets directly: the list is derived
+		// from what the store actually holds for this agent.
+		names, undo, err := m.splitSecretsLocked(row, agentID, b.Config, row.Agents[agentID].Secrets)
+		if err != nil {
+			return err
+		}
+		m.undoSecrets = undo
+		b.Secrets = names
 		row.Agents[agentID] = b
 		return nil
 	})
@@ -450,6 +481,9 @@ func (m *Manager) ForgetAgent(agentID string) error {
 			}
 		}
 		return err
+	}
+	for id := range removed {
+		m.dropSecretsLocked(id, agentID)
 	}
 	return nil
 }
@@ -514,11 +548,19 @@ func (m *Manager) mutate(id string, fn func(*Installed) error) (Installed, error
 	// restoring one of those on a failed save would leave the package
 	// unable to authenticate until it was reinstalled.
 	prev := row.snapshot()
+	// fn may have filed secrets in the credential store before the row
+	// that names them is saved. It leaves the way back in undoSecrets,
+	// so a failed save does not strand a value the registry denies.
+	m.undoSecrets = nil
+	defer func() { m.undoSecrets = nil }()
 	if err := fn(row); err != nil {
 		return Installed{}, err
 	}
 	if err := m.save(); err != nil {
 		*row = prev
+		if m.undoSecrets != nil {
+			m.undoSecrets()
+		}
 		return Installed{}, err
 	}
 	return row.clone(), nil
@@ -649,18 +691,27 @@ func verifyContributions(dir string, m *Manifest) error {
 	// never sees the error.
 	for i, srv := range m.Contributes.MCPServers {
 		cmd := strings.TrimSpace(srv.Command)
-		if !strings.ContainsAny(cmd, `/\`) {
+		label := fmt.Sprintf("contributes.mcpServers[%d].command", i)
+		if len(srv.Exec) > 0 {
+			key := runtime.GOOS + "/" + runtime.GOARCH
+			rel, ok := srv.Exec[key]
+			if !ok {
+				return fmt.Errorf("extension MCP server %q has no executable for %s", srv.Name, key)
+			}
+			cmd = rel
+			label = fmt.Sprintf("contributes.mcpServers[%d].exec[%s]", i, key)
+		} else if !strings.ContainsAny(cmd, `/\`) {
 			// Bare name: resolved through the child's PATH at spawn
 			// time, which is not kojo's to validate here.
 			continue
 		}
 		bin, err := containedPath(dir, cmd)
 		if err != nil {
-			return fmt.Errorf("contributes.mcpServers[%d].command: %s is missing from the package: %w", i, cmd, err)
+			return fmt.Errorf("%s: %s is missing from the package: %w", label, cmd, err)
 		}
 		info, err := os.Stat(bin)
 		if err != nil || info.IsDir() {
-			return fmt.Errorf("contributes.mcpServers[%d].command: %s is not a file in the package", i, cmd)
+			return fmt.Errorf("%s: %s is not a file in the package", label, cmd)
 		}
 		if err := os.Chmod(bin, 0o755); err != nil {
 			return err

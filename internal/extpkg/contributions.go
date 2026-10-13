@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // Per-agent contribution resolution.
@@ -136,6 +138,10 @@ func (m *Manager) mcpEnvLocked(row *Installed, agentID string, extra map[string]
 		"KOJO_EXT_DATA_DIR": dataDir,
 		"KOJO_EXT_AGENT_ID": agentID,
 		"KOJO_EXT_CONFIG":   cfgJSON,
+		// The same directory the service is told about: a tool that
+		// uploads a local file (the Slack package's slack_upload_file)
+		// reads only from here, and refuses every path without it.
+		"KOJO_UPLOAD_DIR": uploadpath.Dir(),
 		// The token goes in a file, not in this map. Unlike a
 		// supervised service — which kojo spawns itself — an MCP
 		// server is spawned by the backend CLI, so its environment

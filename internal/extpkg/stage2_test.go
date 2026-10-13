@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // quietLogger keeps supervisor churn out of the test output.
@@ -234,6 +236,9 @@ func TestMCPServersForAgent(t *testing.T) {
 		"KOJO_EXT_DATA_DIR":   m.DataDir("demo", "ag_1"),
 		"KOJO_EXT_AGENT_ID":   "ag_1",
 		"KOJO_EXT_TOKEN_FILE": filepath.Join(m.DataDir("demo", "ag_1"), tokenFilename),
+		// A file-uploading tool reads from the same directory the
+		// service writes attachments to.
+		"KOJO_UPLOAD_DIR": uploadpath.Dir(),
 		// The backend CLI spawns this server from command-line
 		// config, so the token must not be in its environment.
 		"KOJO_EXT_TOKEN": "",

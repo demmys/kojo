@@ -1420,6 +1420,9 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 	if cfg.ResumeIdleMinutes != nil && !ValidResumeIdle(*cfg.ResumeIdleMinutes) {
 		return "", false, fmt.Errorf("unsupported resumeIdle: %d minutes", *cfg.ResumeIdleMinutes)
 	}
+	if cfg.BackgroundMaxMinutes != nil && !ValidBackgroundMax(*cfg.BackgroundMaxMinutes) {
+		return "", false, fmt.Errorf("unsupported backgroundMax: %d minutes", *cfg.BackgroundMaxMinutes)
+	}
 	// Empty CronExpr is a valid value (= disable scheduling); only non-empty
 	// values are run through the parser.
 	if cfg.CronExpr != nil && *cfg.CronExpr != "" {
@@ -1449,6 +1452,14 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 	if cfg.ThinkingMode != nil && !ValidThinkingMode(*cfg.ThinkingMode) {
 		return "", false, fmt.Errorf("unsupported thinkingMode: %q", *cfg.ThinkingMode)
 	}
+	if cfg.ResponseLanguage != nil {
+		v, ok := NormalizeResponseLanguage(*cfg.ResponseLanguage)
+		if !ok {
+			return "", false, fmt.Errorf("invalid responseLanguage: must be a single line of at most %d characters", ResponseLanguageMaxRunes)
+		}
+		// Normalize in place so the apply step stores the trimmed value.
+		cfg.ResponseLanguage = &v
+	}
 	if cfg.TTS != nil {
 		if verr := ValidateTTS(cfg.TTS); verr != nil {
 			return "", false, verr
@@ -1474,7 +1485,18 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 // persona write to disk + DB, then fail on Effort, leaving the
 // caller with a half-applied PATCH whose visible state diverges
 // from the response code.
-func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
+func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retErr error) {
+	if cfg.BackgroundMaxMinutes != nil {
+		// Live keyed sessions capture the cap at each solicited turn start;
+		// push the new value so a notification turn re-arms with it too.
+		defer func() {
+			if retErr == nil && updated != nil {
+				if cb := m.claudeBackend(); cb != nil {
+					cb.setKeyedLingerMax(updated)
+				}
+			}
+		}()
+	}
 	// Reject pre-CronExpr clients up front (parallel with newAgent) so an
 	// old mobile build can't accidentally clobber a freshly-set cronExpr by
 	// re-PATCHing an intervalMinutes value the server now ignores.
@@ -1725,7 +1747,8 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 		// Already validated upstream (abs path + IsDir).
 		a.WorkDir = *cfg.WorkDir
 	}
-	// CronExpr / TimeoutMinutes / ResumeIdleMinutes / SilentHours
+	// CronExpr / TimeoutMinutes / ResumeIdleMinutes / BackgroundMaxMinutes /
+	// SilentHours
 	// validated up-front (before any I/O / mutation).
 	{
 		s, e := a.SilentStart, a.SilentEnd
@@ -1754,6 +1777,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ResumeIdleMinutes != nil {
 		a.ResumeIdleMinutes = *cfg.ResumeIdleMinutes
 	}
+	if cfg.BackgroundMaxMinutes != nil {
+		a.BackgroundMaxMinutes = *cfg.BackgroundMaxMinutes
+	}
 	if cfg.SilentStart != nil {
 		a.SilentStart = *cfg.SilentStart
 	}
@@ -1773,6 +1799,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.AutoEffort != nil {
 		a.AutoEffort = cfg.AutoEffort
 	}
+	if cfg.CodexApps != nil {
+		a.CodexApps = cfg.CodexApps
+	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
 		a.CustomBaseURL = *cfg.CustomBaseURL
@@ -1786,6 +1815,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (*Agent, error) {
 	if cfg.ThinkingMode != nil {
 		// Validated upstream.
 		a.ThinkingMode = NormalizeThinkingMode(*cfg.ThinkingMode)
+	}
+	if cfg.ResponseLanguage != nil {
+		// Validated + normalized upstream (validateUpdateConfigPure).
+		a.ResponseLanguage = *cfg.ResponseLanguage
 	}
 	if cronMessageDirty {
 		a.CronMessage = nextCronMessage
@@ -4978,6 +5011,10 @@ func copyAgent(a *Agent) *Agent {
 	if a.AutoEffort != nil {
 		v := *a.AutoEffort
 		cp.AutoEffort = &v
+	}
+	if a.CodexApps != nil {
+		v := *a.CodexApps
+		cp.CodexApps = &v
 	}
 	if a.SlackBot != nil {
 		sb := *a.SlackBot

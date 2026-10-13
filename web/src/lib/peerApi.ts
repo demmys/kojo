@@ -19,6 +19,8 @@ export interface PeerInfo {
   lastSeen?: number; // unix millis
   status: "online" | "offline" | "degraded";
   isSelf: boolean;
+  /** "hub" for the Hub row, "peer" otherwise; absent while a daemon peer has not resolved its Hub yet. */
+  role?: "hub" | "peer";
   // kojo build the peer last reported ("v0.119.1", git-describe
   // forms included). Absent when never reported (old builds).
   version?: string;

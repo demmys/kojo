@@ -19,10 +19,12 @@ export interface AgentSettingsFormState {
   tool: string;
   customBaseURL: string;
   thinkingMode: string;
+  responseLanguage: string;
   workDir: string;
   cronExpr: string;
   timeoutMinutes: number;
   resumeIdleMinutes: number;
+  backgroundMaxMinutes: number;
   silentStart: string;
   silentEnd: string;
   notifyDuringSilent: boolean;
@@ -38,6 +40,21 @@ export interface AgentSettingsFormState {
   };
   disabledInjections: string[];
   autoEffort: boolean;
+  /**
+   * Explicit codex "apps" choice to send, or undefined to leave the
+   * stored value (and the per-tool default) untouched.
+   */
+  codexApps?: boolean;
+}
+
+/** True for the backends driven by the codex CLI (codexApps applies). */
+export function isCodexCLITool(tool: string): boolean {
+  return tool === "codex" || tool === "custom-codex";
+}
+
+/** Effective codexApps when the agent has no explicit value. */
+export function defaultCodexApps(tool: string): boolean {
+  return tool === "codex";
 }
 
 /**
@@ -72,6 +89,7 @@ export function needsCustomURLFor(tool: string): boolean {
  *   - customBaseURL: trimmed and included only for tools that need
  *     it; otherwise undefined so the server clears the field.
  *   - thinkingMode: only emitted for custom-bare.
+ *   - responseLanguage: always sent, trimmed ("" = auto).
  *   - allowedTools: only emitted for custom-claude (where the
  *     operator picks per-tool permissions).
  *   - allowProtectedPaths: only emitted for claude / custom-claude — those
@@ -101,10 +119,12 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     tool: trimmed.tool,
     customBaseURL: needsCustomURLFor(state.tool) ? state.customBaseURL.trim() : undefined,
     thinkingMode: state.tool === "custom-bare" ? state.thinkingMode : undefined,
+    responseLanguage: state.responseLanguage.trim(),
     workDir: trimmed.workDir,
     cronExpr: state.cronExpr,
     timeoutMinutes: state.timeoutMinutes,
     resumeIdleMinutes: state.resumeIdleMinutes,
+    backgroundMaxMinutes: state.backgroundMaxMinutes,
     silentStart: state.silentStart,
     silentEnd: state.silentEnd,
     notifyDuringSilent: state.notifyDuringSilent,
@@ -123,5 +143,6 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     },
     disabledInjections: state.disabledInjections,
     autoEffort: state.autoEffort,
+    codexApps: isCodexCLITool(state.tool) ? state.codexApps : undefined,
   };
 }

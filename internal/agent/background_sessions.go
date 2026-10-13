@@ -91,6 +91,63 @@ type keyedSessionSnapshot struct {
 	taskSeen    map[string]time.Time
 }
 
+// keyedLingerMaxEntry is an agent's cap override with the agent row version
+// (Agent.UpdatedAt, RFC3339) it came from.
+type keyedLingerMaxEntry struct {
+	d         time.Duration
+	updatedAt string
+}
+
+// keyedLingerMaxFor returns the agent's background wait cap override
+// (0 = default). Leaf lock: may be called with a session's mu held.
+func (b *ClaudeBackend) keyedLingerMaxFor(agentID string) time.Duration {
+	b.lingerMaxMu.Lock()
+	defer b.lingerMaxMu.Unlock()
+	return b.lingerMaxByAgent[agentID].d
+}
+
+// recordKeyedLingerMax stores the cap from agent row a unless a newer row
+// version was already recorded, so a chat carrying a pre-PATCH snapshot
+// cannot undo the PATCH. UpdatedAt has second precision, so on a tie only
+// the Manager's post-PATCH row (fromUpdate) replaces the entry: a chat
+// snapshot from the same second as the PATCH may predate it. It reports
+// whether the value was stored.
+func (b *ClaudeBackend) recordKeyedLingerMax(a *Agent, fromUpdate bool) bool {
+	b.lingerMaxMu.Lock()
+	defer b.lingerMaxMu.Unlock()
+	if cur, ok := b.lingerMaxByAgent[a.ID]; ok {
+		if cur.updatedAt > a.UpdatedAt || (!fromUpdate && cur.updatedAt == a.UpdatedAt) {
+			return false
+		}
+	}
+	if b.lingerMaxByAgent == nil {
+		b.lingerMaxByAgent = make(map[string]keyedLingerMaxEntry)
+	}
+	b.lingerMaxByAgent[a.ID] = keyedLingerMaxEntry{d: a.BackgroundLingerMax(), updatedAt: a.UpdatedAt}
+	return true
+}
+
+// setKeyedLingerMax records the updated agent's cap and reschedules the
+// running caps of its live keyed sessions against their reference points.
+func (b *ClaudeBackend) setKeyedLingerMax(a *Agent) {
+	if !b.recordKeyedLingerMax(a, true) {
+		return
+	}
+	b.sessMu.Lock()
+	var sessions []*claudeSession
+	for _, s := range b.sessions {
+		if s.keyed && s.agentID == a.ID {
+			sessions = append(sessions, s)
+		}
+	}
+	b.sessMu.Unlock()
+	for _, s := range sessions {
+		s.mu.Lock()
+		s.rescheduleLingerMaxLocked()
+		s.mu.Unlock()
+	}
+}
+
 // keyedSessionsWithTasks snapshots the agent's keyed sessions that have
 // background tasks pending or hold a linger slot.
 func (b *ClaudeBackend) keyedSessionsWithTasks(agentID string) []keyedSessionSnapshot {

@@ -18,15 +18,17 @@ import (
 // instead of killing the tasks at stdin EOF. That later turn is routed to the
 // Manager's keyed background handler (never the main transcript). The process
 // lives only while tasks are pending (+keyedLingerGrace once they drain) or a
-// turn is active, bounded by keyedLingerMax overall.
+// turn is active, bounded by keyedLingerMax (or the agent's
+// backgroundMaxMinutes) since the latest turn ended.
 
 var (
 	// keyedLingerGrace is how long an idle keyed session with no pending
 	// tasks stays up after having lingered (a notification turn usually
 	// follows the tasks=[] snapshot within a second).
 	keyedLingerGrace = 60 * time.Second
-	// keyedLingerMax is the hard cap on how long a keyed session may linger
-	// waiting for background tasks.
+	// keyedLingerMax is the default cap on how long a keyed session may
+	// linger waiting for background tasks after its latest turn ended
+	// (Agent.BackgroundMaxMinutes overrides it per agent).
 	keyedLingerMax = 2 * time.Hour
 	// keyedCloseGrace bounds how long a closing keyed session with nothing
 	// pending may take to exit on its own after stdin EOF before it is
@@ -200,7 +202,7 @@ func (s *claudeSession) onBackgroundTasksChanged(tasks []claudeBackgroundTask) {
 		return
 	}
 	s.stopGraceLocked()
-	s.armLingerMaxLocked()
+	s.ensureLingerMaxLocked()
 	s.mu.Unlock()
 }
 
@@ -403,13 +405,6 @@ func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, clo
 	if s.closing {
 		return 0, false
 	}
-	if s.lingerExpired {
-		if s.closeReason == "" {
-			s.closeReason = "待機上限(2時間)に到達"
-		}
-		s.setClosingLocked()
-		return 0, true
-	}
 	if stopAll && s.unrequestedTasksLocked() > 0 {
 		// A `!stop all` stopped this turn's tasks while it was running; a
 		// task spawned after that stop's snapshot must not outlive it.
@@ -448,6 +443,7 @@ func (s *claudeSession) afterKeyedTurnLocked(unsolicited bool) (pending int, clo
 	// notification turn (or once the session has lingered) keep a short
 	// grace so a follow-up notification or a steered user line can land.
 	if unsolicited || s.lingerTimer != nil {
+		s.noteKeyedTurnEndLocked()
 		s.armGraceLocked()
 		return 0, false
 	}
@@ -485,35 +481,122 @@ func (s *claudeSession) stopGraceLocked() {
 	}
 }
 
-func (s *claudeSession) armLingerMaxLocked() {
-	if s.lingerTimer != nil {
+// effectiveLingerMaxLocked is the linger cap for this session: the agent's
+// backgroundMaxMinutes when set, otherwise the package default. Caller holds mu.
+func (s *claudeSession) effectiveLingerMaxLocked() time.Duration {
+	if s.b != nil {
+		if d := s.b.keyedLingerMaxFor(s.agentID); d > 0 {
+			return d
+		}
+	}
+	return keyedLingerMax
+}
+
+// lingerLimitReason is the close reason when the linger cap elapsed.
+func lingerLimitReason(d time.Duration) string {
+	return "待機上限(" + formatLingerDuration(d) + ")に到達"
+}
+
+func formatLingerDuration(d time.Duration) string {
+	if d >= time.Hour && d%time.Hour == 0 {
+		return fmt.Sprintf("%d時間", int(d/time.Hour))
+	}
+	if d >= time.Minute && d%time.Minute == 0 {
+		return fmt.Sprintf("%d分", int(d/time.Minute))
+	}
+	return d.String()
+}
+
+// ensureLingerMaxLocked arms the linger cap for tasks reappearing on an idle
+// session. It never extends a running cap; with none running it counts from
+// the latest keyed turn end (lingerBase), so a cap that already elapsed closes
+// right away. Caller holds mu.
+func (s *claudeSession) ensureLingerMaxLocked() {
+	if s.lingerArmed {
 		return
 	}
-	s.logger.Info("keyed claude session lingering for background tasks", "agent", s.agentID, "sessionKey", s.sessionKey, "pending", s.pendingTasks)
-	s.lingerTimer = time.AfterFunc(keyedLingerMax, func() {
+	if s.lingerBase.IsZero() {
+		s.lingerBase = time.Now()
+	}
+	s.scheduleLingerMaxLocked()
+}
+
+// armLingerMaxLocked (re)starts the linger cap from now. It is called at the
+// end of every keyed turn that leaves tasks pending, so the cap measures the
+// time since the thread's latest turn rather than since it first lingered: a
+// thread that keeps working is not cut off by an old deadline, while a
+// process whose tasks never finish (and so never produce a turn) is still
+// closed. Caller holds mu.
+func (s *claudeSession) armLingerMaxLocked() {
+	s.lingerBase = time.Now()
+	s.scheduleLingerMaxLocked()
+}
+
+// noteKeyedTurnEndLocked records a keyed turn end with nothing pending as the
+// cap's reference point for tasks that reappear later, and stops a running cap
+// (the idle grace now bounds the session). Caller holds mu.
+func (s *claudeSession) noteKeyedTurnEndLocked() {
+	s.lingerBase = time.Now()
+	if s.lingerArmed {
+		s.lingerGen++
+		s.lingerArmed = false
+		s.lingerTimer.Stop()
+	}
+}
+
+// scheduleLingerMaxLocked (re)schedules the cap timer for lingerBase + the
+// effective cap. Caller holds mu.
+func (s *claudeSession) scheduleLingerMaxLocked() {
+	if s.state == sessDead || s.closing {
+		return
+	}
+	if s.lingerTimer != nil {
+		s.lingerTimer.Stop()
+	}
+	s.lingerGen++
+	s.lingerArmed = true
+	gen := s.lingerGen
+	d := s.effectiveLingerMaxLocked()
+	wait := time.Until(s.lingerBase.Add(d))
+	if wait < 0 {
+		wait = 0
+	}
+	s.logger.Info("keyed claude session lingering for background tasks", "agent", s.agentID, "sessionKey", s.sessionKey, "pending", s.pendingTasks, "max", d, "remaining", wait)
+	s.lingerTimer = time.AfterFunc(wait, func() {
 		s.mu.Lock()
-		if s.state == sessDead || s.closing {
+		if gen != s.lingerGen || s.state == sessDead || s.closing {
 			s.mu.Unlock()
 			return
 		}
+		s.lingerArmed = false
 		if s.state == sessInTurn {
-			// Let the running turn finish; completeTurn closes.
-			s.lingerExpired = true
+			// A running turn is activity: its end re-arms the cap (tasks
+			// still pending) or records the new reference point (nothing
+			// pending) for tasks that reappear later.
 			s.mu.Unlock()
 			return
 		}
 		s.setClosingLocked()
 		if s.closeReason == "" {
-			s.closeReason = "待機上限(2時間)に到達"
+			s.closeReason = lingerLimitReason(d)
 		}
 		s.mu.Unlock()
-		s.logger.Warn("keyed claude session: linger limit reached; closing", "agent", s.agentID, "sessionKey", s.sessionKey)
+		s.logger.Warn("keyed claude session: linger limit reached; closing", "agent", s.agentID, "sessionKey", s.sessionKey, "max", d)
 		s.closeKeyed("")
 	})
 }
 
+// rescheduleLingerMaxLocked reschedules a running cap against its original
+// reference point after the agent's cap changed. Caller holds mu.
+func (s *claudeSession) rescheduleLingerMaxLocked() {
+	if s.lingerArmed {
+		s.scheduleLingerMaxLocked()
+	}
+}
+
 func (s *claudeSession) stopLingerTimersLocked() {
 	s.stopGraceLocked()
+	s.lingerGen++
 	if s.lingerTimer != nil {
 		// The field stays non-nil: a closing/dead session never lingers again.
 		s.lingerTimer.Stop()
@@ -632,6 +715,7 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 	if err := ensureClaudeProjectDir(dir); err != nil {
 		return nil, true, fmt.Errorf("prepare claude project dir: %w", err)
 	}
+	b.recordKeyedLingerMax(agent, false)
 	pk := keyedPoolKey(agent.ID, opts.SessionKey)
 	canAnswer := opts.OnQuestionReady != nil
 

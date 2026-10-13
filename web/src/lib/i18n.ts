@@ -245,6 +245,10 @@ const messages = {
     en: "A new version is available. Reload.",
   },
   "reload.action": { ja: "リロード", en: "Reload" },
+  "reload.chunkFailed": {
+    ja: "このページを読み込めませんでした（ネットワークエラー、またはビルドが古い可能性があります）",
+    en: "Failed to load this page (network error or outdated build).",
+  },
 
   // ── Daemon self-update prompt ──
   "update.available": {
@@ -616,6 +620,12 @@ const messages = {
     ja: "毎ターンの文脈末尾に注入される2〜3行の人格要約 (一人称・口調・態度)。空なら何も注入されない。長文はトークン税になるので短く。",
     en: "A 2-3 line persona summary (first person, tone, attitude) appended to the per-turn context tail. Nothing is injected when empty. Keep it short — long text costs tokens.",
   },
+  "settings.responseLanguage": { ja: "応答言語", en: "Response Language" },
+  "settings.responseLanguageHelp": {
+    ja: "このエージェントが返答や作業報告に使う言語。「日本語」「English」「関西弁の日本語」など自由に書ける。空欄なら自動（ユーザーが書いた言語に合わせる）。",
+    en: "The language this agent uses for replies and work reports. Free text, e.g. \"日本語\", \"English\", \"関西弁の日本語\". Leave empty for auto (match the language the user writes in).",
+  },
+  "settings.responseLanguagePlaceholder": { ja: "空欄で自動（例: 日本語）", en: "Empty = auto (e.g. English)" },
   "settings.publicProfile": { ja: "公開プロフィール", en: "Public Profile" },
   "settings.override": { ja: "上書き", en: "Override" },
   "settings.publicProfileHelpOverride": {
@@ -640,6 +650,11 @@ const messages = {
   "settings.autoEffortDesc": {
     ja: "タスクの難易度に応じて毎ターンの effort を自動で選ぶ。Effort 設定は上限 / フォールバックになる。",
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
+  },
+  "settings.codexApps": { ja: "Codex apps（ChatGPT コネクタ）", en: "Codex apps (ChatGPT connectors)" },
+  "settings.codexAppsDesc": {
+    ja: "ChatGPT アカウントで連携したコネクタ（GitHub / Slack / Gmail / Drive など）を Codex のツールとして読み込む。カスタムエンドポイントでは全ツール定義が毎リクエストに載りコンテキストを大量に消費するため、既定は codex で ON、custom-codex で OFF。",
+    en: "Load the connectors linked to your ChatGPT account (GitHub, Slack, Gmail, Drive, ...) as Codex tools. With a custom endpoint every tool definition is inlined into each request and eats the context window, so the default is on for codex and off for custom-codex.",
   },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
   "settings.customBaseUrlHelp": {
@@ -1132,6 +1147,12 @@ const messages = {
     ja: "コンテキスト超過のセッションを、最後の対話ターンからどれだけの間 resume し続けるか。短いほど早くリセットし、長いほど長い休止をまたいでコンテキストを保つ。空欄で既定 (30分)。",
     en: "How long an over-context session keeps being resumed after the last interactive turn. Smaller resets sooner; larger keeps context across longer pauses. Leave blank for the default (30 min).",
   },
+  "sched.backgroundMax": { ja: "バックグラウンド待機上限", en: "Background Wait Limit" },
+  "sched.backgroundMaxHelp": {
+    ja: "スレッドの最後のターン終了後、run_in_background のタスク完了をどれだけ待つか。超えると残ったタスクは停止される。最大1日。空欄で既定 (2時間)。",
+    en: "How long a thread keeps waiting for run_in_background tasks after its latest turn ends. Tasks still running past this are stopped. Max 1 day. Leave blank for the default (2 hours).",
+  },
+  "sched.backgroundMaxDefault": { ja: "2時間", en: "2 hours" },
   "sched.silentHours": { ja: "静音時間", en: "Silent Hours" },
   "sched.from": { ja: "開始", en: "From" },
   "sched.to": { ja: "終了", en: "To" },

@@ -85,6 +85,62 @@ type peerResponse struct {
 	// reported one (row predates the version column, or the peer
 	// runs a build older than the X-Kojo-Peer-Version header).
 	Version string `json:"version,omitempty"`
+	// Role is "hub" for the Hub's row and "peer" for every other
+	// row, so agents (kojo-switch-device) can resolve "go back to the
+	// Hub" without relying on the device name. Omitted on a daemon
+	// peer whose Hub discovery has not resolved the Hub's device_id
+	// yet — guessing would mislabel the Hub row as "peer".
+	Role string `json:"role,omitempty"`
+}
+
+const (
+	peerRoleHub  = "hub"
+	peerRolePeer = "peer"
+)
+
+// SetHubDeviceIDFunc wires the Hub device_id resolver used on a
+// PeerOnly daemon (peer.Discovery.HubDeviceID). Safe to call after
+// the server started serving.
+func (s *Server) SetHubDeviceIDFunc(fn func() string) {
+	if fn == nil {
+		s.hubDeviceID.Store(nil)
+		return
+	}
+	s.hubDeviceID.Store(&fn)
+}
+
+// peerRole classifies a registry row as Hub or peer. On the Hub the
+// self row is the Hub. On a daemon peer the Hub is whichever device
+// discovery resolved; "" when that is still unknown.
+func (s *Server) peerRole(deviceID string) string {
+	return peerRoleFor(deviceID, s.currentHubDeviceID())
+}
+
+// currentHubDeviceID returns the Hub's device_id as seen from this
+// server, or "" when unknown. List handlers call it once per request
+// so a Hub switch mid-listing can't mark two rows as "hub".
+func (s *Server) currentHubDeviceID() string {
+	if !s.peerOnly {
+		if s.peerID != nil {
+			return s.peerID.DeviceID
+		}
+		return ""
+	}
+	fn := s.hubDeviceID.Load()
+	if fn == nil {
+		return ""
+	}
+	return (*fn)()
+}
+
+func peerRoleFor(deviceID, hubDeviceID string) string {
+	if hubDeviceID == "" {
+		return ""
+	}
+	if deviceID == hubDeviceID {
+		return peerRoleHub
+	}
+	return peerRolePeer
 }
 
 type peerListResponse struct {
@@ -132,6 +188,12 @@ func (s *Server) requireOwnerForPeers(w http.ResponseWriter, r *http.Request) bo
 // against the local identity. Tolerates a nil Server.peerID for
 // unit-test isolation, in which case no row is ever flagged self.
 func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
+	return s.toPeerResponseWithHub(rec, s.currentHubDeviceID())
+}
+
+// toPeerResponseWithHub is toPeerResponse with a pre-resolved Hub
+// device_id (see currentHubDeviceID).
+func (s *Server) toPeerResponseWithHub(rec *store.PeerRecord, hubDeviceID string) peerResponse {
 	out := peerResponse{
 		DeviceID: rec.DeviceID,
 		Name:     rec.Name,
@@ -139,6 +201,7 @@ func (s *Server) toPeerResponse(rec *store.PeerRecord) peerResponse {
 		LastSeen: rec.LastSeen,
 		Status:   rec.Status,
 		Version:  rec.Version,
+		Role:     peerRoleFor(rec.DeviceID, hubDeviceID),
 	}
 	if s.peerID != nil && rec.DeviceID == s.peerID.DeviceID {
 		out.IsSelf = true
@@ -232,8 +295,9 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	if s.peerID != nil {
 		out.SelfDeviceID = s.peerID.DeviceID
 	}
+	hubDeviceID := s.currentHubDeviceID()
 	for _, rec := range rows {
-		row := s.toPeerResponse(rec)
+		row := s.toPeerResponseWithHub(rec, hubDeviceID)
 		out.Items = append(out.Items, row)
 	}
 	writeJSONResponse(w, http.StatusOK, out)

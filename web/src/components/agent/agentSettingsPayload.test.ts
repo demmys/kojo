@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentSavePayload,
+  defaultCodexApps,
+  isCodexCLITool,
   needsCustomURLFor,
   type AgentSettingsFormState,
 } from "./agentSettingsPayload";
@@ -18,10 +20,12 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     tool: "claude",
     customBaseURL: " http://x ",
     thinkingMode: "auto",
+    responseLanguage: "",
     workDir: " /tmp ",
     cronExpr: "0 * * * *",
     timeoutMinutes: 10,
     resumeIdleMinutes: 30,
+    backgroundMaxMinutes: 0,
     silentStart: "22:00",
     silentEnd: "07:00",
     notifyDuringSilent: false,
@@ -77,6 +81,22 @@ describe("buildAgentSavePayload", () => {
     expect(out.effort).toBeUndefined();
   });
 
+  it("forwards codexApps only for codex-CLI tools", () => {
+    expect(buildAgentSavePayload(baseState({ tool: "codex", codexApps: false })).codexApps).toBe(false);
+    expect(buildAgentSavePayload(baseState({ tool: "custom-codex", codexApps: true })).codexApps).toBe(true);
+    expect(buildAgentSavePayload(baseState({ tool: "codex" })).codexApps).toBeUndefined();
+    expect(buildAgentSavePayload(baseState({ tool: "claude", codexApps: false })).codexApps).toBeUndefined();
+  });
+
+  it("codexApps defaults: on for codex, off for custom-codex", () => {
+    expect(defaultCodexApps("codex")).toBe(true);
+    expect(defaultCodexApps("custom-codex")).toBe(false);
+    expect(isCodexCLITool("codex")).toBe(true);
+    expect(isCodexCLITool("custom-codex")).toBe(true);
+    expect(isCodexCLITool("custom")).toBe(false);
+    expect(isCodexCLITool("claude")).toBe(false);
+  });
+
   it("forwards autoEffort as-is", () => {
     expect(buildAgentSavePayload(baseState({ autoEffort: true })).autoEffort).toBe(true);
     expect(buildAgentSavePayload(baseState({ autoEffort: false })).autoEffort).toBe(false);
@@ -96,6 +116,13 @@ describe("buildAgentSavePayload", () => {
       buildAgentSavePayload(baseState({ tool: "custom-bare", customBaseURL: " http://y " }))
         .customBaseURL,
     ).toBe("http://y");
+  });
+
+  it("always emits responseLanguage trimmed (empty = auto)", () => {
+    expect(buildAgentSavePayload(baseState()).responseLanguage).toBe("");
+    expect(
+      buildAgentSavePayload(baseState({ responseLanguage: "  関西弁の日本語 " })).responseLanguage,
+    ).toBe("関西弁の日本語");
   });
 
   it("emits thinkingMode ONLY for custom-bare", () => {
@@ -153,6 +180,7 @@ describe("buildAgentSavePayload", () => {
         notifyDuringSilent: true,
         timeoutMinutes: 25,
         resumeIdleMinutes: 0,
+        backgroundMaxMinutes: 180,
         silentStart: "23:00",
         silentEnd: "08:00",
         cronExpr: "*/5 * * * *",
@@ -161,6 +189,7 @@ describe("buildAgentSavePayload", () => {
     expect(out.notifyDuringSilent).toBe(true);
     expect(out.timeoutMinutes).toBe(25);
     expect(out.resumeIdleMinutes).toBe(0);
+    expect(out.backgroundMaxMinutes).toBe(180);
     expect(out.silentStart).toBe("23:00");
     expect(out.silentEnd).toBe("08:00");
     expect(out.cronExpr).toBe("*/5 * * * *");

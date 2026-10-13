@@ -114,7 +114,14 @@ type Server struct {
 	blobMaxPutBytes int64          // per-PUT body cap; 0 = defaultBlobMaxPutBytes
 	events          *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
 	peerID          *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
-	peerEvents      *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
+	// peerOnly mirrors Config.PeerOnly so read handlers can tell a
+	// Hub (false) from a daemon peer (true) — e.g. to stamp the
+	// role field on GET /api/v1/peers rows.
+	peerOnly bool
+	// hubDeviceID resolves the Hub's device_id on a PeerOnly daemon
+	// (wired from peer.Discovery). Nil or "" means not yet known.
+	hubDeviceID atomic.Pointer[func() string]
+	peerEvents  *peer.EventBus // cross-peer status push bus (§3.10); nil disables /api/v1/peers/events
 	// peerPresence tracks which paired peers currently hold a live
 	// /api/v1/peers/events WS against this daemon. handlePeerEventsWS
 	// Add/Removes the deviceID; OfflineSweeper consults it so a peer
@@ -500,6 +507,7 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
+		peerOnly:             cfg.PeerOnly,
 		sessions:             sessMgr,
 		agents:               cfg.AgentManager,
 		groupdms:             cfg.GroupDMManager,
@@ -700,7 +708,7 @@ func New(cfg Config) *Server {
 	if s.agents != nil {
 		st = s.agents.Store()
 	}
-	publicHandler := s.idempotencyMiddleware(mux)
+	publicHandler := s.idempotencyMiddleware(gzipAPIMiddleware(mux))
 	publicHandler = s.remoteAgentProxyMiddleware(publicHandler)
 	if s.peerID != nil && st != nil {
 		publicHandler = s.sessionPeerProxyMiddleware(publicHandler)
@@ -1228,6 +1236,7 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 
 func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 	fileServer := http.FileServer(http.FS(staticFS))
+	gzCache := newStaticGzipCache(staticFS)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if path == "/" {
@@ -1242,6 +1251,9 @@ func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 			} else {
 				w.Header().Set("Cache-Control", "no-cache")
 			}
+			if gzCache.serve(w, r, path) {
+				return
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -1250,6 +1262,9 @@ func (s *Server) registerStaticFiles(mux *http.ServeMux, staticFS fs.FS) {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-cache")
+		if gzCache.serve(w, r, "index.html") {
+			return
+		}
 		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
@@ -1332,7 +1347,7 @@ func (s *Server) buildAuthHandler(resolver *auth.Resolver) http.Handler {
 	// Fencing's 409 responses stamp X-Kojo-No-Idempotency-Cache so
 	// they aren't saved — a retry after the lock comes back must
 	// re-check rather than replay the stale 409.
-	handler := http.Handler(s.mux)
+	handler := gzipAPIMiddleware(s.mux)
 	if s.peerID != nil && s.agents != nil && s.agents.Store() != nil {
 		handler = auth.AgentFencingMiddleware(
 			s.agents.Store(), s.peerID.DeviceID, s.logger)(handler)

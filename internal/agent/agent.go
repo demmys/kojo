@@ -170,28 +170,29 @@ var xhighModels = map[string]bool{
 	// grok-4.5; none offers max. Keep this in sync with
 	// web/src/lib/toolModels.ts xhighModels / grokXhighModels.
 	"grok-4.7": true, "grok-4.7-build-fast": true, "grok-4.6": true,
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 var codexEffortModels = map[string]bool{
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 	"gpt-5.5": true, "gpt-5.4": true, "gpt-5.4-mini": true,
 	"gpt-5.3-codex": true, "gpt-5.2": true,
 }
 
 // codexMaxEffortModels lists codex models that support the "max" effort
-// level. codex CLI 0.155.0 models_cache.json advertises
-// low/medium/high/xhigh/max for the gpt-6 family (sol, astra, luna) and
-// the gpt-5.6 family (sol, terra, luna). Within those, gpt-6-sol and
-// gpt-6-astra, plus gpt-5.6-sol and gpt-5.6-terra, also list "ultra",
-// which kojo's effort scale doesn't model. Older gpt-5.x models stop at
-// xhigh. Keep in sync with web/src/lib/toolModels.ts codexMaxModels.
+// level. codex CLI 0.159.2 models_cache.json advertises
+// low/medium/high/xhigh/max for gpt-6.1-sol, the gpt-6 family (sol, astra,
+// luna) and the gpt-5.6 family (sol, terra, luna). Within those,
+// gpt-6.1-sol, gpt-6-sol and gpt-6-astra, plus gpt-5.6-sol and
+// gpt-5.6-terra, also list "ultra", which kojo's effort scale doesn't
+// model. Older gpt-5.x models stop at xhigh. Keep in sync with
+// web/src/lib/toolModels.ts codexMaxModels.
 var codexMaxEffortModels = map[string]bool{
-	"gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
+	"gpt-6.1-sol": true, "gpt-6-sol": true, "gpt-6-astra": true, "gpt-6-luna": true,
 	"gpt-5.6-sol": true, "gpt-5.6-terra": true, "gpt-5.6-luna": true,
 }
 
@@ -309,6 +310,19 @@ func ValidResumeIdle(minutes int) bool {
 	return minutes >= 0 && minutes <= maxScheduleMinutes
 }
 
+// maxBackgroundMaxMinutes caps backgroundMaxMinutes at one day. The value
+// bounds how long a thread's CLI process (and its linger slot) may stay up
+// waiting for run_in_background tasks, so it is a resource guard rather than
+// a free schedule knob.
+const maxBackgroundMaxMinutes = 24 * 60
+
+// ValidBackgroundMax reports whether minutes is an acceptable
+// backgroundMaxMinutes value: 0 = "use default" (2 hours at runtime), or any
+// positive minute count up to one day.
+func ValidBackgroundMax(minutes int) bool {
+	return minutes >= 0 && minutes <= maxBackgroundMaxMinutes
+}
+
 // defaultResumeIdleDuration is the fallback window when ResumeIdleMinutes
 // is 0 (unset). 30 minutes: generous enough that a typical interactive
 // lull doesn't reset an over-token-threshold session (token saving beats
@@ -333,9 +347,13 @@ type Agent struct {
 	// which kojo keeps an over-token-threshold claude session via --resume
 	// instead of resetting. 0 = use defaultResumeIdleDuration (30 min).
 	// claude-only; ignored by other backends.
-	ResumeIdleMinutes int    `json:"resumeIdleMinutes,omitempty"`
-	SilentStart       string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
-	SilentEnd         string `json:"silentEnd,omitempty"`   // HH:MM — end of silent window (empty = no restriction)
+	ResumeIdleMinutes int `json:"resumeIdleMinutes,omitempty"`
+	// BackgroundMaxMinutes bounds how long a thread's session may keep
+	// waiting for run_in_background tasks, measured from the end of the
+	// thread's latest turn. 0 = default (2 hours).
+	BackgroundMaxMinutes int    `json:"backgroundMaxMinutes,omitempty"`
+	SilentStart          string `json:"silentStart,omitempty"` // HH:MM — start of silent window (empty = no restriction)
+	SilentEnd            string `json:"silentEnd,omitempty"`   // HH:MM — end of silent window (empty = no restriction)
 	// NotifyDuringSilent controls whether the agent receives DM notifications
 	// during silent hours. Existing agents default to true (backward compat);
 	// new agents default to false.
@@ -431,6 +449,14 @@ type Agent struct {
 	// "on" = enable, "off" = disable, "" = server default.
 	ThinkingMode string `json:"thinkingMode,omitempty"`
 
+	// ResponseLanguage is the free-text language the agent replies in
+	// ("日本語", "English", "関西弁の日本語", ...). "" = auto (match the
+	// user's language). Validated/normalized by NormalizeResponseLanguage
+	// and rendered into the system prompt by responseLanguageDirective.
+	// Lives in settings_json so it travels with the agent row on
+	// peer_agent_sync; the holder that builds the prompt always sees it.
+	ResponseLanguage string `json:"responseLanguage,omitempty"`
+
 	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
 
@@ -496,6 +522,16 @@ type Agent struct {
 	// node install (no other peers registered) suppresses the skill
 	// regardless of this flag because there's nothing to switch to.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled,omitempty"`
+
+	// CodexApps gates the codex CLI's "apps" feature (ChatGPT connectors /
+	// remote plugins surfaced as the codex_apps MCP) for the codex and
+	// custom-codex backends. Nil = per-tool default (see
+	// IsCodexAppsEnabled): on for codex, off for custom-codex — a custom
+	// endpoint gets every connector tool definition inlined into each
+	// request (no deferred loading), which alone can exhaust a local
+	// model's context window, and the connectors would route data to the
+	// operator's ChatGPT account from an agent meant to stay local.
+	CodexApps *bool `json:"codexApps,omitempty"`
 
 	// LastTransferSkips records the session files the most recent
 	// inbound §3.7 device-switch transfer skipped (oversized JSONL,
@@ -610,6 +646,21 @@ func (a *Agent) IsDeviceSwitchEnabled() bool {
 	return *a.DeviceSwitchEnabled
 }
 
+// IsCodexAppsEnabled reports whether the codex CLI's "apps" feature
+// (ChatGPT connectors) should stay enabled for this agent. An explicit
+// CodexApps wins; nil falls back to the per-tool default: enabled for the
+// stock codex backend (CLI default, unchanged behaviour), disabled for
+// custom-codex. Meaningless for non-codex tools.
+func (a *Agent) IsCodexAppsEnabled() bool {
+	if a == nil {
+		return false
+	}
+	if a.CodexApps != nil {
+		return *a.CodexApps
+	}
+	return NormalizeToolName(a.Tool) == ToolCodex
+}
+
 // IsAutoEffortEnabled reports whether the per-turn dynamic effort
 // classifier is enabled for this agent. Nil pointer = default true
 // (opt-out feature) so agents predating the field participate.
@@ -631,6 +682,15 @@ func (a *Agent) ResumeIdleDuration() time.Duration {
 		return defaultResumeIdleDuration
 	}
 	return time.Duration(a.ResumeIdleMinutes) * time.Minute
+}
+
+// BackgroundLingerMax returns the per-agent cap on waiting for background
+// tasks, or 0 when unset/invalid (the caller then applies its default).
+func (a *Agent) BackgroundLingerMax() time.Duration {
+	if a == nil || !ValidBackgroundMax(a.BackgroundMaxMinutes) || a.BackgroundMaxMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(a.BackgroundMaxMinutes) * time.Minute
 }
 
 // MessagePreview is a short summary for agent list display.
@@ -693,16 +753,22 @@ type AgentConfig struct {
 	TimeoutMinutes        *int `json:"timeoutMinutes"` // nil/-1 = no timeout (default for new agents), 0 = legacy 10-min default
 	// ResumeIdleMinutes overrides the per-agent claude --resume idle window.
 	// nil/0 = use defaultResumeIdleDuration (30 min).
-	ResumeIdleMinutes  *int    `json:"resumeIdleMinutes"`
-	SilentStart        *string `json:"silentStart"`        // HH:MM or empty
-	SilentEnd          *string `json:"silentEnd"`          // HH:MM or empty
-	NotifyDuringSilent *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
-	CronMessage        *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
+	ResumeIdleMinutes *int `json:"resumeIdleMinutes"`
+	// BackgroundMaxMinutes overrides the background-task wait cap.
+	// nil/0 = default (2 hours).
+	BackgroundMaxMinutes *int    `json:"backgroundMaxMinutes"`
+	SilentStart          *string `json:"silentStart"`        // HH:MM or empty
+	SilentEnd            *string `json:"silentEnd"`          // HH:MM or empty
+	NotifyDuringSilent   *bool   `json:"notifyDuringSilent"` // nil = use default (false for new)
+	CronMessage          *string `json:"cronMessage"`        // nil/empty = use default trailing instruction
 	// DeviceSwitchEnabled gates the kojo-switch-device skill. nil =
 	// default (true). Persisted into Agent.DeviceSwitchEnabled with
 	// no normalization so the "default" semantic survives schema
 	// evolution.
 	DeviceSwitchEnabled *bool `json:"deviceSwitchEnabled"`
+	// CodexApps toggles the codex CLI "apps" feature. nil = per-tool
+	// default (see Agent.IsCodexAppsEnabled).
+	CodexApps *bool `json:"codexApps"`
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -722,15 +788,20 @@ type AgentUpdateConfig struct {
 	LegacyIntervalMinutes *int    `json:"intervalMinutes,omitempty"`
 	TimeoutMinutes        *int    `json:"timeoutMinutes"`
 	ResumeIdleMinutes     *int    `json:"resumeIdleMinutes"`
+	BackgroundMaxMinutes  *int    `json:"backgroundMaxMinutes"`
 	SilentStart           *string `json:"silentStart"`
 	SilentEnd             *string `json:"silentEnd"`
 	NotifyDuringSilent    *bool   `json:"notifyDuringSilent"`
 	// CronMessage follows the standard *string PATCH convention used by every
 	// other field on this struct: nil/omitted = leave unchanged, "" = clear
 	// back to the built-in default trailing instruction.
-	CronMessage         *string   `json:"cronMessage"`
-	CustomBaseURL       *string   `json:"customBaseURL"`
-	ThinkingMode        *string   `json:"thinkingMode"`
+	CronMessage   *string `json:"cronMessage"`
+	CustomBaseURL *string `json:"customBaseURL"`
+	ThinkingMode  *string `json:"thinkingMode"`
+	// ResponseLanguage: nil = leave as-is, "" = auto, otherwise a
+	// free-text language name (NormalizeResponseLanguage). Holder-only:
+	// see hub_local_update.go.
+	ResponseLanguage    *string   `json:"responseLanguage"`
 	AllowedTools        []string  `json:"allowedTools"`
 	AllowProtectedPaths *[]string `json:"allowProtectedPaths"`
 	// TTS replaces the entire TTSConfig when non-nil. Pass an explicit
@@ -753,6 +824,11 @@ type AgentUpdateConfig struct {
 	// Plain self-PATCHable field (like deviceSwitchEnabled) — not
 	// owner-only.
 	AutoEffort *bool `json:"autoEffort"`
+	// CodexApps toggles the codex CLI "apps" feature (ChatGPT
+	// connectors) for codex / custom-codex. nil = "not provided; leave
+	// as-is"; explicit true/false overwrites. Holder-only: it changes
+	// the app-server launch flags of the live backend.
+	CodexApps *bool `json:"codexApps"`
 }
 
 // Context-injection section keys togglable via Agent.DisabledInjections.
@@ -882,6 +958,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidResumeIdle(resumeIdleMin) {
 		return nil, fmt.Errorf("unsupported resumeIdle: %d minutes", resumeIdleMin)
 	}
+	bgMaxMin := 0 // default (= 2 hours at runtime)
+	if cfg.BackgroundMaxMinutes != nil {
+		bgMaxMin = *cfg.BackgroundMaxMinutes
+	}
+	if !ValidBackgroundMax(bgMaxMin) {
+		return nil, fmt.Errorf("unsupported backgroundMax: %d minutes", bgMaxMin)
+	}
 	var silentStart, silentEnd string
 	if cfg.SilentStart != nil {
 		silentStart = *cfg.SilentStart
@@ -937,28 +1020,30 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		}
 	}
 	a := &Agent{
-		ID:                 id,
-		Name:               cfg.Name,
-		Persona:            cfg.Persona,
-		Mission:            strings.TrimSpace(cfg.Mission),
-		Model:              cfg.Model,
-		Effort:             cfg.Effort,
-		Tool:               cfg.Tool,
-		CustomBaseURL:      cfg.CustomBaseURL,
-		ThinkingMode:       NormalizeThinkingMode(cfg.ThinkingMode),
-		WorkDir:            cfg.WorkDir,
-		CronExpr:           cronExpr,
-		TimeoutMinutes:     timeoutMin,
-		ResumeIdleMinutes:  resumeIdleMin,
-		SilentStart:        silentStart,
-		SilentEnd:          silentEnd,
-		NotifyDuringSilent: notifyDuringSilent,
-		CronMessage:        cronMessage,
+		ID:                   id,
+		Name:                 cfg.Name,
+		Persona:              cfg.Persona,
+		Mission:              strings.TrimSpace(cfg.Mission),
+		Model:                cfg.Model,
+		Effort:               cfg.Effort,
+		Tool:                 cfg.Tool,
+		CustomBaseURL:        cfg.CustomBaseURL,
+		ThinkingMode:         NormalizeThinkingMode(cfg.ThinkingMode),
+		WorkDir:              cfg.WorkDir,
+		CronExpr:             cronExpr,
+		TimeoutMinutes:       timeoutMin,
+		ResumeIdleMinutes:    resumeIdleMin,
+		BackgroundMaxMinutes: bgMaxMin,
+		SilentStart:          silentStart,
+		SilentEnd:            silentEnd,
+		NotifyDuringSilent:   notifyDuringSilent,
+		CronMessage:          cronMessage,
 		// DeviceSwitchEnabled stays nil here when the caller didn't
 		// provide one — IsDeviceSwitchEnabled() returns true for nil
 		// so a fresh agent gets the skill auto-installed without
 		// stamping a sentinel into the row.
 		DeviceSwitchEnabled: cfg.DeviceSwitchEnabled,
+		CodexApps:           cfg.CodexApps,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}

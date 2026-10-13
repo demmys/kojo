@@ -220,3 +220,17 @@ func TestRemoteAgentPatchHubSafeStillProxiedWhenHolderOnline(t *testing.T) {
 		t.Fatalf("store name = %q, want old-name (online edits are holder-side)", rec.Name)
 	}
 }
+
+// responseLanguage is holder-only: with the holder offline it must be
+// proxied (502 peer_offline) rather than written to the hub row.
+func TestRemoteAgentPatchResponseLanguageHolderOnly(t *testing.T) {
+	srv := newRemoteAgentPatchServer(t, "ag_rlang", store.PeerStatusOffline)
+	w := patchRemoteAgent(srv, "ag_rlang", `{"responseLanguage":"English"}`,
+		auth.Principal{Role: auth.RoleOwner})
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "peer_offline") {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	if a := srv.agents.GetRemote("ag_rlang"); a != nil && a.ResponseLanguage != "" {
+		t.Fatalf("hub row mutated: %q", a.ResponseLanguage)
+	}
+}

@@ -131,6 +131,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 	for _, kv := range b.extraConfig {
 		args = append(args, "-c", kv)
 	}
+	args = append(args, codexAppsOverrides(agent)...)
 	// Default mode otherwise rejects request_user_input before emitting its
 	// server request. Enable it only when this caller can answer questions;
 	// keep execution in Default mode (Plan mode would prevent normal work).
@@ -1783,4 +1784,28 @@ func handleCodexServerRequest(msg *rpcMessage, respond codexServerRequestRespond
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// codexAppsOverrides returns the `-c` flags pinning the codex CLI "apps"
+// feature (ChatGPT connectors exposed as the codex_apps MCP) for agent.
+//
+// Disabled → features.apps=false. An explicit opt-in → features.apps=true.
+// Enabled by default (stock codex, CodexApps nil) → no flag, leaving the
+// CLI / ~/.codex/config.toml decision untouched.
+//
+// Why custom-codex defaults off: with a non-OpenAI provider codex has no
+// deferred tool loading, so every connector's tool definitions (hundreds
+// of tools, ~500KB of JSON with a typical ChatGPT account) are inlined
+// into each request and can swallow a local model's whole context window.
+func codexAppsOverrides(agent *Agent) []string {
+	if agent == nil {
+		return nil
+	}
+	if !agent.IsCodexAppsEnabled() {
+		return []string{"-c", "features.apps=false"}
+	}
+	if agent.CodexApps != nil {
+		return []string{"-c", "features.apps=true"}
+	}
+	return nil
 }

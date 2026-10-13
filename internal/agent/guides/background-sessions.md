@@ -21,8 +21,10 @@ Limits:
   tasks are lost, and a notice is posted to the thread (you are told too on the
   next turn there). When the turn-start note says the limit is reached, avoid
   `run_in_background` or stop threads you no longer need first.
-- A lingering thread is stopped anyway after a long idle maximum; tasks still
-  running then are reported as abandoned in the thread.
+- A lingering thread is stopped anyway once it has gone without a turn for the
+  agent's background wait limit (default 2 hours, counted from the end of the
+  thread's latest turn; set by the operator); tasks still running then are
+  reported as abandoned in the thread.
 
 At the start of a thread turn kojo may add a `[kojo]` note: how many OTHER
 threads still run background tasks, or that tasks of THIS thread ended before

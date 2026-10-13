@@ -67,6 +67,7 @@ export function AgentCreate() {
   // -1 = no timeout: the default for new agents.
   const [timeoutMinutes, setTimeoutMinutes] = useState(-1);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
+  const [backgroundMaxMinutes, setBackgroundMaxMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [cronMessage, setCronMessage] = useState("");
@@ -367,6 +368,7 @@ export function AgentCreate() {
         cronExpr: cronExprDirty ? cronExpr : undefined,
         timeoutMinutes,
         resumeIdleMinutes: resumeIdleMinutes || undefined,
+        backgroundMaxMinutes: backgroundMaxMinutes || undefined,
         silentStart: silentStart || undefined,
         silentEnd: silentEnd || undefined,
         cronMessage: cronMessage.trim() || undefined,
@@ -773,6 +775,8 @@ export function AgentCreate() {
             onTimeoutChange={setTimeoutMinutes}
             resumeIdleMinutes={resumeIdleMinutes}
             onResumeIdleChange={setResumeIdleMinutes}
+            backgroundMaxMinutes={backgroundMaxMinutes}
+            onBackgroundMaxChange={setBackgroundMaxMinutes}
             tool={tool}
             silentStart={silentStart}
             silentEnd={silentEnd}

@@ -487,6 +487,9 @@ type ClaudeBackend struct {
 	// session is about to kill, called under that session's mu (it may only
 	// take leaf locks) so a follow-up turn admitted afterwards sees it.
 	onKeyedNoteLocked func(agentID, sessionKey string, pending int, reason string)
+	// Per-agent background wait cap overrides (see keyedLingerMaxFor).
+	lingerMaxMu      sync.Mutex
+	lingerMaxByAgent map[string]keyedLingerMaxEntry
 	// exitNotices counts, per agent, keyed sessions whose exit handling (the
 	// abandoned notice and the surface release) is still running.
 	exitNoticeMu sync.Mutex
@@ -660,7 +663,20 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	// thread's file, causing cross-thread text contamination.
 	expectedSessionID := expectedClaudeSessionID(agent.ID, opts.SessionKey, opts.OneShot)
 
-	cmd := exec.CommandContext(ctx, claudePath, args...)
+	execArgs, cleanupSystemPrompt, err := materializeClaudeSystemPrompt(args)
+	if err != nil {
+		return nil, err
+	}
+	// Removed once the process has been reaped: on every early-return path
+	// below, and by the stream goroutine (deferred) otherwise.
+	started := false
+	defer func() {
+		if !started {
+			cleanupSystemPrompt()
+		}
+	}()
+
+	cmd := exec.CommandContext(ctx, claudePath, execArgs...)
 	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
 	if b.proxyURL != "" {
 		// A custom endpoint must not inherit the daemon's Anthropic cloud
@@ -745,8 +761,11 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 
 	ch := make(chan ChatEvent, 64)
 
+	started = true
 	go func() {
 		defer close(ch)
+		// Runs after every cmd.Wait below (defers are LIFO).
+		defer cleanupSystemPrompt()
 		// Ensure the pipe is always closed so the process can exit even on
 		// an early-return path (cancelled stream, process error, etc.)
 		// that never reaches the "result" event below.

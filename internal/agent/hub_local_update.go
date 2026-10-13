@@ -41,12 +41,18 @@ import (
 // keep the proxy + switching lock):
 //   - persona               (persona.md on holder disk)
 //   - model / tool / customBaseURL / thinkingMode (live backend session)
+//   - responseLanguage      (rendered into the system prompt the holder
+//     builds every turn; the offline-holder override is only re-applied
+//     when the row syncs back to the hub, so the holder would keep
+//     replying in the old language while the hub reported success)
 //   - workDir               (holder filesystem)
 //   - cronExpr              (holder cron scheduler reschedule)
-//   - timeoutMinutes / resumeIdleMinutes (live session watchdogs)
+//   - timeoutMinutes / resumeIdleMinutes / backgroundMaxMinutes
+//     (live session watchdogs)
 //   - allowedTools / allowProtectedPaths (live session permissions)
 //   - tts                   (holder-side synthesis config)
 //   - deviceSwitchEnabled   (installs/removes SKILL.md on holder disk)
+//   - codexApps             (codex app-server launch flags on the holder)
 //   - cronMessage           (persisted via agent_workspace_files
 //     kind=checkin — NOT in the agents settings_json row, so a
 //     hub-row-only write would silently no-op)
@@ -93,12 +99,15 @@ func (cfg *AgentUpdateConfig) HubLocalOnly() bool {
 		cfg.LegacyIntervalMinutes == nil &&
 		cfg.TimeoutMinutes == nil &&
 		cfg.ResumeIdleMinutes == nil &&
+		cfg.BackgroundMaxMinutes == nil &&
 		cfg.CustomBaseURL == nil &&
 		cfg.ThinkingMode == nil &&
+		cfg.ResponseLanguage == nil &&
 		cfg.AllowedTools == nil &&
 		cfg.AllowProtectedPaths == nil &&
 		cfg.TTS == nil &&
-		cfg.DeviceSwitchEnabled == nil
+		cfg.DeviceSwitchEnabled == nil &&
+		cfg.CodexApps == nil
 }
 
 // UpdateRemoteHubRow applies a hub-local-safe PATCH to the hub's own

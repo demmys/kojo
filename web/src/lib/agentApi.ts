@@ -32,6 +32,10 @@ export const INTERVAL_DAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7] as const;
 // resumeIdleMinutes) at one week. Mirrors backend maxScheduleMinutes.
 export const MAX_SCHEDULE_MINUTES = 7 * 24 * 60;
 
+// MAX_BACKGROUND_MAX_MINUTES caps backgroundMaxMinutes at one day. Mirrors
+// backend maxBackgroundMaxMinutes.
+export const MAX_BACKGROUND_MAX_MINUTES = 24 * 60;
+
 // DEFAULT_TIMEOUT_MINUTES mirrors the backend's cronTimeout — what the
 // legacy timeoutMinutes=0 sentinel resolves to at runtime. The editor
 // renders 0 as this value. (The resume-window default lives only in the
@@ -67,6 +71,7 @@ export interface AgentInfo {
   cronExpr?: string;
   timeoutMinutes: number;
   resumeIdleMinutes?: number;
+  backgroundMaxMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
@@ -94,6 +99,8 @@ export interface AgentInfo {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  // Free-text reply language ("" / absent = auto: match the user).
+  responseLanguage?: string;
   lastMessage?: {
     content: string;
     role: string;
@@ -164,6 +171,10 @@ export interface AgentInfo {
   // enabled (the feature is opt-out); the configured effort acts as the
   // ceiling/fallback while enabled. claude / grok tools only.
   autoEffort?: boolean;
+  // codexApps gates the codex CLI "apps" feature (ChatGPT connectors).
+  // Absent = per-tool default: on for codex, off for custom-codex.
+  // codex / custom-codex tools only.
+  codexApps?: boolean;
   // busy is a runtime-only flag: true while the agent has an in-flight
   // interactive/cron chat (server-side Manager.IsBusy). The dashboard
   // folds it into the "N running" figure so a chatting agent counts even
@@ -278,6 +289,8 @@ export interface TTSConfig {
 export interface AgentConfig {
   name: string;
   persona: string;
+  // Optional codexApps override; omitted = per-tool default.
+  codexApps?: boolean;
   // Task description from the task-first create flow. Seeded into the
   // new agent's MEMORY.md as a "## Mission" section server-side.
   mission?: string;
@@ -291,6 +304,7 @@ export interface AgentConfig {
   cronExpr?: string;
   timeoutMinutes?: number;
   resumeIdleMinutes?: number;
+  backgroundMaxMinutes?: number;
   silentStart?: string;
   silentEnd?: string;
   notifyDuringSilent?: boolean;
@@ -303,9 +317,11 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   allowedTools?: string[];
   allowProtectedPaths?: string[];
   thinkingMode?: string;
+  responseLanguage?: string;
   tts?: TTSConfig | null;
   disabledInjections?: string[];
   autoEffort?: boolean;
+  codexApps?: boolean;
 }
 
 export interface AgentMessageAttachment {

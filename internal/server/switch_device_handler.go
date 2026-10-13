@@ -426,6 +426,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	}
 	var callerOneShot agent.OneShotOrigin
 	var continuation *handoffContinuation
+	// continuationLoss records why a thread caller's origin-conversation
+	// continuation was dropped; see threadArrivalUnavailable.
+	var continuationLoss string
 	if execution != nil {
 		binding, err := s.agents.GoalHandoffCheckpoint(agentID, execution.SessionKey, execution.ID)
 		if err != nil {
@@ -457,6 +460,8 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 					SessionKey: callerOneShot.SessionKey, OriginPeerID: callerOneShot.OriginPeerID,
 					Capability: callerOneShot.HandoffCapability,
 				}
+			} else {
+				continuationLoss = "the requesting thread turn carries no arrival capability"
 			}
 		}
 	}
@@ -464,6 +469,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		s.logger.Warn("switch-device: target lacks origin-aware arrival capability; using legacy main WebUI arrival",
 			"agent", agentID, "target", req.TargetPeerID)
 		continuation = nil
+		continuationLoss = "target peer does not support origin-aware arrival"
 	}
 
 	// Step -1: quiesce the local PTY AND set the switching
@@ -521,7 +527,17 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 		// Drained: close the persistent claude process so its session file is
 		// released before the switch transfers session state to the peer.
-		s.agents.CloseClaudeSessionSync(agentID)
+		// A thread self-call is itself running inside a keyed persistent
+		// session: its pending tool call IS this request. Keep that one
+		// process alive so the turn can receive the result (closing it
+		// SIGTERMs the requester → exit 143 and drops its arrival
+		// capability); it is closed after the turn ends once the source is
+		// released (closeCallerKeyedSessionAfterTurn).
+		if selfCall && callerOneShot.SessionKey != "" {
+			s.agents.CloseClaudeSessionSyncExceptKeyed(agentID, callerOneShot.SessionKey)
+		} else {
+			s.agents.CloseClaudeSessionSync(agentID)
+		}
 		// Keyed sessions closed above report abandoned background tasks
 		// asynchronously (to a remote Hub for a holder). Deliver them while
 		// this peer still holds the lock: after the transfer the Hub rejects
@@ -737,9 +753,10 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		})
 		bindCancel()
 		if bindErr != nil {
-			s.logger.Warn("switch-device: origin conversation could not bind handoff; using legacy main arrival",
+			s.logger.Warn("switch-device: origin conversation could not bind handoff; thread arrival will be reported as an error",
 				"agent", agentID, "target", req.TargetPeerID, "op_id", syncReq.OpID, "err", bindErr)
 			continuation = nil
+			continuationLoss = "origin conversation could not bind handoff: " + bindErr.Error()
 		}
 	}
 	keptSessions, capacitySkips, budgetErr := fitAgentSyncSessions(syncReq, int64(peerAgentSyncMaxBody))
@@ -1016,6 +1033,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 					}
 					releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 					s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, lock.FencingToken)
+					s.closeCallerKeyedSessionAfterTurn(agentID, selfCall, callerOneShot)
 					releaseCancel()
 				}
 				resp.Outcome = "complete_errored_lock_at_target"
@@ -1099,6 +1117,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				}
 				releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 				s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
+				s.closeCallerKeyedSessionAfterTurn(agentID, selfCall, callerOneShot)
 				releaseCancel()
 			}
 			writeJSONResponse(w, http.StatusOK, resp)
@@ -1166,6 +1185,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 			}
 			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 			s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
+			s.closeCallerKeyedSessionAfterTurn(agentID, selfCall, callerOneShot)
 			releaseCancel()
 		}
 		writeJSONResponse(w, http.StatusOK, resp)
@@ -1207,7 +1227,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// could not negotiate origin-aware continuation (old target or failed
 		// capability bind). Preserve legacy main-chat arrival without letting it
 		// overlap the source turn that is still blocked inside this curl.
-		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
+		go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, threadArrivalUnavailable(callerOneShot, continuationLoss), completeResp.LockFencing)
 	} else {
 		// Uses a fresh background ctx so a wedged target doesn't
 		// stall past switchDeviceOpTimeout — the switch is already
@@ -1235,8 +1255,9 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 				// one-shot self-call, legacy main arrival must remain behind the
 				// source turn that is still waiting for this HTTP response.
 				continuation = nil
+				continuationLoss = "target rejected origin-aware finalize continuation"
 				if selfCall && callerOneShot.ID != 0 {
-					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, completeResp.LockFencing)
+					go s.runDeferredOneShotFinalize(targetAddr, req.TargetPeerID, agentID, syncReq.OpID, callerOneShot.ID, threadArrivalUnavailable(callerOneShot, continuationLoss), completeResp.LockFencing)
 					finalizeErr = nil
 					break
 				}
@@ -1294,6 +1315,7 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		}
 		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
 		s.releaseHandoffSource(releaseCtx, agentID, req.TargetPeerID, completeResp.LockFencing)
+		s.closeCallerKeyedSessionAfterTurn(agentID, selfCall, callerOneShot)
 		releaseCancel()
 	}
 
@@ -1437,7 +1459,7 @@ func (s *Server) runDeferredFinalize(targetAddr, targetDeviceID, agentID, opID s
 	}
 }
 
-func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64, expectedToken ...int64) {
+func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID, opID string, oneShotID int64, threadArrivalUnavailable string, expectedToken ...int64) {
 	waitCtx, cancel := context.WithTimeout(context.Background(), deferredFinalizeTailWaitBudget)
 	err := s.agents.WaitOneShotDone(waitCtx, agentID, oneShotID)
 	cancel()
@@ -1449,7 +1471,7 @@ func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID,
 	const attempts = 3
 	for attempt := 0; attempt < attempts; attempt++ {
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), handoffOpTimeout)
-		finalizeErr := s.dispatchPeerAgentSyncFinalize(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil, expectedToken...)
+		finalizeErr := s.dispatchPeerAgentSyncFinalizeArrival(finalizeCtx, targetAddr, targetDeviceID, agentID, opID, nil, nil, threadArrivalUnavailable, expectedToken...)
 		finalizeCancel()
 		if finalizeErr == nil {
 			return
@@ -1462,6 +1484,66 @@ func (s *Server) runDeferredOneShotFinalize(targetAddr, targetDeviceID, agentID,
 		time.Sleep(500 * time.Millisecond)
 	}
 }
+
+// threadArrivalUnavailable returns the reason a thread-initiated self switch
+// lost its origin-conversation continuation, or "" for keyless (main WebUI)
+// callers whose legacy main arrival IS the originating conversation. A thread
+// caller must never fall back to a main-conversation arrival turn: the thread
+// may continue on its own, and the two turns would do the same work twice.
+func threadArrivalUnavailable(caller agent.OneShotOrigin, loss string) string {
+	if caller.SessionKey == "" {
+		return ""
+	}
+	if loss == "" {
+		loss = "thread continuation unavailable"
+	}
+	return loss
+}
+
+// closeCallerKeyedSessionAfterTurn closes the keyed claude process preserved
+// for a thread self-call once that turn has finished. Called only after the
+// source has been released: the agent now lives on the target, so the source
+// must not keep a lingering keyed process (or its background tasks) alive.
+func (s *Server) closeCallerKeyedSessionAfterTurn(agentID string, selfCall bool, caller agent.OneShotOrigin) {
+	if !selfCall || caller.SessionKey == "" || caller.ID == 0 || s.agents == nil {
+		return
+	}
+	// Pin the session that is running the caller turn now: after a reclaim or
+	// a switch back, the same key may hold a replacement session that must
+	// not be killed.
+	handle := s.agents.ClaudeKeyedSessionHandle(agentID, caller.SessionKey)
+	if handle == nil {
+		return
+	}
+	go func() {
+		waitCtx, cancel := context.WithTimeout(context.Background(), callerKeyedCloseWaitBudget)
+		err := s.agents.WaitOneShotDone(waitCtx, agentID, caller.ID)
+		cancel()
+		if err != nil {
+			// Never cut a still-running turn short; the keyed idle timer
+			// reaps the process once it settles.
+			s.logger.Warn("switch-device: caller thread turn still running; leaving keyed session to idle reaper",
+				"agent", agentID, "err", err)
+			return
+		}
+		// A force-reclaim / switch back may have returned the agent here and
+		// reused this very process; only close while another device holds it.
+		lockCtx, lockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		lock, lerr := s.agents.Store().GetAgentLockVersion(lockCtx, agentID)
+		lockCancel()
+		if lerr != nil || lock.Holder == "" || lock.Holder == s.peerID.DeviceID {
+			s.logger.Info("switch-device: agent not confirmed elsewhere; keeping caller keyed session",
+				"agent", agentID, "holder", lock.Holder, "err", lerr)
+			return
+		}
+		s.agents.CloseClaudeKeyedSessionIfSame(agentID, caller.SessionKey, handle, "agent moved to another device")
+	}()
+}
+
+// callerKeyedCloseWaitBudget bounds how long the source waits for the
+// thread turn that requested the switch before handing cleanup to the
+// keyed idle reaper.
+const callerKeyedCloseWaitBudget = 30 * time.Minute
 
 func retryableFinalizeError(err error) bool {
 	if err == nil {
@@ -1500,6 +1582,15 @@ var errFinalizeContinuationDowngrade = errors.New("target rejected origin-aware 
 // preferring "target runtime activates without the commitment text"
 // over "target never activates because finalize itself 413'd").
 func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation, expectedToken ...int64) error {
+	return s.dispatchPeerAgentSyncFinalizeArrival(ctx, targetAddr, targetDeviceID, agentID, opID, tail, continuation, "", expectedToken...)
+}
+
+// dispatchPeerAgentSyncFinalizeArrival is dispatchPeerAgentSyncFinalize with an
+// explicit thread-arrival failure. A non-empty threadArrivalUnavailable (only
+// meaningful with a nil continuation) tells the target that the switch was
+// requested from a thread whose continuation could not be bound: record a
+// main-transcript error instead of starting the legacy main arrival chat.
+func (s *Server) dispatchPeerAgentSyncFinalizeArrival(ctx context.Context, targetAddr, targetDeviceID, agentID, opID string, tail *store.MessageRecord, continuation *handoffContinuation, threadArrivalUnavailable string, expectedToken ...int64) error {
 	if len(expectedToken) > 0 {
 		current, err := s.agents.Store().GetAgentLockVersion(ctx, agentID)
 		if err != nil {
@@ -1516,6 +1607,9 @@ func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, 
 		OpID:           opID,
 		TailMessage:    tail,
 		Continuation:   continuation,
+	}
+	if continuation == nil {
+		body.ThreadArrivalUnavailable = threadArrivalUnavailable
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -1537,6 +1631,21 @@ func (s *Server) dispatchPeerAgentSyncFinalize(ctx context.Context, targetAddr, 
 	}
 	err = s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
 		"/api/v1/peers/agent-sync/finalize", raw)
+	if err != nil && body.ThreadArrivalUnavailable != "" &&
+		strings.Contains(err.Error(), "phase-2 HTTP 400") && strings.Contains(err.Error(), "thread_arrival_unavailable") {
+		// An older target rejects the unknown field (DisallowUnknownFields).
+		// Ownership has already moved, so activation must still happen: resend
+		// without it. That target can only run its legacy main arrival.
+		s.logger.Warn("switch-device: target does not support thread_arrival_unavailable; resending legacy finalize",
+			"agent", agentID, "op_id", opID, "target", targetDeviceID)
+		body.ThreadArrivalUnavailable = ""
+		raw, err = json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("re-marshal finalize body (legacy arrival): %w", err)
+		}
+		err = s.dispatchPeerAgentSyncPhase2Body(ctx, targetAddr, targetDeviceID, agentID, opID,
+			"/api/v1/peers/agent-sync/finalize", raw)
+	}
 	if err == nil || continuation == nil || continuation.GoalHandoffID != "" ||
 		!strings.Contains(err.Error(), "phase-2 HTTP 400") || !strings.Contains(err.Error(), "continuation") {
 		return err

@@ -433,7 +433,7 @@ func (s *Server) dispatchHandoffArrivalContinuation(ctx context.Context, originP
 	if !current {
 		return errors.New("handoff arrival holder changed before fallback")
 	}
-	s.logger.Warn("device-switch origin conversation unavailable; falling back to main WebUI arrival",
+	s.logger.Warn("device-switch origin conversation unavailable; recording main-transcript error instead of an arrival turn",
 		"agent", req.AgentID, "op_id", req.OpID, "session_key", req.SessionKey,
 		"origin_peer", originPeerID, "err", lastErr)
 	if fallback != nil {

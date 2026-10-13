@@ -1,26 +1,30 @@
 import { StrictMode } from "react";
+import { lazyRoute } from "./lib/lazyRoute";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { bootstrapTokenFromURL } from "./lib/auth";
 import { bootstrapLocales } from "./lib/i18n";
 import { AppLayout, EmptyPane } from "./components/AppLayout";
-import { SessionPage } from "./components/SessionPage";
-import { NewSession } from "./components/NewSession";
-import { FileBrowser } from "./components/FileBrowser";
-import { AgentChat } from "./components/agent/AgentChat";
-import { AgentCreate } from "./components/agent/AgentCreate";
-import { AgentSettings } from "./components/agent/AgentSettings";
-import { AgentCredentials } from "./components/agent/AgentCredentials";
-import { AgentDataBrowser } from "./components/agent/AgentDataBrowser";
-import { AgentTodos } from "./components/agent/AgentTodos";
-import { GroupDMChat } from "./components/groupdm/GroupDMChat";
-import { GlobalSettings } from "./components/GlobalSettings";
 import { ReloadPrompt } from "./components/ui/ReloadPrompt";
 import { UpdatePrompt } from "./components/ui/UpdatePrompt";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "@fontsource/ibm-plex-mono/600.css";
 import "./index.css";
+
+// Route-level code splitting: each page is its own chunk so the
+// initial load only carries the shell (router, AppLayout / Dashboard).
+const SessionPage = lazyRoute(() => import("./components/SessionPage"), "SessionPage");
+const NewSession = lazyRoute(() => import("./components/NewSession"), "NewSession");
+const FileBrowser = lazyRoute(() => import("./components/FileBrowser"), "FileBrowser");
+const AgentChat = lazyRoute(() => import("./components/agent/AgentChat"), "AgentChat");
+const AgentCreate = lazyRoute(() => import("./components/agent/AgentCreate"), "AgentCreate");
+const AgentSettings = lazyRoute(() => import("./components/agent/AgentSettings"), "AgentSettings");
+const AgentCredentials = lazyRoute(() => import("./components/agent/AgentCredentials"), "AgentCredentials");
+const AgentDataBrowser = lazyRoute(() => import("./components/agent/AgentDataBrowser"), "AgentDataBrowser");
+const AgentTodos = lazyRoute(() => import("./components/agent/AgentTodos"), "AgentTodos");
+const GroupDMChat = lazyRoute(() => import("./components/groupdm/GroupDMChat"), "GroupDMChat");
+const GlobalSettings = lazyRoute(() => import("./components/GlobalSettings"), "GlobalSettings");
 
 // Pull the Owner token out of `?token=…` and stash it before any
 // component mounts and starts hitting /api/v1/*.

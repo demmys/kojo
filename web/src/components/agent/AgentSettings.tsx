@@ -25,7 +25,12 @@ import { EffortPicker } from "./fields/EffortPicker";
 import { StatusField } from "./fields/StatusField";
 import { WorkDirInput } from "./fields/WorkDirInput";
 import { useAvatarImageProviders } from "./useAvatarImageProviders";
-import { buildAgentSavePayload, needsCustomURLFor } from "./agentSettingsPayload";
+import {
+  buildAgentSavePayload,
+  defaultCodexApps,
+  isCodexCLITool,
+  needsCustomURLFor,
+} from "./agentSettingsPayload";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -135,6 +140,9 @@ export function AgentSettings() {
   // Per-turn dynamic effort classifier. Absent on the server = enabled
   // (opt-out feature); the Effort selector becomes the ceiling/fallback.
   const [autoEffort, setAutoEffort] = useState(true);
+  // Explicit codexApps choice; null = follow the per-tool default.
+  const [codexAppsOverride, setCodexAppsOverride] = useState<boolean | null>(null);
+  const [responseLanguage, setResponseLanguage] = useState("");
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
   const [customAPIKey, setCustomAPIKey] = useState("");
@@ -148,6 +156,7 @@ export function AgentSettings() {
   const [cronExpr, setCronExpr] = useState("");
   const [timeoutMinutes, setTimeoutMinutes] = useState(-1);
   const [resumeIdleMinutes, setResumeIdleMinutes] = useState(0);
+  const [backgroundMaxMinutes, setBackgroundMaxMinutes] = useState(0);
   const [silentStart, setSilentStart] = useState("");
   const [silentEnd, setSilentEnd] = useState("");
   const [notifyDuringSilent, setNotifyDuringSilent] = useState(false);
@@ -343,6 +352,8 @@ export function AgentSettings() {
     setModel(a.model);
     setEffort((a.effort || "") as EffortLevel | "");
     setAutoEffort(a.autoEffort ?? true);
+    setCodexAppsOverride(a.codexApps ?? null);
+    setResponseLanguage(a.responseLanguage ?? "");
     setTool(a.tool);
     setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
     setThinkingMode(a.thinkingMode ?? "");
@@ -350,6 +361,7 @@ export function AgentSettings() {
     setCronExpr(a.cronExpr ?? "");
     setTimeoutMinutes(a.timeoutMinutes || 10);
     setResumeIdleMinutes(a.resumeIdleMinutes ?? 0);
+    setBackgroundMaxMinutes(a.backgroundMaxMinutes ?? 0);
     setSilentStart(a.silentStart ?? "");
     setSilentEnd(a.silentEnd ?? "");
     setNotifyDuringSilent(a.notifyDuringSilent ?? true);
@@ -695,13 +707,19 @@ export function AgentSettings() {
           model,
           effort,
           autoEffort,
+          codexApps:
+            codexAppsOverride !== null && codexAppsOverride !== agent?.codexApps
+              ? codexAppsOverride
+              : undefined,
           tool,
           customBaseURL,
           thinkingMode,
+          responseLanguage,
           workDir,
           cronExpr,
           timeoutMinutes,
           resumeIdleMinutes,
+          backgroundMaxMinutes,
           silentStart,
           silentEnd,
           notifyDuringSilent,
@@ -1274,14 +1292,17 @@ export function AgentSettings() {
       model.trim() !== agent.model ||
       (supportsEffort(tool) && effort !== ((agent.effort || "") as EffortLevel | "")) ||
       autoEffort !== (agent.autoEffort ?? true) ||
+      (isCodexCLITool(tool) && codexAppsOverride !== (agent.codexApps ?? null)) ||
       tool.trim() !== agent.tool ||
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
       (tool === "custom-bare" && thinkingMode !== (agent.thinkingMode ?? "")) ||
+      responseLanguage.trim() !== (agent.responseLanguage ?? "") ||
       workDir.trim() !== (agent.workDir ?? "") ||
       cronExpr !== (agent.cronExpr ?? "") ||
       timeoutMinutes !== (agent.timeoutMinutes || 10) ||
       resumeIdleMinutes !== (agent.resumeIdleMinutes ?? 0) ||
+      backgroundMaxMinutes !== (agent.backgroundMaxMinutes ?? 0) ||
       silentStart !== (agent.silentStart ?? "") ||
       silentEnd !== (agent.silentEnd ?? "") ||
       notifyDuringSilent !== (agent.notifyDuringSilent ?? true) ||
@@ -1538,6 +1559,15 @@ export function AgentSettings() {
               />
             </Field>
 
+            {/* Response language */}
+            <Field label={t("settings.responseLanguage")} help={t("settings.responseLanguageHelp")}>
+              <Input
+                value={responseLanguage}
+                onChange={(e) => setResponseLanguage(e.target.value)}
+                placeholder={t("settings.responseLanguagePlaceholder")}
+              />
+            </Field>
+
             {/* Public Profile */}
             <Field
               label={t("settings.publicProfile")}
@@ -1716,6 +1746,22 @@ export function AgentSettings() {
               />
             )}
 
+            {isCodexCLITool(tool) && (
+              <ToggleRow
+                checked={codexAppsOverride ?? defaultCodexApps(tool)}
+                onChange={(v) =>
+                  // Toggling back to the default on an agent with no
+                  // stored value returns to "follow the per-tool default"
+                  // instead of pinning an explicit boolean.
+                  setCodexAppsOverride(
+                    agent?.codexApps === undefined && v === defaultCodexApps(tool) ? null : v,
+                  )
+                }
+                title={t("settings.codexApps")}
+                desc={t("settings.codexAppsDesc")}
+              />
+            )}
+
             {/* Allowed Tools (custom only) */}
             {tool === "custom-claude" && (
               <Field
@@ -1842,6 +1888,8 @@ export function AgentSettings() {
             onTimeoutChange={setTimeoutMinutes}
             resumeIdleMinutes={resumeIdleMinutes}
             onResumeIdleChange={setResumeIdleMinutes}
+            backgroundMaxMinutes={backgroundMaxMinutes}
+            onBackgroundMaxChange={setBackgroundMaxMinutes}
             tool={tool}
             silentStart={silentStart}
             silentEnd={silentEnd}

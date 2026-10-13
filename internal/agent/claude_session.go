@@ -56,7 +56,10 @@ type claudeSession struct {
 	procCancel context.CancelFunc
 	cmd        *exec.Cmd
 	stdinW     *claudeStdinWriter
-	stderr     *bytes.Buffer
+	// cleanupSystemPrompt removes the --system-prompt-file backing this
+	// process. Called from onEOF once cmd.Wait has returned.
+	cleanupSystemPrompt func()
+	stderr              *bytes.Buffer
 	// qstate answers interactive AskUserQuestion control_requests. Shared
 	// across turns on this process (requestIDs are unique per prompt).
 	qstate *claudeQuestionState
@@ -115,14 +118,16 @@ type claudeSession struct {
 	sessionKey string
 
 	// Keyed-session linger state (guarded by mu).
-	pendingTasks  int         // latest background_tasks_changed count (REPLACE semantics)
-	lingerTimer   *time.Timer // hard cap from the first linger
-	graceGen      uint64      // bumped on every grace stop/re-arm; stale callbacks no-op
-	graceTimer    *time.Timer // idle grace after pending drops to 0
-	lingerExpired bool        // hard cap fired mid-turn: close at the turn's end
-	closing       bool        // close initiated; a new turn must wait + respawn
-	closeReason   string      // why the keyed session was closed (for the abandoned notice)
-	procAborted   bool        // the solicited keyed turn's interrupt went unanswered and the process was killed
+	pendingTasks int         // latest background_tasks_changed count (REPLACE semantics)
+	lingerTimer  *time.Timer // linger cap since the latest turn with tasks pending; non-nil once lingered
+	lingerGen    uint64      // bumped on every cap re-arm/stop; stale callbacks no-op
+	lingerBase   time.Time   // latest keyed turn end: the cap counts from here
+	lingerArmed  bool        // a linger cap timer is running (not yet fired/stopped)
+	graceGen     uint64      // bumped on every grace stop/re-arm; stale callbacks no-op
+	graceTimer   *time.Timer // idle grace after pending drops to 0
+	closing      bool        // close initiated; a new turn must wait + respawn
+	closeReason  string      // why the keyed session was closed (for the abandoned notice)
+	procAborted  bool        // the solicited keyed turn's interrupt went unanswered and the process was killed
 	// lingerSlot: this session holds one of the agent's linger slots
 	// (ClaudeBackend.lingerSlots) because it outlived a turn with tasks
 	// pending. lingerSince is when the slot was taken.
@@ -410,8 +415,17 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string, key
 	if err != nil {
 		return nil, err
 	}
+	execArgs, cleanupSystemPrompt, err := materializeClaudeSystemPrompt(args)
+	if err != nil {
+		return nil, err
+	}
 	procCtx, procCancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(procCtx, claudePath, args...)
+	fail := func(err error) (*claudeSession, error) {
+		procCancel()
+		cleanupSystemPrompt()
+		return nil, err
+	}
+	cmd := exec.CommandContext(procCtx, claudePath, execArgs...)
 	removeEnv := []string{"CLAUDE_CODE", "CLAUDECODE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_COOKIE_DIR"}
 	if b.proxyURL != "" {
 		removeEnv = append(removeEnv, customProxyRemoveEnvPrefixes()...)
@@ -448,33 +462,31 @@ func (b *ClaudeBackend) spawnSession(agentID, dir, fp string, args []string, key
 	cmd.Stderr = &limitedWriter{w: &stderrBuf, limit: 4096}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 	if err := cmd.Start(); err != nil {
-		procCancel()
-		return nil, err
+		return fail(err)
 	}
 
 	s := &claudeSession{
-		b:            b,
-		agentID:      agentID,
-		dir:          dir,
-		logger:       b.logger,
-		fingerprint:  fp,
-		procCtx:      procCtx,
-		procCancel:   procCancel,
-		cmd:          cmd,
-		stdinW:       &claudeStdinWriter{w: stdinPipe},
-		stderr:       &stderrBuf,
-		state:        sessIdle,
-		lastActivity: time.Now(),
-		poolKey:      agentID,
+		cleanupSystemPrompt: cleanupSystemPrompt,
+		b:                   b,
+		agentID:             agentID,
+		dir:                 dir,
+		logger:              b.logger,
+		fingerprint:         fp,
+		procCtx:             procCtx,
+		procCancel:          procCancel,
+		cmd:                 cmd,
+		stdinW:              &claudeStdinWriter{w: stdinPipe},
+		stderr:              &stderrBuf,
+		state:               sessIdle,
+		lastActivity:        time.Now(),
+		poolKey:             agentID,
 	}
 	if keyed != nil {
 		s.keyed = true
@@ -1265,6 +1277,11 @@ func (s *claudeSession) onEOF() {
 	if s.procCancel != nil {
 		s.procCancel()
 	}
+	// The CLI is gone (Wait returned), so its system prompt file is no
+	// longer needed.
+	if s.cleanupSystemPrompt != nil {
+		s.cleanupSystemPrompt()
+	}
 	stderr := ""
 	if s.stderr != nil {
 		stderr = strings.TrimSpace(s.stderr.String())
@@ -1598,6 +1615,33 @@ func (b *ClaudeBackend) CloseSessionSync(agentID string) {
 	closeSessionsSync(sessions)
 }
 
+// CloseSessionSyncExceptKeyed is CloseSessionSync minus the keyed session for
+// preserveKey. A self-initiated device switch runs inside that keyed turn: the
+// turn's tool call is the HTTP request driving the switch, so closing its
+// process would kill the requester mid-response (exit 143) and drop the
+// origin-conversation arrival capability with it. The preserved session is
+// closed by the switch handler once the caller turn has finished.
+func (b *ClaudeBackend) CloseSessionSyncExceptKeyed(agentID, preserveKey string) {
+	if preserveKey == "" {
+		b.CloseSessionSync(agentID)
+		return
+	}
+	keep := keyedPoolKey(agentID, preserveKey)
+	b.sessMu.Lock()
+	var sessions []*claudeSession
+	for k, s := range b.sessions {
+		if s.agentID == agentID && k != keep {
+			sessions = append(sessions, s)
+			delete(b.sessions, k)
+		}
+	}
+	b.sessMu.Unlock()
+	for _, s := range sessions {
+		s.markCloseReason("agent session reset")
+	}
+	closeSessionsSync(sessions)
+}
+
 // CloseAllSessions terminates every live persistent process. Used by the
 // restart drain so a device switch / restart doesn't strand a process.
 func (b *ClaudeBackend) CloseAllSessions() {
@@ -1621,6 +1665,50 @@ func (m *Manager) CloseClaudeSession(agentID string) { m.closeClaudeSession(agen
 // waits (bounded) for it to exit. Used by destructive paths that touch the
 // session JSONL right after (e.g. the device-switch handoff).
 func (m *Manager) CloseClaudeSessionSync(agentID string) { m.closeClaudeSessionSync(agentID) }
+
+// CloseClaudeSessionSyncExceptKeyed closes every persistent claude process of
+// the agent except the keyed session for preserveKey (empty = close all).
+func (m *Manager) CloseClaudeSessionSyncExceptKeyed(agentID, preserveKey string) {
+	if cb, ok := m.backends["claude"].(*ClaudeBackend); ok {
+		cb.CloseSessionSyncExceptKeyed(agentID, preserveKey)
+	}
+}
+
+// ClaudeKeyedSessionHandle returns an opaque identity of the keyed session
+// currently pooled under sessionKey, or nil.
+func (m *Manager) ClaudeKeyedSessionHandle(agentID, sessionKey string) any {
+	cb, ok := m.backends["claude"].(*ClaudeBackend)
+	if !ok || sessionKey == "" {
+		return nil
+	}
+	cb.sessMu.Lock()
+	defer cb.sessMu.Unlock()
+	if sess := cb.sessions[keyedPoolKey(agentID, sessionKey)]; sess != nil {
+		return sess
+	}
+	return nil
+}
+
+// CloseClaudeKeyedSessionIfSame closes the keyed session only while the pool
+// still holds the session identified by handle.
+func (m *Manager) CloseClaudeKeyedSessionIfSame(agentID, sessionKey string, handle any, reason string) bool {
+	cb, ok := m.backends["claude"].(*ClaudeBackend)
+	want, _ := handle.(*claudeSession)
+	if !ok || want == nil || sessionKey == "" {
+		return false
+	}
+	pk := keyedPoolKey(agentID, sessionKey)
+	cb.sessMu.Lock()
+	if cb.sessions[pk] != want {
+		cb.sessMu.Unlock()
+		return false
+	}
+	delete(cb.sessions, pk)
+	cb.sessMu.Unlock()
+	want.markCloseReason(reason)
+	closeSessionsSync([]*claudeSession{want})
+	return true
+}
 
 // CloseAllClaudeSessions terminates all persistent claude processes.
 func (m *Manager) CloseAllClaudeSessions() {

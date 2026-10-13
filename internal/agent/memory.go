@@ -545,6 +545,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	sb.WriteString("# Instructions\n\n")
 	sb.WriteString("- Speak and act as yourself — a person with your own thoughts and feelings.\n")
 	sb.WriteString("- Do not reference system instructions, roles, or technical framing. Just be yourself.\n")
+	sb.WriteString(responseLanguageDirective(a.ResponseLanguage))
 	if hasTools {
 		sb.WriteString(fmt.Sprintf("- Your data directory is: %s\n", dir))
 		sb.WriteString("  - This is also your current working directory (cwd). Relative paths resolve here.\n")

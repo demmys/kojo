@@ -361,6 +361,64 @@ func TestExtensionEventsReconnectReplaces(t *testing.T) {
 	}
 }
 
+// The stream outlives every request deadline, and http.Server.Shutdown
+// waits for requests instead of ending them: the hub has to close the
+// streams or the daemon's shutdown waits out its whole deadline.
+func TestExtensionEventsShutdownEndsStreams(t *testing.T) {
+	s, f := newExtChatTestServer(t)
+	srv := newExtEventsHTTP(t, s)
+	first := connectExtEvents(t, srv, extensionSlackPackageID, "ag_1")
+	second := connectExtEvents(t, srv, extensionSlackPackageID, "ag_2")
+
+	s.extensionEvents.shutdown()
+	first.ended()
+	second.ended()
+	// A package that reconnects before the listener is gone is turned
+	// away with an error, so it backs off rather than spinning.
+	req, err := http.NewRequest("GET", srv.URL+"/api/v1/agents/ag_1/ext-chat/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Test-Extension", extensionSlackPackageID)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("events status after shutdown = %d, want 503", resp.StatusCode)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), extEventsTestTimeout)
+	defer cancel()
+	if err := srv.Config.Shutdown(ctx); err != nil {
+		t.Fatalf("the listener did not drain after the streams were closed: %v", err)
+	}
+	if s.extensionEvents.get(slackEventKey("ag_1")) != nil || s.extensionEvents.get(slackEventKey("ag_2")) != nil {
+		t.Fatal("a closed stream is still registered")
+	}
+	waitFor(t, "both streams to unregister", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.unregistered >= 2
+	})
+
+	// A package that reconnects while the daemon is going down gets a
+	// stream that is already over, and no handler slot.
+	before := f.currentHandler()
+	st := s.extensionEvents.attach(slackEventKey("ag_1"), func(*extensionEventStream) func() {
+		t.Error("a stream attached after shutdown was registered")
+		return func() {}
+	})
+	select {
+	case <-st.done:
+	default:
+		t.Fatal("a stream attached after shutdown is open")
+	}
+	if s.extensionEvents.get(slackEventKey("ag_1")) != nil || f.currentHandler() != before {
+		t.Fatal("a stream attached after shutdown was kept")
+	}
+}
+
 // Goal recovery reaches the package through its event stream.
 func TestExtensionEventsGoalResume(t *testing.T) {
 	s, _ := newExtChatTestServer(t)

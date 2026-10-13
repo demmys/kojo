@@ -96,6 +96,9 @@ type extensionEventHub struct {
 
 	mu      sync.Mutex
 	streams map[extensionEventKey]*extensionEventStream
+	// stopped is set by shutdown; from then on attach hands back a
+	// stream that is already closed.
+	stopped bool
 }
 
 // attach makes a new stream the current one for key. A package that
@@ -119,6 +122,11 @@ func (h *extensionEventHub) attach(key extensionEventKey, register func(*extensi
 	if h.streams == nil {
 		h.streams = map[extensionEventKey]*extensionEventStream{}
 	}
+	if h.stopped {
+		h.mu.Unlock()
+		st.close()
+		return st
+	}
 	old := h.streams[key]
 	h.streams[key] = st
 	h.mu.Unlock()
@@ -135,6 +143,25 @@ func (h *extensionEventHub) get(key extensionEventKey) *extensionEventStream {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.streams[key]
+}
+
+// shutdown closes every connected stream and refuses new ones. The
+// events request never ends by itself, and http.Server.Shutdown waits
+// for requests rather than ending them, so the daemon has to close
+// these before it drains its listeners.
+func (h *extensionEventHub) shutdown() {
+	h.attachMu.Lock()
+	defer h.attachMu.Unlock()
+	h.mu.Lock()
+	h.stopped = true
+	streams := make([]*extensionEventStream, 0, len(h.streams))
+	for _, st := range h.streams {
+		streams = append(streams, st)
+	}
+	h.mu.Unlock()
+	for _, st := range streams {
+		st.close()
+	}
 }
 
 // detach forgets st unless a newer stream has already replaced it.
@@ -562,6 +589,14 @@ func (s *Server) handleExtensionChatEvents(w http.ResponseWriter, r *http.Reques
 	}
 	st := s.extensionEvents.attach(extensionEventKey{extensionID: p.ExtensionID, agentID: agentID}, register)
 	defer st.close()
+	select {
+	case <-st.done:
+		// The daemon is shutting down. An error status makes the
+		// package back off instead of reconnecting at once.
+		writeError(w, http.StatusServiceUnavailable, "unavailable", "kojo is shutting down")
+		return
+	default:
+	}
 
 	w.Header().Set("Content-Type", extensionChatContentType)
 	w.Header().Set("Cache-Control", "no-store")

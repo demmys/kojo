@@ -1845,6 +1845,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.logger.Info("shutting down...")
 
+	// The extension events streams stay open for as long as the package
+	// runs, so the drain below would wait out its whole deadline on
+	// them. End them first; the packages themselves are stopped after
+	// the drain.
+	s.extensionEvents.shutdown()
+
 	// Drain HTTP listeners first so no new requests can land while the
 	// rest of the system tears down. Otherwise an in-flight agent chat
 	// could be cancelled mid-stream by agents.Shutdown() and surface a

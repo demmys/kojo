@@ -245,6 +245,10 @@ const messages = {
     en: "A new version is available. Reload.",
   },
   "reload.action": { ja: "リロード", en: "Reload" },
+  "reload.chunkFailed": {
+    ja: "このページを読み込めませんでした（ネットワークエラー、またはビルドが古い可能性があります）",
+    en: "Failed to load this page (network error or outdated build).",
+  },
 
   // ── Daemon self-update prompt ──
   "update.available": {

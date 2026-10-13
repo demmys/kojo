@@ -103,6 +103,10 @@ type Server struct {
 	// the registry directory could not be opened; every handler
 	// degrades to 503 rather than panicking.
 	extensions *extpkg.Manager
+	// slackMigration moves leftover built-in Slack bot state into the
+	// slack extension package (see slack_migration.go). Nil on a
+	// PeerOnly daemon, which never ran the built-in bot.
+	slackMigration *slackMigration
 	// extSupervisor owns the extension service processes. Nil until
 	// StartExtensions runs (i.e. until the API listener is bound).
 	extSupervisor  *extpkg.Supervisor
@@ -606,6 +610,14 @@ func New(cfg Config) *Server {
 				}
 			}
 		}
+		// Built even when the registry failed to open: the Owner is
+		// then told why Slack is not running instead of being told
+		// nothing.
+		if s.agents != nil {
+			if creds := s.agents.Credentials(); creds != nil {
+				s.slackMigration = newSlackMigration(s.agents, creds, s.extensions, logger, s.publishExtensionsChanged)
+			}
+		}
 	}
 
 	// send push notification when an agent finishes its response.
@@ -833,6 +845,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("POST /api/v1/extensions/{id}/token", s.handleRotateExtensionToken)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/config", s.handlePutExtensionConfig)
 	mux.HandleFunc("PUT /api/v1/extensions/{id}/agents/{agentId}", s.handlePutExtensionAgentBinding)
+	mux.HandleFunc("GET /api/v1/slack-migration", s.handleGetSlackMigration)
+	mux.HandleFunc("POST /api/v1/slack-migration/retry", s.handleRetrySlackMigration)
 	// Routes an extension calls on itself with its own token.
 	mux.HandleFunc("GET /api/v1/extension/secrets", s.handleExtensionSecrets)
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat", s.handleExtensionChat)

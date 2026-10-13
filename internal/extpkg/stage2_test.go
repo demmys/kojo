@@ -381,7 +381,7 @@ func TestSupervisorPerAgentServiceFollowsBindings(t *testing.T) {
 	}
 
 	// An archived (filtered-out) agent loses its process.
-	sup.SetAgentFilter(func(agentID string) bool { return agentID != "ag_2" })
+	sup.SetAgentFilter(func(_, agentID string) bool { return agentID != "ag_2" })
 	sup.Reconcile()
 	if got := sup.Running(); len(got) != 1 || got[0].AgentID != "ag_1" {
 		t.Fatalf("agent filter not applied: %+v", got)

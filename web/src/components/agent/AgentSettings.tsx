@@ -16,6 +16,7 @@ import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { SlackBotSettings } from "./SlackBotSettings";
+import { SlackMigrationNotice, useSlackMigration } from "./SlackMigrationNotice";
 import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { useCustomModels } from "./fields/useCustomModels";
 import { PersonaField } from "./fields/PersonaField";
@@ -1263,6 +1264,7 @@ export function AgentSettings() {
     );
   };
 
+  const slackMigration = useSlackMigration(id);
   const activeSection = useScrollSpy(SECTION_IDS, !!agent);
 
   // Order-insensitive compare for the checkbox-driven string arrays —
@@ -2118,6 +2120,7 @@ export function AgentSettings() {
 
         {/* ── Integrations ── */}
         <SectionCard id="integrations" title={t("settings.sec.integrations")}>
+          <SlackMigrationNotice state={slackMigration} />
           <SlackBotSettings agentId={id!} />
         </SectionCard>
 

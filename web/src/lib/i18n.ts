@@ -1064,6 +1064,82 @@ const messages = {
     en: "Cancel queued message {id}",
   },
 
+  // ── SlackMigrationNotice ──
+  "slackMig.title": {
+    ja: "Slack 連携は拡張パッケージに移った",
+    en: "Slack has moved to an extension package",
+  },
+  "slackMig.body": {
+    ja: "このエージェントの Slack ボットは、Slack が kojo 本体に組み込まれていた頃に設定されたもの。設定・トークン・スレッド履歴は Slack パッケージへ自動で引き継がれるが、まだ完了していないため、ボットは停止している。引き継ぎが終わるまで元のデータは消えない。",
+    en: "This agent's Slack bot was set up when Slack was built into kojo. Its settings, tokens and thread history are carried over to the Slack package automatically, but that has not finished, so the bot is not running. Nothing is deleted until the move is complete.",
+  },
+  "slackMig.reason.in_progress": {
+    ja: "引き継ぎを実行中、または起動直後でまだ始まっていない。少し待ってから再試行する。",
+    en: "The move is running, or has not started yet after startup. Wait a moment, then retry.",
+  },
+  "slackMig.reason.extensions_unavailable": {
+    ja: "この kojo では拡張機能が使えない状態になっている。ログを確認して kojo を再起動する。",
+    en: "Extensions are unavailable on this kojo. Check the log and restart kojo.",
+  },
+  "slackMig.reason.install_failed": {
+    ja: "Slack パッケージを導入できなかった（ネットワークに繋がらない、git が無い、など）。",
+    en: "The Slack package could not be installed (no network, git missing, or similar).",
+  },
+  "slackMig.reason.review_required": {
+    ja: "Slack パッケージが、組み込みボットには無かった権限を要求している。自動では承認しないので、拡張機能の設定から内容を確認して導入する。",
+    en: "The Slack package asks for permissions the built-in bot did not have. kojo does not approve those for you: review and install it from the Extensions settings.",
+  },
+  "slackMig.reason.untrusted_source": {
+    ja: "公式の配布元ではない「slack」パッケージが導入されている。トークンは渡していない。公式のものに入れ替えるか、そのパッケージを信頼するなら拡張機能の設定でこのエージェントに自分で割り当てる。",
+    en: "A package named \"slack\" is installed from somewhere other than the official source, so the tokens were not handed to it. Replace it with the official one, or, if you trust it, assign it to this agent yourself in the Extensions settings.",
+  },
+  "slackMig.reason.incompatible_package": {
+    ja: "導入されている Slack パッケージはトークンを安全に受け取れない版だ。拡張機能の設定から更新する。",
+    en: "The installed Slack package is a version that cannot take the tokens safely. Update it from the Extensions settings.",
+  },
+  "slackMig.reason.tokens_unreadable": {
+    ja: "保存されている Slack トークンを読み出せなかった。",
+    en: "The stored Slack tokens could not be read.",
+  },
+  "slackMig.reason.bind_failed": {
+    ja: "Slack パッケージをこのエージェントに割り当てられなかった。",
+    en: "The Slack package could not be assigned to this agent.",
+  },
+  "slackMig.reason.history_copy_failed": {
+    ja: "スレッド履歴をコピーできなかった。設定とトークンは引き継ぎ済み。",
+    en: "The thread history could not be copied. Settings and tokens have already been carried over.",
+  },
+  "slackMig.reason.cleanup_failed": {
+    ja: "引き継ぎは済んだが、古い設定の片付けが終わっていない（エージェントがデバイス間を移動中、など）。",
+    en: "Everything has been carried over, but the old settings could not be cleared yet (for example, the agent is moving between devices).",
+  },
+  "slackMig.retry": { ja: "再試行", en: "Retry" },
+  "slackMig.retrying": { ja: "再試行中...", en: "Retrying..." },
+  "slackMig.retryFailed": {
+    ja: "再試行を実行できなかった: {error}",
+    en: "The retry could not be run: {error}",
+  },
+  "slackMig.openExtensions": {
+    ja: "拡張機能の設定を開く",
+    en: "Open Extensions settings",
+  },
+  "slackMig.manualTitle": {
+    ja: "自動で進まないときの手順",
+    en: "If it does not go through by itself",
+  },
+  "slackMig.manualInstall": {
+    ja: "設定 → 拡張機能 で、次の URL から Slack パッケージを導入する。",
+    en: "In Settings → Extensions, install the Slack package from this URL.",
+  },
+  "slackMig.manualRetry": {
+    ja: "ここに戻って「再試行」を押す。設定・トークン・履歴が引き継がれる。",
+    en: "Come back here and press Retry. Settings, tokens and history are carried over.",
+  },
+  "slackMig.manualBind": {
+    ja: "それでも駄目なら、拡張機能の設定で Slack パッケージをこのエージェントに割り当て、トークンを入力し直す。",
+    en: "If that still fails, assign the Slack package to this agent in the Extensions settings and enter the tokens again.",
+  },
+
   // ── SlackBotSettings ──
   "slack.connectedResult": {
     ja: "接続した: team={team}, bot={bot}",

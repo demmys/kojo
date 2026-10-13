@@ -307,9 +307,12 @@ func (s *Server) handlePutExtensionAgentBinding(w http.ResponseWriter, r *http.R
 	}
 	agentID := r.PathValue("agentId")
 	// Reject bindings to agents that do not exist: a typo would
-	// otherwise sit in the registry forever, invisible in the UI.
+	// otherwise sit in the registry forever, invisible in the UI. An
+	// agent whose runtime is on another device does exist: its binding
+	// lives here all the same and must stay editable (see
+	// extensionServiceWanted).
 	if s.agents != nil {
-		if _, ok := s.agents.Get(agentID); !ok {
+		if _, ok := s.agents.GetAny(agentID); !ok {
 			writeError(w, http.StatusNotFound, "not_found", "agent not found: "+agentID)
 			return
 		}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -342,6 +343,12 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 			if err := m.trusted(current, l.AgentID); err != nil {
 				return err
 			}
+			// cfg was merged from the binding as first read. If the
+			// Owner edited it since, writing would undo their edit;
+			// the next run merges from what they saved.
+			if now, ok := current.Agents[l.AgentID]; ok != hasBinding || !reflect.DeepEqual(now, binding) {
+				return errSlackBindingChanged
+			}
 			return acceptsSlackTokens(secretKeys)
 		})
 		var untrusted *slackUntrustedSourceError
@@ -356,24 +363,37 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 		bound = true
 	}
 
+	// Everything above worked from a package read at the start. If the
+	// Owner removed or replaced the package meanwhile, the binding went
+	// with it: the transcripts must not go into the newcomer's data
+	// directory, and the old store holds the only copy of the tokens.
+	// So look again before each of the two steps. The registry is not
+	// locked across them; what is left is an Owner uninstalling within
+	// the same instant, which discards the tokens by their own hand.
+	stillHolds := func() error {
+		current, err := m.ext.Get(pkg.ID)
+		if err != nil {
+			return err
+		}
+		if err := m.trusted(current, l.AgentID); err != nil {
+			return err
+		}
+		held := current.Agents[l.AgentID].Secrets
+		if (appToken != "" && !containsAll(held, slackSecretAppToken)) ||
+			(botToken != "" && !containsAll(held, slackSecretBotToken)) {
+			return errors.New("the slack package no longer holds this agent's tokens; it was changed while migrating")
+		}
+		return nil
+	}
+	if err := stillHolds(); err != nil {
+		return bound, slackMigrationBindFailed, err
+	}
 	dst := filepath.Join(m.ext.DataDir(pkg.ID, l.AgentID), "chat_history", "slack")
 	if err := copyTreeKeepingExisting(l.HistoryDir, dst); err != nil {
 		return bound, slackMigrationCopyFailed, err
 	}
-
-	// Deleting the old tokens is the one step that cannot be redone, and
-	// everything above worked from a package read at the start. Look
-	// again: if the Owner removed or replaced the package meanwhile, the
-	// binding went with it, and the old store holds the only copy.
-	current, err := m.ext.Get(pkg.ID)
-	if err != nil {
+	if err := stillHolds(); err != nil {
 		return bound, slackMigrationBindFailed, err
-	}
-	held := current.Agents[l.AgentID].Secrets
-	if (appToken != "" && !containsAll(held, slackSecretAppToken)) ||
-		(botToken != "" && !containsAll(held, slackSecretBotToken)) {
-		return bound, slackMigrationBindFailed,
-			errors.New("the slack package no longer holds this agent's tokens; it was changed while migrating")
 	}
 
 	// Tokens before settings. The settings are what lists the agent as
@@ -389,6 +409,8 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 	}
 	return bound, "", nil
 }
+
+var errSlackBindingChanged = errors.New("the agent's slack package settings were changed while migrating; retry")
 
 var errSlackTokensNotSecret = errors.New("the installed slack package does not accept the app and bot tokens as secrets")
 

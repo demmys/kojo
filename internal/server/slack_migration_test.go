@@ -437,6 +437,35 @@ func TestSlackMigrationLeavesACompleteBindingAlone(t *testing.T) {
 	}
 }
 
+// A binding can list a secret whose stored value is gone. The old store
+// then has the only copy, so it must not be emptied.
+func TestSlackMigrationKeepsTokensThePackageCannotReadBack(t *testing.T) {
+	f := newSlackMigFixture(t)
+	f.addLegacy("ag_1", agent.SlackBotConfig{Enabled: true})
+	f.install(f.repo)
+	if _, err := f.ext.SetAgentBinding("slack", "ag_1", extpkg.AgentBinding{
+		Enabled: true,
+		Config:  map[string]any{"appToken": "xapp-new", "botToken": "xoxb-new"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for k := range f.secrets.rows {
+		if !strings.HasPrefix(k, slackMigKey(agent.LegacySlackTokenProvider, "")) {
+			delete(f.secrets.rows, k)
+		}
+	}
+
+	f.mig.Run(context.Background())
+
+	f.wantPending("ag_1", slackMigrationBindFailed)
+	if n := f.secrets.legacyCount("ag_1"); n != 2 {
+		t.Fatalf("%d legacy token(s) left, want both kept", n)
+	}
+	if got := f.history("ag_1", "C1/1700.1.jsonl"); got != "" {
+		t.Fatalf("transcript copied before the tokens were confirmed: %q", got)
+	}
+}
+
 // Each of these stops a run partway, the way a crash would, and checks
 // that the next run finishes without redoing or losing anything.
 func TestSlackMigrationResumesAfterInterruption(t *testing.T) {

@@ -383,6 +383,18 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 			(botToken != "" && !containsAll(held, slackSecretBotToken)) {
 			return errors.New("the slack package no longer holds this agent's tokens; it was changed while migrating")
 		}
+		// The binding only lists the names. The values live in the
+		// credential store, and a row that is missing or cannot be
+		// decrypted reads as absent — in which case the old store still
+		// has the only usable copy and must keep it.
+		values, err := m.ext.Secrets(pkg.ID, l.AgentID)
+		if err != nil {
+			return err
+		}
+		if (appToken != "" && values[slackSecretAppToken] == "") ||
+			(botToken != "" && values[slackSecretBotToken] == "") {
+			return errors.New("the slack package's stored tokens for this agent cannot be read back")
+		}
 		return nil
 	}
 	if err := stillHolds(); err != nil {

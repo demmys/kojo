@@ -198,3 +198,8 @@ kojo --clean v0-trash --clean-apply
 - **Gmail 通知設定** — 引き継ぎません。機能削除
 - **Slack `<reply>` フィルタ** — Slack agent はライブ stream に戻り
   ました。タグ依存の外部ツールがあれば書き換えてください
+- **Slack bot の設定** — 従来どおり `--migrate` で引き継ぎます。以降の
+  リリースは Slack bot を本体に含まず、`slack` 拡張パッケージになって
+  います。引き継いだ設定は kojo が起動時に自動でパッケージへ移します。
+  [README](../README.ja.md#slack-は拡張パッケージに移りました) の
+  「Slack は拡張パッケージに移りました」を参照してください

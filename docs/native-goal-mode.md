@@ -8,7 +8,8 @@ Tested with Codex 0.153.4. An older CLI without the goal API fails explicitly.
 
 - Main WebUI chat and single-agent thread rooms: enable **Goal · Codex native**
   before sending. An optional token budget is available in the composer.
-- Slack: `!goal <objective>` (or `!goal start <objective>`).
+- Slack (with the `slack` extension package): `!goal <objective>` (or
+  `!goal start <objective>`).
 - Initial budget: `!goal --tokens 20000 <objective>`.
 - Commands: `!goal status`, `!goal pause`, `!goal resume`, `!goal clear`,
   `!goal budget 40000`.
@@ -100,7 +101,8 @@ A normal human reply in a Slack thread with an unfinished goal resumes that goal
 Goal controls carry a validated structured request; their chat message can be
 empty. Both local and peer routes preserve the Slack user and operation ID.
 Only the initiating user can control or continue an unfinished Slack goal when
-its owner is known; an older Hub that omits the user must be upgraded.
+its owner is known; an older Slack-side device that omits the user must be
+upgraded.
 
 `!stop` cancels the currently tracked turn. If there is no active turn it does
 not clear or pause a stored goal: the response points to `!goal status` and

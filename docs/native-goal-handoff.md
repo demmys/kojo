@@ -10,7 +10,8 @@ X-Kojo-Session-Key: <current conversation key>
 {"target_peer_id":"<target>"}
 ```
 
-Main WebUI uses an empty session key. Slack uses the exact current thread key.
+Main WebUI uses an empty session key. Slack (the `slack` extension package)
+uses the exact current thread key.
 GroupDM and other external surfaces are not supported by this queued path yet.
 Ordinary, non-Goal moves retain the synchronous behavior.
 
@@ -28,22 +29,24 @@ Kojo then:
 3. Pauses native continuation, drains any competing next turn, reads the final
    state, and waits for normal app-server exit. Forced termination cannot make a
    valid checkpoint. The paused native database row supplies final accounting.
-4. For Slack, waits for the original adapter's FIFO completion, including final
+4. For Slack, waits for the extension's FIFO completion, including final
    delivery and local history persistence. This is a passive completion barrier,
    not a reused arrival capability. A missing/failed barrier aborts the move.
 5. Quiesces other work, rechecks ownership and the operation identity, then
    invokes the existing sync/pull/lock-transfer/finalize flow. Missing required
    rollout, thread row, or native Goal row aborts before ownership transfer.
 6. On the destination, verifies the operation and the origin's stop fence,
-   then requests the exact Goal generation to resume. Slack retains its original
-   Hub/thread; main WebUI follows the agent to the destination.
+   then requests the exact Goal generation to resume. Slack stays on the
+   device running the Slack extension, in the same thread; main WebUI follows
+   the agent to the destination.
 
 A resume admission is not a native ACK. `Move: resumed` is recorded only on the
 native activation ACK. A successful resume also emits an operation-tagged notice
 on the original response surface. There is **no ordinary main-WebUI arrival
 fallback** for a queued Goal move.
 
-All participants—source, destination, and any separate Slack Hub—must advertise
+All participants—source, destination, and the device running the Slack
+extension if it is a third one—must advertise
 `X-Kojo-Goal-Handoff: v1`. Upgrade all of them before using this path.
 Degraded state transfer is not allowed for a queued Goal move.
 
@@ -108,4 +111,4 @@ Deterministic tests cover:
 - no downgrade from Goal continuation to an ordinary arrival.
 
 These tests do not replace an actual two-machine acceptance test after both
-peers and the Slack Hub have been upgraded.
+peers and the device running the Slack extension have been upgraded.

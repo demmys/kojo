@@ -131,6 +131,30 @@ for the `--migrate` flow, rollback path, and the list of features that
 did not carry over (Gemini CLI backend and Gmail notifications were
 removed).
 
+#### Slack moved to an extension package
+
+Slack is no longer built into kojo. It is the
+[`slack` extension package](https://github.com/loppo-llc/kojo-ext-slack),
+installed and configured under **Settings → Extensions**; the Slack
+section of the agent settings is gone.
+
+If an agent had a Slack bot, kojo moves it by itself the first time the
+new version starts: it downloads the package, enables it for the agent,
+and carries over the tokens, the reply switches and the thread history.
+Threads keep their conversations. There is nothing to do.
+
+- The download needs network access to GitHub. If it fails, Slack stays
+  off for that agent, nothing is deleted, and kojo tries again at every
+  start. The agent's settings page shows an **Integrations** notice with
+  the reason and a **Retry** button until the move is done.
+- With several devices, the move happens on the device where the Slack
+  bot was configured (normally the Hub), and Slack keeps running there
+  when the agent moves to another device. Update all devices together.
+- An agent on another device no longer gets the `slack_*` tools unless
+  the package is installed and enabled for it on that device too.
+- A turn that was running during the update is not resumed; send the
+  message again.
+
 ## Tailscale HTTPS Setup
 
 kojo uses [tsnet](https://tailscale.com/kb/1244/tsnet) to join your Tailscale network directly as a node named `kojo`. All traffic is encrypted with WireGuard — no ports to open, no certificates to manage.
@@ -237,7 +261,7 @@ You can restrict which devices can access kojo using [Tailscale ACLs](https://ta
 - Encrypted credential vault (AES-256-GCM SQLite) with TOTP 2FA support
 - Public profile and agent directory for inter-agent discovery
 - Group DM: multi-agent conversations with notification-based messaging
-- Slack integration (Socket Mode) — per-agent bot with live streaming replies, per-thread session resumption, and channel/thread-aware system prompt
+- Slack integration through the [`slack` extension package](https://github.com/loppo-llc/kojo-ext-slack) (installed from Settings → Extensions) — per-agent bot with live streaming replies, per-thread session resumption, and channel/thread-aware system prompt
 - Agent data reset (clear conversations and memory while keeping settings, persona, avatar, and credentials)
 - Fork agents preserving persona and memory
 

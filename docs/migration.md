@@ -204,3 +204,8 @@ directory, then realized I needed something."
 - **Gmail notification settings** — Not preserved. Feature removed.
 - **Slack `<reply>` filtering** — Slack agents now stream all output
   live. Update any external tooling that depended on the tag.
+- **Slack bot settings** — Carried over by `--migrate` as before. Later
+  releases no longer contain the Slack bot: it is the `slack` extension
+  package, and kojo moves these settings into it by itself at startup.
+  See "Slack moved to an extension package" in the
+  [README](../README.md#slack-moved-to-an-extension-package).

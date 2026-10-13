@@ -159,6 +159,12 @@ automatically — you do not re-enter API keys on the new machine.
 If the source machine is offline when you trigger the switch, kojo
 holds the request and fires it the moment the source reconnects.
 
+Extension packages are installed and configured per machine and do not
+move with the agent. The `slack` package in particular keeps running on
+the machine where it was enabled for the agent, and relays Slack
+conversations to wherever the agent currently runs; enable it for an
+agent on one machine only, or two bots will answer.
+
 ## Hub failover (replacing the Hub machine)
 
 The Hub holds the cluster's source-of-truth SQLite and global blob

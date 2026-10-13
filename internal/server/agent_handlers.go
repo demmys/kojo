@@ -815,14 +815,12 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 	// are stopped around it — they hold those files and their own
 	// in-memory view of each thread — and come back afterwards. A
 	// failed reset leaves the transcripts alone.
-	var err error
+	var err, clearErr error
 	s.extSupervisor.WithAgentStopped(id, func() {
 		if err = s.agents.ResetData(id); err != nil || s.extensions == nil {
 			return
 		}
-		if clearErr := s.extensions.ClearAgentChatHistory(id); clearErr != nil {
-			s.logger.Warn("reset: clearing extension chat history failed", "agent", id, "err", clearErr)
-		}
+		clearErr = s.extensions.ClearAgentChatHistory(id)
 	})
 	if err != nil {
 		if errors.Is(err, agent.ErrAgentNotFound) {
@@ -832,6 +830,15 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
+		return
+	}
+	if clearErr != nil {
+		// The agent's own data is gone, but a package still holds
+		// transcripts it would feed back. Not a success: the Owner
+		// runs the reset again once the cause is fixed.
+		s.logger.Warn("reset: clearing extension chat history failed", "agent", id, "err", clearErr)
+		writeError(w, http.StatusInternalServerError, "internal_error",
+			"agent data was reset, but extension chat history could not be cleared: "+clearErr.Error())
 		return
 	}
 

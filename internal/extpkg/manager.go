@@ -430,10 +430,26 @@ func (m *Manager) SetConfig(id string, cfg map[string]any) (Installed, error) {
 
 // SetAgentBinding enables/configures the extension for one agent.
 func (m *Manager) SetAgentBinding(id, agentID string, b AgentBinding) (Installed, error) {
+	return m.SetAgentBindingIf(id, agentID, b, nil)
+}
+
+// SetAgentBindingIf is SetAgentBinding with a condition on the package
+// as it is at the moment of the write. accept sees the installed row
+// and the settings its schema files as secrets, under the registry
+// lock, and a non-nil error from it cancels the binding. It is for a
+// caller that decided to hand a package secrets from an earlier read:
+// the package may have been replaced, updated or unbound since, and the
+// decision has to hold for the one actually written to.
+func (m *Manager) SetAgentBindingIf(id, agentID string, b AgentBinding, accept func(row Installed, secretKeys []string) error) (Installed, error) {
 	if err := validateAgentID(agentID); err != nil {
 		return Installed{}, err
 	}
 	return m.mutate(id, func(row *Installed) error {
+		if accept != nil {
+			if err := accept(row.clone(), m.secretKeys(row)); err != nil {
+				return err
+			}
+		}
 		if !row.Manifest.hasPerAgentContribution() {
 			return fmt.Errorf("extension %s has no per-agent contribution", id)
 		}

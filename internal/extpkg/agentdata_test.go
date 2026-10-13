@@ -1,6 +1,7 @@
 package extpkg
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -79,6 +80,31 @@ func TestAgentDataLifecycle(t *testing.T) {
 	}
 	if err := m.RemoveAgentData("../../x"); err == nil {
 		t.Fatal("unsafe agent id accepted")
+	}
+}
+
+func TestSetAgentBindingIf(t *testing.T) {
+	m := newManager(t)
+	install(t, m, serviceManifest(ScopePerAgent), map[string]string{"bin/svc": sleepScript})
+
+	refused := errors.New("refused")
+	_, err := m.SetAgentBindingIf("demo", "ag_1", AgentBinding{Enabled: true},
+		func(Installed, []string) error { return refused })
+	if !errors.Is(err, refused) {
+		t.Fatalf("err = %v, want the condition's error", err)
+	}
+	if row, _ := m.Get("demo"); len(row.Agents) != 0 {
+		t.Fatalf("binding written despite the refusal: %+v", row.Agents)
+	}
+
+	// The condition sees the row as it is now.
+	var seen string
+	if _, err := m.SetAgentBindingIf("demo", "ag_1", AgentBinding{Enabled: true},
+		func(row Installed, _ []string) error { seen = row.ID; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := m.Get("demo"); seen != "demo" || !row.Agents["ag_1"].Enabled {
+		t.Fatalf("seen = %q, agents = %+v", seen, row.Agents)
 	}
 }
 

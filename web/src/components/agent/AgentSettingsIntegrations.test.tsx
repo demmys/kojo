@@ -111,6 +111,20 @@ describe("agent settings Integrations section", () => {
     expect(document.getElementById("integrations")).toBeNull();
   });
 
+  it("goes away by itself once a migration that was in progress finishes", async () => {
+    mocks.getSlackMigration
+      .mockResolvedValueOnce({
+        pending: [{ agentId: "demo", reason: "in_progress" }],
+        source: "https://example.invalid/slack",
+      })
+      .mockResolvedValue({ pending: [], source: "https://example.invalid/slack" });
+    renderSettings();
+    await waitFor(() => expect(document.getElementById("integrations")).not.toBeNull());
+    await waitFor(() => expect(document.getElementById("integrations")).toBeNull(), {
+      timeout: 6000,
+    });
+  }, 10000);
+
   it("appears with the notice and a nav entry while this agent is pending", async () => {
     mocks.getSlackMigration.mockResolvedValue({
       pending: [{ agentId: "demo", reason: "install_failed", detail: "network down" }],

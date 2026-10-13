@@ -342,6 +342,34 @@ func TestSlackMigrationDoesNotApproveExtraScopes(t *testing.T) {
 	}
 }
 
+// The trust decision must hold for the package the binding is written
+// to, not the one read earlier: the Owner can replace it in between.
+func TestSlackMigrationRechecksSourceWhenBinding(t *testing.T) {
+	f := newSlackMigFixture(t)
+	f.addLegacy("ag_1", agent.SlackBotConfig{Enabled: true})
+	f.install(newSlackMigTestRepo(t, slackMigTestManifest, slackMigTestSchema))
+	stale, err := f.ext.Get("slack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the migration believes it saw: the official package.
+	stale.Source = f.mig.source
+
+	_, reason, err := f.mig.migrateAgent(stale, f.mig.agents.LegacySlackBots()[0])
+	if reason != slackMigrationUntrustedSource || err == nil {
+		t.Fatalf("reason = %q, err = %v", reason, err)
+	}
+	if _, ok := f.binding("ag_1"); ok {
+		t.Fatal("agent was bound to a package from an unknown source")
+	}
+	if got := f.packageSecrets("ag_1"); len(got) != 0 {
+		t.Fatalf("tokens handed to an unknown package: %v", got)
+	}
+	if f.secrets.legacyCount("ag_1") != 2 {
+		t.Fatal("legacy tokens were touched")
+	}
+}
+
 func TestSlackMigrationRefusesPackageFromAnotherSource(t *testing.T) {
 	f := newSlackMigFixture(t)
 	f.addLegacy("ag_1", agent.SlackBotConfig{Enabled: true})

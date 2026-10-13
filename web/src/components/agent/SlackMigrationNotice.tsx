@@ -10,6 +10,8 @@ import { errMsg } from "../../lib/utils";
 import { Button } from "../ui/Button";
 import { useT } from "../../lib/i18n";
 
+const IN_PROGRESS_POLL_MS = 3000;
+
 export interface SlackMigrationState {
   /** Set while this agent's built-in Slack bot has not been moved yet. */
   pending?: SlackMigrationPending;
@@ -47,6 +49,32 @@ export function useSlackMigration(agentId: string | undefined): SlackMigrationSt
     };
   }, [agentId]);
 
+  // "in_progress" is the one state that ends by itself (the startup run
+  // is still going), so ask again until it turns into done or a reason
+  // the Owner can act on.
+  const pending = status?.pending.find((p) => p.agentId === agentId);
+  const inProgress = pending?.reason === "in_progress";
+  const [failedPolls, setFailedPolls] = useState(0);
+  useEffect(() => {
+    if (!inProgress) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      getSlackMigration()
+        .then((s) => {
+          if (!cancelled) setStatus(s);
+        })
+        .catch(() => {
+          if (!cancelled) setFailedPolls((n) => n + 1);
+        });
+    }, IN_PROGRESS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // status and failedPolls are dependencies so that every answer still
+    // in progress, and every poll that failed, schedules the next one.
+  }, [inProgress, status, failedPolls]);
+
   const retry = useCallback(() => {
     setRetrying(true);
     setRetryError("");
@@ -57,7 +85,7 @@ export function useSlackMigration(agentId: string | undefined): SlackMigrationSt
   }, []);
 
   return {
-    pending: status?.pending.find((p) => p.agentId === agentId),
+    pending,
     source: status?.source ?? "",
     retrying,
     retryError,

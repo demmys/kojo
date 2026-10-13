@@ -273,9 +273,8 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 	// themselves, which is the same decision made by hand. A package
 	// under this ID from anywhere else leaves the agent pending for the
 	// Owner to sort out; kojo does not guess.
-	if !hasBinding && !sameGitSource(pkg.Source, m.source) {
-		return false, slackMigrationUntrustedSource,
-			fmt.Errorf("the installed slack package comes from %s, not %s", pkg.Source, m.source)
+	if err := m.trusted(pkg, l.AgentID); err != nil {
+		return false, slackMigrationUntrustedSource, err
 	}
 
 	// A token is only safe to hand over as a secret. If this version of
@@ -285,9 +284,8 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 	if err != nil {
 		return false, slackMigrationIncompatible, err
 	}
-	if !containsAll(secretKeys, slackSecretAppToken, slackSecretBotToken) {
-		return false, slackMigrationIncompatible,
-			errors.New("the installed slack package does not accept the app and bot tokens as secrets")
+	if err := acceptsSlackTokens(secretKeys); err != nil {
+		return false, slackMigrationIncompatible, err
 	}
 
 	appToken, err := m.legacyToken(l.AgentID, agent.LegacySlackAppTokenKey)
@@ -334,10 +332,25 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 		// after entering the tokens.
 		complete := have[slackSecretAppToken] && have[slackSecretBotToken]
 		enabled := (l.Config.Enabled && complete) || (hasBinding && binding.Enabled)
-		if _, err := m.ext.SetAgentBinding(pkg.ID, l.AgentID, extpkg.AgentBinding{
+		// pkg was read a moment ago, and the Owner may have replaced,
+		// updated or unbound the package since. The registry repeats
+		// both checks on the row it is about to write, under its lock.
+		_, err := m.ext.SetAgentBindingIf(pkg.ID, l.AgentID, extpkg.AgentBinding{
 			Enabled: enabled,
 			Config:  cfg,
-		}); err != nil {
+		}, func(current extpkg.Installed, secretKeys []string) error {
+			if err := m.trusted(current, l.AgentID); err != nil {
+				return err
+			}
+			return acceptsSlackTokens(secretKeys)
+		})
+		var untrusted *slackUntrustedSourceError
+		switch {
+		case errors.As(err, &untrusted):
+			return false, slackMigrationUntrustedSource, err
+		case errors.Is(err, errSlackTokensNotSecret):
+			return false, slackMigrationIncompatible, err
+		case err != nil:
 			return false, slackMigrationBindFailed, err
 		}
 		bound = true
@@ -346,6 +359,21 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 	dst := filepath.Join(m.ext.DataDir(pkg.ID, l.AgentID), "chat_history", "slack")
 	if err := copyTreeKeepingExisting(l.HistoryDir, dst); err != nil {
 		return bound, slackMigrationCopyFailed, err
+	}
+
+	// Deleting the old tokens is the one step that cannot be redone, and
+	// everything above worked from a package read at the start. Look
+	// again: if the Owner removed or replaced the package meanwhile, the
+	// binding went with it, and the old store holds the only copy.
+	current, err := m.ext.Get(pkg.ID)
+	if err != nil {
+		return bound, slackMigrationBindFailed, err
+	}
+	held := current.Agents[l.AgentID].Secrets
+	if (appToken != "" && !containsAll(held, slackSecretAppToken)) ||
+		(botToken != "" && !containsAll(held, slackSecretBotToken)) {
+		return bound, slackMigrationBindFailed,
+			errors.New("the slack package no longer holds this agent's tokens; it was changed while migrating")
 	}
 
 	// Tokens before settings. The settings are what lists the agent as
@@ -360,6 +388,34 @@ func (m *slackMigration) migrateAgent(pkg extpkg.Installed, l agent.LegacySlackB
 		return bound, slackMigrationCleanupFailed, err
 	}
 	return bound, "", nil
+}
+
+var errSlackTokensNotSecret = errors.New("the installed slack package does not accept the app and bot tokens as secrets")
+
+// acceptsSlackTokens checks that the package files both tokens as
+// secrets, given the keys its schema marks so.
+func acceptsSlackTokens(secretKeys []string) error {
+	if !containsAll(secretKeys, slackSecretAppToken, slackSecretBotToken) {
+		return errSlackTokensNotSecret
+	}
+	return nil
+}
+
+// slackUntrustedSourceError says the installed "slack" package is not
+// one the migration may hand tokens to.
+type slackUntrustedSourceError struct{ installed, official string }
+
+func (e *slackUntrustedSourceError) Error() string {
+	return fmt.Sprintf("the installed slack package comes from %s, not %s", e.installed, e.official)
+}
+
+// trusted reports whether the Owner has vouched for this checkout of
+// the package as far as one agent is concerned (see migrateAgent).
+func (m *slackMigration) trusted(pkg extpkg.Installed, agentID string) error {
+	if _, bound := pkg.Agents[agentID]; bound || sameGitSource(pkg.Source, m.source) {
+		return nil
+	}
+	return &slackUntrustedSourceError{installed: pkg.Source, official: m.source}
 }
 
 // legacyToken reads one of the built-in bot's tokens. A token that was
@@ -448,9 +504,10 @@ func copyTreeKeepingExisting(src, dst string) error {
 }
 
 // copyFileKeepingExisting copies one file so that the destination is
-// either absent or complete. The bytes go to a temporary file first; it
-// is then hard-linked into place, which fails rather than replaces if
-// the name was taken in the meantime.
+// never replaced: the package may be running and writing the same
+// thread. The bytes go to a temporary file first; it is then hard-linked
+// into place, which fails rather than replaces if the name was taken in
+// the meantime, and leaves the destination either absent or complete.
 func copyFileKeepingExisting(src, dst string) error {
 	if _, err := os.Lstat(dst); err == nil {
 		return nil
@@ -483,13 +540,28 @@ func copyFileKeepingExisting(src, dst string) error {
 	if err == nil || errors.Is(err, fs.ErrExist) {
 		return nil
 	}
-	// A filesystem without hard links. Rename replaces, so check
-	// again first; what is left is a window of microseconds against a
-	// package writing the very same thread file.
-	if _, serr := os.Lstat(dst); serr == nil {
+	// A filesystem without hard links. Rename would replace a file the
+	// package created in the meantime, so claim the name exclusively
+	// and copy into it. A crash mid-copy can leave it short; the old
+	// transcript is still in place and that is the lesser loss.
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
-	return os.Rename(tmpName, dst)
+	if err != nil {
+		return err
+	}
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
 
 // RunSlackMigration runs the migration once. Called at startup after

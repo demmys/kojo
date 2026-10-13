@@ -57,8 +57,13 @@ func (m *Manager) agentDataDirs(agentID string) ([]string, error) {
 			continue
 		}
 		dir := m.DataDir(e.Name(), agentID)
-		if _, err := os.Lstat(dir); err == nil {
+		switch _, err := os.Lstat(dir); {
+		case err == nil:
 			out = append(out, dir)
+		case !errors.Is(err, os.ErrNotExist):
+			// Unreadable is not absent: reporting it keeps a reset or
+			// a delete from passing over data it could not look at.
+			return nil, err
 		}
 	}
 	return out, nil

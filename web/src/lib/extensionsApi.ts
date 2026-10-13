@@ -20,7 +20,8 @@ export interface ScopeSummary {
 
 export interface ExtensionMCPServer {
   name: string;
-  command: string;
+  command?: string;
+  exec?: Record<string, string>;
   args?: string[];
 }
 
@@ -63,6 +64,8 @@ export interface ExtensionManifest {
 export interface ExtensionAgentBinding {
   enabled: boolean;
   config?: Record<string, unknown>;
+  /** Names of the secret settings stored for this agent. Values are never returned. */
+  secrets?: string[];
 }
 
 export interface InstalledExtension {
@@ -75,6 +78,8 @@ export interface InstalledExtension {
   enabled: boolean;
   grantedScopes?: string[];
   config?: Record<string, unknown>;
+  /** Names of the global secret settings that are set. Values are never returned. */
+  secrets?: string[];
   agents?: Record<string, ExtensionAgentBinding>;
   manifest: ExtensionManifest;
 }

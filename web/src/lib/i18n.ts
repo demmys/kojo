@@ -1548,6 +1548,10 @@ const messages = {
   "gs.extUpdate": { ja: "更新", en: "Update" },
   "gs.extRemove": { ja: "削除", en: "Remove" },
   "gs.extSave": { ja: "設定を保存", en: "Save settings" },
+  "gs.extSecretSaved": { ja: "保存済み (変更するときだけ入力)", en: "Saved (type to replace)" },
+  "gs.extSecretClear": { ja: "削除", en: "Remove" },
+  "gs.extSecretCleared": { ja: "保存時に削除されます", en: "Will be removed on save" },
+  "gs.extSecretUndo": { ja: "取り消す", en: "Undo" },
   "gs.extUrlRequired": {
     ja: "リポジトリ URL を入力して",
     en: "Repository URL is required",

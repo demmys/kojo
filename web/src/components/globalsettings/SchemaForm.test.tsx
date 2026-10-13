@@ -37,6 +37,28 @@ describe("SchemaForm", () => {
     expect(screen.getByLabelText("Token").getAttribute("type")).toBe("password");
   });
 
+  it("never shows a stored secret, and removes it only as an explicit null", () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <SchemaForm schema={schema} value={{}} onChange={onChange} secretsSet={["token"]} />,
+    );
+    const input = screen.getByLabelText("Token") as HTMLInputElement;
+    expect(input.value).toBe("");
+    expect(input.getAttribute("placeholder")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /削除|Remove/ }));
+    expect(onChange).toHaveBeenLastCalledWith({ token: null });
+    rerender(
+      <SchemaForm schema={schema} value={{ token: null }} onChange={onChange} secretsSet={["token"]} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /取り消す|Undo/ }));
+    expect(onChange).toHaveBeenLastCalledWith({ token: "" });
+  });
+
+  it("offers no remove button for a secret that is not stored", () => {
+    render(<SchemaForm schema={schema} value={{}} onChange={() => {}} />);
+    expect(screen.queryByRole("button", { name: /削除|Remove/ })).toBeNull();
+  });
+
   it("emits the edited key without dropping the others", () => {
     const onChange = vi.fn();
     render(
@@ -93,5 +115,22 @@ describe("SchemaForm", () => {
       />,
     );
     expect(screen.getByText("nothing to configure")).toBeTruthy();
+  });
+
+  it("shows the schema default for an unset property without writing it", () => {
+    const onChange = vi.fn();
+    const withDefaults: JSONSchema = {
+      type: "object",
+      properties: {
+        limit: { type: "integer", title: "Limit", default: 20 },
+        greet: { type: "boolean", title: "Greet", default: true },
+      },
+    };
+    const { rerender } = render(<SchemaForm schema={withDefaults} value={{}} onChange={onChange} />);
+    expect((screen.getByLabelText("Limit") as HTMLInputElement).value).toBe("20");
+    expect(onChange).not.toHaveBeenCalled();
+    // An explicit value wins over the default, including false.
+    rerender(<SchemaForm schema={withDefaults} value={{ limit: 5, greet: false }} onChange={onChange} />);
+    expect((screen.getByLabelText("Limit") as HTMLInputElement).value).toBe("5");
   });
 });

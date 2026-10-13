@@ -122,6 +122,16 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Extension chat: the package's token means nothing to the
+		// holder, which would see the proxied call as a peer and refuse
+		// it. The handlers go through the external-chat router instead,
+		// which relays the turn to the holder with this host's own
+		// peer identity — the same path a Slack thread takes.
+		if sub == "/ext-chat" || sub == "/ext-chat/steer" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Attachment-cache purge acts on THIS device's blob store.
 		// Attachments replicate to every peer that has seen them, so the
 		// disk pressure the operator is trying to relieve is local by

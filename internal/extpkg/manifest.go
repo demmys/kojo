@@ -32,6 +32,7 @@ const ManifestFilename = "kojo-package.json"
 // with fewer privileges than it expects.
 var ScopeSet = map[string]string{
 	"chat:send":        "エージェントにメッセージを送る",
+	"chat:session":     "専用セッションでエージェントと会話する (システムプロンプトへの追記を含む)",
 	"chat:read":        "エージェントの会話履歴を読む",
 	"events:subscribe": "イベントストリームを購読する",
 	"agents:read":      "エージェントの一覧と設定を読む",
@@ -157,10 +158,16 @@ type LocaleFile struct {
 
 // MCPServer is an stdio MCP server definition contributed to agents.
 type MCPServer struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
+	Name string `json:"name"`
+	// Command is a bare name resolved through PATH or a path inside
+	// the package. Mutually exclusive with Exec.
+	Command string `json:"command,omitempty"`
+	// Exec maps "GOOS/GOARCH" to a repository-relative executable,
+	// the same shape Service.Exec has, for a package that ships a
+	// compiled server per platform. Mutually exclusive with Command.
+	Exec map[string]string `json:"exec,omitempty"`
+	Args []string          `json:"args,omitempty"`
+	Env  map[string]string `json:"env,omitempty"`
 }
 
 // Service is a long-lived process kojo supervises on the package's
@@ -260,8 +267,19 @@ func (m *Manifest) Validate() error {
 		}
 		names[srv.Name] = true
 		cmd := strings.TrimSpace(srv.Command)
-		if cmd == "" {
-			return fmt.Errorf("contributes.mcpServers[%d]: command is required", i)
+		switch {
+		case cmd == "" && len(srv.Exec) == 0:
+			return fmt.Errorf("contributes.mcpServers[%d]: command or exec is required", i)
+		case cmd != "" && len(srv.Exec) > 0:
+			return fmt.Errorf("contributes.mcpServers[%d]: command and exec are mutually exclusive", i)
+		}
+		for key, rel := range srv.Exec {
+			if !execKeyRe.MatchString(key) {
+				return fmt.Errorf("contributes.mcpServers[%d].exec: invalid platform key %q, want GOOS/GOARCH", i, key)
+			}
+			if err := checkRelPath(rel); err != nil {
+				return fmt.Errorf("contributes.mcpServers[%d].exec[%s]: %w", i, key, err)
+			}
 		}
 		// A command is either a bare name resolved through PATH
 		// ("npx", "python3") or a path inside the package. An

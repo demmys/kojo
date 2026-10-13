@@ -88,6 +88,20 @@ func TestAllowExtensionRoutes(t *testing.T) {
 		{"patch without scope", extPrincipal([]string{"agents:read"}, "ag_1"), "PATCH", "/api/v1/agents/ag_1", false},
 		{"attention", extPrincipal([]string{"chat:send"}, "ag_1"), "POST", "/api/v1/agents/ag_1/attention", true},
 
+		// Keyed chat sessions are their own scope: chat:send reaches
+		// the main conversation only.
+		{"ext-chat", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat", true},
+		{"ext-chat steer", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/steer", true},
+		{"ext-chat with chat:send only", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat", false},
+		{"ext-chat unbound", extPrincipal([]string{"chat:session"}, "ag_2"), "POST", "/api/v1/agents/ag_1/ext-chat", false},
+		{"ext-chat get", extPrincipal([]string{"chat:session"}, "ag_1"), "GET", "/api/v1/agents/ag_1/ext-chat", false},
+		{"peer external-chat stays closed", extPrincipal(append([]string{"chat:session"}, all...), "ag_1"), "POST", "/api/v1/agents/ag_1/external-chat", false},
+
+		// A package may always read its own secrets; the handler
+		// scopes them to the token's package.
+		{"own secrets", extPrincipal(nil), "GET", "/api/v1/extension/secrets", true},
+		{"secrets write", extPrincipal(all, "ag_1"), "PUT", "/api/v1/extension/secrets", false},
+
 		// Nothing destructive or administrative, whatever the scopes.
 		{"delete agent", extPrincipal(all, "ag_1"), "DELETE", "/api/v1/agents/ag_1", false},
 		{"reset agent", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/reset", false},

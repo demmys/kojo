@@ -57,12 +57,12 @@ func isGrokSessionID(s string) bool {
 // key) never reads or writes any stored ID, and the session directory
 // grok creates for it is removed after the turn completes.
 //
-// MCP injection is intentionally unsupported here: the grok CLI loads
-// MCP servers from `~/.grok/config.toml` (global) or a project-scoped
-// `<cwd>/.grok/config.toml`. Per-session inline overrides are not
-// available. When opts.MCPServers is non-empty we log a warning so
-// the caller can see that the configured servers were dropped — use
-// the operator's global grok config to wire MCP for now.
+// MCP: the grok CLI has no per-invocation MCP flag; it loads servers
+// from `~/.grok/config.toml` (global) or a project-scoped
+// `<cwd>/.grok/config.toml`. opts.MCPServers is therefore written into
+// a kojo-managed block of the agent directory's file before every turn
+// (grok_mcp_config.go), and the turn runs with --trust, without which
+// grok does not start project-scoped servers.
 type GrokBackend struct {
 	logger *slog.Logger
 }
@@ -243,7 +243,7 @@ func deleteGrokThreadRefStrict(agentID, sessionKey string) error {
 	return err
 }
 
-func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string) []string {
+func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string, trust bool) []string {
 	args := []string{
 		"--prompt-file", promptPath,
 		"--output-format", "streaming-json",
@@ -257,6 +257,14 @@ func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt 
 		// Skip plan mode + subagent spawning to keep behaviour predictable.
 		"--no-plan",
 		"--no-subagents",
+	}
+	if trust {
+		// Folder trust gates the MCP servers of <dir>/.grok/config.toml.
+		// grok records the grant in ~/.grok/trusted_folders.toml, and it
+		// also covers the directory's project hooks, instructions and
+		// skills. The directory is the agent's own workspace, which the
+		// agent already controls under --always-approve.
+		args = append(args, "--trust")
 	}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
@@ -350,17 +358,16 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		return nil, fmt.Errorf("close prompt file: %w", err)
 	}
 
-	args := buildGrokArgs(promptPath, dir, resumeID, agent, systemPrompt)
-	mcpWarning := ""
-	if len(opts.MCPServers) > 0 {
-		names := make([]string, 0, len(opts.MCPServers))
-		for name := range opts.MCPServers {
-			names = append(names, name)
-		}
-		mcpWarning = fmt.Sprintf("grok backend: dropped %d MCP server(s) — grok only loads MCP from ~/.grok/config.toml or <cwd>/.grok/config.toml. Configure them there to use them with this agent. Dropped: %s",
-			len(opts.MCPServers), strings.Join(names, ", "))
-		b.logger.Warn("grok backend: dropped MCP servers", "agent", agent.ID, "count", len(opts.MCPServers), "names", names)
+	// Runs with no servers too: it is what removes the block of an
+	// extension that was disabled since the last turn. A failure ends
+	// the turn — grok would otherwise start against whatever the file
+	// said last.
+	declared, releaseMCPConfig, err := holdGrokMCPConfig(ctx, dir, opts.MCPServers)
+	if err != nil {
+		os.Remove(promptPath)
+		return nil, fmt.Errorf("write %s: %w", grokMCPConfigPath(dir), err)
 	}
+	args := buildGrokArgs(promptPath, dir, resumeID, agent, systemPrompt, declared > 0)
 
 	cmd := exec.CommandContext(ctx, grokPath, args...)
 	cmd.Env = grokCommandEnv(agent.ID, dir)
@@ -377,11 +384,13 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		os.Remove(promptPath)
+		releaseMCPConfig()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
 		os.Remove(promptPath)
+		releaseMCPConfig()
 		return nil, fmt.Errorf("start grok: %w", err)
 	}
 
@@ -390,28 +399,10 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 	go func() {
 		defer close(ch)
 		defer os.Remove(promptPath)
+		// Every path below has waited for grok by the time it returns.
+		defer releaseMCPConfig()
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
-
-		// Surface MCP-drop warning ahead of the model output so the
-		// caller's transcript records it. Use a Type:"message"
-		// system event — the WebUI's AgentChat switch renders
-		// "message" events into the conversation, whereas plain
-		// "status" events are not displayed.
-		//
-		// CAVEAT: the manager's processChatEvents accumulator does
-		// not currently persist backend-emitted "message" events to
-		// the on-disk transcript (see internal/agent/manager.go
-		// handleTerminal — only "done" and ErrorMessage land in the
-		// store). The warning is therefore live-only: a client that
-		// connects AFTER the turn sees the agent reply but not the
-		// MCP-drop notice. logger.Warn above covers that gap for
-		// operators. Persisting "message" centrally is tracked
-		// separately; doing it here would mean wiring a per-backend
-		// store handle that other backends don't carry today.
-		if mcpWarning != "" {
-			send(ChatEvent{Type: "message", Message: newSystemMessage(mcpWarning)})
-		}
 
 		result := parseGrokStream(stdout, b.logger, send)
 

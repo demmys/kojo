@@ -413,7 +413,7 @@ func TestReadGrokSessionID_DropsPoisonedFile(t *testing.T) {
 }
 
 func TestBuildGrokArgs_DisablesNativeMemory(t *testing.T) {
-	args := buildGrokArgs("/tmp/prompt.txt", "/tmp/agent", "", &Agent{ID: "ag_grok"}, "system")
+	args := buildGrokArgs("/tmp/prompt.txt", "/tmp/agent", "", &Agent{ID: "ag_grok"}, "system", false)
 	if !stringSliceContains(args, "--no-memory") {
 		t.Fatalf("grok args missing --no-memory: %#v", args)
 	}

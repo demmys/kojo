@@ -244,6 +244,13 @@ func shouldIdempotencyApply(r *http.Request) bool {
 	// values and compare via mime.ParseMediaType so case / parameter
 	// noise (e.g. "Text/Event-Stream; charset=utf-8") doesn't slip
 	// past a substring check.
+	// Extension chat answers with an NDJSON stream that runs for the
+	// length of an agent turn. Recording it would replay a half-written
+	// 200 to a retry after a dropped connection — and the turn is not
+	// repeatable anyway.
+	if _, sub, ok := auth.SplitAgentIDPath(r.URL.Path); ok && sub == "/ext-chat" {
+		return false
+	}
 	for _, raw := range r.Header.Values("Accept") {
 		for _, part := range strings.Split(raw, ",") {
 			mt, _, err := mime.ParseMediaType(strings.TrimSpace(part))

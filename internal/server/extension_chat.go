@@ -21,15 +21,15 @@ import (
 // agent's main conversation, which is the wrong shape for a chat
 // bridge: a Discord channel must not share a transcript with the
 // operator's own chat, or with another channel. These routes give a
-// package the same primitive the built-in Slack bot uses — a keyed
-// one-shot turn whose backend session is resumed per key — behind the
-// `chat:session` scope.
+// package a keyed one-shot turn whose backend session is resumed per
+// key — the primitive the Slack bot ran on when it was built into kojo
+// — behind the `chat:session` scope.
 //
 // The session key a package supplies is only a suffix. The server
 // prefixes the agent and package IDs, so a package cannot resume
 // another package's session. The one deliberate exception is the
 // first-party Slack package (extensionSlackPackageID), which owns the
-// namespace the built-in Slack bot used.
+// namespace the built-in Slack bot used before it was removed.
 
 const (
 	extensionChatBodyLimit    = 2 << 20
@@ -47,7 +47,7 @@ const (
 var extensionSessionKeyRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.-]{0,159}$`)
 
 // extensionSlackPackageID is the one package ID that does not get an
-// "ext.<id>" session namespace. The first-party Slack package replaces
+// "ext.<id>" session namespace. The first-party Slack package replaced
 // the built-in Slack bot and inherits its "<agentID>:slack:<suffix>"
 // keys, so the thread sessions, goal bindings and lingering background
 // sessions that already exist keep resolving after the move, and the
@@ -164,7 +164,7 @@ type extensionChatGoalStopRequest struct {
 }
 
 // extensionChatBackend is what these routes need from the external chat
-// router. It is the set of methods the built-in Slack bot calls on it,
+// router. It is the set of methods the built-in Slack bot called on it,
 // so an out-of-process bot gets the same capabilities.
 type extensionChatBackend interface {
 	ChatOneShot(ctx context.Context, agentID, message string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error)

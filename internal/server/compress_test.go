@@ -212,7 +212,6 @@ func TestGzipAPIMiddlewarePassthrough(t *testing.T) {
 		{"peers", "GET", "/api/v1/peers/blobs/x", nil},
 		{"raw", "GET", "/api/v1/files/raw", nil},
 		{"blob", "GET", "/api/v1/blob/global/x.json", nil},
-		{"mcp", "GET", "/api/v1/agents/a/mcp", nil},
 		{"range", "GET", "/api/v1/agents", map[string]string{"Range": "bytes=0-1"}},
 		{"sse-accept", "GET", "/api/v1/agents", map[string]string{"Accept": "text/event-stream"}},
 		{"non-api", "GET", "/index.html", nil},

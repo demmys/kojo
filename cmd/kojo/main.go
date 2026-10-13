@@ -690,7 +690,7 @@ func main() {
 			// owns the agent. Skip rather than half-wire it.
 			//
 			// Also gated on !--peer: daemon-only peers do NOT host
-			// agent runtimes (StartSchedulers / SlackHub / push are
+			// agent runtimes (StartSchedulers / push are
 			// already off), so taking agent_locks under this peer's
 			// DeviceID would deceive the Hub's fencing logic into
 			// thinking this peer owns those agents. Lock acquisition

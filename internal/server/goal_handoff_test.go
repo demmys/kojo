@@ -269,7 +269,7 @@ func TestGoalResumeAuthorizationUsesLockNotCachedSource(t *testing.T) {
 	req := authedRequest(httptest.NewRequest("POST", "/", bytes.NewReader(body)), auth.Principal{Role: auth.RolePeer, PeerID: "holder"})
 	w := httptest.NewRecorder()
 	s.handlePeerGoalResume(w, req)
-	// No Slack bot in this fixture, but authoritative ownership must pass.
+	// No Slack package in this fixture, but authoritative ownership must pass.
 	if w.Code != 409 || !strings.Contains(w.Body.String(), "recovery_unavailable") || strings.Contains(w.Body.String(), "wrong_holder") {
 		t.Fatalf("%d %s", w.Code, w.Body.String())
 	}

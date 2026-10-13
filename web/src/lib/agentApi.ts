@@ -460,17 +460,6 @@ export interface AgentTask {
   etag?: string;
 }
 
-export interface SlackBotStatus {
-  enabled: boolean;
-  threadReplies: boolean;
-  respondDM: boolean;
-  respondMention: boolean;
-  respondThread: boolean;
-  hasAppToken: boolean;
-  hasBotToken: boolean;
-  connected: boolean;
-}
-
 // TruncateMemoryResult is the response of POST /memory/truncate. Counts are
 // best-effort — entries with malformed timestamps or unparseable JSON are
 // kept verbatim and not counted, matching the server-side stance of "never
@@ -494,16 +483,6 @@ export interface TruncateMemoryResult {
   grokSessionFilesRemoved?: number;
   diaryFilesRemoved: number;
   diaryEntriesRemoved: number;
-}
-
-export interface SlackBotSetRequest {
-  enabled: boolean;
-  appToken?: string;
-  botToken?: string;
-  threadReplies?: boolean;
-  respondDM?: boolean;
-  respondMention?: boolean;
-  respondThread?: boolean;
 }
 
 // PostAgentMessageResult is the 202 body of POST /agents/{id}/messages.
@@ -1099,20 +1078,4 @@ export const agentApi = {
       get<{ models: string[] }>(`/api/v1/embedding-models`).then((r) => r.models ?? []),
   },
 
-  slackBot: {
-    get: (agentId: string) =>
-      get<SlackBotStatus>(`/api/v1/agents/${agentId}/slackbot`),
-
-    set: (agentId: string, cfg: SlackBotSetRequest) =>
-      put<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`, cfg),
-
-    delete: (agentId: string) =>
-      del<{ ok: boolean }>(`/api/v1/agents/${agentId}/slackbot`),
-
-    test: (agentId: string, tokens?: { appToken?: string; botToken?: string }) =>
-      post<{ ok: boolean; team: string; botUser: string }>(
-        `/api/v1/agents/${agentId}/slackbot/test`,
-        tokens,
-      ),
-  },
 };

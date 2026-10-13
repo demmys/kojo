@@ -1,5 +1,8 @@
-// Package chathistory provides platform-agnostic chat history storage and
-// formatting for external messaging platforms (Slack, Discord, etc.).
+// Package chathistory provides the platform-agnostic shape of a chat
+// message from an external messaging platform (Slack, Discord, etc.),
+// its formatting for injection into a prompt, and a bounded JSONL
+// reader. Storing the history is the business of the extension package
+// that talks to the platform.
 package chathistory
 
 // HistoryMessage is a platform-agnostic representation of a chat message.

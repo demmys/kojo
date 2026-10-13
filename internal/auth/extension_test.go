@@ -128,11 +128,6 @@ func TestAllowExtensionRoutes(t *testing.T) {
 		{"read creds", extPrincipal(all, "ag_1"), "GET", "/api/v1/credentials", false},
 		{"agent token", extPrincipal(all, "ag_1"), "GET", "/api/v1/agents/ag_1/token", false},
 		{"exec", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/exec", false},
-		// The agent's own MCP transport is its tool surface — every
-		// tool it holds, with no scope in front of it. A package
-		// bound to the agent still does not get to speak through it.
-		{"agent mcp", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/mcp", false},
-		{"agent mcp get", extPrincipal(all, "ag_1"), "GET", "/api/v1/agents/ag_1/mcp", false},
 		{"unknown route", extPrincipal(all, "ag_1"), "GET", "/api/v1/whatever", false},
 	}
 	for _, c := range cases {

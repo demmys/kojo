@@ -19,10 +19,9 @@ import (
 // Three things have no such request to answer on: a background task
 // finishing in a lingering session, a goal that has to be resumed
 // after a restart or a device move, and a device handoff that needs
-// the arrival turn run in the conversation it left. The built-in Slack
-// bot receives all three as Go calls. A package runs in another
-// process, so it holds one long-lived GET open per agent and core
-// writes them to it as NDJSON events.
+// the arrival turn run in the conversation it left. A package runs in
+// another process, so it holds one long-lived GET open per agent and
+// core writes all three to it as NDJSON events.
 //
 // Nothing here may block core for long. Every write into a stream is
 // bounded, and a stream that does not keep up is closed rather than
@@ -400,8 +399,8 @@ func (h *extensionBackgroundRelay) HandleKeyedBackgroundTurn(agentID, sessionKey
 }
 
 // KeyedBackgroundTasksAbandoned tells the package that a lingering
-// session ended with tasks still running. Best effort, like the notice
-// the built-in bot posts.
+// session ended with tasks still running. Best effort: it is only a
+// notice for the package to post.
 func (h *extensionBackgroundRelay) KeyedBackgroundTasksAbandoned(agentID, sessionKey string, pending int, reason string) {
 	st := h.stream
 	suffix, ok := extensionSessionSuffix(agentID, st.key.extensionID, sessionKey)
@@ -427,9 +426,8 @@ func (s *Server) resumeGoalOnExtensionStream(agentID, sessionKey, userID, comman
 }
 
 // extensionHandoffReservation stands in, inside core, for a slot the
-// package reserved in its own conversation queue behind a turn. Core
-// treats it like the built-in bot's reservation; each call becomes a
-// request on the events stream.
+// package reserved in its own conversation queue behind a turn. Each
+// call core makes on it becomes a request on the events stream.
 //
 // It looks the stream up at call time rather than holding one, so a
 // package that reconnected mid-turn still gets the request.
@@ -559,23 +557,8 @@ func (s *Server) handleExtensionChatEvents(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	agentID := r.PathValue("id")
-	// The agent's background handler slot holds one handler and gives it
-	// back to nobody: registering over the built-in bot would silence it
-	// for good once this stream closes. While that bot runs for the
-	// agent it keeps the slot, exactly as it keeps goal resumes.
-	//
-	// That is decided once, when the stream connects. If the bot starts
-	// later it takes the slot (the same precedence); if it stops, the
-	// package gets the slot back on its next reconnect.
 	register := func(st *extensionEventStream) func() {
 		return backend.RegisterKeyedBackgroundHandler(agentID, &extensionBackgroundRelay{stream: st})
-	}
-	if s.slackHub != nil && s.slackHub.IsRunning(agentID) {
-		if s.logger != nil {
-			s.logger.Warn("extension events: built-in Slack bot is running for this agent; background turns stay with it",
-				"agent", agentID, "extension", p.ExtensionID)
-		}
-		register = nil
 	}
 	st := s.extensionEvents.attach(extensionEventKey{extensionID: p.ExtensionID, agentID: agentID}, register)
 	defer st.close()

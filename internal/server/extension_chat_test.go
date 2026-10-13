@@ -37,7 +37,7 @@ func TestExtensionSessionKeyIsNamespaced(t *testing.T) {
 	if got != "ag_1:ext.discord:c1:t2" {
 		t.Fatalf("session key = %q", got)
 	}
-	// A package cannot spell its way into the Slack bot's key space:
+	// A package cannot spell its way into the Slack key space:
 	// whatever suffix it picks sits behind its own "ext.<id>:" tag.
 	if strings.HasPrefix(extensionSessionKey("ag_1", "discord", "slack:C1:1.2"), "ag_1:slack:") {
 		t.Fatal("extension key collides with the slack namespace")

@@ -764,17 +764,18 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	incrementalMemoryEntries := req.SinceMemoryEntryUpdatedAt > 0
 
 	// Serialize settings owned by the receiving peer against their mutation
-	// endpoints. This protects both Hub-owned Slack state and the owner-facing
-	// transfer-warning acknowledgement. Keep the established LockPatch ->
-	// memorySync order used by the settings/persona paths.
-	releaseSlackPatch := s.agents.LockPatch(req.Agent.ID)
+	// endpoints. This protects the owner-facing transfer-warning
+	// acknowledgement and the leftover built-in Slack settings. Keep the
+	// established LockPatch -> memorySync order used by the settings/persona
+	// paths.
+	releasePatch := s.agents.LockPatch(req.Agent.ID)
 	// Preserve the repository-wide LockPatch -> memorySync order used by
 	// memory/persona writes. Hold memorySyncMu across BOTH the DB write and
 	// disk materialize so prepareChat cannot scan stale disk between them and
 	// overwrite the freshly synced rows.
 	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
 	if err := s.applyReceiverOwnedSettingsToSyncRecord(r.Context(), req.Agent, req.OpID, req.TransferSkips); err != nil {
-		releaseSlackPatch()
+		releasePatch()
 		releaseMemSync()
 		writeError(w, http.StatusInternalServerError, "internal",
 			"merge receiver-owned settings: "+err.Error())
@@ -795,7 +796,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		IncrementalMessages:      incrementalMessages,
 		IncrementalMemoryEntries: incrementalMemoryEntries,
 	}); err != nil {
-		releaseSlackPatch()
+		releasePatch()
 		releaseMemSync()
 		if sessionRollback != nil {
 			sessionRollback()
@@ -812,7 +813,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			"sync apply: "+err.Error())
 		return
 	}
-	releaseSlackPatch()
+	releasePatch()
 	if sessionCommit != nil {
 		sessionCommit()
 	}
@@ -987,7 +988,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 
 // applyReceiverOwnedSettingsToSyncRecord merges every settings field owned by
 // the receiving peer, then refreshes record metadata exactly once. Combining
-// transfer acknowledgement and Hub Slack ownership in one pass is important:
+// transfer acknowledgement and the legacy Slack settings in one pass is important:
 // a retry of the same sync must converge on the current row rather than bumping
 // version/ETag once per independently merged field.
 func (s *Server) applyReceiverOwnedSettingsToSyncRecord(ctx context.Context, rec *store.AgentRecord, opID string, skips []agent.SkippedSessionFile) error {
@@ -1009,7 +1010,7 @@ func (s *Server) applyReceiverOwnedSettingsToSyncRecord(ctx context.Context, rec
 	if err := mergeTransferSkipsSettings(rec.Settings, current, opID, skips); err != nil {
 		return err
 	}
-	s.mergeSlackOwnershipSettings(rec.Settings, current)
+	keepLocalLegacySlackSettings(rec.Settings, current)
 	finalizeReceiverOwnedSettingsMetadata(rec, current, originalSettings)
 	return nil
 }
@@ -1047,37 +1048,23 @@ func mergeTransferSkipsSettings(settings map[string]any, current *store.AgentRec
 	return nil
 }
 
-// applySlackOwnershipToSyncRecord makes the wire's AgentRecord consistent
-// with where Slack is actually owned. Holder peers never retain a stale copy
-// of slackBot. The Hub preserves its local value when a runtime returns. Any
-// changed record gets fresh metadata so its ETag still hashes the bytes that
-// SyncAgentFromPeer will persist.
-func (s *Server) applySlackOwnershipToSyncRecord(ctx context.Context, rec *store.AgentRecord) error {
-	if rec == nil {
-		return errors.New("nil agent record")
-	}
-	if rec.Settings == nil {
-		rec.Settings = make(map[string]any)
-	}
-	originalSettings := make(map[string]any, len(rec.Settings))
-	for key, value := range rec.Settings {
-		originalSettings[key] = value
-	}
-	current, err := s.agents.Store().GetAgent(ctx, rec.ID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return err
-	}
-	s.mergeSlackOwnershipSettings(rec.Settings, current)
-	finalizeReceiverOwnedSettingsMetadata(rec, current, originalSettings)
-	return nil
-}
-
-func (s *Server) mergeSlackOwnershipSettings(settings map[string]any, current *store.AgentRecord) {
+// keepLocalLegacySlackSettings keeps the built-in Slack bot's leftover
+// settings from travelling between devices: whatever the sender put on
+// the wire is dropped and the receiver's own value, if it has one, is
+// kept.
+//
+// The settings were always private to the device the bot was configured
+// on, because its tokens are in that device's credential store. That is
+// what lets the Slack migration act without coordinating with peers
+// (see slack_migration.go): exactly one device ever holds them, and it
+// must not lose them to a sync before it has migrated them.
+func keepLocalLegacySlackSettings(settings map[string]any, current *store.AgentRecord) {
 	takeSettingFold(settings, "slackBot")
-	if s.slackHub != nil && current != nil {
-		if desiredValue, desiredHas := findSettingFold(current.Settings, "slackBot"); desiredHas {
-			settings["slackBot"] = desiredValue
-		}
+	if current == nil {
+		return
+	}
+	if value, has := findSettingFold(current.Settings, "slackBot"); has {
+		settings["slackBot"] = value
 	}
 }
 

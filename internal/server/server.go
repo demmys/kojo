@@ -34,7 +34,6 @@ import (
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/selfupdate"
 	"github.com/loppo-llc/kojo/internal/session"
-	"github.com/loppo-llc/kojo/internal/slackbot"
 	"github.com/loppo-llc/kojo/internal/store"
 	"github.com/loppo-llc/kojo/internal/store/secretcrypto"
 	"github.com/loppo-llc/kojo/internal/thumbnail"
@@ -96,7 +95,6 @@ type Server struct {
 	sessions            *session.Manager
 	agents              *agent.Manager
 	groupdms            *agent.GroupDMManager
-	slackHub            *slackbot.Hub
 	externalChat        *externalChatRouter
 	// extensions is the kojo extension-package registry (packages
 	// installed from a git URL). Nil on PeerOnly daemons and when
@@ -229,7 +227,7 @@ type Server struct {
 	// probe self-heal path (PurgeAgentRuntimeStateForRetry)
 	// deletes the local agent_locks row + handoff markers. The
 	// DB is clean, but the in-memory AgentLockGuard.desired set
-	// and runtime side channels (cron / notify / slack) still
+	// and runtime side channels (cron / notify) still
 	// reference the agent — leaving them attached would let the
 	// guard's refresh loop re-Acquire the just-deleted lock
 	// with a stale view. cmd/kojo wires this to
@@ -287,7 +285,7 @@ type Server struct {
 	// when the listener is the public one). Wired from --unsafe.
 	unsafePeer bool
 	// externalChatRelays authorizes short-lived Hub callbacks for files
-	// produced by an agent during a remotely dispatched Slack turn.
+	// produced by an agent during a remotely dispatched external chat turn.
 	externalChatRelays *externalChatRelayRegistry
 	// keyedBg holds remote keyed background continuation state: holder-side
 	// buffered turns awaiting the Hub's attach, Hub-side notify dedup.
@@ -565,37 +563,21 @@ func New(cfg Config) *Server {
 	// without bound on long-running deployments.
 	thumbnail.StartPurger(s.thumbPurgeDone)
 
-	// Initialize Slack bot hub — server owns the lifecycle. PeerOnly
-	// skips this: the daemon-only peer is an inbound-traffic
-	// terminus, not an agent host, and a second SlackHub from the
-	// peer would race the Hub's hub for the same Slack tokens.
+	// External chat turns (group DM one-shots, extension chat) go
+	// through a router that dispatches to whichever device holds the
+	// agent. PeerOnly skips this: the daemon-only peer is an
+	// inbound-traffic terminus, not an agent host.
 	if s.agents != nil && !cfg.PeerOnly {
-		creds := s.agents.Credentials()
 		s.externalChat = newExternalChatRouter(s)
 		if s.groupdms != nil {
 			s.groupdms.SetOneShotRouter(s.externalChat.ChatOneShot)
 			s.groupdms.SetOneShotSteerRouter(s.externalChat.SteerOneShot)
 		}
-		s.slackHub = slackbot.NewHub(
-			s.externalChat, creds,
-			func(id string) string { return agent.AgentDir(id) },
-			logger,
-		)
-		allAgents := append(s.agents.List(), s.agents.ListRemote()...)
-		for _, a := range allAgents {
-			if a.Archived {
-				continue
-			}
-			if a.SlackBot != nil && a.SlackBot.Enabled {
-				s.slackHub.StartBot(a.ID, *a.SlackBot)
-			}
-		}
 	}
 
-	// Extension-package registry. PeerOnly skips it for the same
-	// reason it skips the Slack hub: a daemon-only peer hosts no
-	// agents, so it must not run a second copy of an extension that
-	// the Hub already runs. A failure here is logged and leaves the
+	// Extension-package registry. PeerOnly skips it: a daemon-only
+	// peer hosts no agents, so it must not run a second copy of an
+	// extension that the Hub already runs. A failure here is logged and leaves the
 	// registry nil — the rest of the daemon must still start.
 	if !cfg.PeerOnly {
 		extRoot := filepath.Join(configdir.Path(), "extensions")
@@ -1216,12 +1198,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Manual check-in (fires the periodic check-in prompt on demand)
 	mux.HandleFunc("POST /api/v1/agents/{id}/checkin", s.handleCheckin)
 
-	// Slack bot
-	mux.HandleFunc("GET /api/v1/agents/{id}/slackbot", s.handleGetSlackBot)
-	mux.HandleFunc("PUT /api/v1/agents/{id}/slackbot", s.handleSetSlackBot)
-	mux.HandleFunc("DELETE /api/v1/agents/{id}/slackbot", s.handleDeleteSlackBot)
-	mux.HandleFunc("POST /api/v1/agents/{id}/slackbot/test", s.handleTestSlackBot)
-
 	// API keys
 	mux.HandleFunc("GET /api/v1/api-keys/{provider}", s.handleGetAPIKey)
 	mux.HandleFunc("PUT /api/v1/api-keys/{provider}", s.handleSetAPIKey)
@@ -1230,10 +1206,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	// Embedding model setting
 	mux.HandleFunc("PUT /api/v1/embedding-model", s.handleSetEmbeddingModel)
 	mux.HandleFunc("GET /api/v1/embedding-models", s.handleListEmbeddingModels)
-
-	// MCP tool server (Streamable HTTP transport)
-	mcpHandler := newMCPHandler(s.agents, s.logger)
-	mux.Handle("/api/v1/agents/{id}/mcp", mcpHandler)
 
 	if s.groupdms != nil {
 		mux.HandleFunc("GET /api/v1/groupdms", s.handleListGroupDMs)
@@ -1755,14 +1727,6 @@ func (s *Server) dropPendingAgentSync(ctx context.Context, agentID, opID string)
 	return s.commitPendingAgentSync(ctx, agentID, opID)
 }
 
-// SlackHub returns the wired-in slackbot.Hub or nil when the
-// server was built without one (--peer mode or test fixtures).
-// Used by cmd/kojo/main.go's source-release hook to stop a
-// migrated agent's Slack bot on the source peer.
-func (s *Server) SlackHub() *slackbot.Hub {
-	return s.slackHub
-}
-
 // SetOnAgentSynced installs the post-agent-sync hook that
 // handlePeerAgentSync invokes after a successful row write. The
 // hook MUST be set on the target peer before it can receive a
@@ -1950,9 +1914,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-drainStopped:
 		case <-ctx.Done():
 		}
-	}
-	if s.slackHub != nil {
-		s.slackHub.Stop()
 	}
 	if s.sessions != nil {
 		s.sessions.StopAll()

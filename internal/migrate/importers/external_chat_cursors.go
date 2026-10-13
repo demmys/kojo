@@ -21,7 +21,7 @@ import (
 // per thread into the v1 external_chat_cursors table. Domain key:
 // "external_chat_cursors".
 //
-// v0 layout (from internal/chathistory/store.go):
+// v0 layout (from v0's internal/chathistory/store.go):
 //
 //	<v0>/agents/<agentID>/chat_history/<platform>/<channelID>/_channel.jsonl
 //	<v0>/agents/<agentID>/chat_history/<platform>/<channelID>/<threadID>.jsonl
@@ -304,10 +304,10 @@ func (externalChatCursorsImporter) Run(ctx context.Context, st *store.Store, opt
 	})
 }
 
-// lastPlatformTSFromV0 mirrors chathistory.LastPlatformTS but routes the
-// read through openV0 so the O_RDONLY + root-escape guards apply. We
-// can't reuse internal/chathistory directly because its LoadHistory uses
-// os.Open and would silently follow a hostile symlink past the v0 root.
+// lastPlatformTSFromV0 reimplements v0's chathistory.LastPlatformTS (the
+// v1 chathistory package no longer carries it) and routes the read
+// through openV0 so the O_RDONLY + root-escape guards apply: a plain
+// os.Open would silently follow a hostile symlink past the v0 root.
 //
 // Returns the messageId of the last entry whose id is a real platform
 // timestamp (digits + dots only — see isNumericTSChars). Synthetic ids

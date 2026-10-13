@@ -70,10 +70,6 @@ vi.mock("../../lib/agentApi", async (importOriginal) => {
   };
 });
 
-vi.mock("./SlackBotSettings", () => ({
-  SlackBotSettings: () => null,
-}));
-
 function demoAgent() {
   const now = "2026-06-08T00:00:00Z";
   return {

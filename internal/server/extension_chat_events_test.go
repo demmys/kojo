@@ -361,17 +361,11 @@ func TestExtensionEventsReconnectReplaces(t *testing.T) {
 	}
 }
 
-// Goal recovery reaches the package through the same entry point the
-// built-in bot is resumed from.
+// Goal recovery reaches the package through its event stream.
 func TestExtensionEventsGoalResume(t *testing.T) {
 	s, _ := newExtChatTestServer(t)
 	srv := newExtEventsHTTP(t, s)
 	req := goalRecoveryRequest{AgentID: "ag_1", SessionKey: "ag_1:slack:C1:1.2", UserID: "U123", ThreadID: "019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b", Generation: 4}
-
-	// No bot and no stream: the old answer.
-	if err := s.resumeGoalSurface(context.Background(), req); err == nil || !strings.Contains(err.Error(), "Slack bot unavailable") {
-		t.Fatalf("resume with nothing connected = %v", err)
-	}
 
 	c := connectExtEvents(t, srv, extensionSlackPackageID, "ag_1")
 	if err := s.resumeGoalSurface(context.Background(), req); err != nil {

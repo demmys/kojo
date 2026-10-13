@@ -39,7 +39,10 @@ func ValidateTTS(c *TTSConfig) error {
 	return nil
 }
 
-// SlackBotConfig holds Slack bot configuration for an agent.
+// SlackBotConfig is the configuration of the Slack bot that used to be
+// built into kojo. Slack is now the "slack" extension package and
+// nothing acts on this type; it remains so the settings an older kojo
+// stored can be read and handed to the package (see legacy_slack.go).
 type SlackBotConfig struct {
 	Enabled       bool `json:"enabled"`
 	ThreadReplies bool `json:"threadReplies"` // always reply in-thread (default true)
@@ -457,7 +460,9 @@ type Agent struct {
 	// peer_agent_sync; the holder that builds the prompt always sees it.
 	ResponseLanguage string `json:"responseLanguage,omitempty"`
 
-	// SlackBot holds the Slack Socket Mode bot configuration for this agent.
+	// SlackBot is the built-in Slack bot's configuration as an older
+	// kojo stored it. Read by the migration to the slack extension
+	// package and cleared once that has run; no API sets it.
 	SlackBot *SlackBotConfig `json:"slackBot,omitempty"`
 
 	// TTS holds per-agent text-to-speech configuration. Nil = TTS disabled
@@ -481,7 +486,7 @@ type Agent struct {
 	// /api/v1/agents/{id}?archive=true. Archived agents retain most on-disk
 	// data (agent dir, credentials, notify tokens, messages, memory) but
 	// have all runtime activity stopped: cron, notify polling, one-shot
-	// chats, Slack bot, and inbound chats are refused with ErrAgentArchived.
+	// chats, extension services, and inbound chats are refused with ErrAgentArchived.
 	// Group DM memberships are an exception — they are removed on archive
 	// (2-person groups are dissolved) and NOT restored on Unarchive.
 	// Restored via POST /api/v1/agents/{id}/unarchive.

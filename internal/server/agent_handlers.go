@@ -270,7 +270,7 @@ func (s *Server) readAgentETag(r *http.Request, agentID string) string {
 //
 // Locking contract:
 //
-//   - PATCH-class callers (handleUpdateAgent, PUT /slackbot, POST
+//   - PATCH-class callers (handleUpdateAgent, POST
 //     /privilege) MUST hold s.agents.LockPatch(agentID) across this
 //     check and the subsequent mutation. Otherwise two concurrent
 //     PATCHes carrying the same etag could both observe the same
@@ -809,12 +809,22 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stop Slack bot before resetting to avoid stale file references.
-	if s.slackHub != nil {
-		s.slackHub.StopBot(id)
-	}
-
-	if err := s.agents.ResetData(id); err != nil {
+	// A reset makes the agent forget its conversations, so the
+	// transcripts chat packages keep for it go too: fed back as thread
+	// context they would undo the reset. The agent's package services
+	// are stopped around it — they hold those files and their own
+	// in-memory view of each thread — and come back afterwards. A
+	// failed reset leaves the transcripts alone.
+	var err error
+	s.extSupervisor.WithAgentStopped(id, func() {
+		if err = s.agents.ResetData(id); err != nil || s.extensions == nil {
+			return
+		}
+		if clearErr := s.extensions.ClearAgentChatHistory(id); clearErr != nil {
+			s.logger.Warn("reset: clearing extension chat history failed", "agent", id, "err", clearErr)
+		}
+	})
+	if err != nil {
 		if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else if errors.Is(err, agent.ErrAgentBusy) {
@@ -823,13 +833,6 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 		}
 		return
-	}
-
-	// Restart Slack bot if it was enabled.
-	if s.slackHub != nil {
-		if a, ok := s.agents.Get(id); ok && a.SlackBot != nil && a.SlackBot.Enabled {
-			s.slackHub.StartBot(id, *a.SlackBot)
-		}
 	}
 
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
@@ -1021,17 +1024,8 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Lifecycle mutation runs first so the agent record reaches its
-	// final state (archived / deleted) before we try to teardown the
-	// Slack bot. Reversing the order would race a concurrent PUT
-	// /slackbot: that handler also takes Manager.LockPatch, so it
-	// serializes with our Archive/Delete, but if we StopBot here the
-	// PUT would land between StopBot and Archive, see a.Archived=
-	// false (Archive hasn't run yet), reconfigure the bot, and leave
-	// it running for the about-to-be-archived agent. By archiving
-	// first, any subsequent PUT inside the same lock observes
-	// a.Archived=true and Reconfigure's `!a.Archived` guard skips
-	// StartBot; our StopBot below then catches anything the PUT had
-	// already started.
+	// final state (archived / deleted) before its extension services
+	// are reconciled below: the reconcile reads that state.
 	var opErr error
 	if archive {
 		opErr = s.agents.Archive(id)
@@ -1048,9 +1042,6 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if s.slackHub != nil {
-		s.slackHub.StopBot(id)
-	}
 	s.reconcileLocalAgentLifecycle(r.Context(), id)
 	if s.extensions != nil {
 		// Drop the deleted agent's extension bindings. Archive keeps
@@ -1064,6 +1055,14 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		// Either way the agent is gone from service: reconcile stops
 		// any per-agent extension process that was running for it.
 		s.reconcileExtensionServices()
+		// With the services stopped, a deleted agent's package data
+		// (chat transcripts above all) goes with it. ForgetAgent
+		// already removed its secrets.
+		if !archive {
+			if err := s.extensions.RemoveAgentData(id); err != nil {
+				s.logger.Warn("remove extension data failed", "agent", id, "err", err)
+			}
+		}
 	}
 	// Echo the new ETag for archive=true (the row still exists with
 	// a bumped etag). For full delete the row is gone — no useful
@@ -1075,8 +1074,8 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleUnarchiveAgent restores an archived agent. Re-arms cron, notify
-// poller, and (if previously enabled) the Slack bot.
+// handleUnarchiveAgent restores an archived agent. Re-arms cron, the
+// notify poller and the agent's extension services.
 func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if p := auth.FromContext(r.Context()); !p.CanDeleteOrReset(id) {
@@ -1115,35 +1114,6 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reconcileLocalAgentLifecycle(r.Context(), id)
-	// Re-arm Slack bot if it was configured. Manager.Unarchive can't do
-	// this — slackHub lives on the server, not the manager. The
-	// `!a.Archived` re-check guards against a concurrent
-	// Archive/Delete that landed between Unarchive returning and our
-	// Get: without it we'd start the bot for a freshly-re-archived
-	// agent. Re-Archive runs under Manager.LockPatch so the record
-	// we read here is the post-Unarchive (or post-Re-archive) state,
-	// not a torn snapshot.
-	if s.slackHub != nil {
-		// §3.7 race: a device-switch could have begun after
-		// Manager.Unarchive released its reset guard but before
-		// this StartBot. AcquireMutation fails-closed when
-		// switching is set; we ALSO re-Get under the mutation
-		// hold so a stale snapshot (Get before AcquireMutation)
-		// doesn't carry SlackBot config that's since been
-		// cleared by a parallel release. The previous order
-		// (Get → Acquire → Start) let the agent be evicted
-		// between Get and Acquire on the source-release path,
-		// then started a bot on a released agent.
-		if rel, mutErr := s.agents.AcquireMutation(id); mutErr == nil {
-			if a, ok := s.agents.Get(id); ok && !a.Archived && a.SlackBot != nil && a.SlackBot.Enabled {
-				s.slackHub.StartBot(id, *a.SlackBot)
-			}
-			rel()
-		} else {
-			s.logger.Info("unarchive: skipped SlackBot StartBot — agent mutation refused",
-				"agent", id, "reason", mutErr.Error())
-		}
-	}
 	// Per-agent extension services are gated on the agent being
 	// active, so the restored agent's processes come back here.
 	s.reconcileExtensionServices()

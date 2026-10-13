@@ -69,7 +69,7 @@ func (s *Server) externalChatHubAddress(ctx context.Context, r *http.Request, hi
 		// migrated agent. Only the peer stamped into the agent lock by the
 		// handoff protocol may supply the Hub MCP endpoint; otherwise an
 		// unrelated paired peer could make the runtime send its agent token
-		// (and Slack MCP calls) to an attacker-controlled registry URL.
+		// and relayed files to an attacker-controlled registry URL.
 		lock, err := s.agents.Store().GetAgentLock(ctx, r.PathValue("id"))
 		if err != nil {
 			return "", "", fmt.Errorf("resolve agent lock for Hub: %w", err)

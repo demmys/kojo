@@ -85,7 +85,7 @@ func (s *Server) queueGoalHandoff(w http.ResponseWriter, r *http.Request, id, ta
 		}
 		originAddr, err := peer.NormalizeAddress(originRec.URL)
 		if err != nil || !s.targetSupportsGoalHandoff(r.Context(), originAddr, id) {
-			writeError(w, 409, "goal_handoff_unsupported", "The original Slack Hub must also support safe Goal handoff")
+			writeError(w, 409, "goal_handoff_unsupported", "The device running the Slack extension must also support safe Goal handoff")
 			return
 		}
 	}

@@ -290,16 +290,12 @@ func (s *Server) resumeGoalSurface(ctx context.Context, req goalRecoveryRequest)
 		return s.agents.WakeThread(req.AgentID, req.SessionKey, command)
 	}
 	if strings.HasPrefix(req.SessionKey, req.AgentID+":slack:") {
-		// The built-in bot takes the resume while it runs for the agent.
-		// Otherwise the namespace belongs to the Slack package, which
-		// receives it on its events stream.
-		if s.slackHub != nil && s.slackHub.ResumeGoal(req.AgentID, req.SessionKey+"\n"+req.UserID+"\n"+command) {
-			return nil
-		}
+		// The namespace belongs to the Slack package, which receives
+		// the resume on its events stream.
 		if s.resumeGoalOnExtensionStream(req.AgentID, req.SessionKey, req.UserID, command) {
 			return nil
 		}
-		return errors.New("Slack bot unavailable")
+		return errors.New("Slack extension is not connected for this agent")
 	}
 	if req.SessionKey != "" {
 		return errors.New("unsupported goal response surface")

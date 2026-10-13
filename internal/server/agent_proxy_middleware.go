@@ -115,13 +115,6 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Slack Socket configuration and credentials belong to the
-		// canonical Hub even while the agent runtime is remote.
-		if sub == "/slackbot" || sub == "/slackbot/test" || sub == "/mcp" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		// Extension chat: the package's token means nothing to the
 		// holder, which would see the proxied call as a peer and refuse
 		// it. The handlers go through the external-chat router instead,

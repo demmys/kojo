@@ -923,7 +923,7 @@ func (m *Manager) IsSwitching(agentID string) bool {
 //
 // Common entry guard for every agent-state mutation surface
 // that does NOT route through prepareChat (persona / settings
-// / slackbot / tasks / credentials / avatar / slack tokens).
+// / tasks / credentials / avatar).
 // The release callback is idempotent and safe to defer.
 //
 // Threadsafe; nil-safe for hand-rolled test fixtures.

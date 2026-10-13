@@ -64,20 +64,20 @@ func TestBuildMCPServersIncludesExtensionStdio(t *testing.T) {
 		}
 		return []ExternalMCPServer{
 			{Name: "demo_api", Command: "/pkg/bin/srv", Args: []string{"--serve"}, Env: map[string]string{"K": "V"}},
-			{Name: "", Command: "/pkg/bin/x"},   // dropped: no name
-			{Name: "demo_bad"},                  // dropped: no command
-			{Name: "slack", Command: "/pkg/hj"}, // dropped: name already taken
+			{Name: "", Command: "/pkg/bin/x"},      // dropped: no name
+			{Name: "demo_bad"},                     // dropped: no command
+			{Name: "demo_api", Command: "/pkg/hj"}, // dropped: name already taken
 		}
 	})
 
 	// An empty apiBase still yields nothing: extension servers are
 	// handed KOJO_API_BASE, so they cannot run before the listener is
 	// up either.
-	if got := BuildMCPServers("ag_1", "", true); got != nil {
+	if got := BuildMCPServers("ag_1", ""); got != nil {
 		t.Fatalf("empty apiBase = %v", got)
 	}
 
-	got := BuildMCPServers("ag_1", "http://127.0.0.1:8080", true)
+	got := BuildMCPServers("ag_1", "http://127.0.0.1:8080")
 	entry, ok := got["demo_api"]
 	if !ok {
 		t.Fatalf("extension server missing: %v", got)
@@ -91,14 +91,11 @@ func TestBuildMCPServersIncludesExtensionStdio(t *testing.T) {
 	if _, bad := got["demo_bad"]; bad {
 		t.Fatal("a server with no command was accepted")
 	}
-	if got["slack"].isStdio() {
-		t.Fatal("an extension hijacked the built-in slack server name")
-	}
-	if len(got) != 2 {
+	if len(got) != 1 {
 		t.Fatalf("servers = %v", got)
 	}
 	// Another agent gets nothing.
-	if other := BuildMCPServers("ag_2", "http://127.0.0.1:8080", false); len(other) != 0 {
+	if other := BuildMCPServers("ag_2", "http://127.0.0.1:8080"); len(other) != 0 {
 		t.Fatalf("unbound agent got %v", other)
 	}
 }
@@ -120,11 +117,10 @@ func makeSkill(t *testing.T, name string, files map[string]string) ExtensionSkil
 	return ExtensionSkill{ExtensionID: "demo", Name: name, Dir: dir}
 }
 
-// The first-party Slack package names its server "slack", the name the
-// built-in bot's entry uses. The built-in entry wins while it exists;
-// without it the package's server takes the name. Either way the
-// outcome is fixed by the inputs, not by map order.
-func TestBuildMCPServersSlackNameCollision(t *testing.T) {
+// The Slack package names its server "slack". It gets that name, and
+// when two contributions claim one name the outcome is fixed by the
+// lookup's order, not by map order.
+func TestBuildMCPServersSlackName(t *testing.T) {
 	t.Cleanup(func() { SetExternalMCPLookup(nil) })
 	SetExternalMCPLookup(func(agentID string) []ExternalMCPServer {
 		return []ExternalMCPServer{
@@ -134,20 +130,12 @@ func TestBuildMCPServersSlackNameCollision(t *testing.T) {
 		}
 	})
 	for i := 0; i < 20; i++ {
-		withBot := BuildMCPServers("ag_1", "http://127.0.0.1:8080", true)
-		if e := withBot["slack"]; e.Type != "http" || e.Command != "" || e.URL != "http://127.0.0.1:8080/api/v1/agents/ag_1/mcp" {
-			t.Fatalf("built-in slack entry was replaced: %+v", e)
-		}
-		if _, ok := withBot["slack_extra"]; !ok || len(withBot) != 2 {
-			t.Fatalf("with the built-in bot = %+v", withBot)
-		}
-
-		withoutBot := BuildMCPServers("ag_1", "http://127.0.0.1:8080", false)
-		if e := withoutBot["slack"]; e.Command != "/pkg/slack/bin/mcp" || e.URL != "" {
+		got := BuildMCPServers("ag_1", "http://127.0.0.1:8080")
+		if e := got["slack"]; e.Command != "/pkg/slack/bin/mcp" || e.URL != "" {
 			t.Fatalf("contributed slack entry = %+v", e)
 		}
-		if len(withoutBot) != 2 {
-			t.Fatalf("without the built-in bot = %+v", withoutBot)
+		if len(got) != 2 {
+			t.Fatalf("servers = %+v", got)
 		}
 	}
 }

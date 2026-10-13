@@ -27,8 +27,8 @@ import (
 // A few fields are owned by this hub regardless of placement and are
 // overlaid on the holder's view:
 //   - placement: holderPeer / holderPeerName / holderPeerStatus
-//   - hub-only management routes (never proxied): slackBot,
-//     privileged, ownerDeputy, lastTransferSkips(+Generation)
+//   - hub-only management routes (never proxied): privileged,
+//     ownerDeputy, lastTransferSkips(+Generation)
 //   - hub-local-safe edits made while the holder was offline, projected
 //     with the same 3-way merge the next sync ingest applies
 //     (Manager.ProjectHubLocalOverrides)
@@ -44,7 +44,7 @@ const holderAgentBodyLimit = 8 << 20
 // the merged (hub-overlaid) agent instead of the holder's raw body.
 var hubOwnedAgentKeys = []string{
 	"holderPeer", "holderPeerName", "holderPeerStatus",
-	"slackBot", "privileged", "ownerDeputy",
+	"privileged", "ownerDeputy",
 	"lastTransferSkips", "lastTransferSkipsGeneration",
 	// hub-local-safe fields (pending offline overrides)
 	"name", "publicProfile", "publicProfileOverride", "effort", "autoEffort",
@@ -115,7 +115,6 @@ func (s *Server) mergeHolderAgent(ctx context.Context, hub, holder *agent.Agent)
 	m.HolderPeer = hub.HolderPeer
 	m.HolderPeerName = hub.HolderPeerName
 	m.HolderPeerStatus = hub.HolderPeerStatus
-	m.SlackBot = hub.SlackBot
 	m.Privileged = hub.Privileged
 	m.OwnerDeputy = hub.OwnerDeputy
 	m.LastTransferSkips = hub.LastTransferSkips

@@ -1140,45 +1140,6 @@ const messages = {
     en: "If that still fails, assign the Slack package to this agent in the Extensions settings and enter the tokens again.",
   },
 
-  // ── SlackBotSettings ──
-  "slack.connectedResult": {
-    ja: "接続した: team={team}, bot={bot}",
-    en: "Connected: team={team}, bot={bot}",
-  },
-  "slack.removeConfirm": {
-    ja: "Slack ボット設定を削除する?",
-    en: "Remove Slack bot configuration?",
-  },
-  "slack.connected": { ja: "接続済み", en: "Connected" },
-  "slack.enableAria": { ja: "Slack ボットを有効化", en: "Enable Slack bot" },
-  "slack.appToken": {
-    ja: "App-Level Token (xapp-...)",
-    en: "App-Level Token (xapp-...)",
-  },
-  "slack.botToken": { ja: "Bot Token (xoxb-...)", en: "Bot Token (xoxb-...)" },
-  "slack.configured": { ja: "設定済み", en: "configured" },
-  "slack.threadReplies": {
-    ja: "常にスレッドで返信",
-    en: "Always reply in thread",
-  },
-  "slack.respondTo": { ja: "応答する対象", en: "Respond to" },
-  "slack.respondDM": { ja: "ダイレクトメッセージ", en: "Direct messages" },
-  "slack.respondMention": {
-    ja: "チャンネル内の @メンション",
-    en: "@mentions in channels",
-  },
-  "slack.respondThread": {
-    ja: "スレッドの続き (メンションなしで自動返信)",
-    en: "Thread follow-ups (auto-reply without mention)",
-  },
-  "slack.testing": { ja: "テスト中...", en: "Testing..." },
-  "slack.testConnection": { ja: "接続テスト", en: "Test Connection" },
-  "slack.removeBot": { ja: "Slack ボットを削除", en: "Remove Slack Bot" },
-  "slack.setupHelp": {
-    ja: "Socket Mode を有効にした Slack App を作る。必要なスコープ: chat:write, app_mentions:read, im:history。購読するイベント: message.im, app_mention。",
-    en: "Create a Slack App with Socket Mode enabled. Required scopes: chat:write, app_mentions:read, im:history. Subscribe to events: message.im, app_mention.",
-  },
-
   // ── MessageAttachments ──
   "attach.imageUnavailable": {
     ja: "画像を取得できない",

@@ -107,3 +107,32 @@ func TestClearLegacySlackBotRefusedDuringDeviceSwitch(t *testing.T) {
 		t.Fatal("settings cleared while the agent was switching devices")
 	}
 }
+
+// A fork starts without the source's leftover Slack settings: it has
+// none of the source's tokens, so the migration could only ever turn
+// them into a dead binding.
+func TestForkDoesNotCopyLegacySlackBot(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m, err := NewManager(slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	src, err := m.Create(AgentConfig{Name: "source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setLegacySlackBot(t, m, src.ID, SlackBotConfig{Enabled: true})
+
+	fork, err := m.Fork(src.ID, ForkOptions{Name: "fork"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fork.SlackBot != nil {
+		t.Fatalf("fork carries Slack settings: %+v", fork.SlackBot)
+	}
+	bots := m.LegacySlackBots()
+	if len(bots) != 1 || bots[0].AgentID != src.ID {
+		t.Fatalf("legacy bots = %+v, want only the source", bots)
+	}
+}

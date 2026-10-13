@@ -174,6 +174,23 @@ const mcpManifest = `{
   }
 }`
 
+// A server named after its package keeps the bare package ID; every
+// other name stays behind the package prefix.
+func TestQualifyMCPName(t *testing.T) {
+	for _, c := range []struct{ ext, name, want string }{
+		{"slack", "slack", "slack"},
+		{"slack", "files", "slack_files"},
+		{"demo", "slack", "demo_slack"},
+		{"demo", "api", "demo_api"},
+		{"demo", "Demo", "demo_Demo"},
+		{"demo", "demo_demo", "demo_demo_demo"},
+	} {
+		if got := qualifyMCPName(c.ext, c.name); got != c.want {
+			t.Errorf("qualifyMCPName(%q, %q) = %q, want %q", c.ext, c.name, got, c.want)
+		}
+	}
+}
+
 func TestMCPServersForAgent(t *testing.T) {
 	m := newManager(t)
 	m.SetAPIBase("http://127.0.0.1:8081")

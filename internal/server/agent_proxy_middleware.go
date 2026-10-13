@@ -127,7 +127,9 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		// it. The handlers go through the external-chat router instead,
 		// which relays the turn to the holder with this host's own
 		// peer identity — the same path a Slack thread takes.
-		if sub == "/ext-chat" || sub == "/ext-chat/steer" {
+		// That holds for every ext-chat route: the control routes act on
+		// sessions and streams this host keeps, not the holder.
+		if sub == "/ext-chat" || strings.HasPrefix(sub, "/ext-chat/") {
 			next.ServeHTTP(w, r)
 			return
 		}

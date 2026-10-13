@@ -105,15 +105,20 @@ type Server struct {
 	extensions *extpkg.Manager
 	// extSupervisor owns the extension service processes. Nil until
 	// StartExtensions runs (i.e. until the API listener is bound).
-	extSupervisor   *extpkg.Supervisor
-	extensionChats  extensionChatSessions
-	files           *filebrowser.Browser
-	git             *gitpkg.Manager
-	notify          *notify.Manager
-	blob            *blob.Store    // native blob API (Phase 3); nil disables /api/v1/blob/...
-	blobMaxPutBytes int64          // per-PUT body cap; 0 = defaultBlobMaxPutBytes
-	events          *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
-	peerID          *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
+	extSupervisor  *extpkg.Supervisor
+	extensionChats extensionChatSessions
+	// extensionEvents holds the connected ext-chat/events streams.
+	extensionEvents extensionEventHub
+	// extensionChatBackend replaces externalChat behind the extension
+	// chat routes. Tests set it; it is nil in a running daemon.
+	extensionChatBackend extensionChatBackend
+	files                *filebrowser.Browser
+	git                  *gitpkg.Manager
+	notify               *notify.Manager
+	blob                 *blob.Store    // native blob API (Phase 3); nil disables /api/v1/blob/...
+	blobMaxPutBytes      int64          // per-PUT body cap; 0 = defaultBlobMaxPutBytes
+	events               *eventbus.Bus  // invalidation broadcast (Phase 4); nil disables /api/v1/events
+	peerID               *peer.Identity // local peer identity (Phase G); nil disables /api/v1/peers
 	// peerOnly mirrors Config.PeerOnly so read handlers can tell a
 	// Hub (false) from a daemon peer (true) — e.g. to stamp the
 	// role field on GET /api/v1/peers rows.
@@ -832,6 +837,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("GET /api/v1/extension/secrets", s.handleExtensionSecrets)
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat", s.handleExtensionChat)
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/steer", s.handleExtensionChatSteer)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/cancel", s.handleExtensionChatCancel)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/question", s.handleExtensionChatQuestion)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/goal-stop", s.handleExtensionChatGoalStop)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/background-stop", s.handleExtensionChatBackgroundStop)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/background-cancel", s.handleExtensionChatBackgroundCancel)
+	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/handoff-ack", s.handleExtensionChatHandoffAck)
+	mux.HandleFunc("GET /api/v1/agents/{id}/ext-chat/events", s.handleExtensionChatEvents)
 	// UI languages contributed by extensions. Separate from
 	// /api/v1/extensions because they are a property of the browser
 	// rather than of any one package: the frontend asks "what

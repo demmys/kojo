@@ -105,10 +105,15 @@ func BuildMCPServers(agentID, apiBase string, hasSlackBot bool) map[string]mcpSe
 		servers["slack"] = entry
 	}
 
-	// Extension-contributed stdio servers. The names are already
-	// namespaced by package ID (extpkg.qualifyMCPName), so a package
-	// cannot shadow "slack" or another package's server; the explicit
-	// skip below keeps that true even if the namespacing ever changes.
+	// Extension-contributed stdio servers. The names are namespaced by
+	// package ID (extpkg.qualifyMCPName), with one exception: a server
+	// named after its own package keeps the bare ID. So the first-party
+	// Slack package's server is called "slack" too, the same name the
+	// agent already knows its Slack tools by. The skip below settles
+	// that collision: while the built-in entry exists it wins, and the
+	// contributed one takes the name only for an agent without a
+	// built-in bot. Between two contributions the first in the lookup's
+	// (sorted) order wins, so the result does not vary run to run.
 	if externalMCPLookup != nil {
 		for _, srv := range externalMCPLookup(agentID) {
 			if srv.Name == "" || srv.Command == "" {

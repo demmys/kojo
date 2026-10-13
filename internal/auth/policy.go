@@ -698,12 +698,19 @@ func allowExtension(p Principal, method, path string) bool {
 			return p.HasScope("chat:read")
 		case "/files", "/files/raw", "/files/view", "/files/thumb":
 			return p.HasScope("files:agent")
+		case "/ext-chat/events":
+			// The other half of a keyed session: what core sends the
+			// package without being asked.
+			return p.HasScope("chat:session")
 		}
 	case http.MethodPost:
 		switch sub {
 		case "/messages", "/steer", "/answer":
 			return p.HasScope("chat:send")
-		case "/ext-chat", "/ext-chat/steer":
+		case "/ext-chat", "/ext-chat/steer", "/ext-chat/cancel",
+			"/ext-chat/question", "/ext-chat/goal-stop",
+			"/ext-chat/background-stop", "/ext-chat/background-cancel",
+			"/ext-chat/handoff-ack":
 			return p.HasScope("chat:session")
 		case "/attention":
 			// Paging the operator is a notification, not a config

@@ -120,6 +120,38 @@ func makeSkill(t *testing.T, name string, files map[string]string) ExtensionSkil
 	return ExtensionSkill{ExtensionID: "demo", Name: name, Dir: dir}
 }
 
+// The first-party Slack package names its server "slack", the name the
+// built-in bot's entry uses. The built-in entry wins while it exists;
+// without it the package's server takes the name. Either way the
+// outcome is fixed by the inputs, not by map order.
+func TestBuildMCPServersSlackNameCollision(t *testing.T) {
+	t.Cleanup(func() { SetExternalMCPLookup(nil) })
+	SetExternalMCPLookup(func(agentID string) []ExternalMCPServer {
+		return []ExternalMCPServer{
+			{Name: "slack", Command: "/pkg/slack/bin/mcp"},
+			{Name: "slack", Command: "/pkg/other/bin/mcp"}, // a later duplicate never wins
+			{Name: "slack_extra", Command: "/pkg/slack/bin/extra"},
+		}
+	})
+	for i := 0; i < 20; i++ {
+		withBot := BuildMCPServers("ag_1", "http://127.0.0.1:8080", true)
+		if e := withBot["slack"]; e.Type != "http" || e.Command != "" || e.URL != "http://127.0.0.1:8080/api/v1/agents/ag_1/mcp" {
+			t.Fatalf("built-in slack entry was replaced: %+v", e)
+		}
+		if _, ok := withBot["slack_extra"]; !ok || len(withBot) != 2 {
+			t.Fatalf("with the built-in bot = %+v", withBot)
+		}
+
+		withoutBot := BuildMCPServers("ag_1", "http://127.0.0.1:8080", false)
+		if e := withoutBot["slack"]; e.Command != "/pkg/slack/bin/mcp" || e.URL != "" {
+			t.Fatalf("contributed slack entry = %+v", e)
+		}
+		if len(withoutBot) != 2 {
+			t.Fatalf("without the built-in bot = %+v", withoutBot)
+		}
+	}
+}
+
 func TestSyncExtensionSkillsInstallsAndSweeps(t *testing.T) {
 	skills := t.TempDir()
 	sk := makeSkill(t, "demo", map[string]string{

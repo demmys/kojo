@@ -36,6 +36,12 @@ type MCPContribution struct {
 // validation, so the joined name stays safe to use as a Codex config
 // key and a JSON object key.
 func qualifyMCPName(extensionID, name string) string {
+	// A server named after its package is the package's own server:
+	// "slack" rather than "slack_slack". This is the one way a package
+	// can produce an unprefixed name, and it can only produce its own ID.
+	if name == extensionID {
+		return extensionID
+	}
 	return extensionID + "_" + name
 }
 

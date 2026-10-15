@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 	"io"
 	"log/slog"
 	"os"
@@ -121,11 +122,13 @@ type Supervisor struct {
 	recMu sync.Mutex
 
 	mu sync.Mutex
-	// agentActive, when set, reports whether a per-agent service
-	// should run for this agent. The registry tracks bindings, not
-	// agent lifecycle, so archiving an agent would otherwise leave its
-	// service running against a row nobody can reach.
-	agentActive func(agentID string) bool
+	// agentActive, when set, reports whether a package's per-agent
+	// service should run for this agent. The registry tracks bindings,
+	// not agent lifecycle, so archiving an agent would otherwise leave
+	// its service running against a row nobody can reach. The package
+	// ID is part of the question because the answer can differ by
+	// package for an agent whose runtime is on another device.
+	agentActive func(extensionID, agentID string) bool
 	procs       map[string]*serviceProc
 	// stopping holds processes that have been cancelled but have not
 	// finished exiting. They are out of procs already, so Shutdown
@@ -137,7 +140,7 @@ type Supervisor struct {
 
 // SetAgentFilter installs the predicate that decides whether a
 // per-agent service may run. Nil means "every bound agent".
-func (s *Supervisor) SetAgentFilter(fn func(agentID string) bool) {
+func (s *Supervisor) SetAgentFilter(fn func(extensionID, agentID string) bool) {
 	if s == nil {
 		return
 	}
@@ -148,11 +151,11 @@ func (s *Supervisor) SetAgentFilter(fn func(agentID string) bool) {
 
 // agentAllowed applies the filter. A nil supervisor or nil filter
 // admits everything.
-func (s *Supervisor) agentAllowed(agentID string) bool {
+func (s *Supervisor) agentAllowed(extensionID, agentID string) bool {
 	s.mu.Lock()
 	fn := s.agentActive
 	s.mu.Unlock()
-	return fn == nil || fn(agentID)
+	return fn == nil || fn(extensionID, agentID)
 }
 
 // NewSupervisor builds a supervisor for the registry. Supervision stays
@@ -225,6 +228,40 @@ func (s *Supervisor) Reconcile() {
 		}
 		s.startLocked(key, spec)
 	}
+}
+
+// WithAgentStopped runs fn while no per-agent service is running for
+// agentID, then starts whatever the registry still calls for. It is for
+// an operation that rewrites state a running service holds open or has
+// in memory — an agent reset — where a plain Reconcile would leave the
+// process untouched because its launch spec did not change.
+//
+// fn always runs, including on a nil or idle supervisor. Reconciles
+// are held off for its duration, so it must not call Reconcile itself.
+func (s *Supervisor) WithAgentStopped(agentID string, fn func()) {
+	if s == nil {
+		fn()
+		return
+	}
+	s.recMu.Lock()
+	s.mu.Lock()
+	var stopped []*serviceProc
+	for key, proc := range s.procs {
+		if agentID != "" && proc.spec.AgentID == agentID {
+			s.stopLocked(key, proc)
+			stopped = append(stopped, proc)
+		}
+	}
+	s.mu.Unlock()
+	for _, proc := range stopped {
+		<-proc.done
+		s.mu.Lock()
+		delete(s.stopping, proc)
+		s.mu.Unlock()
+	}
+	fn()
+	s.recMu.Unlock()
+	s.Reconcile()
 }
 
 // Shutdown stops every supervised process and blocks until they exit.
@@ -538,7 +575,7 @@ func (s *Supervisor) desired() map[string]serviceSpec {
 			out[spec.key()] = spec
 		case ScopePerAgent:
 			for _, agentID := range enabledAgents(row) {
-				if !s.agentAllowed(agentID) {
+				if !s.agentAllowed(row.ID, agentID) {
 					continue
 				}
 				spec := s.spec(row, svc, bin, token, agentID)
@@ -598,6 +635,18 @@ func (s *Supervisor) spec(row Installed, svc *Service, bin, token, agentID strin
 		s.logger.Warn("write extension token file failed",
 			"extension", row.ID, "path", tokenFile, "error", err)
 	}
+	// Secrets ride in the environment for the same reason the token
+	// does. Keys are sorted by json.Marshal, so an unchanged set
+	// produces an unchanged string and Reconcile leaves the process
+	// alone; a changed secret restarts it.
+	secretsJSON := "{}"
+	if secrets, err := s.mgr.Secrets(row.ID, agentID); err != nil {
+		s.logger.Warn("read extension secrets failed", "extension", row.ID, "error", err)
+	} else if len(secrets) > 0 {
+		if data, err := json.Marshal(secrets); err == nil {
+			secretsJSON = string(data)
+		}
+	}
 	env := baseServiceEnv()
 	env = append(env,
 		"KOJO_API_BASE="+s.mgr.APIBase(),
@@ -608,6 +657,10 @@ func (s *Supervisor) spec(row Installed, svc *Service, bin, token, agentID strin
 		"KOJO_EXT_DATA_DIR="+dataDir,
 		"KOJO_EXT_DIR="+s.mgr.Dir(row.ID),
 		"KOJO_EXT_CONFIG="+cfgJSON,
+		"KOJO_EXT_SECRETS="+secretsJSON,
+		// Where a package drops files it wants to hand an agent as
+		// chat attachments; the API accepts paths under here only.
+		"KOJO_UPLOAD_DIR="+uploadpath.Dir(),
 	)
 	if agentID != "" {
 		env = append(env, "KOJO_EXT_AGENT_ID="+agentID)

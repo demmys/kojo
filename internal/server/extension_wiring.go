@@ -77,18 +77,38 @@ func (s *Server) StartExtensions(apiBase string, resolver *auth.Resolver) {
 	})
 
 	s.extSupervisor = extpkg.NewSupervisor(mgr, s.logger)
-	// An archived agent is not reachable, so its per-agent service has
-	// nothing to serve. The registry keeps the binding (unarchive
-	// restores the agent's config), the supervisor just declines to
-	// run it.
 	if s.agents != nil {
-		agents := s.agents
-		s.extSupervisor.SetAgentFilter(func(agentID string) bool {
-			a, ok := agents.Get(agentID)
-			return ok && !a.Archived
-		})
+		s.extSupervisor.SetAgentFilter(s.extensionServiceWanted)
 	}
 	s.extSupervisor.Reconcile()
+}
+
+// extensionServiceWanted decides whether a package's per-agent service
+// runs on this device for an agent it is bound to.
+//
+// An archived agent is not reachable, so its service has nothing to
+// serve. The registry keeps the binding (unarchive restores the agent's
+// config); the supervisor just declines to run it.
+//
+// An agent whose runtime is on another device normally gets no service
+// here either: the holder runs its own copy if the Owner bound the
+// package there, and two copies would both answer. The Slack package is
+// the exception. One Slack app accepts one Socket Mode connection, so
+// it runs in one place — the device where the Owner configured it — and
+// stays there when the agent moves; its turns are relayed to whichever
+// device holds the runtime (see extensionChatRouter). That is how the
+// built-in bot behaved, and it is what keeps a thread alive across a
+// device switch. The price is the same as before: the Slack tokens must
+// be configured on one device only.
+func (s *Server) extensionServiceWanted(extensionID, agentID string) bool {
+	if a, ok := s.agents.Get(agentID); ok {
+		return !a.Archived
+	}
+	if !extensionOwnsSlackNamespace(extensionID) {
+		return false
+	}
+	a := s.agents.GetRemote(agentID)
+	return a != nil && !a.Archived
 }
 
 // reconcileExtensionServices brings supervised processes in line with

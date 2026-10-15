@@ -254,12 +254,11 @@ func TestAllowNonOwner_Whitelist(t *testing.T) {
 		{http.MethodDelete, "/api/v1/agents/ag_x/background-sessions/groupdm:gd_1/tasks/t1", ag, true},
 		{http.MethodDelete, "/api/v1/agents/ag_y/background-sessions/groupdm:gd_1", ag, false},
 		{http.MethodGet, "/api/v1/agents/ag_y/background-sessions", guest, false},
-		{http.MethodGet, "/api/v1/agents/ag_x/slackbot", ag, true},
-		{http.MethodPut, "/api/v1/agents/ag_x/slackbot", ag, true},
+		// The built-in Slack bot's routes are gone; nothing is allowed
+		// on their paths.
+		{http.MethodPut, "/api/v1/agents/ag_x/slackbot", ag, false},
+		{http.MethodPost, "/api/v1/agents/ag_x/mcp", ag, false},
 		{http.MethodPost, "/api/v1/agents/ag_x/pre-compact", ag, true},
-		// MCP transport — agent's own tool surface
-		{http.MethodPost, "/api/v1/agents/ag_x/mcp", ag, true},
-		{http.MethodPost, "/api/v1/agents/ag_y/mcp", ag, false},
 		// per-agent ws — only self
 		{http.MethodGet, "/api/v1/agents/ag_x/ws", ag, true},
 		{http.MethodGet, "/api/v1/agents/ag_y/ws", ag, false},

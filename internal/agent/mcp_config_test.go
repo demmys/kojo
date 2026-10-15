@@ -8,14 +8,14 @@ import (
 
 func TestBuildMCPServers(t *testing.T) {
 	t.Run("empty apiBase returns nil", func(t *testing.T) {
-		got := BuildMCPServers("ag_123", "", true)
+		got := BuildMCPServers("ag_123", "")
 		if got != nil {
 			t.Fatalf("expected nil, got %v", got)
 		}
 	})
 
-	t.Run("no slack bot produces empty map", func(t *testing.T) {
-		got := BuildMCPServers("ag_123", "http://127.0.0.1:8080", false)
+	t.Run("no contributed servers produces empty map", func(t *testing.T) {
+		got := BuildMCPServers("ag_123", "http://127.0.0.1:8080")
 		if got == nil {
 			t.Fatalf("expected non-nil map, got nil")
 		}
@@ -24,20 +24,6 @@ func TestBuildMCPServers(t *testing.T) {
 		}
 	})
 
-	t.Run("slack bot produces http entry with agent-scoped URL", func(t *testing.T) {
-		got := BuildMCPServers("ag_abc", "http://127.0.0.1:8080", true)
-		entry, ok := got["slack"]
-		if !ok {
-			t.Fatalf("expected slack entry, got %v", got)
-		}
-		if entry.Type != "http" {
-			t.Errorf("entry.Type = %q, want %q", entry.Type, "http")
-		}
-		wantURL := "http://127.0.0.1:8080/api/v1/agents/ag_abc/mcp"
-		if entry.URL != wantURL {
-			t.Errorf("entry.URL = %q, want %q", entry.URL, wantURL)
-		}
-	})
 }
 
 func TestMCPConfigJSON(t *testing.T) {

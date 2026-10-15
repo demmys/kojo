@@ -202,7 +202,7 @@ func (m *Manager) fireWake(agentID, sessionKey, msg string) error {
 // WakeThread delivers the wake turn into a group-DM thread room. Only the
 // "groupdm:<id>" session-key flavour has a boot-time registry that can be
 // resolved and re-driven; anything else (e.g. a Slack thread key, which
-// needs the slackbot to redeliver) returns errWakeThreadGone so fireWake
+// needs the Slack package to redeliver) returns errWakeThreadGone so fireWake
 // falls back to the main conversation. Delivery reuses the normal thread
 // post path (PostUserMessage) so the wake lands in the thread transcript
 // and triggers the agent turn exactly like a human message would.

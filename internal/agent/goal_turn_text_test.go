@@ -314,8 +314,8 @@ func TestIsNoReplyOnly(t *testing.T) {
 	for text, want := range map[string]bool{
 		"": true, "[[NO": true, tok + "\n[[NO_RE": true, tok + "x": false, "hi": false,
 	} {
-		if CouldBeNoReplyOnly(text) != want {
-			t.Errorf("CouldBeNoReplyOnly(%q) != %v", text, want)
+		if couldBeNoReplyOnly(text) != want {
+			t.Errorf("couldBeNoReplyOnly(%q) != %v", text, want)
 		}
 	}
 }

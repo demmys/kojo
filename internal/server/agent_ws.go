@@ -300,9 +300,8 @@ func (s *Server) handleAgentWebSocket(w http.ResponseWriter, r *http.Request) {
 				// The response is saved to transcript even if the client navigates away.
 				turnCtx, turnDone := agent.WithChatCompletion(context.Background())
 				releaseRelay := func() {}
-				hubPeerID, hubAddr, hubErr := s.externalChatHubAddress(turnCtx, r, "")
+				hubPeerID, _, hubErr := s.externalChatHubAddress(turnCtx, r, "")
 				if hubErr == nil {
-					turnCtx = agent.WithSlackMCPBaseURL(turnCtx, hubAddr)
 					if s.externalChatRelays != nil {
 						releaseRelay = s.externalChatRelays.acquire(agentID, hubPeerID)
 					}

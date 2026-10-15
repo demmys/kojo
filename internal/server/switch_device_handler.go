@@ -1101,8 +1101,8 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 	// under a fresh fencing token once target's lease expires —
 	// effectively stealing the agent back with no claude
 	// session JSONL / blob bodies to back it up. Run source
-	// release before returning so RemoveAgent + SlackHub.Stop
-	// fire just like on the success path.
+	// release before returning so RemoveAgent fires just like on
+	// the success path.
 	for _, b := range completeResp.Blobs {
 		if b.Status != "ok" {
 			s.logger.Warn("switch-device: complete left blob row in non-ok state",

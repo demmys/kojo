@@ -2,6 +2,7 @@ package extpkg
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // quietLogger keeps supervisor churn out of the test output.
@@ -173,6 +176,23 @@ const mcpManifest = `{
   }
 }`
 
+// A server named after its package keeps the bare package ID; every
+// other name stays behind the package prefix.
+func TestQualifyMCPName(t *testing.T) {
+	for _, c := range []struct{ ext, name, want string }{
+		{"slack", "slack", "slack"},
+		{"slack", "files", "slack_files"},
+		{"demo", "slack", "demo_slack"},
+		{"demo", "api", "demo_api"},
+		{"demo", "Demo", "demo_Demo"},
+		{"demo", "demo_demo", "demo_demo_demo"},
+	} {
+		if got := qualifyMCPName(c.ext, c.name); got != c.want {
+			t.Errorf("qualifyMCPName(%q, %q) = %q, want %q", c.ext, c.name, got, c.want)
+		}
+	}
+}
+
 func TestMCPServersForAgent(t *testing.T) {
 	m := newManager(t)
 	m.SetAPIBase("http://127.0.0.1:8081")
@@ -216,6 +236,9 @@ func TestMCPServersForAgent(t *testing.T) {
 		"KOJO_EXT_DATA_DIR":   m.DataDir("demo", "ag_1"),
 		"KOJO_EXT_AGENT_ID":   "ag_1",
 		"KOJO_EXT_TOKEN_FILE": filepath.Join(m.DataDir("demo", "ag_1"), tokenFilename),
+		// A file-uploading tool reads from the same directory the
+		// service writes attachments to.
+		"KOJO_UPLOAD_DIR": uploadpath.Dir(),
 		// The backend CLI spawns this server from command-line
 		// config, so the token must not be in its environment.
 		"KOJO_EXT_TOKEN": "",
@@ -363,7 +386,7 @@ func TestSupervisorPerAgentServiceFollowsBindings(t *testing.T) {
 	}
 
 	// An archived (filtered-out) agent loses its process.
-	sup.SetAgentFilter(func(agentID string) bool { return agentID != "ag_2" })
+	sup.SetAgentFilter(func(_, agentID string) bool { return agentID != "ag_2" })
 	sup.Reconcile()
 	if got := sup.Running(); len(got) != 1 || got[0].AgentID != "ag_1" {
 		t.Fatalf("agent filter not applied: %+v", got)
@@ -534,4 +557,44 @@ func (c captureHandler) Handle(ctx context.Context, r slog.Record) error {
 		return true
 	})
 	return nil
+}
+
+// A package that ships a compiled MCP server names one binary per
+// platform, the same way a service does.
+func TestMCPServerExecPerPlatform(t *testing.T) {
+	m := newManager(t)
+	key := runtime.GOOS + "/" + runtime.GOARCH
+	manifest := `{
+  "id": "demo", "name": "Demo", "version": "1.0.0",
+  "contributes": {"mcpServers": [
+    {"name": "api", "exec": {"` + key + `": "bin/native/srv", "plan9/mips": "bin/other/srv"}, "args": ["mcp"]}
+  ]}
+}`
+	install(t, m, manifest, map[string]string{"bin/native/srv": "#!/bin/sh\n", "bin/other/srv": "x"})
+	if _, err := m.SetAgentBinding("demo", "ag_1", AgentBinding{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got := m.MCPServersForAgent("ag_1")
+	if len(got) != 1 {
+		t.Fatalf("MCPServersForAgent = %+v", got)
+	}
+	if want := filepath.Join(m.Dir("demo"), "bin", "native", "srv"); got[0].Command != want {
+		t.Fatalf("command = %q, want %q", got[0].Command, want)
+	}
+
+	for name, body := range map[string]string{
+		"both":         `{"name":"a","command":"npx","exec":{"linux/amd64":"bin/a"}}`,
+		"neither":      `{"name":"a"}`,
+		"bad platform": `{"name":"a","exec":{"linux":"bin/a"}}`,
+		"escaping":     `{"name":"a","exec":{"linux/amd64":"../a"}}`,
+	} {
+		var mf Manifest
+		raw := `{"id":"demo","name":"Demo","version":"1.0.0","contributes":{"mcpServers":[` + body + `]}}`
+		if err := json.Unmarshal([]byte(raw), &mf); err != nil {
+			t.Fatal(err)
+		}
+		if err := mf.Validate(); err == nil {
+			t.Errorf("%s: manifest accepted", name)
+		}
+	}
 }

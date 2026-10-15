@@ -1,39 +1,8 @@
 package agent
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
 )
-
-type slackMCPBaseURLContextKey struct{}
-
-// WithSlackMCPBaseURL directs one interactive chat turn at the stable Hub's
-// Slack MCP endpoint. It is used by a migrated agent's holder; the server only
-// sets it after authenticating the Hub against agent_locks.allowed_proxy_peer.
-func WithSlackMCPBaseURL(ctx context.Context, baseURL string) context.Context {
-	return context.WithValue(ctx, slackMCPBaseURLContextKey{}, baseURL)
-}
-
-func slackMCPBaseURLFromContext(ctx context.Context) string {
-	url, _ := ctx.Value(slackMCPBaseURLContextKey{}).(string)
-	return url
-}
-
-func applySlackMCPRelay(prep *chatPrep, agentID, baseURL string) {
-	if baseURL == "" {
-		return
-	}
-	prep.mcpServers = BuildMCPServers(agentID, baseURL, true)
-	if entry, ok := prep.mcpServers["slack"]; ok {
-		entry.URL += "?external_chat_relay=1"
-		if entry.Headers == nil {
-			entry.Headers = make(map[string]string)
-		}
-		entry.Headers["X-Kojo-External-Chat-Relay"] = "1"
-		prep.mcpServers["slack"] = entry
-	}
-}
 
 // mcpServerEntry represents one MCP server configuration.
 // For HTTP transport, only URL (and optionally Type) are set.
@@ -76,13 +45,10 @@ var externalMCPLookup func(agentID string) []ExternalMCPServer
 func SetExternalMCPLookup(fn func(string) []ExternalMCPServer) { externalMCPLookup = fn }
 
 // BuildMCPServers returns the set of MCP servers that should be available
-// to the given agent. apiBase is the kojo server URL (e.g. "http://127.0.0.1:8080").
-//
-// When the agent has its own kojo auth token (i.e. agentTokenLookup is
-// wired up by the server) the per-agent /mcp endpoint requires the
-// X-Kojo-Token header. Without it the call lands as a Guest principal
-// and is denied by the auth middleware.
-func BuildMCPServers(agentID, apiBase string, hasSlackBot bool) map[string]mcpServerEntry {
+// to the given agent: the stdio servers contributed by the extension
+// packages bound to it. apiBase is the kojo server URL (e.g.
+// "http://127.0.0.1:8080").
+func BuildMCPServers(agentID, apiBase string) map[string]mcpServerEntry {
 	// No API base means kojo has not finished booting its listener.
 	// Extension stdio servers are held back too: they are handed
 	// KOJO_API_BASE and would come up unable to call back.
@@ -92,23 +58,13 @@ func BuildMCPServers(agentID, apiBase string, hasSlackBot bool) map[string]mcpSe
 
 	servers := make(map[string]mcpServerEntry)
 
-	if hasSlackBot {
-		entry := mcpServerEntry{
-			URL:  fmt.Sprintf("%s/api/v1/agents/%s/mcp", apiBase, agentID),
-			Type: "http",
-		}
-		if agentTokenLookup != nil {
-			if tok, ok := agentTokenLookup(agentID); ok && tok != "" {
-				entry.Headers = map[string]string{"X-Kojo-Token": tok}
-			}
-		}
-		servers["slack"] = entry
-	}
-
-	// Extension-contributed stdio servers. The names are already
-	// namespaced by package ID (extpkg.qualifyMCPName), so a package
-	// cannot shadow "slack" or another package's server; the explicit
-	// skip below keeps that true even if the namespacing ever changes.
+	// The names are namespaced by package ID (extpkg.qualifyMCPName),
+	// with one exception: a server named after its own package keeps
+	// the bare ID. That is how the Slack package's server keeps the
+	// name "slack", which agents knew their Slack tools by when the
+	// integration was built in. Should two contributions ever claim one
+	// name, the first in the lookup's (sorted) order wins, so the
+	// result does not vary run to run.
 	if externalMCPLookup != nil {
 		for _, srv := range externalMCPLookup(agentID) {
 			if srv.Name == "" || srv.Command == "" {

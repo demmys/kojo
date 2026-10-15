@@ -690,7 +690,7 @@ func main() {
 			// owns the agent. Skip rather than half-wire it.
 			//
 			// Also gated on !--peer: daemon-only peers do NOT host
-			// agent runtimes (StartSchedulers / SlackHub / push are
+			// agent runtimes (StartSchedulers / push are
 			// already off), so taking agent_locks under this peer's
 			// DeviceID would deceive the Hub's fencing logic into
 			// thinking this peer owns those agents. Lock acquisition
@@ -1739,6 +1739,10 @@ func main() {
 	// handed as KOJO_API_BASE. A PeerOnly daemon has no registry and
 	// this is a no-op.
 	srv.StartExtensions(agent.KojoAPIBase(), resolver)
+	// Move a pre-package Slack bot's settings into the slack package.
+	// After StartExtensions so a newly bound service can start; on its
+	// own goroutine because it may download the package.
+	go srv.RunSlackMigration(ctx)
 
 	// Consume a restart-wake marker if the previous process armed one
 	// (POST /api/v1/system/restart {"wake":true}) — fires ONE chat turn

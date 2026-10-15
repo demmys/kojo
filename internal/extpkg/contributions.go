@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/loppo-llc/kojo/internal/uploadpath"
 )
 
 // Per-agent contribution resolution.
@@ -35,6 +38,12 @@ type MCPContribution struct {
 // validation, so the joined name stays safe to use as a Codex config
 // key and a JSON object key.
 func qualifyMCPName(extensionID, name string) string {
+	// A server named after its package is the package's own server:
+	// "slack" rather than "slack_slack". This is the one way a package
+	// can produce an unprefixed name, and it can only produce its own ID.
+	if name == extensionID {
+		return extensionID
+	}
 	return extensionID + "_" + name
 }
 
@@ -56,10 +65,22 @@ func (m *Manager) MCPServersForAgent(agentID string) []MCPContribution {
 			continue
 		}
 		for _, srv := range row.Manifest.Contributes.MCPServers {
+			command := resolveCommand(pkgPath(m.root, id), srv.Command)
+			if len(srv.Exec) > 0 {
+				rel, ok := srv.Exec[runtime.GOOS+"/"+runtime.GOARCH]
+				if !ok {
+					// Install-time validation rejects this, so reaching
+					// it means the checkout was swapped underneath us.
+					m.logger.Warn("extension mcp server has no executable for this platform",
+						"extension", id, "server", srv.Name)
+					continue
+				}
+				command = filepath.Join(pkgPath(m.root, id), filepath.FromSlash(rel))
+			}
 			out = append(out, MCPContribution{
 				ExtensionID: id,
 				Name:        qualifyMCPName(id, srv.Name),
-				Command:     resolveCommand(pkgPath(m.root, id), srv.Command),
+				Command:     command,
 				Args:        append([]string(nil), srv.Args...),
 				Env:         m.mcpEnvLocked(row, agentID, srv.Env),
 			})
@@ -117,6 +138,10 @@ func (m *Manager) mcpEnvLocked(row *Installed, agentID string, extra map[string]
 		"KOJO_EXT_DATA_DIR": dataDir,
 		"KOJO_EXT_AGENT_ID": agentID,
 		"KOJO_EXT_CONFIG":   cfgJSON,
+		// The same directory the service is told about: a tool that
+		// uploads a local file (the Slack package's slack_upload_file)
+		// reads only from here, and refuses every path without it.
+		"KOJO_UPLOAD_DIR": uploadpath.Dir(),
 		// The token goes in a file, not in this map. Unlike a
 		// supervised service — which kojo spawns itself — an MCP
 		// server is spawned by the backend CLI, so its environment

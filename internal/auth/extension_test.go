@@ -88,6 +88,35 @@ func TestAllowExtensionRoutes(t *testing.T) {
 		{"patch without scope", extPrincipal([]string{"agents:read"}, "ag_1"), "PATCH", "/api/v1/agents/ag_1", false},
 		{"attention", extPrincipal([]string{"chat:send"}, "ag_1"), "POST", "/api/v1/agents/ag_1/attention", true},
 
+		// Keyed chat sessions are their own scope: chat:send reaches
+		// the main conversation only.
+		{"ext-chat", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat", true},
+		{"ext-chat steer", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/steer", true},
+		{"ext-chat cancel", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/cancel", true},
+		{"ext-chat question", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/question", true},
+		{"ext-chat goal-stop", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/goal-stop", true},
+		{"ext-chat background-stop", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/background-stop", true},
+		{"ext-chat background-cancel", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/background-cancel", true},
+		{"ext-chat handoff-ack", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/handoff-ack", true},
+		{"ext-chat events", extPrincipal([]string{"chat:session"}, "ag_1"), "GET", "/api/v1/agents/ag_1/ext-chat/events", true},
+		{"ext-chat events with chat:send only", extPrincipal(all, "ag_1"), "GET", "/api/v1/agents/ag_1/ext-chat/events", false},
+		{"ext-chat events unbound", extPrincipal([]string{"chat:session"}, "ag_2"), "GET", "/api/v1/agents/ag_1/ext-chat/events", false},
+		{"ext-chat events post", extPrincipal([]string{"chat:session"}, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/events", false},
+		{"ext-chat question with chat:send only", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/question", false},
+		{"ext-chat goal-stop unbound", extPrincipal([]string{"chat:session"}, "ag_2"), "POST", "/api/v1/agents/ag_1/ext-chat/goal-stop", false},
+		{"ext-chat handoff-ack unbound", extPrincipal([]string{"chat:session"}, "ag_2"), "POST", "/api/v1/agents/ag_1/ext-chat/handoff-ack", false},
+		{"ext-chat question get", extPrincipal([]string{"chat:session"}, "ag_1"), "GET", "/api/v1/agents/ag_1/ext-chat/question", false},
+		{"ext-chat unknown subroute", extPrincipal(append([]string{"chat:session"}, all...), "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat/other", false},
+		{"ext-chat with chat:send only", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/ext-chat", false},
+		{"ext-chat unbound", extPrincipal([]string{"chat:session"}, "ag_2"), "POST", "/api/v1/agents/ag_1/ext-chat", false},
+		{"ext-chat get", extPrincipal([]string{"chat:session"}, "ag_1"), "GET", "/api/v1/agents/ag_1/ext-chat", false},
+		{"peer external-chat stays closed", extPrincipal(append([]string{"chat:session"}, all...), "ag_1"), "POST", "/api/v1/agents/ag_1/external-chat", false},
+
+		// A package may always read its own secrets; the handler
+		// scopes them to the token's package.
+		{"own secrets", extPrincipal(nil), "GET", "/api/v1/extension/secrets", true},
+		{"secrets write", extPrincipal(all, "ag_1"), "PUT", "/api/v1/extension/secrets", false},
+
 		// Nothing destructive or administrative, whatever the scopes.
 		{"delete agent", extPrincipal(all, "ag_1"), "DELETE", "/api/v1/agents/ag_1", false},
 		{"reset agent", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/reset", false},
@@ -99,11 +128,6 @@ func TestAllowExtensionRoutes(t *testing.T) {
 		{"read creds", extPrincipal(all, "ag_1"), "GET", "/api/v1/credentials", false},
 		{"agent token", extPrincipal(all, "ag_1"), "GET", "/api/v1/agents/ag_1/token", false},
 		{"exec", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/exec", false},
-		// The agent's own MCP transport is its tool surface — every
-		// tool it holds, with no scope in front of it. A package
-		// bound to the agent still does not get to speak through it.
-		{"agent mcp", extPrincipal(all, "ag_1"), "POST", "/api/v1/agents/ag_1/mcp", false},
-		{"agent mcp get", extPrincipal(all, "ag_1"), "GET", "/api/v1/agents/ag_1/mcp", false},
 		{"unknown route", extPrincipal(all, "ag_1"), "GET", "/api/v1/whatever", false},
 	}
 	for _, c := range cases {

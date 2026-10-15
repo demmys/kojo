@@ -15,7 +15,7 @@ import { errMsg, formatBytes } from "../../lib/utils";
 import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
-import { SlackBotSettings } from "./SlackBotSettings";
+import { SlackMigrationNotice, useSlackMigration } from "./SlackMigrationNotice";
 import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { useCustomModels } from "./fields/useCustomModels";
 import { PersonaField } from "./fields/PersonaField";
@@ -41,10 +41,10 @@ import { Toggle } from "../ui/Toggle";
 import { Banner } from "../ui/Banner";
 import { Button } from "../ui/Button";
 
-// Section ids (also i18n keys under "settings.sec.<id>"). Stable list so
+// Section ids (also i18n keys under "settings.sec.<id>"). Stable lists so
 // useScrollSpy's effect deps don't churn every render; labels are resolved
 // through t() at render time so they follow the active locale.
-const SECTION_IDS = [
+const ALL_SECTION_IDS = [
   "identity",
   "injections",
   "model",
@@ -54,6 +54,11 @@ const SECTION_IDS = [
   "memory",
   "danger",
 ] as const;
+
+// "integrations" holds nothing but the notice for a Slack bot that has not
+// been moved to the Slack extension package yet, so the section and its nav
+// entry exist only while that is pending.
+const DEFAULT_SECTION_IDS = ALL_SECTION_IDS.filter((s) => s !== "integrations");
 
 /**
  * Scroll-spy: tracks which SectionCard is currently in the reading zone so
@@ -1263,7 +1268,9 @@ export function AgentSettings() {
     );
   };
 
-  const activeSection = useScrollSpy(SECTION_IDS, !!agent);
+  const slackMigration = useSlackMigration(id);
+  const sectionIds = slackMigration.pending ? ALL_SECTION_IDS : DEFAULT_SECTION_IDS;
+  const activeSection = useScrollSpy(sectionIds, !!agent);
 
   // Order-insensitive compare for the checkbox-driven string arrays —
   // unchecking and re-checking an entry must not read as dirty just
@@ -1360,7 +1367,7 @@ export function AgentSettings() {
         below={
           // Mobile section nav: sticky, horizontally scrollable chip row.
           <nav className="flex gap-1.5 overflow-x-auto border-t border-hairline px-4 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:hidden">
-            {SECTION_IDS.map((s) => (
+            {sectionIds.map((s) => (
               <button
                 key={s}
                 type="button"
@@ -1382,7 +1389,7 @@ export function AgentSettings() {
         {/* Desktop sticky section rail */}
         <nav className="hidden lg:block">
           <div className="sticky top-24 space-y-0.5">
-            {SECTION_IDS.map((s) => (
+            {sectionIds.map((s) => (
               <button
                 key={s}
                 type="button"
@@ -2117,9 +2124,11 @@ export function AgentSettings() {
         </SectionCard>
 
         {/* ── Integrations ── */}
-        <SectionCard id="integrations" title={t("settings.sec.integrations")}>
-          <SlackBotSettings agentId={id!} />
-        </SectionCard>
+        {slackMigration.pending && (
+          <SectionCard id="integrations" title={t("settings.sec.integrations")}>
+            <SlackMigrationNotice state={slackMigration} />
+          </SectionCard>
+        )}
 
         {/* ── Memory ── */}
         <SectionCard

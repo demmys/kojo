@@ -245,6 +245,10 @@ const messages = {
     en: "A new version is available. Reload.",
   },
   "reload.action": { ja: "リロード", en: "Reload" },
+  "reload.chunkFailed": {
+    ja: "このページを読み込めませんでした（ネットワークエラー、またはビルドが古い可能性があります）",
+    en: "Failed to load this page (network error or outdated build).",
+  },
 
   // ── Daemon self-update prompt ──
   "update.available": {
@@ -1060,43 +1064,80 @@ const messages = {
     en: "Cancel queued message {id}",
   },
 
-  // ── SlackBotSettings ──
-  "slack.connectedResult": {
-    ja: "接続した: team={team}, bot={bot}",
-    en: "Connected: team={team}, bot={bot}",
+  // ── SlackMigrationNotice ──
+  "slackMig.title": {
+    ja: "Slack 連携は拡張パッケージに移った",
+    en: "Slack has moved to an extension package",
   },
-  "slack.removeConfirm": {
-    ja: "Slack ボット設定を削除する?",
-    en: "Remove Slack bot configuration?",
+  "slackMig.body": {
+    ja: "このエージェントの Slack ボットは、Slack が kojo 本体に組み込まれていた頃に設定されたもの。設定・トークン・スレッド履歴は Slack パッケージへ自動で引き継がれるが、まだ完了していないため、ボットは停止している。引き継ぎが終わるまで元のデータは消えない。",
+    en: "This agent's Slack bot was set up when Slack was built into kojo. Its settings, tokens and thread history are carried over to the Slack package automatically, but that has not finished, so the bot is not running. Nothing is deleted until the move is complete.",
   },
-  "slack.connected": { ja: "接続済み", en: "Connected" },
-  "slack.enableAria": { ja: "Slack ボットを有効化", en: "Enable Slack bot" },
-  "slack.appToken": {
-    ja: "App-Level Token (xapp-...)",
-    en: "App-Level Token (xapp-...)",
+  "slackMig.reason.in_progress": {
+    ja: "引き継ぎを実行中、または起動直後でまだ始まっていない。少し待ってから再試行する。",
+    en: "The move is running, or has not started yet after startup. Wait a moment, then retry.",
   },
-  "slack.botToken": { ja: "Bot Token (xoxb-...)", en: "Bot Token (xoxb-...)" },
-  "slack.configured": { ja: "設定済み", en: "configured" },
-  "slack.threadReplies": {
-    ja: "常にスレッドで返信",
-    en: "Always reply in thread",
+  "slackMig.reason.extensions_unavailable": {
+    ja: "この kojo では拡張機能が使えない状態になっている。ログを確認して kojo を再起動する。",
+    en: "Extensions are unavailable on this kojo. Check the log and restart kojo.",
   },
-  "slack.respondTo": { ja: "応答する対象", en: "Respond to" },
-  "slack.respondDM": { ja: "ダイレクトメッセージ", en: "Direct messages" },
-  "slack.respondMention": {
-    ja: "チャンネル内の @メンション",
-    en: "@mentions in channels",
+  "slackMig.reason.install_failed": {
+    ja: "Slack パッケージを導入できなかった（ネットワークに繋がらない、git が無い、など）。",
+    en: "The Slack package could not be installed (no network, git missing, or similar).",
   },
-  "slack.respondThread": {
-    ja: "スレッドの続き (メンションなしで自動返信)",
-    en: "Thread follow-ups (auto-reply without mention)",
+  "slackMig.reason.review_required": {
+    ja: "Slack パッケージが、組み込みボットには無かった権限を要求している。自動では承認しないので、拡張機能の設定から内容を確認して導入する。",
+    en: "The Slack package asks for permissions the built-in bot did not have. kojo does not approve those for you: review and install it from the Extensions settings.",
   },
-  "slack.testing": { ja: "テスト中...", en: "Testing..." },
-  "slack.testConnection": { ja: "接続テスト", en: "Test Connection" },
-  "slack.removeBot": { ja: "Slack ボットを削除", en: "Remove Slack Bot" },
-  "slack.setupHelp": {
-    ja: "Socket Mode を有効にした Slack App を作る。必要なスコープ: chat:write, app_mentions:read, im:history。購読するイベント: message.im, app_mention。",
-    en: "Create a Slack App with Socket Mode enabled. Required scopes: chat:write, app_mentions:read, im:history. Subscribe to events: message.im, app_mention.",
+  "slackMig.reason.untrusted_source": {
+    ja: "公式の配布元ではない「slack」パッケージが導入されている。トークンは渡していない。公式のものに入れ替えるか、そのパッケージを信頼するなら拡張機能の設定でこのエージェントに自分で割り当てる。",
+    en: "A package named \"slack\" is installed from somewhere other than the official source, so the tokens were not handed to it. Replace it with the official one, or, if you trust it, assign it to this agent yourself in the Extensions settings.",
+  },
+  "slackMig.reason.incompatible_package": {
+    ja: "導入されている Slack パッケージはトークンを安全に受け取れない版だ。拡張機能の設定から更新する。",
+    en: "The installed Slack package is a version that cannot take the tokens safely. Update it from the Extensions settings.",
+  },
+  "slackMig.reason.tokens_unreadable": {
+    ja: "保存されている Slack トークンを読み出せなかった。",
+    en: "The stored Slack tokens could not be read.",
+  },
+  "slackMig.reason.bind_failed": {
+    ja: "Slack パッケージをこのエージェントに割り当てられなかった。",
+    en: "The Slack package could not be assigned to this agent.",
+  },
+  "slackMig.reason.history_copy_failed": {
+    ja: "スレッド履歴をコピーできなかった。設定とトークンは引き継ぎ済み。",
+    en: "The thread history could not be copied. Settings and tokens have already been carried over.",
+  },
+  "slackMig.reason.cleanup_failed": {
+    ja: "引き継ぎは済んだが、古い設定の片付けが終わっていない（エージェントがデバイス間を移動中、など）。",
+    en: "Everything has been carried over, but the old settings could not be cleared yet (for example, the agent is moving between devices).",
+  },
+  "slackMig.retry": { ja: "再試行", en: "Retry" },
+  "slackMig.retrying": { ja: "再試行中...", en: "Retrying..." },
+  "slackMig.retryFailed": {
+    ja: "再試行を実行できなかった: {error}",
+    en: "The retry could not be run: {error}",
+  },
+  "slackMig.openExtensions": {
+    ja: "拡張機能の設定を開く",
+    en: "Open Extensions settings",
+  },
+  "slackMig.manualTitle": {
+    ja: "自動で進まないときの手順",
+    en: "If it does not go through by itself",
+  },
+  "slackMig.manualInstall": {
+    ja: "設定 → 拡張機能 で、次の URL から Slack パッケージを導入する。",
+    en: "In Settings → Extensions, install the Slack package from this URL.",
+  },
+  "slackMig.manualRetry": {
+    ja: "ここに戻って「再試行」を押す。設定・トークン・履歴が引き継がれる。",
+    en: "Come back here and press Retry. Settings, tokens and history are carried over.",
+  },
+  "slackMig.manualBind": {
+    ja: "それでも駄目なら、拡張機能の設定で Slack パッケージをこのエージェントに割り当て、トークンを入力し直す。",
+    en: "If that still fails, assign the Slack package to this agent in the Extensions settings and enter the tokens again.",
   },
 
   // ── MessageAttachments ──
@@ -1548,6 +1589,10 @@ const messages = {
   "gs.extUpdate": { ja: "更新", en: "Update" },
   "gs.extRemove": { ja: "削除", en: "Remove" },
   "gs.extSave": { ja: "設定を保存", en: "Save settings" },
+  "gs.extSecretSaved": { ja: "保存済み (変更するときだけ入力)", en: "Saved (type to replace)" },
+  "gs.extSecretClear": { ja: "削除", en: "Remove" },
+  "gs.extSecretCleared": { ja: "保存時に削除されます", en: "Will be removed on save" },
+  "gs.extSecretUndo": { ja: "取り消す", en: "Undo" },
   "gs.extUrlRequired": {
     ja: "リポジトリ URL を入力して",
     en: "Repository URL is required",

@@ -7,7 +7,8 @@ import (
 
 // createTokenTable creates the notify_tokens table for storing encrypted
 // per-(provider, agent, source) tokens. The Gmail notify-source feature
-// was removed; the table now backs the Slack bot's app/bot token storage.
+// was removed; the table now backs extension package secrets (and the
+// built-in Slack bot's app/bot tokens until they are migrated).
 // The name is kept for migration compatibility with v1 databases.
 func createTokenTable(s *CredentialStore) error {
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS notify_tokens (

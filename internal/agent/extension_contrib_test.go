@@ -64,20 +64,20 @@ func TestBuildMCPServersIncludesExtensionStdio(t *testing.T) {
 		}
 		return []ExternalMCPServer{
 			{Name: "demo_api", Command: "/pkg/bin/srv", Args: []string{"--serve"}, Env: map[string]string{"K": "V"}},
-			{Name: "", Command: "/pkg/bin/x"},   // dropped: no name
-			{Name: "demo_bad"},                  // dropped: no command
-			{Name: "slack", Command: "/pkg/hj"}, // dropped: name already taken
+			{Name: "", Command: "/pkg/bin/x"},      // dropped: no name
+			{Name: "demo_bad"},                     // dropped: no command
+			{Name: "demo_api", Command: "/pkg/hj"}, // dropped: name already taken
 		}
 	})
 
 	// An empty apiBase still yields nothing: extension servers are
 	// handed KOJO_API_BASE, so they cannot run before the listener is
 	// up either.
-	if got := BuildMCPServers("ag_1", "", true); got != nil {
+	if got := BuildMCPServers("ag_1", ""); got != nil {
 		t.Fatalf("empty apiBase = %v", got)
 	}
 
-	got := BuildMCPServers("ag_1", "http://127.0.0.1:8080", true)
+	got := BuildMCPServers("ag_1", "http://127.0.0.1:8080")
 	entry, ok := got["demo_api"]
 	if !ok {
 		t.Fatalf("extension server missing: %v", got)
@@ -91,14 +91,11 @@ func TestBuildMCPServersIncludesExtensionStdio(t *testing.T) {
 	if _, bad := got["demo_bad"]; bad {
 		t.Fatal("a server with no command was accepted")
 	}
-	if got["slack"].isStdio() {
-		t.Fatal("an extension hijacked the built-in slack server name")
-	}
-	if len(got) != 2 {
+	if len(got) != 1 {
 		t.Fatalf("servers = %v", got)
 	}
 	// Another agent gets nothing.
-	if other := BuildMCPServers("ag_2", "http://127.0.0.1:8080", false); len(other) != 0 {
+	if other := BuildMCPServers("ag_2", "http://127.0.0.1:8080"); len(other) != 0 {
 		t.Fatalf("unbound agent got %v", other)
 	}
 }
@@ -118,6 +115,29 @@ func makeSkill(t *testing.T, name string, files map[string]string) ExtensionSkil
 		}
 	}
 	return ExtensionSkill{ExtensionID: "demo", Name: name, Dir: dir}
+}
+
+// The Slack package names its server "slack". It gets that name, and
+// when two contributions claim one name the outcome is fixed by the
+// lookup's order, not by map order.
+func TestBuildMCPServersSlackName(t *testing.T) {
+	t.Cleanup(func() { SetExternalMCPLookup(nil) })
+	SetExternalMCPLookup(func(agentID string) []ExternalMCPServer {
+		return []ExternalMCPServer{
+			{Name: "slack", Command: "/pkg/slack/bin/mcp"},
+			{Name: "slack", Command: "/pkg/other/bin/mcp"}, // a later duplicate never wins
+			{Name: "slack_extra", Command: "/pkg/slack/bin/extra"},
+		}
+	})
+	for i := 0; i < 20; i++ {
+		got := BuildMCPServers("ag_1", "http://127.0.0.1:8080")
+		if e := got["slack"]; e.Command != "/pkg/slack/bin/mcp" || e.URL != "" {
+			t.Fatalf("contributed slack entry = %+v", e)
+		}
+		if len(got) != 2 {
+			t.Fatalf("servers = %+v", got)
+		}
+	}
 }
 
 func TestSyncExtensionSkillsInstallsAndSweeps(t *testing.T) {

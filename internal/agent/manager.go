@@ -141,8 +141,8 @@ type Manager struct {
 	switching map[string]bool
 
 	// mutating tracks the per-agent in-flight count of state
-	// mutations (persona / settings / slackbot / task /
-	// credential / avatar / slack token) that don't route
+	// mutations (persona / settings / task / credential /
+	// avatar) that don't route
 	// through Chat → busy. Every mutation entry uses
 	// AcquireMutation to bump the counter under busyMu (which
 	// also refuses when switching is set), and defers
@@ -1940,75 +1940,6 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	return cp, nil
 }
 
-// UpdateSlackBot updates the Slack bot configuration for an agent.
-// Pass nil to remove the configuration.
-func (m *Manager) UpdateSlackBot(id string, cfg *SlackBotConfig) error {
-	releaseMut, err := m.AcquireMutation(id)
-	if err != nil {
-		return err
-	}
-	defer releaseMut()
-	return m.updateSlackBotUnguarded(id, cfg)
-}
-
-// UpdateSlackBotAlreadyGuarded is the no-guard variant of
-// UpdateSlackBot for callers that already hold AcquireMutation
-// for the agent (e.g. handleSetSlackBot / handleDeleteSlackBot,
-// which wrap token Save + UpdateSlackBot + hub Reconfigure in
-// one outer mutation hold). Calling UpdateSlackBot from inside
-// the outer hold races with SetSwitching: switching can flip
-// to true between the outer Acquire and the inner Acquire,
-// leaving the token saved but the config row unwritten. This
-// variant skips the inner guard so the whole handler is one
-// transactional unit under the outer mutation.
-//
-// For a remote runtime this updates only the Hub-owned slackBot field in the
-// persisted mirror, leaving all holder-owned settings untouched.
-//
-// MUST NOT be called from any path that does NOT already hold
-// AcquireMutation and LockPatch for this agent.
-func (m *Manager) UpdateSlackBotAlreadyGuarded(id string, cfg *SlackBotConfig) error {
-	m.mu.Lock()
-	_, local := m.agents[id]
-	m.mu.Unlock()
-	if local {
-		return m.updateSlackBotUnguarded(id, cfg)
-	}
-	if m.store == nil {
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
-	return m.store.UpdateAgentSetting(id, "slackBot", cfg, cfg == nil)
-}
-
-func (m *Manager) updateSlackBotUnguarded(id string, cfg *SlackBotConfig) error {
-	m.mu.Lock()
-	a, ok := m.agents[id]
-	if !ok {
-		m.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
-	}
-	a.SlackBot = cfg
-	a.UpdatedAt = time.Now().Format(time.RFC3339)
-	m.mu.Unlock()
-
-	m.save()
-	return nil
-}
-
-// loadSlackBotToken retrieves the Slack bot token for an agent from the
-// credential store.  Returns "" if Slack bot is not configured/enabled or
-// the token is unavailable.
-func (m *Manager) loadSlackBotToken(agentID string, a *Agent) string {
-	if a.SlackBot == nil || !a.SlackBot.Enabled || m.creds == nil {
-		return ""
-	}
-	botToken, err := m.creds.GetToken("slack", agentID, "", "bot_token")
-	if err != nil || botToken == "" {
-		return ""
-	}
-	return botToken
-}
-
 // Credentials returns the credential store. Returns nil if the store failed to initialize.
 func (m *Manager) Credentials() *CredentialStore {
 	return m.creds
@@ -2188,8 +2119,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	SyncExtensionSkillsForTool(agentID, agentCopy.Tool, m.logger)
 
 	// Build MCP server list (backend-agnostic, URL-based).
-	hasSlackBot := m.loadSlackBotToken(agentID, &agentCopy) != ""
-	mcpServers := BuildMCPServers(agentID, apiBase, hasSlackBot)
+	mcpServers := BuildMCPServers(agentID, apiBase)
 
 	// MCP servers are injected per-backend:
 	// - Claude: --mcp-config CLI arg (in backend_claude.go)
@@ -2401,7 +2331,6 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
-	applySlackMCPRelay(prep, agentID, slackMCPBaseURLFromContext(ctx))
 
 	// Check if agent is busy, editing, being reset, or switching
 	m.busyMu.Lock()
@@ -2702,11 +2631,6 @@ type OneShotOpts struct {
 	// same attachment block as the interactive WebUI chat path.
 	Attachments []MessageAttachment
 
-	// SlackMCPBaseURL overrides the local Slack MCP endpoint for this turn.
-	// Runtime peers use the canonical Hub URL so Slack credentials stay on the
-	// Hub while the agent backend itself runs on the holder.
-	SlackMCPBaseURL string
-
 	// LingerBackgroundTasks opts a keyed claude turn into keeping its CLI
 	// process alive after the result while run_in_background tasks are still
 	// pending, so their completion is delivered as a keyed background turn to
@@ -2795,7 +2719,6 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
-	applySlackMCPRelay(prep, agentID, opts.SlackMCPBaseURL)
 
 	chatCtx, cancel := context.WithCancel(ctx)
 	var responseAttachments *attachWatcher
@@ -3831,11 +3754,11 @@ func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 // as "no session" because sessionFileUsable would delete it and start
 // fresh on the next invocation anyway).
 //
-// Used by the Slack bot to gate the "head+tail safety net" injection
+// Used by chat surfaces to gate the "head+tail safety net" injection
 // mode: on the first message in a thread we replay the full history,
 // on subsequent messages we send only a small head+tail recap because
 // the resumed session already carries the bulk of the conversation
-// (see slackbot.Bot.sendToAgent and chathistory.FormatForInjectionHeadTail).
+// (see chathistory.FormatForInjectionHeadTail).
 //
 // Claude caveat: this does NOT check sessionResetThresholdTokens. If a
 // long-running thread's JSONL eventually exceeds the reset threshold,
@@ -4924,8 +4847,8 @@ func (m *Manager) Shutdown() {
 }
 
 // AgentDir returns the data directory path for the given agent ID.
-// Exported for use by external subsystems (e.g. slackbot Hub) that need
-// to resolve agent data directories without importing agent internals.
+// Exported for use by external subsystems that need to resolve agent
+// data directories without importing agent internals.
 func AgentDir(id string) string {
 	return agentDir(id)
 }

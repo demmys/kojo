@@ -273,8 +273,8 @@ func (m *Manager) ResetData(id string) error {
 // that doesn't survive archive. Unarchive does NOT restore memberships —
 // the agent must be re-invited.
 //
-// The handler is responsible for stopping the Slack bot, since the bot lifecycle
-// is owned by the server (slackHub), not the agent manager.
+// The handler is responsible for stopping the agent's extension services,
+// since their lifecycle is owned by the server, not the agent manager.
 //
 // Idempotent: calling Archive on an already-archived agent is a no-op.
 //
@@ -352,8 +352,8 @@ func (m *Manager) Archive(id string) error {
 }
 
 // Unarchive restores a previously archived agent: clears the Archived flag
-// and re-schedules its cron. Slack bot re-arming is the handler's
-// responsibility (server owns slackHub lifecycle).
+// and re-schedules its cron. Restarting the agent's extension services
+// is the handler's responsibility (the server owns their lifecycle).
 //
 // Idempotent: calling Unarchive on a non-archived agent is a no-op.
 //

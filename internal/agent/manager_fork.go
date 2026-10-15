@@ -29,8 +29,11 @@ type ForkOptions struct {
 // per-row ids so the destination's primary keys don't collide with
 // the source's.
 //
-// External integrations are intentionally NOT copied: SlackBot and
-// credentials all require per-agent tokens that cannot be safely shared.
+// External integrations are intentionally NOT copied: credentials are
+// per-agent tokens that cannot be safely shared, extension bindings are
+// keyed by agent ID and so stay with the source, and leftover built-in
+// Slack settings would make the migration treat the fork as a bot that
+// has no tokens.
 // CLI local state (.claude/) is also skipped so the fork starts a
 // fresh session. WorkDir is cleared so the fork does not share external output
 // storage with the source.

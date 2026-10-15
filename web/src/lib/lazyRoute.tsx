@@ -1,4 +1,21 @@
 import { Component, lazy, Suspense, type ComponentType, type ReactNode } from "react";
+import { useT } from "./i18n";
+
+function ChunkErrorNotice() {
+  const t = useT();
+  return (
+    <div className="p-6 text-sm text-neutral-400">
+      <p>{t("reload.chunkFailed")}</p>
+      <button
+        type="button"
+        className="mt-3 rounded border border-neutral-600 px-3 py-1 text-neutral-200"
+        onClick={() => window.location.reload()}
+      >
+        {t("reload.action")}
+      </button>
+    </div>
+  );
+}
 
 // Catches a chunk that failed to load (after the one-shot auto reload
 // was already spent) and offers a manual retry instead of leaving the
@@ -10,18 +27,7 @@ class ChunkErrorBoundary extends Component<{ children: ReactNode }, { failed: bo
   }
   render() {
     if (!this.state.failed) return this.props.children;
-    return (
-      <div className="p-6 text-sm text-neutral-400">
-        <p>Failed to load this page (network error or outdated build).</p>
-        <button
-          type="button"
-          className="mt-3 rounded border border-neutral-600 px-3 py-1 text-neutral-200"
-          onClick={() => window.location.reload()}
-        >
-          Reload
-        </button>
-      </div>
-    );
+    return <ChunkErrorNotice />;
   }
 }
 

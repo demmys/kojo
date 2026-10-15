@@ -41,7 +41,7 @@ const (
 
 var fallbackLocalSteerSem = make(chan struct{}, maxConcurrentLocalSteers)
 
-// externalChatRouter keeps Slack transport ownership on the Hub while
+// externalChatRouter keeps chat transport ownership on the Hub while
 // dispatching only the agent turn to the machine that currently owns the
 // runtime. Routing hints are memory-only: correctness comes from the holder's
 // existing agent_lock fence, and a stale hint is repaired by probing peers.
@@ -245,7 +245,7 @@ func (r *externalChatRouter) rememberRoute(agentID, holder string) {
 	}
 }
 
-// ChatOneShot implements slackbot.ChatManager. A remote transport request is
+// ChatOneShot runs one external chat turn. A remote transport request is
 // never replayed after its POST may have reached a holder. Only explicit
 // pre-admission responses (switching / wrong holder / runtime not ready) are
 // safe to route again.
@@ -1156,7 +1156,6 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			SystemPromptExtra:                 req.SystemPromptExtra,
 			DisableKojoAttachmentInstructions: req.DisableAttachments,
 			Attachments:                       req.Attachments,
-			SlackMCPBaseURL:                   hubAddr,
 			OriginPeerID:                      hubPeerID,
 			ForceFreshSession:                 req.ForceFreshSession,
 			HandoffCapability:                 strings.TrimSpace(r.Header.Get("X-Kojo-Handoff-Capability")),
@@ -1602,7 +1601,7 @@ func sendExternalChatEvent(ctx context.Context, out chan<- agent.ChatEvent, evt 
 	}
 }
 
-// RegisterKeyedBackgroundHandler lets the Slack bot receive keyed background
+// RegisterKeyedBackgroundHandler lets a chat surface receive keyed background
 // turns from agents running on this process. Lingering only happens for
 // Hub-local dispatch, so delegating to the local Manager is complete.
 func (r *externalChatRouter) RegisterKeyedBackgroundHandler(agentID string, h agent.KeyedBackgroundHandler) func() {

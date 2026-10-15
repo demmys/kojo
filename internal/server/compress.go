@@ -159,8 +159,8 @@ func (c *staticGzipCache) serve(w http.ResponseWriter, r *http.Request, name str
 // ---------------------------------------------------------------------
 
 // gzipExcludedPrefixes lists API paths that must never be compressed:
-// WebSockets, streaming, raw file / blob downloads (Range), MCP
-// (streamable HTTP / SSE) and the whole peer-to-peer surface, which
+// WebSockets, streaming, raw file / blob downloads (Range) and the
+// whole peer-to-peer surface, which
 // has its own wire-encoding conventions. /api/v1/blob serves binary
 // content with Range / strong-ETag (If-Match) semantics.
 var gzipExcludedPrefixes = []string{
@@ -180,9 +180,6 @@ func gzipAPIEligible(r *http.Request) bool {
 	}
 	p := r.URL.Path
 	if !strings.HasPrefix(p, "/api/") {
-		return false
-	}
-	if strings.HasSuffix(p, "/mcp") || strings.Contains(p, "/mcp/") {
 		return false
 	}
 	for _, pre := range gzipExcludedPrefixes {

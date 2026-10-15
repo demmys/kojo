@@ -9,7 +9,6 @@ import (
 
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
-	"github.com/loppo-llc/kojo/internal/slackbot"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -165,7 +164,6 @@ func TestRemoteTransferSkipDismissStaysOnHub(t *testing.T) {
 
 func TestApplyTransferSkipsRetryPreservesDismissal(t *testing.T) {
 	srv, _, _, ag := newGroupDMHandlerTestServer(t)
-	srv.slackHub = &slackbot.Hub{}
 	seedTransferSkips(t, srv, ag.ID, "op-retry")
 	if _, err := srv.agents.Store().UpdateAgent(context.Background(), ag.ID, "", func(rec *store.AgentRecord) error {
 		rec.Settings["slackBot"] = map[string]any{"enabled": true}

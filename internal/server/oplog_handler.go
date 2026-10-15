@@ -730,7 +730,7 @@ func isPKConflict(err error) bool {
 
 // isPrintableASCII rejects any byte outside the printable ASCII
 // range (so a peer_id / op_id can't smuggle newlines or NULs into
-// log output / kv keys). Mirrors the slackbot label gate's posture.
+// log output / kv keys).
 func isPrintableASCII(s string) bool {
 	for i := 0; i < len(s); i++ {
 		c := s[i]

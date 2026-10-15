@@ -248,10 +248,8 @@ func IsNoReplyOnly(text string) bool {
 	return true
 }
 
-// CouldBeNoReplyOnly reports whether streaming text may still become an
+// couldBeNoReplyOnly reports whether streaming text may still become an
 // IsNoReplyOnly response (including empty/whitespace text).
-func CouldBeNoReplyOnly(text string) bool { return couldBeNoReplyOnly(text) }
-
 func couldBeNoReplyOnly(text string) bool {
 	rest := strings.TrimSpace(text)
 	for strings.HasPrefix(rest, SlackNoReplyToken) {

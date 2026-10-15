@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// KeyedBackgroundHandler is implemented by a response surface (the Slack bot,
+// KeyedBackgroundHandler is implemented by a response surface (the Slack package's relay,
 // the GroupDMManager for WebUI threads) that owns keyed conversations of an
 // agent. It receives unsolicited turns
 // produced by a keyed lingering claude session — the completion notification
@@ -89,7 +89,7 @@ const webUIThreadKeyPrefix = "groupdm:"
 
 // keyedBackgroundHandler resolves the response surface owning sessionKey:
 // WebUI thread keys belong to the GroupDMManager, everything else to the
-// per-agent registered handler (the Slack bot).
+// per-agent registered handler (the Slack package's relay).
 func (m *Manager) keyedBackgroundHandler(agentID, sessionKey string) KeyedBackgroundHandler {
 	if isWebUIThreadKey(sessionKey) {
 		if m.groupdms != nil {
@@ -445,7 +445,7 @@ type RemoteKeyedTurnOpener func(ctx context.Context, responseGroupID, responseMe
 
 // HasKeyedBackgroundSurface reports whether this node (the Hub) owns a
 // response surface for sessionKey: a live WebUI thread room of the agent or
-// the agent's registered keyed handler (the Slack bot).
+// the agent's registered keyed handler (the Slack package's relay).
 func (m *Manager) HasKeyedBackgroundSurface(agentID, sessionKey string) bool {
 	if groupID, ok := strings.CutPrefix(sessionKey, webUIThreadKeyPrefix); ok {
 		return groupID != "" && m.groupdms != nil && m.groupdms.liveAgentThread(groupID, agentID)

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -563,8 +564,10 @@ func generateAvatarWithGemini(
 			map[string]any{"type": "text", "text": imagePrompt},
 		},
 		"response_format": map[string]any{
-			"type":         "image",
-			"mime_type":    "image/png",
+			"type": "image",
+			// The Interactions API rejects image/png for image output
+			// ("Supported values: 'image/jpeg'"), so request JPEG.
+			"mime_type":    "image/jpeg",
 			"aspect_ratio": "1:1",
 			"image_size":   "1K",
 		},
@@ -608,7 +611,7 @@ func generateAvatarWithGemini(
 	}
 	if resp.StatusCode != http.StatusOK {
 		if logger != nil {
-			logger.Debug("gemini API error", "status", resp.StatusCode, "body_bytes", len(body))
+			logger.Warn("gemini API error", "status", resp.StatusCode, "detail", geminiErrorDetail(body))
 		}
 		kind := "avatar_provider_error"
 		status := http.StatusBadGateway
@@ -850,3 +853,22 @@ func generateSVGAvatar(name string) string {
     font-family="system-ui,-apple-system,sans-serif" font-size="36" font-weight="600" fill="white">%s</text>
 </svg>`, h1, h2, initials)
 }
+
+// geminiErrorDetail extracts the provider's structured error message for
+// server logs only (never returned to clients). Unstructured bodies are not
+// logged, Google API key-shaped tokens are redacted, and the result is
+// truncated so an unexpected message cannot flood the log.
+func geminiErrorDetail(body []byte) string {
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Error.Message == "" {
+		return "(no structured error message)"
+	}
+	msg := googleAPIKeyPattern.ReplaceAllString(parsed.Error.Message, "[REDACTED]")
+	return truncateRunes(strings.TrimSpace(msg), 300)
+}
+
+var googleAPIKeyPattern = regexp.MustCompile(`AIza[0-9A-Za-z_\-]{20,}`)

@@ -296,3 +296,13 @@ func TestBuildAvatarPromptIncludesUserDirectionAndCapsPersona(t *testing.T) {
 		t.Fatal("avatar constraints missing")
 	}
 }
+
+func TestGeminiErrorDetail(t *testing.T) {
+	got := geminiErrorDetail([]byte(`{"error":{"message":"bad key AIzaSyA1234567890abcdefghijklmn","code":"invalid_request"}}`))
+	if got != "bad key [REDACTED]" {
+		t.Fatalf("got %q", got)
+	}
+	if got := geminiErrorDetail([]byte("raw prompt echo")); got != "(no structured error message)" {
+		t.Fatalf("raw body leaked: %q", got)
+	}
+}

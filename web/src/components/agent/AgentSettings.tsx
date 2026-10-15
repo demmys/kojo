@@ -16,7 +16,7 @@ import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { SlackMigrationNotice, useSlackMigration } from "./SlackMigrationNotice";
-import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { modelsForTool, supportsAutoEffort, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { useCustomModels } from "./fields/useCustomModels";
 import { PersonaField } from "./fields/PersonaField";
 import { ToolPicker } from "./fields/ToolPicker";
@@ -1744,7 +1744,7 @@ export function AgentSettings() {
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
-            {(tool === "claude" || tool === "grok") && (
+            {supportsAutoEffort(tool) && (
               <ToggleRow
                 checked={autoEffort}
                 onChange={setAutoEffort}

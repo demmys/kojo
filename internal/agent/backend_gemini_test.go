@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,9 @@ func collectGeminiEvents(t *testing.T, lines ...string) ([]ChatEvent, *geminiStr
 const geminiSampleSessionID = "fb573b1c-c020-4912-8ae5-08c14d3adc44"
 
 func TestParseGeminiStream_Sample(t *testing.T) {
+	origNow := geminiNow
+	geminiNow = func() time.Time { return time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC) }
+	t.Cleanup(func() { geminiNow = origNow })
 	events, res := collectGeminiEvents(t,
 		`YOLO mode is enabled. All tool calls will be automatically approved.`,
 		`{"type":"init","timestamp":"2026-10-15T00:00:00Z","session_id":"`+geminiSampleSessionID+`","model":"flash"}`,
@@ -34,7 +38,7 @@ func TestParseGeminiStream_Sample(t *testing.T) {
 		`{"type":"message","timestamp":"t","role":"assistant","content":"The output is:\n\n","delta":true}`,
 		`{"type":"message","timestamp":"t","role":"assistant","content":"hi","delta":true}`,
 		`    at stack trace line`,
-		`{"type":"result","timestamp":"t","status":"success","stats":{"total_tokens":20505,"input_tokens":20289,"output_tokens":42,"cached":100,"input":20189,"duration_ms":7921,"tool_calls":1,"models":{"gemini-3.8-flash":{}}}}`,
+		`{"type":"result","timestamp":"t","status":"success","stats":{"total_tokens":20505,"input_tokens":20289,"output_tokens":42,"cached":100,"input":20189,"duration_ms":7921,"tool_calls":1,"models":{"gemini-3.8-flash":{"total_tokens":20505,"input_tokens":20289,"output_tokens":42,"cached":100,"input":20189}}}}`,
 	)
 	if res.sessionID != geminiSampleSessionID {
 		t.Fatalf("sessionID = %q", res.sessionID)
@@ -46,8 +50,12 @@ func TestParseGeminiStream_Sample(t *testing.T) {
 		!strings.Contains(res.toolUses[0].Input, `"echo hi"`) {
 		t.Fatalf("toolUses = %+v", res.toolUses)
 	}
-	if res.usage == nil || res.usage.InputTokens != 20189 || res.usage.OutputTokens != 42 || res.usage.CacheReadInputTokens != 100 {
+	if res.usage == nil || res.usage.InputTokens != 20189 || res.usage.OutputTokens != 42+174 || res.usage.CacheReadInputTokens != 100 {
 		t.Fatalf("usage = %+v", res.usage)
+	}
+	// flash intro price: 20189×0.75 + 100×0.075 + (42+174 thoughts)×3.75, per 1M.
+	if want := (20189*0.75 + 100*0.075 + 216*3.75) / 1e6; math.Abs(res.usage.CostUSD-want) > 1e-12 {
+		t.Fatalf("CostUSD = %v, want %v", res.usage.CostUSD, want)
 	}
 	if res.resultStatus != "success" || res.streamError != "" || res.cancelled {
 		t.Fatalf("status=%q err=%q cancelled=%v", res.resultStatus, res.streamError, res.cancelled)
@@ -150,7 +158,7 @@ func TestGeminiModelDefault(t *testing.T) {
 }
 
 func TestGeminiCommandEnv_Sanitizes(t *testing.T) {
-	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_CLOUD_PROJECT",
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA", "GOOGLE_VERTEX_BASE_URL", "GOOGLE_CLOUD_ACCESS_TOKEN", "GOOGLE_CLOUD_PROJECT",
 		"GOOGLE_CLOUD_LOCATION", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GEMINI_BASE_URL", "GEMINI_API_KEY", "GEMINI_CLI_HOME", "GEMINI_SYSTEM_MD", "GEMINI_MODEL"} {
 		t.Setenv(k, "parent-"+k)
 	}
@@ -599,6 +607,42 @@ func TestGeminiChat_Live(t *testing.T) {
 			}
 		}
 	}
+	// Billable output (candidates + thoughts, derived from the stream's
+	// total_tokens) must match the session file's per-step token counts,
+	// and a priced model must report a cost.
+	if last.Usage == nil {
+		t.Fatal("turn1: no usage")
+	}
+	if sid := readGeminiSessionIDFor(agentDir(a.ID), ""); sid != "" {
+		fileOut := 0
+		for _, f := range geminiSessionFiles(agentDir(a.ID), sid) {
+			body, _ := os.ReadFile(f)
+			steps := map[string]int{}
+			for _, line := range strings.Split(string(body), "\n") {
+				var rec struct {
+					ID     string `json:"id"`
+					Type   string `json:"type"`
+					Tokens *struct {
+						Output   int `json:"output"`
+						Thoughts int `json:"thoughts"`
+					} `json:"tokens"`
+				}
+				if json.Unmarshal([]byte(line), &rec) == nil && rec.Type == "gemini" && rec.Tokens != nil {
+					steps[rec.ID] = rec.Tokens.Output + rec.Tokens.Thoughts
+				}
+			}
+			for _, n := range steps {
+				fileOut += n
+			}
+		}
+		if fileOut != last.Usage.OutputTokens {
+			t.Fatalf("usage output = %d, session file output+thoughts = %d", last.Usage.OutputTokens, fileOut)
+		}
+	}
+	if _, priced := geminiPriceTable[geminiEffortModels[model]]; priced && last.Usage.CostUSD <= 0 {
+		t.Fatalf("priced model %s reported no cost: %+v", model, last.Usage)
+	}
+	t.Logf("turn1 usage: %+v", *last.Usage)
 	if countThinking(evs) != fileThoughts {
 		t.Fatalf("thinking events = %d, session file thoughts = %d", countThinking(evs), fileThoughts)
 	}

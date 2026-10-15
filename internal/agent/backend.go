@@ -265,6 +265,13 @@ func backendLoadsClaudeSkills(tool string) bool {
 //     sqlite rows via CodexSession; backend_codex.go resumes with
 //     app-server `thread/resume`.
 //
+//   - gemini: the orchestrator transfers the kojo resume refs
+//     (main + per-SessionKey threads) and their session JSONLs from
+//     the per-agent GEMINI_CLI_HOME via GeminiSession (see
+//     gemini_session_transfer.go); backend_gemini.go on target
+//     resumes with `gemini --resume <id>`. The skill installs under
+//     `.gemini/skills`.
+//
 // custom-bare has no session state to transfer: every turn is a fresh
 // stateless request, and its continuity comes from kojo replaying the
 // transcript it already stores (ChatOptions.History), which the target
@@ -276,7 +283,7 @@ func backendLoadsClaudeSkills(tool string) bool {
 // offers a switch it cannot fulfil.
 func backendSupportsDeviceSwitch(tool string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolClaude, ToolCustomClaude, ToolGrok, ToolCodex, ToolCustomCodex:
+	case ToolClaude, ToolCustomClaude, ToolGrok, ToolCodex, ToolCustomCodex, ToolGemini:
 		return true
 	default:
 		return false

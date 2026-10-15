@@ -76,7 +76,7 @@ func (m *Manager) ResetData(id string) error {
 	}
 
 	// Clear the global CLI session stores BEFORE acquiring
-	// memorySyncMu. clearGrokSession / clearCodexSession take their
+	// memorySyncMu. clearGrokSession / clearCodexSession / clearGeminiHome take their
 	// transfer locks internally, and the peer-agent-sync handler holds
 	// the transfer lock THEN takes memorySyncMu (via
 	// agent.LockAgentMemorySync at peer_agent_sync_handler.go:519).
@@ -89,6 +89,10 @@ func (m *Manager) ResetData(id string) error {
 	clearClaudeSession(id, m.logger)
 	clearGrokSession(id)
 	clearCodexSession(id)
+	// Gemini CLI home: sessions, kojo session refs and the per-turn
+	// settings.json (regenerated on the next turn). Under the gemini
+	// transfer lock, hence here rather than in the memorySyncMu region.
+	clearGeminiHome(id, m.logger)
 
 	// Hold the per-agent memory-sync lock around the entire on-
 	// disk wipe + recreate + post-reset sync so concurrent CRUD /
@@ -185,12 +189,6 @@ func (m *Manager) ResetData(id string) error {
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
-	// Gemini CLI home: sessions, kojo session refs and the per-turn
-	// settings.json (regenerated on the next turn).
-	if err := os.RemoveAll(geminiCLIHome(dir)); err != nil {
-		m.logger.Warn("reset: failed to remove gemini cli home", "agent", id, "err", err)
-	}
-
 	// (Global CLI session stores cleared above, BEFORE lockMemorySync,
 	// to avoid the lock-order inversion against the peer-agent-sync
 	// handler. See the comment at the top of this function for detail.)

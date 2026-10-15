@@ -2110,6 +2110,44 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 		}
 	}
 
+	// gemini session: same tool gate and optional-artifact policy as
+	// grok. gemini-cli appends whole JSONL records per message, so a
+	// mid-turn read sees at worst a torn trailing line, which the CLI
+	// drops on load. Read failure degrades to the canonical-history
+	// fallback rather than blocking the switch.
+	if tool == agent.ToolGemini {
+		gemTransfer, gemSkipped, gmerr := agent.ReadGeminiSessionFiles(agentID)
+		if gmerr != nil {
+			s.logger.Warn("agent-sync: gemini session unavailable; using history fallback",
+				"agent", agentID, "err", gmerr)
+			req.TransferSkips = append(req.TransferSkips, agent.SkippedSessionFile{
+				Path: "gemini-session", Reason: "unreadable",
+			})
+			gemTransfer = nil
+		}
+		if len(gemSkipped) > 0 {
+			s.logger.Warn("agent-sync: skipped gemini session files",
+				"agent", agentID, "files", gemSkipped)
+			req.TransferSkips = append(req.TransferSkips, gemSkipped...)
+		}
+		if gemTransfer != nil && len(gemTransfer.Files) > 0 {
+			gw := &geminiSessionWire{
+				Refs:  make([]geminiSessionRefWire, 0, len(gemTransfer.Refs)),
+				Files: make([]geminiSessionFileWire, 0, len(gemTransfer.Files)),
+			}
+			for _, r := range gemTransfer.Refs {
+				gw.Refs = append(gw.Refs, geminiSessionRefWire{Name: r.Name, SessionID: r.SessionID})
+			}
+			for _, f := range gemTransfer.Files {
+				gw.Files = append(gw.Files, geminiSessionFileWire{
+					RelPath:    f.RelPath,
+					ContentB64: base64.StdEncoding.EncodeToString(f.Content),
+				})
+			}
+			req.GeminiSession = gw
+		}
+	}
+
 	if agentRecordUsesCodex(rec) {
 		codexTransfer, codexSkipped, cerr := agent.ReadCodexSessionFiles(agentID)
 		if cerr != nil {

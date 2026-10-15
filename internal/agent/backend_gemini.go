@@ -58,7 +58,9 @@ var geminiStripEnvPrefixes = []string{
 	"GEMINI_",
 	"GOOGLE_API_KEY=",
 	"GOOGLE_GEMINI_", // e.g. GOOGLE_GEMINI_BASE_URL would redirect the injected key
-	"GOOGLE_GENAI_USE_VERTEXAI=",
+	"GOOGLE_GENAI_",  // USE_VERTEXAI / USE_GCA (auth switch), API_VERSION
+	"GOOGLE_VERTEX_BASE_URL=",
+	"GOOGLE_CLOUD_ACCESS_TOKEN=",
 	"GOOGLE_CLOUD_PROJECT=",
 	"GOOGLE_CLOUD_LOCATION=",
 	"GOOGLE_APPLICATION_CREDENTIALS=",
@@ -189,10 +191,14 @@ func geminiSessionIDPersisted(agentDirPath, sessionID string) bool {
 // The filename only carries the first 8 hex digits, so each candidate's
 // header line is checked for the full sessionId.
 func geminiSessionFiles(agentDirPath, sessionID string) []string {
+	return geminiSessionFilesInHome(geminiCLIHome(agentDirPath), sessionID)
+}
+
+func geminiSessionFilesInHome(home, sessionID string) []string {
 	if !isGeminiSessionID(sessionID) {
 		return nil
 	}
-	pattern := filepath.Join(geminiCLIHome(agentDirPath), ".gemini", "tmp", "*", "chats", "session-*-"+sessionID[:8]+".jsonl")
+	pattern := filepath.Join(home, ".gemini", "tmp", "*", "chats", "session-*-"+sessionID[:8]+".jsonl")
 	matches, _ := filepath.Glob(pattern)
 	var out []string
 	for _, p := range matches {
@@ -257,6 +263,10 @@ func deleteGeminiThreadRefStrict(agentID, sessionKey string) error {
 // clearGeminiSessionCounted removes every CLI session file and every kojo
 // session ref for the agent. Settings are left alone (rewritten per turn).
 func clearGeminiSessionCounted(agentID string) (filesRemoved int, err error) {
+	// Serialise with device-switch Read/Stage so a reset cannot
+	// interleave with a staged swap of the same paths.
+	release := lockGeminiSessionTransfer(agentID)
+	defer release()
 	dir := agentDir(agentID)
 	tmpRoot := filepath.Join(geminiCLIHome(dir), ".gemini", "tmp")
 	_ = filepath.Walk(tmpRoot, func(_ string, info os.FileInfo, werr error) error {
@@ -275,6 +285,16 @@ func clearGeminiSessionCounted(agentID string) (filesRemoved int, err error) {
 		}
 	}
 	return filesRemoved, err
+}
+
+// clearGeminiHome removes the agent's whole GEMINI_CLI_HOME (ResetData),
+// serialised with device-switch Read/Stage like clearGeminiSessionCounted.
+func clearGeminiHome(agentID string, logger *slog.Logger) {
+	release := lockGeminiSessionTransfer(agentID)
+	defer release()
+	if err := os.RemoveAll(geminiCLIHome(agentDir(agentID))); err != nil && logger != nil {
+		logger.Warn("reset: failed to remove gemini cli home", "agent", agentID, "err", err)
+	}
 }
 
 // geminiModel returns the model id kojo passes with -m.
@@ -375,12 +395,25 @@ func buildGeminiSettings(model, effort string, mcpServers map[string]mcpServerEn
 }
 
 func writeGeminiSettings(agentDirPath, model, effort string, mcpServers map[string]mcpServerEntry) error {
+	return writeGeminiSettingsFile(geminiSettingsPath(agentDirPath), model, effort, mcpServers)
+}
+
+func writeGeminiSettingsFile(path, model, effort string, mcpServers map[string]mcpServerEntry) error {
 	body, err := json.MarshalIndent(buildGeminiSettings(model, effort, mcpServers), "", "  ")
 	if err != nil {
 		return err
 	}
-	path := geminiSettingsPath(agentDirPath)
+	// path is <home>/.gemini/settings.json. The agent can write its own
+	// dir, so a planted .gemini-cli-home or .gemini symlink (e.g. to the
+	// operator's ~/.gemini) must not redirect this write.
+	dirs := []string{filepath.Dir(filepath.Dir(path)), filepath.Dir(path)}
+	if err := geminiRefuseSymlinks(dirs...); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := geminiRefuseSymlinks(dirs...); err != nil {
 		return err
 	}
 	// Atomic so a concurrent keyed turn starting up never reads a torn file.
@@ -612,12 +645,13 @@ type geminiStreamEvent struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	Stats *struct {
-		InputTokens  int  `json:"input_tokens"`
-		OutputTokens int  `json:"output_tokens"`
-		Cached       int  `json:"cached"`
-		Input        *int `json:"input"`
+		geminiModelStats
+		Models map[string]geminiModelStats `json:"models"`
 	} `json:"stats"`
 }
+
+// geminiNow is the clock used to pick the price step; tests override it.
+var geminiNow = time.Now
 
 // parseGeminiStream reads `gemini -o stream-json` NDJSON from r. Event types:
 //
@@ -713,17 +747,13 @@ func parseGeminiStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 				res.streamError = ev.Error.Message
 			}
 			if s := ev.Stats; s != nil && (s.InputTokens > 0 || s.OutputTokens > 0) {
-				input := s.InputTokens - s.Cached
-				if s.Input != nil {
-					input = *s.Input
-				}
-				if input < 0 {
-					input = 0
-				}
+				// OutputTokens includes thinking (as claude's does): it is
+				// what the turn bills at the output rate.
 				res.usage = &Usage{
-					InputTokens:          input,
-					OutputTokens:         s.OutputTokens,
+					InputTokens:          s.uncached(),
+					OutputTokens:         s.OutputTokens + s.thoughts(),
 					CacheReadInputTokens: s.Cached,
+					CostUSD:              geminiCostUSD(s.Models, geminiNow()),
 				}
 			}
 		}

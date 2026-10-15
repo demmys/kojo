@@ -244,6 +244,7 @@ func splitAgentSyncIntoChunks(payload *peerAgentSyncRequest, budgetBytes int) (b
 		Memory:                    payload.Memory,
 		AgentToken:                payload.AgentToken,
 		GrokSession:               payload.GrokSession,
+		GeminiSession:             payload.GeminiSession,
 		Credentials:               payload.Credentials,
 		CustomAPIKey:              payload.CustomAPIKey,
 		SinceMessageSeq:           payload.SinceMessageSeq,
@@ -427,6 +428,10 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 	if payload.GrokSession != nil {
 		grokHeader = &grokSessionWire{SessionID: payload.GrokSession.SessionID}
 	}
+	var geminiHeader *geminiSessionWire
+	if payload.GeminiSession != nil {
+		geminiHeader = &geminiSessionWire{Refs: payload.GeminiSession.Refs}
+	}
 	singletons := struct {
 		SourceDeviceID            string
 		OpID                      string
@@ -435,6 +440,7 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 		Memory                    any
 		AgentToken                string
 		GrokSession               any
+		GeminiSession             any
 		Credentials               any
 		CustomAPIKey              any
 		SinceMessageSeq           int64
@@ -448,6 +454,7 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 		Memory:                    payload.Memory,
 		AgentToken:                payload.AgentToken,
 		GrokSession:               grokHeader,
+		GeminiSession:             geminiHeader,
 		Credentials:               payload.Credentials,
 		CustomAPIKey:              payload.CustomAPIKey,
 		SinceMessageSeq:           payload.SinceMessageSeq,
@@ -464,6 +471,15 @@ func estimateAgentSyncRawSize(payload *peerAgentSyncRequest) (int64, error) {
 			b, merr := json.Marshal(f)
 			if merr != nil {
 				return 0, fmt.Errorf("estimate grok_session_file: %w", merr)
+			}
+			total += int64(len(b)) + 1
+		}
+	}
+	if payload.GeminiSession != nil {
+		for _, f := range payload.GeminiSession.Files {
+			b, merr := json.Marshal(f)
+			if merr != nil {
+				return 0, fmt.Errorf("estimate gemini_session_file: %w", merr)
 			}
 			total += int64(len(b)) + 1
 		}

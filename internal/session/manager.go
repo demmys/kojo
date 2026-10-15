@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +66,7 @@ var userTools = map[string]bool{
 	"claude":         true,
 	"codex":          true,
 	"grok":           true,
+	toolGemini:       true,
 	toolCustomClaude: true,
 }
 
@@ -98,6 +100,10 @@ type Manager struct {
 
 	// customBaseURL is the base URL for a custom Anthropic Messages API endpoint.
 	customBaseURL string
+
+	// launchers isolate user tools that must not run bare (see
+	// SetToolLauncher / toolGemini).
+	launchers map[string]ToolLauncher
 
 	// callback for session events
 	OnSessionExit func(s *Session)
@@ -174,6 +180,8 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 	var runArgs []string
 	if !userTools[tool] {
 		runArgs, toolSessionID = platformBuildInternalToolArgs(id, tool, workDir, args)
+	} else if actualTool == toolGemini {
+		toolSessionID, runArgs = assignGeminiSessionID(args)
 	} else {
 		toolSessionID, runArgs = assignClaudeSessionID(actualTool, args)
 	}
@@ -182,7 +190,14 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 
 	var res *startResult
 	if userTools[tool] {
-		res, err = m.platformStartUserTool(id, workDir, toolPath, runArgs, 0, 0, extraEnv)
+		launchPath, launchArgs, cleanup, lerr := m.prepareLaunch(tool, toolPath, workDir, runArgs)
+		if lerr != nil {
+			return nil, lerr
+		}
+		res, err = m.platformStartUserTool(id, workDir, launchPath, launchArgs, 0, 0, extraEnv)
+		if err != nil && cleanup != nil {
+			cleanup()
+		}
 	} else {
 		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, runArgs, toolSessionID)
 	}
@@ -302,7 +317,15 @@ func (m *Manager) Restart(id string) (*Session, error) {
 		s.mu.Lock()
 		cols, rows := s.lastCols, s.lastRows
 		s.mu.Unlock()
-		res, err = m.platformStartUserTool(id, workDir, toolPath, restartArgs, cols, rows, extraEnv)
+		launchPath, launchArgs, cleanup, lerr := m.prepareLaunch(tool, toolPath, workDir, restartArgs)
+		if lerr != nil {
+			clearRestarting()
+			return nil, lerr
+		}
+		res, err = m.platformStartUserTool(id, workDir, launchPath, launchArgs, cols, rows, extraEnv)
+		if err != nil && cleanup != nil {
+			cleanup()
+		}
 	} else {
 		res, err = m.platformStartInternalTool(id, tool, toolPath, workDir, restartArgs, toolSessionID)
 	}
@@ -661,6 +684,24 @@ func (m *Manager) resolveCustomAPI(tool string, args []string) customAPIResult {
 	return result
 }
 
+// prepareLaunch routes a user tool through its launcher, if any. Tools
+// that require one (gemini) fail closed when none is installed rather
+// than starting against the operator's own CLI state.
+func (m *Manager) prepareLaunch(tool, toolPath, workDir string, args []string) (string, []string, func(), error) {
+	fn := m.toolLauncher(tool)
+	if fn == nil {
+		if toolRequiresLauncher(tool) {
+			return "", nil, nil, fmt.Errorf("%w: %s (isolated launcher not configured)", ErrToolNotFound, tool)
+		}
+		return toolPath, args, nil, nil
+	}
+	l, err := fn(ToolLaunchRequest{ToolPath: toolPath, WorkDir: workDir, Args: args})
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("prepare %s launch: %w", tool, err)
+	}
+	return l.Path, l.Args, l.Cleanup, nil
+}
+
 // buildCustomEnv builds extra environment variables for custom API sessions.
 func (m *Manager) buildCustomEnv(r customAPIResult) []string {
 	if r.baseURL == "" {
@@ -694,6 +735,8 @@ func yoloNativeFlag(tool string) string {
 		return "--dangerously-skip-permissions"
 	case "codex":
 		return "--dangerously-bypass-approvals-and-sandbox"
+	case toolGemini:
+		return "--yolo"
 	default:
 		return ""
 	}
@@ -709,6 +752,11 @@ func appendYoloFlag(tool string, args []string, yoloMode bool) []string {
 	}
 	flag := yoloNativeFlag(tool)
 	if flag == "" {
+		return args
+	}
+	if tool == toolGemini && geminiHasApprovalMode(args) {
+		// The user picked an approval mode (or -y) already; adding
+		// --yolo would make gemini-cli reject the combination.
 		return args
 	}
 	for _, a := range args {
@@ -837,6 +885,9 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 			return append(args, "--continue")
 		}
 
+	case toolGemini:
+		return buildGeminiRestartArgs(origArgs, toolSessionID)
+
 	default:
 		// Internal tools (tmux/shell) use platform-specific restart args
 		if internalTools[tool] {
@@ -863,6 +914,11 @@ func ToolAvailability() map[string]ToolInfo {
 			// ANTHROPIC_BASE_URL).
 			claudePath, err := exec.LookPath("claude")
 			result[tool] = ToolInfo{Available: err == nil, Path: claudePath}
+			continue
+		}
+		if tool == toolGemini && runtime.GOOS == "windows" {
+			// The isolated launcher is a POSIX sh wrapper (see toolGemini).
+			result[tool] = ToolInfo{}
 			continue
 		}
 		path, err := exec.LookPath(tool)

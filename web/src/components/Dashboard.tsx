@@ -9,7 +9,7 @@ import { TransferSkipsNotice } from "./agent/TransferSkipsNotice";
 import { usePushNotifications } from "../hooks/usePushNotifications";
 import { useCollapsedSet } from "../hooks/useCollapsedSet";
 import { errMsg } from "../lib/utils";
-import { supportsEffort } from "../lib/toolModels";
+import { supportsAutoEffort, supportsEffort } from "../lib/toolModels";
 import { useT } from "../lib/i18n";
 import { Header } from "./ui/Header";
 import { Lamp, type LampState } from "./ui/Lamp";
@@ -774,7 +774,7 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                                   <Chip
                                     className="shrink-0"
                                     title={t("dash.configuredEffort", { level: agent.effort || t("field.effortCliDefault") }) + (
-                                      (agent.tool === "claude" || agent.tool === "grok") && agent.autoEffort !== false
+                                      supportsAutoEffort(agent.tool) && agent.autoEffort !== false
                                         ? ` — ${t("settings.autoEffortDesc")}`
                                         : ""
                                     )}

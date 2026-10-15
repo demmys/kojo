@@ -634,6 +634,11 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		m.agents[a.ID] = a
 	}
 
+	// Gemini PTY wrappers carry the API key and are normally consumed
+	// (self-deleted) within milliseconds; any still present at startup
+	// were orphaned by a previous process dying mid-launch.
+	sweepGeminiPTYWrappers(geminiPTYLaunchDir(), time.Now())
+
 	return m, nil
 }
 
@@ -2227,7 +2232,7 @@ func (m *Manager) resolveTurnEffortAsync(ctx context.Context, agentID, userMessa
 		var diary, jevKey string
 		// Diary/key reads only matter for the LLM path; skip the disk
 		// reads for system turns / disabled agents / other tools.
-		if !systemTurn && snap.IsAutoEffortEnabled() && (snap.Tool == "claude" || snap.Tool == "grok") {
+		if !systemTurn && snap.IsAutoEffortEnabled() && toolSupportsAutoEffort(snap.Tool) {
 			diary = RecentDiarySummary(agentID)
 			jevKey, _ = LoadTypeSafeAPIKey(m.creds) // "" → claude CLI classifier
 		}
@@ -2254,7 +2259,7 @@ func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turn
 	// tool/model/effort change) must win over a classification computed
 	// against the stale settings.
 	if !prep.agentCopy.IsAutoEffortEnabled() ||
-		(prep.agentCopy.Tool != "claude" && prep.agentCopy.Tool != "grok") {
+		!toolSupportsAutoEffort(prep.agentCopy.Tool) {
 		return
 	}
 	// Recover the raw verdict: the classifier paths encode it as

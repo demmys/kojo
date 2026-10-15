@@ -160,10 +160,12 @@ export function NewSession() {
         parsedArgs = ["--model", model, ...parsedArgs];
       }
       // Effort flag differs per CLI: claude/grok take --effort, codex takes
-      // a -c config override. Skip when the user already passed their own,
-      // and when a manual --model/-m overrides the dropdown model — the
-      // selected effort was validated against the dropdown model's ladder,
-      // which may not apply to the manually-typed one.
+      // a -c config override. gemini has no effort flag; kojo's launcher
+      // strips --effort and turns it into the settings.json thinking level.
+      // Skip when the user already passed their own, and when a manual
+      // --model/-m overrides the dropdown model — the selected effort was
+      // validated against the dropdown model's ladder, which may not apply
+      // to the manually-typed one.
       if (effort && model && !hasModelArg && supportsEffort(tool)) {
         const hasEffortArg = parsedArgs.some(
           (a) =>
@@ -364,7 +366,9 @@ export function NewSession() {
                     ? t("ns.yoloClaude")
                     : tool === "codex"
                       ? t("ns.yoloCodex")
-                      : t("ns.yoloOther")}
+                      : tool === "gemini"
+                        ? t("ns.yoloGemini")
+                        : t("ns.yoloOther")}
                 </div>
               </div>
               <span onClick={(e) => e.stopPropagation()}>

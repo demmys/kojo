@@ -1843,6 +1843,10 @@ const messages = {
     ja: "--dangerously-bypass-approvals-and-sandbox 付きで起動する",
     en: "Launches with --dangerously-bypass-approvals-and-sandbox",
   },
+  "ns.yoloGemini": {
+    ja: "--yolo 付きで起動する",
+    en: "Launches with --yolo",
+  },
   "ns.yoloOther": {
     ja: "権限確認をスキップする",
     en: "Skip permission prompts",

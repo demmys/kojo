@@ -120,6 +120,12 @@ const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"])
  */
 const defaultXhighModels = new Set(["claude-opus-4-7"]);
 
+/** Tools whose per-turn effort the server's auto-effort classifier can
+ * drive (internal/agent/auto_effort.go toolSupportsAutoEffort). */
+export function supportsAutoEffort(tool: string): boolean {
+  return tool === "claude" || tool === "grok" || tool === "gemini";
+}
+
 export function supportsEffort(tool: string): boolean {
   return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini";
 }

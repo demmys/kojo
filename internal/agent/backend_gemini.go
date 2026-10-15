@@ -786,7 +786,7 @@ func isGeminiStaleSessionError(msg string) bool {
 // skill sections (substituted by the CLI) so the model still learns the
 // real Gemini tool names alongside kojo's backend-neutral prompt.
 func geminiSystemMD(systemPrompt string) string {
-	return systemPrompt + "\n\n# Gemini CLI tools\n\nThe following tools are available to you: ${AvailableTools}\n\n${AgentSkills}\n\n${SubAgents}\n"
+	return systemPrompt + "\n\n# Gemini CLI tools\n\nThe following tools are available to you: ${AvailableTools}\n\nThe shell tool rejects commands that use command or process substitution ($(...), backticks, <(...), >(...)), including inside double quotes. When you need those, write the commands to a script file in your working directory (e.g. `task.sh`) and run it with `bash task.sh`.\n\n${AgentSkills}\n\n${SubAgents}\n"
 }
 
 // geminiGuideDir returns GuideDir as an absolute path: the CLI resolves

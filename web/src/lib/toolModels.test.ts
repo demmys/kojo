@@ -207,6 +207,7 @@ describe("toolModels — Opus 5 / effort defaults", () => {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");
     }
+    expect(effortLevelsForModel("flash")).toEqual(["low", "medium", "high"]);
   });
 });
 

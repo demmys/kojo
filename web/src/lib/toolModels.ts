@@ -31,10 +31,9 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "grok-4.7",
     models: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
   },
-  // gemini-cli. Only concrete ids are listed: kojo maps effort onto the
+  // gemini-cli. Only concrete ids are listed; kojo maps effort onto the
   // model's thinkingLevel via a settings.json override keyed on the
-  // concrete id, which the CLI's pro/flash/auto aliases would not match.
-  // Keep in sync with internal/agent/backend_gemini.go geminiEffortModels.
+  // concrete id (see geminiEffortModels below).
   gemini: {
     default: "gemini-4-argon",
     models: ["gemini-4-argon", "gemini-3.8-flash"],
@@ -104,7 +103,10 @@ const claudeMediumDefaultModels = new Set(["claude-opus-5-5"]);
 // grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
 // Gemini thinkingLevel ladder: low/medium/high, API default medium.
-const geminiEffortModels = new Set(toolModels.gemini.models);
+// "flash" is the CLI alias for gemini-3.8-flash; the backend keys the
+// override on the resolved id. Keep in sync with
+// internal/agent/backend_gemini.go geminiEffortModels.
+const geminiEffortModels = new Set([...toolModels.gemini.models, "flash"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**

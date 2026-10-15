@@ -270,7 +270,7 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 			if model == "" {
 				model = GeminiDefaultModel
 			}
-			return geminiEffortModels[model]
+			return geminiEffortModels[model] != ""
 		}
 		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:

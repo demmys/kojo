@@ -26,14 +26,19 @@ import (
 // thinkingLevel override in settings.json has a concrete model to match.
 const GeminiDefaultModel = "gemini-4-argon"
 
-// geminiEffortModels lists the Gemini models whose thinking level kojo can
+// geminiEffortModels maps the Gemini models whose thinking level kojo can
 // drive through agent.Effort (low/medium/high → generationConfig
-// .thinkingConfig.thinkingLevel). Only concrete ids are listed: the CLI's
-// alias resolution (pro/flash/auto) happens before modelConfigs matching,
-// so an override keyed on an alias would silently never apply.
-var geminiEffortModels = map[string]bool{
-	"gemini-4-argon":   true,
-	"gemini-3.8-flash": true,
+// .thinkingConfig.thinkingLevel) to the concrete id the settings.json
+// modelConfigs override must match. gemini-cli resolves aliases before
+// matching overrides, so an override keyed on an alias never applies
+// (verified against gemini-cli 0.64.0: `-m flash` with an override on
+// "flash" is ignored, on "gemini-3.8-flash" it applies). Only "flash" is
+// mapped: "pro" and "auto" resolve to models outside this list (auto even
+// routes per request), so effort stays rejected for them.
+var geminiEffortModels = map[string]string{
+	"gemini-4-argon":   "gemini-4-argon",
+	"gemini-3.8-flash": "gemini-3.8-flash",
+	"flash":            "gemini-3.8-flash",
 }
 
 // geminiSessionIDPattern matches the Gemini CLI's session UUIDs. Every
@@ -283,7 +288,7 @@ func geminiModel(agent *Agent) string {
 // geminiThinkingLevel maps kojo's effort onto the API's thinkingLevel
 // enum, or "" when the CLI default should apply.
 func geminiThinkingLevel(model, effort string) string {
-	if !geminiEffortModels[model] {
+	if geminiEffortModels[model] == "" {
 		return ""
 	}
 	switch effort {
@@ -350,10 +355,16 @@ func buildGeminiSettings(model, effort string, mcpServers map[string]mcpServerEn
 		settings["modelConfigs"] = map[string]any{
 			"customOverrides": []any{
 				map[string]any{
-					"match": map[string]any{"model": model},
+					"match": map[string]any{"model": geminiEffortModels[model]},
 					"modelConfig": map[string]any{
 						"generateContentConfig": map[string]any{
-							"thinkingConfig": map[string]any{"thinkingLevel": level},
+							// The override replaces the CLI's default
+							// thinkingConfig, which carries includeThoughts;
+							// without it the session file's "thoughts" come
+							// back empty (verified live on gemini-4-argon)
+							// and kojo has no thinking to show. The stream
+							// content stays thought-free either way.
+							"thinkingConfig": map[string]any{"thinkingLevel": level, "includeThoughts": true},
 						},
 					},
 				},
@@ -379,7 +390,7 @@ func writeGeminiSettings(agentDirPath, model, effort string, mcpServers map[stri
 // buildGeminiArgs builds the argv. The prompt itself goes on stdin
 // (`-p ""` makes the CLI headless and appends stdin), so long prompts
 // never hit ARG_MAX and a prompt starting with "-" is never a flag.
-func buildGeminiArgs(model, resumeID string) []string {
+func buildGeminiArgs(model, resumeID string, includeDirs []string) []string {
 	args := []string{
 		// The agent dir is the agent's own workspace; without this the
 		// headless CLI refuses to start in an untrusted folder.
@@ -388,9 +399,9 @@ func buildGeminiArgs(model, resumeID string) []string {
 		"--yolo",
 		"-o", "stream-json",
 		"-m", model,
-		// The shared guide dir lives outside the agent workspace; the
-		// CLI's file tools refuse paths outside included directories.
-		"--include-directories", geminiGuideDir(),
+	}
+	for _, d := range includeDirs {
+		args = append(args, "--include-directories", d)
 	}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
@@ -473,7 +484,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, geminiPath, buildGeminiArgs(model, resumeID)...)
+	cmd := exec.CommandContext(ctx, geminiPath, buildGeminiArgs(model, resumeID, geminiIncludeDirs())...)
 	cmd.Env = appendKojoTurnEnv(geminiCommandEnv(agent.ID, dir, apiKey, systemMDPath), opts)
 	cmd.Dir = dir
 	cmd.Stdin = strings.NewReader(userMessage)
@@ -490,6 +501,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		removeSystemMD()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
+	thoughts := newGeminiThoughtTail(dir, resumeID, time.Now())
 	if err := cmd.Start(); err != nil {
 		removeSystemMD()
 		return nil, fmt.Errorf("start gemini: %w", err)
@@ -501,7 +513,23 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		defer removeSystemMD()
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
-		result := parseGeminiStream(stdout, b.logger, send)
+
+		// Thought summaries come from the session file, not stdout; tail
+		// it alongside the stream. stopTail must run before any terminal
+		// event so no "thinking" event can trail it.
+		tailStop, tailDone := make(chan struct{}), make(chan struct{})
+		go thoughts.run(tailStop, tailDone, send)
+		stopTail := func() {
+			select {
+			case <-tailStop:
+			default:
+				close(tailStop)
+			}
+			<-tailDone
+		}
+		defer stopTail()
+
+		result := parseGeminiStream(stdout, b.logger, send, thoughts.setSession)
 
 		cleanupOneShot := func() {
 			if opts.OneShot && result.sessionID != "" && !geminiSessionIDPersisted(dir, result.sessionID) {
@@ -510,13 +538,21 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		}
 
 		if result.cancelled {
+			stopTail()
 			cmd.Wait()
-			emitCancelDone(ctx, ch, result.text, "", result.toolUses, result.usage)
+			// Collect (without sending: the consumer is gone) whatever the
+			// last step recorded, so the cancelled message keeps it.
+			thoughts.poll(func(ChatEvent) bool { return false })
+			emitCancelDone(ctx, ch, result.text, thoughts.thinking(), result.toolUses, result.usage)
 			cleanupOneShot()
 			return
 		}
 
 		waitErr := cmd.Wait()
+		// Final drain: the last step's record is written when the step
+		// completes, typically right before the process exits.
+		stopTail()
+		thoughts.poll(send)
 		processError := classifyGeminiProcessError(waitErr, stderrBuf.String(), result)
 		if processError != "" {
 			b.logger.Warn("gemini turn failed",
@@ -540,7 +576,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		}
 		cleanupOneShot()
 
-		msg := assembleAssistantMessage(result.text, "", result.toolUses, result.usage)
+		msg := assembleAssistantMessage(result.text, thoughts.thinking(), result.toolUses, result.usage)
 		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
 	}()
 
@@ -594,7 +630,9 @@ type geminiStreamEvent struct {
 //
 // Non-JSON lines (startup warnings, stack traces) are ignored; unknown
 // event types are skipped.
-func parseGeminiStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool) *geminiStreamResult {
+//
+// onSession, when non-nil, is called with the init event's session id.
+func parseGeminiStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onSession func(string)) *geminiStreamResult {
 	res := &geminiStreamResult{}
 	scanner := newSkippingLineScanner(r)
 	loggedSkips := 0
@@ -623,6 +661,9 @@ func parseGeminiStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bo
 		case "init":
 			if isGeminiSessionID(ev.SessionID) {
 				res.sessionID = ev.SessionID
+				if onSession != nil {
+					onSession(ev.SessionID)
+				}
 			}
 		case "message":
 			if ev.Role != "assistant" || ev.Content == "" {
@@ -751,6 +792,18 @@ func geminiSystemMD(systemPrompt string) string {
 // geminiGuideDir returns GuideDir as an absolute path: the CLI resolves
 // relative include dirs against its cwd (the agent dir), which would
 // break when kojo runs with a relative --config-dir.
+// geminiIncludeDirs returns the extra workspace directories to pass via
+// --include-directories. The shared guide dir lives outside the agent
+// workspace and the CLI's file tools refuse paths outside included
+// directories, but gemini-cli aborts at startup ("Directory does not
+// exist") on a missing one, so it is only included when present.
+func geminiIncludeDirs() []string {
+	if fi, err := os.Stat(geminiGuideDir()); err == nil && fi.IsDir() {
+		return []string{geminiGuideDir()}
+	}
+	return nil
+}
+
 func geminiGuideDir() string {
 	if abs, err := filepath.Abs(GuideDir()); err == nil {
 		return abs

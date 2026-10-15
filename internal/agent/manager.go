@@ -506,6 +506,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			ToolClaude:       NewClaudeBackend(logger),
 			ToolCodex:        NewCodexBackend(logger),
 			ToolGrok:         NewGrokBackend(logger),
+			ToolGemini:       NewGeminiBackend(logger, creds),
 			ToolCustomClaude: NewCustomClaudeBackend(logger, creds),
 			ToolCustomCodex:  NewCustomCodexBackend(logger, creds),
 			ToolCustomBare:   NewCustomBareBackend(logger, creds),
@@ -2829,6 +2830,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
 		case ToolGrok:
 			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
+		case ToolGemini:
+			resetErr = deleteGeminiThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
 			if responseAttachments != nil {
@@ -3800,6 +3803,8 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 		return codexCanResumeSession(agentID, sessionKey)
 	case ToolGrok:
 		return grokCanResumeSession(agentID, sessionKey)
+	case ToolGemini:
+		return geminiCanResumeSession(agentID, sessionKey)
 	}
 
 	// Probe the deterministic Claude session file. expectedClaudeSessionID is

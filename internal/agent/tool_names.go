@@ -16,6 +16,7 @@ const (
 	ToolClaude       = "claude"
 	ToolCodex        = "codex"
 	ToolGrok         = "grok"
+	ToolGemini       = "gemini"
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"

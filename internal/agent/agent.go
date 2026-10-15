@@ -258,6 +258,21 @@ func ValidModelEffort(model, effort string) bool {
 // assumptions about that built-in model's effort ladder.
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
+	case ToolGemini:
+		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
+		// only set it for the concrete models in geminiEffortModels (an
+		// empty model means GeminiDefaultModel). Aliases and unknown ids
+		// accept no effort rather than one that would silently not apply.
+		switch effort {
+		case "":
+			return true
+		case "low", "medium", "high":
+			if model == "" {
+				model = GeminiDefaultModel
+			}
+			return geminiEffortModels[model]
+		}
+		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
 		if !ValidEffort(effort) {
 			return false

@@ -201,7 +201,9 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok:
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGemini:
+		// gemini keeps the same per-key ref layout as grok under
+		// agentDir/.gemini-cli-home/kojo/threads.
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
 		// CodexBackend.Chat; codex stores a deterministic per-key thread ref
 		// under agentDir/.codex/threads, and grok the equivalent under

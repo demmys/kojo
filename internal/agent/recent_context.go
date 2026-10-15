@@ -136,14 +136,16 @@ const (
 // custom-claude both run through ClaudeBackend; grok keeps its own session
 // directories but loses them the same way (reset, GC, stale ref, a rewind
 // that lands on the session's first turn), and its Chat injects the excerpt
-// only when it is actually starting fresh. Backends whose resume path
+// only when it is actually starting fresh. gemini follows the same pattern
+// (it is also the only continuity a device switch carries for gemini, whose
+// native sessions are not transferred). Backends whose resume path
 // cannot silently vanish do not receive it.
 func backendNeedsRecentMessagesFallback(b ChatBackend) bool {
 	if b == nil {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolGrok:
+	case ToolClaude, ToolCustomClaude, ToolGrok, ToolGemini:
 		return true
 	default:
 		return false

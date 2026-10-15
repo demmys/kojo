@@ -301,6 +301,16 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.CodexSessionFilesRemoved = codexFilesRm
 	res.CodexThreadsRemoved = codexThreadsRm
 
+	// 2d. Gemini CLI sessions. Dropped wholesale like codex: the CLI's
+	//     session JSONL has no stable turn-boundary marker kojo can cut
+	//     at, so the next turn opens a fresh session bootstrapped from
+	//     the (already truncated) transcript. No-op for other tools.
+	if geminiFilesRm, gerr := clearGeminiSessionCounted(agentID); gerr != nil {
+		m.logger.Warn("truncate: gemini session partial failure", "agent", agentID, "err", gerr)
+	} else if geminiFilesRm > 0 {
+		m.logger.Info("truncate: gemini sessions cleared", "agent", agentID, "files", geminiFilesRm)
+	}
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race

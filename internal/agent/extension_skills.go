@@ -58,7 +58,7 @@ func SetExtensionSkillLookup(fn func(string) []ExtensionSkill) { extensionSkillL
 
 // extensionSkillRoot maps a backend tool onto the project config
 // directory whose skills/ subtree it reads. Codex has its own; claude,
-// custom-claude and grok all walk `.claude`. custom-bare runs no CLI
+// custom-claude and grok all walk `.claude`; gemini reads `.gemini`. custom-bare runs no CLI
 // with a skill concept, so it gets nothing.
 func extensionSkillRoot(tool string) string {
 	switch NormalizeToolName(tool) {
@@ -66,6 +66,9 @@ func extensionSkillRoot(tool string) string {
 		return ".claude"
 	case ToolCodex, ToolCustomCodex:
 		return ".codex"
+	case ToolGemini:
+		// gemini-cli loads project skills from <cwd>/.gemini/skills.
+		return ".gemini"
 	}
 	return ""
 }

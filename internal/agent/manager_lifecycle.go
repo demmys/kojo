@@ -185,6 +185,11 @@ func (m *Manager) ResetData(id string) error {
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
+	// Gemini CLI home: sessions, kojo session refs and the per-turn
+	// settings.json (regenerated on the next turn).
+	if err := os.RemoveAll(geminiCLIHome(dir)); err != nil {
+		m.logger.Warn("reset: failed to remove gemini cli home", "agent", id, "err", err)
+	}
 
 	// (Global CLI session stores cleared above, BEFORE lockMemorySync,
 	// to avoid the lock-order inversion against the peer-agent-sync
@@ -2274,6 +2279,15 @@ func (m *Manager) ResetSession(agentID string) error {
 			m.logger.Debug("CLI session reset: codex cleared",
 				"agent", agentID,
 				"filesRemoved", files, "threadsRemoved", threads)
+		}
+	case ToolGemini:
+		files, cerr := clearGeminiSessionCounted(agentID)
+		if cerr != nil {
+			m.logger.Warn("CLI session reset: gemini clear partial failure",
+				"agent", agentID, "err", cerr, "filesRemoved", files)
+		} else {
+			m.logger.Debug("CLI session reset: gemini cleared",
+				"agent", agentID, "filesRemoved", files)
 		}
 	}
 

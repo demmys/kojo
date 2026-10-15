@@ -7,7 +7,7 @@ import { Field } from "../../ui/Field";
 import { useT } from "../../../lib/i18n";
 import { needsCustomURLFor } from "../agentSettingsPayload";
 
-const TOOLS = ["claude", "codex", "grok", "custom-claude", "custom-codex", "custom-bare"];
+const TOOLS = ["claude", "codex", "grok", "gemini", "custom-claude", "custom-codex", "custom-bare"];
 
 /**
  * The "Tool" (backend) selector. Switching tools resets the model to the

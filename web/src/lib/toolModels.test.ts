@@ -199,6 +199,15 @@ describe("toolModels — Opus 5 / effort defaults", () => {
     expect(effortLevelsForModel("grok-4.5")).not.toContain("max");
     expect(defaultEffortForModel("grok-4.5")).toBe("high");
   });
+
+  it("gemini lists argon (default) and flash with low/medium/high, default medium", () => {
+    expect(modelsForTool("gemini")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
+    expect(defaultModelForTool("gemini")).toBe("gemini-4-argon");
+    for (const m of ["gemini-4-argon", "gemini-3.8-flash"]) {
+      expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
+      expect(defaultEffortForModel(m)).toBe("medium");
+    }
+  });
 });
 
 describe("sessionEffortLevelsForModel — ultra is session-only", () => {

@@ -129,7 +129,7 @@ func TestClassifyGeminiProcessError_NoResult(t *testing.T) {
 
 func TestBuildGeminiArgs(t *testing.T) {
 	args := buildGeminiArgs("gemini-4-argon", "")
-	want := []string{"--skip-trust", "--yolo", "-o", "stream-json", "-m", "gemini-4-argon", "-p", ""}
+	want := []string{"--skip-trust", "--yolo", "-o", "stream-json", "-m", "gemini-4-argon", "--include-directories", geminiGuideDir(), "-p", ""}
 	if strings.Join(args, "|") != strings.Join(want, "|") {
 		t.Fatalf("args = %q", args)
 	}
@@ -426,7 +426,7 @@ func TestGeminiChat_PersistsAndResumes(t *testing.T) {
 	logBody, _ := os.ReadFile(logPath)
 	log := string(logBody)
 	for _, want := range []string{
-		"ARGS:--skip-trust --yolo -o stream-json -m gemini-4-argon -p",
+		"ARGS:--skip-trust --yolo -o stream-json -m gemini-4-argon --include-directories " + geminiGuideDir() + " -p",
 		"HOME_ENV:" + geminiCLIHome(dir),
 		"KEY:test-key",
 		"GOOGLE:\n",

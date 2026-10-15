@@ -388,6 +388,9 @@ func buildGeminiArgs(model, resumeID string) []string {
 		"--yolo",
 		"-o", "stream-json",
 		"-m", model,
+		// The shared guide dir lives outside the agent workspace; the
+		// CLI's file tools refuse paths outside included directories.
+		"--include-directories", geminiGuideDir(),
 	}
 	if resumeID != "" {
 		args = append(args, "--resume", resumeID)
@@ -743,4 +746,14 @@ func isGeminiStaleSessionError(msg string) bool {
 // real Gemini tool names alongside kojo's backend-neutral prompt.
 func geminiSystemMD(systemPrompt string) string {
 	return systemPrompt + "\n\n# Gemini CLI tools\n\nThe following tools are available to you: ${AvailableTools}\n\n${AgentSkills}\n\n${SubAgents}\n"
+}
+
+// geminiGuideDir returns GuideDir as an absolute path: the CLI resolves
+// relative include dirs against its cwd (the agent dir), which would
+// break when kojo runs with a relative --config-dir.
+func geminiGuideDir() string {
+	if abs, err := filepath.Abs(GuideDir()); err == nil {
+		return abs
+	}
+	return GuideDir()
 }

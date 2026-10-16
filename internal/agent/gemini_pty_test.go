@@ -182,8 +182,8 @@ func TestGeminiPTYLaunch_AgentAndPlain(t *testing.T) {
 
 	const id = "ag_gempty"
 	m.mu.Lock()
-	m.agents[id] = &Agent{ID: id, Tool: ToolGemini, Model: "gemini-3.8-flash", Effort: "low"}
-	m.agents["ag_other"] = &Agent{ID: "ag_other", Tool: ToolClaude, Model: "opus", Effort: "max"}
+	m.agents[id] = &Agent{ID: id, Tool: ToolGemini, Model: "gemini-3.8-flash", Effort: "low", MaxOutputTokens: 4096}
+	m.agents["ag_other"] = &Agent{ID: "ag_other", Tool: ToolClaude, Model: "opus", Effort: "max", MaxOutputTokens: 777}
 	m.mu.Unlock()
 	for _, a := range []string{id, "ag_other"} {
 		if err := os.MkdirAll(filepath.Join(agentDir(a), "sub"), 0o755); err != nil {
@@ -234,7 +234,7 @@ func TestGeminiPTYLaunch_AgentAndPlain(t *testing.T) {
 	if !strings.Contains(string(body), "GEMINI_CLI_HOME="+shSingleQuote(geminiCLIHome(agentDir(id)))) {
 		t.Fatalf("agent wrapper does not point at the agent home:\n%s", body)
 	}
-	if th := thinking(readSettings(geminiCLIHome(agentDir(id)))); !strings.Contains(th, `"thinkingLevel":"LOW"`) || !strings.Contains(th, "gemini-3.8-flash") {
+	if th := thinking(readSettings(geminiCLIHome(agentDir(id)))); !strings.Contains(th, `"thinkingLevel":"LOW"`) || !strings.Contains(th, "gemini-3.8-flash") || !strings.Contains(th, `"maxOutputTokens":4096`) {
 		t.Fatalf("agent thinking override = %s", th)
 	}
 	cleanup()
@@ -264,7 +264,7 @@ func TestGeminiPTYLaunch_AgentAndPlain(t *testing.T) {
 	if want := []string{"--skip-trust", "-m", GeminiDefaultModel}; !reflect.DeepEqual(args, want) {
 		t.Fatalf("other-agent args = %q", args)
 	}
-	if th := thinking(readSettings(geminiCLIHome(agentDir("ag_other")))); th != "" {
+	if th := thinking(readSettings(geminiCLIHome(agentDir("ag_other")))); strings.Contains(th, "thinkingLevel") || !strings.Contains(th, `"maxOutputTokens":65536`) {
 		t.Fatalf("other agent's effort leaked: %s", th)
 	}
 

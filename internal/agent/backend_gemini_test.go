@@ -189,7 +189,7 @@ func TestGeminiCommandEnv_Sanitizes(t *testing.T) {
 }
 
 func TestBuildGeminiSettings(t *testing.T) {
-	s := buildGeminiSettings("gemini-4-argon", "low", map[string]mcpServerEntry{
+	s := buildGeminiSettings("gemini-4-argon", "low", 0, map[string]mcpServerEntry{
 		"kojo":  {URL: "http://127.0.0.1:1/mcp", Type: "http", Headers: map[string]string{"X-Kojo-Token": "tok"}},
 		"local": {Command: "node", Args: []string{"srv.js"}, Env: map[string]string{"A": "1"}},
 	})
@@ -217,10 +217,11 @@ func TestBuildGeminiSettings(t *testing.T) {
 		} `json:"mcpServers"`
 		ModelConfigs struct {
 			CustomOverrides []struct {
-				Match       map[string]string `json:"match"`
+				Match       map[string]any `json:"match"`
 				ModelConfig struct {
 					GenerateContentConfig struct {
-						ThinkingConfig struct {
+						MaxOutputTokens *int `json:"maxOutputTokens"`
+						ThinkingConfig  struct {
 							ThinkingLevel   string `json:"thinkingLevel"`
 							IncludeThoughts bool   `json:"includeThoughts"`
 						} `json:"thinkingConfig"`
@@ -246,26 +247,58 @@ func TestBuildGeminiSettings(t *testing.T) {
 	if l.Command != "node" || len(l.Args) != 1 || l.Env["A"] != "1" || l.HTTPURL != "" {
 		t.Fatalf("local mcp = %+v", l)
 	}
-	if len(got.ModelConfigs.CustomOverrides) != 1 ||
-		got.ModelConfigs.CustomOverrides[0].Match["model"] != "gemini-4-argon" ||
-		got.ModelConfigs.CustomOverrides[0].ModelConfig.GenerateContentConfig.ThinkingConfig.ThinkingLevel != "LOW" ||
-		!got.ModelConfigs.CustomOverrides[0].ModelConfig.GenerateContentConfig.ThinkingConfig.IncludeThoughts {
-		t.Fatalf("overrides = %+v", got.ModelConfigs.CustomOverrides)
+	ov := got.ModelConfigs.CustomOverrides
+	if len(ov) != 2 ||
+		ov[0].Match["isChatModel"] != true || len(ov[0].Match) != 1 ||
+		ov[0].ModelConfig.GenerateContentConfig.MaxOutputTokens == nil ||
+		*ov[0].ModelConfig.GenerateContentConfig.MaxOutputTokens != GeminiDefaultMaxOutputTokens ||
+		ov[1].Match["model"] != "gemini-4-argon" ||
+		ov[1].ModelConfig.GenerateContentConfig.MaxOutputTokens != nil ||
+		ov[1].ModelConfig.GenerateContentConfig.ThinkingConfig.ThinkingLevel != "LOW" ||
+		!ov[1].ModelConfig.GenerateContentConfig.ThinkingConfig.IncludeThoughts {
+		t.Fatalf("overrides = %+v", ov)
 	}
 
-	// No effort / alias model → no override; no servers → no mcpServers key.
-	// The flash alias keys the override on its resolved id.
-	fl := buildGeminiSettings("flash", "high", nil)["modelConfigs"].(map[string]any)["customOverrides"].([]any)[0].(map[string]any)
+	// The flash alias keys the thinking override on its resolved id.
+	fl := buildGeminiSettings("flash", "high", 0, nil)["modelConfigs"].(map[string]any)["customOverrides"].([]any)[1].(map[string]any)
 	if fl["match"].(map[string]any)["model"] != "gemini-3.8-flash" {
 		t.Fatalf("flash alias override = %+v", fl)
 	}
+	// No effort / non-effort model → only the maxOutputTokens override
+	// (which applies to any model); no servers → no mcpServers key.
 	for _, tc := range [][2]string{{"gemini-4-argon", ""}, {"pro", "high"}, {"auto", "low"}} {
-		s := buildGeminiSettings(tc[0], tc[1], nil)
-		if _, ok := s["modelConfigs"]; ok {
-			t.Fatalf("%v: unexpected modelConfigs", tc)
+		s := buildGeminiSettings(tc[0], tc[1], 0, nil)
+		ovs := s["modelConfigs"].(map[string]any)["customOverrides"].([]any)
+		if len(ovs) != 1 {
+			t.Fatalf("%v: overrides = %+v", tc, ovs)
 		}
 		if _, ok := s["mcpServers"]; ok {
 			t.Fatalf("%v: unexpected mcpServers", tc)
+		}
+	}
+}
+
+func TestBuildGeminiSettings_MaxOutputTokens(t *testing.T) {
+	for _, tc := range []struct{ in, want int }{
+		{0, GeminiDefaultMaxOutputTokens},
+		{-5, GeminiDefaultMaxOutputTokens},
+		{1, 1},
+		{8192, 8192},
+		{GeminiMaxOutputTokensLimit, GeminiMaxOutputTokensLimit},
+		{GeminiMaxOutputTokensLimit + 1, GeminiMaxOutputTokensLimit},
+	} {
+		ovs := buildGeminiSettings("auto", "", tc.in, nil)["modelConfigs"].(map[string]any)["customOverrides"].([]any)
+		gc := ovs[0].(map[string]any)["modelConfig"].(map[string]any)["generateContentConfig"].(map[string]any)
+		if gc["maxOutputTokens"] != tc.want {
+			t.Fatalf("in=%d: maxOutputTokens = %v, want %d", tc.in, gc["maxOutputTokens"], tc.want)
+		}
+	}
+}
+
+func TestValidMaxOutputTokens(t *testing.T) {
+	for v, want := range map[int]bool{-1: false, 0: true, 1: true, 8192: true, GeminiMaxOutputTokensLimit: true, GeminiMaxOutputTokensLimit + 1: false} {
+		if got := ValidMaxOutputTokens(v); got != want {
+			t.Fatalf("ValidMaxOutputTokens(%d) = %v", v, got)
 		}
 	}
 }

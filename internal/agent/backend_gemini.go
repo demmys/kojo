@@ -305,6 +305,30 @@ func geminiModel(agent *Agent) string {
 	return GeminiDefaultModel
 }
 
+// GeminiDefaultMaxOutputTokens is the generateContentConfig.maxOutputTokens
+// kojo sends when the agent has no explicit MaxOutputTokens (0 / unset).
+// GeminiMaxOutputTokensLimit is the PATCH upper bound; a value above the
+// model's real output limit surfaces as an API 400 on the turn.
+const (
+	GeminiDefaultMaxOutputTokens = 65536
+	GeminiMaxOutputTokensLimit   = 65536
+)
+
+// ValidMaxOutputTokens reports whether v is acceptable on PATCH/create
+// (0 = reset to default).
+func ValidMaxOutputTokens(v int) bool { return v >= 0 && v <= GeminiMaxOutputTokensLimit }
+
+// EffectiveGeminiMaxOutputTokens maps the stored setting to the value sent.
+func EffectiveGeminiMaxOutputTokens(v int) int {
+	if v <= 0 {
+		return GeminiDefaultMaxOutputTokens
+	}
+	if v > GeminiMaxOutputTokensLimit {
+		return GeminiMaxOutputTokensLimit
+	}
+	return v
+}
+
 // geminiThinkingLevel maps kojo's effort onto the API's thinkingLevel
 // enum, or "" when the CLI default should apply.
 func geminiThinkingLevel(model, effort string) string {
@@ -334,10 +358,22 @@ func geminiThinkingLevel(model, effort string) string {
 //   - mcpServers: HTTP entries use `httpUrl` (streamable HTTP; plain `url`
 //     means SSE to the CLI), stdio entries pass command/args/env through.
 //     trust=true skips per-tool confirmation, matching --yolo.
-//   - modelConfigs.customOverrides carries the thinking level, matched on
-//     the concrete model id (verified against gemini-cli 0.64.0: a bogus
-//     value there surfaces as a 400 on thinking_config.thinking_level).
-func buildGeminiSettings(model, effort string, mcpServers map[string]mcpServerEntry) map[string]any {
+//   - modelConfigs.customOverrides always carries maxOutputTokens (the
+//     agent's setting or GeminiDefaultMaxOutputTokens), matched on
+//     isChatModel=true, plus the thinking level matched on the concrete model id
+//     (verified against gemini-cli 0.64.0: a bogus value there surfaces as
+//     a 400 on thinking_config.thinking_level). gemini-cli's
+//     ModelConfigService deep-merges every matching override's
+//     generateContentConfig onto the resolved alias chain (chat-base for
+//     an unaliased chat model), so these keys layer on top of the CLI's
+//     defaults (temperature/topP/topK/includeThoughts) instead of
+//     replacing them. The main chat resolves its config with
+//     {model: <routed/fallback model>, isChatModel: true}, so an
+//     isChatModel match applies to any model (incl. "auto" routing and
+//     availability fallbacks, where the -m value never reaches the
+//     resolver) while utility aliases (summarizer, compression,
+//     classifier...) keep their own limits.
+func buildGeminiSettings(model, effort string, maxOutputTokens int, mcpServers map[string]mcpServerEntry) map[string]any {
 	settings := map[string]any{
 		"security": map[string]any{
 			"auth": map[string]any{"selectedType": "gemini-api-key"},
@@ -371,35 +407,43 @@ func buildGeminiSettings(model, effort string, mcpServers map[string]mcpServerEn
 		}
 		settings["mcpServers"] = servers
 	}
-	if level := geminiThinkingLevel(model, effort); level != "" {
-		settings["modelConfigs"] = map[string]any{
-			"customOverrides": []any{
-				map[string]any{
-					"match": map[string]any{"model": geminiEffortModels[model]},
-					"modelConfig": map[string]any{
-						"generateContentConfig": map[string]any{
-							// The override replaces the CLI's default
-							// thinkingConfig, which carries includeThoughts;
-							// without it the session file's "thoughts" come
-							// back empty (verified live on gemini-4-argon)
-							// and kojo has no thinking to show. The stream
-							// content stays thought-free either way.
-							"thinkingConfig": map[string]any{"thinkingLevel": level, "includeThoughts": true},
-						},
-					},
+	overrides := []any{
+		map[string]any{
+			"match": map[string]any{"isChatModel": true},
+			"modelConfig": map[string]any{
+				"generateContentConfig": map[string]any{
+					"maxOutputTokens": EffectiveGeminiMaxOutputTokens(maxOutputTokens),
 				},
 			},
-		}
+		},
 	}
+	if level := geminiThinkingLevel(model, effort); level != "" {
+		overrides = append(overrides,
+			map[string]any{
+				"match": map[string]any{"model": geminiEffortModels[model]},
+				"modelConfig": map[string]any{
+					"generateContentConfig": map[string]any{
+						// The override replaces the CLI's default
+						// thinkingConfig, which carries includeThoughts;
+						// without it the session file's "thoughts" come
+						// back empty (verified live on gemini-4-argon)
+						// and kojo has no thinking to show. The stream
+						// content stays thought-free either way.
+						"thinkingConfig": map[string]any{"thinkingLevel": level, "includeThoughts": true},
+					},
+				},
+			})
+	}
+	settings["modelConfigs"] = map[string]any{"customOverrides": overrides}
 	return settings
 }
 
-func writeGeminiSettings(agentDirPath, model, effort string, mcpServers map[string]mcpServerEntry) error {
-	return writeGeminiSettingsFile(geminiSettingsPath(agentDirPath), model, effort, mcpServers)
+func writeGeminiSettings(agentDirPath, model, effort string, maxOutputTokens int, mcpServers map[string]mcpServerEntry) error {
+	return writeGeminiSettingsFile(geminiSettingsPath(agentDirPath), model, effort, maxOutputTokens, mcpServers)
 }
 
-func writeGeminiSettingsFile(path, model, effort string, mcpServers map[string]mcpServerEntry) error {
-	body, err := json.MarshalIndent(buildGeminiSettings(model, effort, mcpServers), "", "  ")
+func writeGeminiSettingsFile(path, model, effort string, maxOutputTokens int, mcpServers map[string]mcpServerEntry) error {
+	body, err := json.MarshalIndent(buildGeminiSettings(model, effort, maxOutputTokens, mcpServers), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -492,7 +536,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}
 
 	model := geminiModel(agent)
-	if err := writeGeminiSettings(dir, model, agent.Effort, opts.MCPServers); err != nil {
+	if err := writeGeminiSettings(dir, model, agent.Effort, agent.MaxOutputTokens, opts.MCPServers); err != nil {
 		return nil, fmt.Errorf("write %s: %w", geminiSettingsPath(dir), err)
 	}
 

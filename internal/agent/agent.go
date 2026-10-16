@@ -553,6 +553,12 @@ type Agent struct {
 	// operator's ChatGPT account from an agent meant to stay local.
 	CodexApps *bool `json:"codexApps,omitempty"`
 
+	// MaxOutputTokens is generateContentConfig.maxOutputTokens for the
+	// gemini backend (headless turns and PTY sessions). 0 = default
+	// (GeminiDefaultMaxOutputTokens). Persisted inside
+	// agents.settings_json — absent key decodes to 0, no migration.
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+
 	// LastTransferSkips records the session files the most recent
 	// inbound §3.7 device-switch transfer skipped (oversized JSONL,
 	// unreadable codex ref, …). Stamped into settings_json by the
@@ -789,6 +795,8 @@ type AgentConfig struct {
 	// CodexApps toggles the codex CLI "apps" feature. nil = per-tool
 	// default (see Agent.IsCodexAppsEnabled).
 	CodexApps *bool `json:"codexApps"`
+	// MaxOutputTokens: gemini maxOutputTokens; nil/0 = default.
+	MaxOutputTokens *int `json:"maxOutputTokens"`
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -849,6 +857,12 @@ type AgentUpdateConfig struct {
 	// as-is"; explicit true/false overwrites. Holder-only: it changes
 	// the app-server launch flags of the live backend.
 	CodexApps *bool `json:"codexApps"`
+	// MaxOutputTokens sets the gemini backend's maxOutputTokens. nil =
+	// "not provided; leave as-is"; 0 = reset to default
+	// (GeminiDefaultMaxOutputTokens); 1..GeminiMaxOutputTokensLimit
+	// otherwise. Holder-only: it changes the settings.json written on
+	// the holder each turn.
+	MaxOutputTokens *int `json:"maxOutputTokens"`
 }
 
 // Context-injection section keys togglable via Agent.DisabledInjections.
@@ -1024,6 +1038,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidThinkingMode(cfg.ThinkingMode) {
 		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)
 	}
+	maxOut := 0
+	if cfg.MaxOutputTokens != nil {
+		if !ValidMaxOutputTokens(*cfg.MaxOutputTokens) {
+			return nil, fmt.Errorf("unsupported maxOutputTokens: %d (must be 0..%d)", *cfg.MaxOutputTokens, GeminiMaxOutputTokensLimit)
+		}
+		maxOut = *cfg.MaxOutputTokens
+	}
 	if cfg.WorkDir != "" {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
@@ -1064,6 +1085,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		// stamping a sentinel into the row.
 		DeviceSwitchEnabled: cfg.DeviceSwitchEnabled,
 		CodexApps:           cfg.CodexApps,
+		MaxOutputTokens:     maxOut,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}

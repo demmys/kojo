@@ -74,6 +74,8 @@ type geminiPTYTarget struct {
 	agentID string // "" for a plain session
 	model   string // default when args carry none
 	effort  string // default when args carry none
+	// maxOutputTokens is the agent's setting (0 = default).
+	maxOutputTokens int
 }
 
 // geminiPTYTargetFor resolves workDir to an agent's home or the shared
@@ -94,8 +96,9 @@ func (m *Manager) geminiPTYTargetFor(workDir string) geminiPTYTarget {
 	m.mu.Lock()
 	a, ok := m.agents[id]
 	var tool, model, effort string
+	var maxOut int
 	if ok {
-		tool, model, effort = a.Tool, a.Model, a.Effort
+		tool, model, effort, maxOut = a.Tool, a.Model, a.Effort, a.MaxOutputTokens
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -107,6 +110,7 @@ func (m *Manager) geminiPTYTargetFor(workDir string) geminiPTYTarget {
 			t.model = model
 		}
 		t.effort = effort
+		t.maxOutputTokens = maxOut
 	}
 	return t
 }
@@ -269,7 +273,7 @@ func (m *Manager) GeminiPTYLaunch(geminiPath, workDir string, args []string) (st
 		}
 		mcp = BuildMCPServers(t.agentID, apiBase)
 	}
-	if err := writeGeminiSettingsFile(filepath.Join(t.home, ".gemini", "settings.json"), model, effort, mcp); err != nil {
+	if err := writeGeminiSettingsFile(filepath.Join(t.home, ".gemini", "settings.json"), model, effort, t.maxOutputTokens, mcp); err != nil {
 		return "", nil, nil, fmt.Errorf("write gemini settings: %w", err)
 	}
 	runArgs = geminiFixResume(runArgs, t.home, workDir)

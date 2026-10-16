@@ -580,7 +580,7 @@ func TestGemini_SymlinkedChatsAndSettings(t *testing.T) {
 	if err := os.Symlink(victim, filepath.Join(home, ".gemini")); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeGeminiSettingsFile(filepath.Join(home, ".gemini", "settings.json"), "gemini-3.8-flash", "low", nil); err == nil {
+	if err := writeGeminiSettingsFile(filepath.Join(home, ".gemini", "settings.json"), "gemini-3.8-flash", "low", 0, nil); err == nil {
 		t.Fatal("settings written through a symlinked .gemini")
 	}
 	if entries, _ := os.ReadDir(victim); len(entries) != 0 {

@@ -1476,6 +1476,9 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 			return "", false, verr
 		}
 	}
+	if cfg.MaxOutputTokens != nil && !ValidMaxOutputTokens(*cfg.MaxOutputTokens) {
+		return "", false, fmt.Errorf("unsupported maxOutputTokens: %d (must be 0..%d)", *cfg.MaxOutputTokens, GeminiMaxOutputTokensLimit)
+	}
 	return nextCronMessage, cronMessageDirty, nil
 }
 
@@ -1807,6 +1810,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	}
 	if cfg.CodexApps != nil {
 		a.CodexApps = cfg.CodexApps
+	}
+	if cfg.MaxOutputTokens != nil {
+		// Validated upstream (validateUpdateConfigPure).
+		a.MaxOutputTokens = *cfg.MaxOutputTokens
 	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.

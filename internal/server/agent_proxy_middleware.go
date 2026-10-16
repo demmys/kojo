@@ -163,6 +163,7 @@ func (s *Server) remoteAgentProxyMiddleware(next http.Handler) http.Handler {
 		//   thinkingMode, responseLanguage, workDir, cronExpr, cronMessage (persists via
 		//   agent_workspace_files, not the agents row), timeout/resumeIdle,
 		//   allowedTools/allowProtectedPaths, tts, deviceSwitchEnabled, codexApps,
+		//   maxOutputTokens,
 		//   plus the non-PATCH routes (avatar upload, persona/status/
 		//   memory/workspace-file writes, transcript edits, credentials,
 		//   tasks, sessions).

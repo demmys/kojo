@@ -656,6 +656,11 @@ const messages = {
     ja: "タスクの難易度に応じて毎ターンの effort を自動で選ぶ。Effort 設定は上限 / フォールバックになる。",
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
   },
+  "settings.maxOutputTokens": { ja: "最大出力トークン", en: "Max output tokens" },
+  "settings.maxOutputTokensDesc": {
+    ja: "1 ターンの応答で生成できるトークン数の上限 (思考トークンを含む)。空欄で既定値 65536。",
+    en: "Upper bound on tokens generated per response (thinking included). Leave empty for the default (65536).",
+  },
   "settings.codexApps": { ja: "Codex apps（ChatGPT コネクタ）", en: "Codex apps (ChatGPT connectors)" },
   "settings.codexAppsDesc": {
     ja: "ChatGPT アカウントで連携したコネクタ（GitHub / Slack / Gmail / Drive など）を Codex のツールとして読み込む。カスタムエンドポイントでは全ツール定義が毎リクエストに載りコンテキストを大量に消費するため、既定は codex で ON、custom-codex で OFF。",

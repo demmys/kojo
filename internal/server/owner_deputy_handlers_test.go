@@ -352,3 +352,48 @@ func TestUpdateAgent_ResponseLanguage(t *testing.T) {
 		t.Fatalf("resp = %+v err %v (body %s)", resp, err, w.Body.String())
 	}
 }
+
+// PATCH maxOutputTokens: out-of-range → 400; valid → 200, echoed, and
+// visible on a fresh Get; 0 resets to the default (omitted on the wire).
+func TestUpdateAgent_MaxOutputTokens(t *testing.T) {
+	srv := newChunkedSyncTestServer(t)
+	a, err := srv.agents.Create(agent.AgentConfig{Name: "maxout-target", Tool: "gemini"})
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	do := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPatch, "/api/v1/agents/"+a.ID, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		r.SetPathValue("id", a.ID)
+		r = authedRequest(r, auth.Principal{Role: auth.RoleOwner})
+		w := httptest.NewRecorder()
+		srv.handleUpdateAgent(w, r)
+		return w
+	}
+	for _, bad := range []string{`{"maxOutputTokens":-1}`, `{"maxOutputTokens":65537}`, `{"maxOutputTokens":"8192"}`} {
+		if w := do(bad); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d (body %s)", bad, w.Code, w.Body.String())
+		}
+	}
+	w := do(`{"maxOutputTokens":8192}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid status = %d (body %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		MaxOutputTokens *int `json:"maxOutputTokens"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp.MaxOutputTokens == nil || *resp.MaxOutputTokens != 8192 {
+		t.Fatalf("resp = %+v err %v (body %s)", resp, err, w.Body.String())
+	}
+	if got, ok := srv.agents.Get(a.ID); !ok || got.MaxOutputTokens != 8192 {
+		t.Fatalf("Get after PATCH = %+v ok=%v", got, ok)
+	}
+	w = do(`{"maxOutputTokens":0}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset status = %d (body %s)", w.Code, w.Body.String())
+	}
+	resp.MaxOutputTokens = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil || resp.MaxOutputTokens != nil {
+		t.Fatalf("reset resp = %+v err %v", resp, err)
+	}
+}

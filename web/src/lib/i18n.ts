@@ -397,6 +397,11 @@ const messages = {
     en: "Add one above — the agent can also add todos via its API",
   },
   "todos.doneSection": { ja: "完了 {count}", en: "Done {count}" },
+  "todos.clearDone": { ja: "完了を全削除", en: "Delete all done" },
+  "todos.clearDoneConfirm": {
+    ja: "完了済みのToDo {count} 件をすべて削除する？",
+    en: "Delete all {count} done todos?",
+  },
   "todos.markDone": { ja: "完了にする", en: "Mark done" },
   "todos.reopen": { ja: "未完了に戻す", en: "Reopen" },
   "todos.delete": { ja: "削除", en: "Delete" },

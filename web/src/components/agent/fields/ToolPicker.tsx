@@ -35,7 +35,7 @@ export function ToolPicker({
 }) {
   const t = useT();
   return (
-    <Field label={t("field.tool")}>
+    <Field label={t("field.tool")} help={tool === "gemini" ? t("field.toolGeminiHelp") : undefined}>
       <div className="flex flex-wrap gap-2">
         {TOOLS.map((name) => {
           const selected = tool === name;

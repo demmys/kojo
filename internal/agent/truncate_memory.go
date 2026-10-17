@@ -301,10 +301,10 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	res.CodexSessionFilesRemoved = codexFilesRm
 	res.CodexThreadsRemoved = codexThreadsRm
 
-	// 2d. Gemini CLI sessions. Dropped wholesale like codex: the CLI's
-	//     session JSONL has no stable turn-boundary marker kojo can cut
-	//     at, so the next turn opens a fresh session bootstrapped from
-	//     the (already truncated) transcript. No-op for other tools.
+	// 2d. Gemini (OpenCode) sessions. Dropped wholesale like codex:
+	//     kojo cannot cut an OpenCode session at a transcript turn
+	//     boundary, so the next turn opens a fresh session bootstrapped
+	//     from the (already truncated) transcript. No-op for other tools.
 	if geminiFilesRm, gerr := clearGeminiSessionCounted(agentID); gerr != nil {
 		m.logger.Warn("truncate: gemini session partial failure", "agent", agentID, "err", gerr)
 	} else if geminiFilesRm > 0 {

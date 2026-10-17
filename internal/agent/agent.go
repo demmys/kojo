@@ -260,9 +260,10 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
 	case ToolGemini:
 		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
-		// only set it for the concrete models in geminiEffortModels (an
-		// empty model means GeminiDefaultModel). Aliases and unknown ids
-		// accept no effort rather than one that would silently not apply.
+		// only set it (as an OpenCode variant) for the models in
+		// geminiEffortModels (an empty model means GeminiDefaultModel).
+		// Unknown ids accept no effort rather than one that would
+		// silently not apply.
 		switch effort {
 		case "":
 			return true
@@ -553,8 +554,8 @@ type Agent struct {
 	// operator's ChatGPT account from an agent meant to stay local.
 	CodexApps *bool `json:"codexApps,omitempty"`
 
-	// MaxOutputTokens is generateContentConfig.maxOutputTokens for the
-	// gemini backend (headless turns and PTY sessions). 0 = default
+	// MaxOutputTokens is the maxOutputTokens OpenCode sends to Gemini for
+	// the gemini backend (headless turns and PTY sessions). 0 = default
 	// (GeminiDefaultMaxOutputTokens). Persisted inside
 	// agents.settings_json — absent key decodes to 0, no migration.
 	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
@@ -860,7 +861,7 @@ type AgentUpdateConfig struct {
 	// MaxOutputTokens sets the gemini backend's maxOutputTokens. nil =
 	// "not provided; leave as-is"; 0 = reset to default
 	// (GeminiDefaultMaxOutputTokens); 1..GeminiMaxOutputTokensLimit
-	// otherwise. Holder-only: it changes the settings.json written on
+	// otherwise. Holder-only: it changes the OpenCode config written on
 	// the holder each turn.
 	MaxOutputTokens *int `json:"maxOutputTokens"`
 }

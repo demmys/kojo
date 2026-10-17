@@ -190,7 +190,7 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 		case "grok":
 			addSessionBytes = int64(len(`,"grok_session":`)) + a.sessionJSONBytes
 		case "gemini":
-			addSessionBytes = int64(len(`,"gemini_session":`)) + a.sessionJSONBytes
+			addSessionBytes = int64(len(`,"opencode_session":`)) + a.sessionJSONBytes
 		}
 		if baseSize < maxRawBytes && currentSize-removeSkipBytes+addSessionBytes <= maxRawBytes {
 			selected = append(selected, a.artifact)

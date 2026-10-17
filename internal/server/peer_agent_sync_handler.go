@@ -155,15 +155,19 @@ type peerAgentSyncRequest struct {
 	// session starts on target).
 	GrokSession *grokSessionWire `json:"grok_session,omitempty"`
 
-	// GeminiSession carries the gemini agent's session refs (main
-	// `.gemini/kojo/session_id` plus per-SessionKey thread refs) and
-	// the chat JSONLs under $GEMINI_CLI_HOME/.gemini/tmp/<slug>/chats/
-	// they point at. Target rebuilds `.gemini/tmp` under ITS OWN
-	// project slug so `gemini --resume <id>` finds the conversation.
+	// GeminiSession carries the gemini agent's OpenCode session refs
+	// (main `.opencode-home/kojo/session_id` plus per-SessionKey thread
+	// refs) and an `opencode export` of each session they point at.
+	// Target stages the exports under .opencode-home/kojo/pending-import
+	// and `opencode import`s them (re-homed to ITS agent dir) before the
+	// next turn, so `opencode run -s <id>` continues the conversation.
 	// Absent for non-gemini agents and gemini agents with no live
 	// session; the receiver treats absence as authoritative and purges
-	// target-local gemini state.
-	GeminiSession *geminiSessionWire `json:"gemini_session,omitempty"`
+	// target-local gemini refs. The wire key is "opencode_session" (the
+	// gemini-cli era used "gemini_session" with incompatible contents,
+	// so a mixed-version pair degrades to a fresh session, never to a
+	// misparsed one).
+	GeminiSession *geminiSessionWire `json:"opencode_session,omitempty"`
 
 	// CodexSession carries Codex app-server thread refs plus their
 	// rollout JSONLs and sqlite metadata so `thread/resume` on target
@@ -326,12 +330,11 @@ type grokSessionFileWire struct {
 	ContentB64 string `json:"content_b64"`
 }
 
-// geminiSessionWire is the JSON shape of a transferred gemini session
-// set. Refs name the resume pointers (Name "" = main ref, "key-<uuid>"
-// = per-SessionKey thread ref); Files carry the chat logs RELATIVE to
-// the project's chats/ dir ("session-….jsonl" main logs and
-// "<parentSessionId>/<id>.jsonl" subagent logs). Content is base64 so
-// the envelope stays text-only.
+// geminiSessionWire is the JSON shape of a transferred gemini (OpenCode)
+// session set. Refs name the resume pointers (Name "" = main ref,
+// "key-<uuid>" = per-SessionKey thread ref); Files carry one
+// `opencode export` JSON per referenced session, named "<sessionID>.json".
+// Content is base64 so the envelope stays text-only.
 type geminiSessionWire struct {
 	Refs  []geminiSessionRefWire  `json:"refs,omitempty"`
 	Files []geminiSessionFileWire `json:"files,omitempty"`
@@ -663,7 +666,7 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 			})
 		}
 		for i, gf := range req.GeminiSession.Files {
-			body, ok := decodeSyncB64(w, "gemini_session.files", i, gf.ContentB64)
+			body, ok := decodeSyncB64(w, "opencode_session.files", i, gf.ContentB64)
 			if !ok {
 				return
 			}

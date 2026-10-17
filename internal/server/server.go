@@ -512,9 +512,9 @@ func New(cfg Config) *Server {
 	if baseURL := os.Getenv("CUSTOM_API_BASE_URL"); baseURL != "" {
 		sessMgr.SetCustomBaseURL(baseURL)
 	}
-	// gemini PTY sessions start only through the agent package's
-	// isolated launcher (kojo-managed GEMINI_CLI_HOME + key); without an
-	// agent manager session.Manager refuses the tool.
+	// gemini PTY sessions (OpenCode TUI) start only through the agent
+	// package's isolated launcher (kojo-managed OpenCode home + key via
+	// env); without an agent manager session.Manager refuses the tool.
 	if am := cfg.AgentManager; am != nil {
 		sessMgr.SetToolLauncher("gemini", func(req session.ToolLaunchRequest) (session.ToolLaunch, error) {
 			path, args, cleanup, err := am.GeminiPTYLaunch(req.ToolPath, req.WorkDir, req.Args)
@@ -523,6 +523,7 @@ func New(cfg Config) *Server {
 			}
 			return session.ToolLaunch{Path: path, Args: args, Cleanup: cleanup}, nil
 		})
+		sessMgr.SetToolReaper("gemini", am.GeminiPTYReap)
 	}
 
 	s := &Server{

@@ -30,39 +30,30 @@ func TestGeminiPriceAt_DateSwitch(t *testing.T) {
 	}
 }
 
-func TestGeminiCostUSD(t *testing.T) {
+func TestGeminiUsageCostUSD(t *testing.T) {
 	intro := time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)
 	later := time.Date(2026, 12, 2, 0, 0, 0, 0, time.UTC)
-	argon := geminiModelStats{TotalTokens: 9212, InputTokens: 9103, OutputTokens: 6, Cached: 1000}
-	// input unset → prompt − cached = 8103; thoughts = 9212−9103−6 = 103.
+	u := &Usage{InputTokens: 8103, OutputTokens: 109, CacheReadInputTokens: 1000}
 	want := (8103*2.0 + 1000*0.10 + 109*10.0) / 1e6
-	if got := geminiCostUSD(map[string]geminiModelStats{"gemini-4-argon": argon}, intro); math.Abs(got-want) > 1e-12 {
+	if got := geminiUsageCostUSD("gemini-4-argon", u, intro); math.Abs(got-want) > 1e-12 {
 		t.Fatalf("argon intro = %v, want %v", got, want)
 	}
-	if got := geminiCostUSD(map[string]geminiModelStats{"gemini-4-argon": argon}, later); math.Abs(got-2*want) > 1e-12 {
+	// Argon's price doubles on 12/1.
+	if got := geminiUsageCostUSD("gemini-4-argon", u, later); math.Abs(got-2*want) > 1e-12 {
 		t.Fatalf("argon after step-up = %v, want %v", got, 2*want)
 	}
-
-	// Two priced models sum.
-	flash := geminiModelStats{TotalTokens: 300, InputTokens: 200, OutputTokens: 100}
-	both := map[string]geminiModelStats{"gemini-4-argon": argon, "gemini-3.8-flash": flash}
-	if got := geminiCostUSD(both, intro); math.Abs(got-(want+(200*0.75+100*3.75)/1e6)) > 1e-12 {
-		t.Fatalf("two models = %v", got)
+	// The default model ("") and the legacy alias resolve before pricing.
+	if got := geminiUsageCostUSD("", u, intro); math.Abs(got-want) > 1e-12 {
+		t.Fatalf("default model = %v", got)
 	}
-
-	// Unknown model with tokens → unset; unknown model with zero usage is ignored.
-	if got := geminiCostUSD(map[string]geminiModelStats{"gemini-4-argon": argon, "gemini-3-flash-base": flash}, intro); got != 0 {
+	flash := (8103*0.75 + 1000*0.075 + 109*3.75) / 1e6
+	if got := geminiUsageCostUSD("flash", u, intro); math.Abs(got-flash) > 1e-12 {
+		t.Fatalf("flash alias = %v, want %v", got, flash)
+	}
+	if got := geminiUsageCostUSD("gemini-3-flash-base", u, intro); got != 0 {
 		t.Fatalf("unknown model priced: %v", got)
 	}
-	if got := geminiCostUSD(map[string]geminiModelStats{"gemini-4-argon": argon, "mystery": {}}, intro); math.Abs(got-want) > 1e-12 {
-		t.Fatalf("zero-usage unknown model should be ignored: %v", got)
-	}
-	if got := geminiCostUSD(nil, intro); got != 0 {
-		t.Fatalf("nil models = %v", got)
-	}
-	// total < input+output (malformed) clamps thoughts at 0.
-	odd := geminiModelStats{TotalTokens: 1, InputTokens: 100, OutputTokens: 10, Input: new(int)}
-	if got := geminiCostUSD(map[string]geminiModelStats{"gemini-4-argon": odd}, intro); math.Abs(got-(10*10.0)/1e6) > 1e-12 {
-		t.Fatalf("clamped = %v", got)
+	if got := geminiUsageCostUSD("gemini-4-argon", nil, intro); got != 0 {
+		t.Fatalf("nil usage = %v", got)
 	}
 }

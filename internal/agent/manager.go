@@ -634,10 +634,11 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		m.agents[a.ID] = a
 	}
 
-	// Gemini PTY wrappers carry the API key and are normally consumed
+	// Gemini PTY wrappers and key FIFOs are normally consumed
 	// (self-deleted) within milliseconds; any still present at startup
-	// were orphaned by a previous process dying mid-launch.
-	sweepGeminiPTYWrappers(geminiPTYLaunchDir(), time.Now())
+	// were orphaned by a previous process dying mid-launch. The legacy
+	// gemini-cli launch dir is swept too: its wrappers held the API key.
+	sweepGeminiPTYLaunchDirs(time.Now())
 
 	return m, nil
 }

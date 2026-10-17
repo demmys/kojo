@@ -2111,10 +2111,10 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	}
 
 	// gemini session: same tool gate and optional-artifact policy as
-	// grok. gemini-cli appends whole JSONL records per message, so a
-	// mid-turn read sees at worst a torn trailing line, which the CLI
-	// drops on load. Read failure degrades to the canonical-history
-	// fallback rather than blocking the switch.
+	// grok. Each referenced OpenCode session is read with `opencode
+	// export` (a consistent snapshot from its SQLite DB, even mid-turn).
+	// Read failure degrades to the canonical-history fallback rather
+	// than blocking the switch.
 	if tool == agent.ToolGemini {
 		gemTransfer, gemSkipped, gmerr := agent.ReadGeminiSessionFiles(agentID)
 		if gmerr != nil {

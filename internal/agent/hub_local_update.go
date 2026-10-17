@@ -53,7 +53,7 @@ import (
 //   - tts                   (holder-side synthesis config)
 //   - deviceSwitchEnabled   (installs/removes SKILL.md on holder disk)
 //   - codexApps             (codex app-server launch flags on the holder)
-//   - maxOutputTokens       (gemini settings.json written on the holder)
+//   - maxOutputTokens       (gemini OpenCode config written on the holder)
 //   - cronMessage           (persisted via agent_workspace_files
 //     kind=checkin — NOT in the agents settings_json row, so a
 //     hub-row-only write would silently no-op)

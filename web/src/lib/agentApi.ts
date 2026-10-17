@@ -175,8 +175,8 @@ export interface AgentInfo {
   // Absent = per-tool default: on for codex, off for custom-codex.
   // codex / custom-codex tools only.
   codexApps?: boolean;
-  // maxOutputTokens is generateContentConfig.maxOutputTokens for the
-  // gemini tool. Absent / 0 = server default (65536).
+  // maxOutputTokens caps the Gemini request's maxOutputTokens for the
+  // gemini tool (sent through OpenCode). Absent / 0 = server default (65536).
   maxOutputTokens?: number;
   // busy is a runtime-only flag: true while the agent has an in-flight
   // interactive/cron chat (server-side Manager.IsBusy). The dashboard

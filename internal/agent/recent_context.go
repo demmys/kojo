@@ -137,7 +137,7 @@ const (
 // directories but loses them the same way (reset, GC, stale ref, a rewind
 // that lands on the session's first turn), and its Chat injects the excerpt
 // only when it is actually starting fresh. gemini follows the same pattern:
-// its chat logs ride a device switch (gemini_session_transfer.go), but a
+// its sessions ride a device switch (gemini_session_transfer.go), but a
 // skipped/oversized or unreadable transfer, a reset, or a stale ref still
 // lands on a fresh session, where the excerpt is the only continuity.
 // Backends whose resume path cannot silently vanish do not receive it.

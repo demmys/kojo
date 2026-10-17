@@ -20,7 +20,7 @@ import "time"
 //
 // The step-up dates are the introductory-price end dates on the pricing
 // page; kojo switches on the turn's completion time (UTC). Batch / Flex /
-// Priority tiers and cache storage are not used by gemini-cli and are not
+// Priority tiers and cache storage are not used by kojo and are not
 // modelled.
 type geminiPriceStep struct {
 	from                     time.Time // inclusive; zero = since forever
@@ -53,65 +53,23 @@ func geminiPriceAt(model string, at time.Time) (geminiPriceStep, bool) {
 	return cur, true
 }
 
-// geminiModelStats is one entry of the stream-json result's
-// stats.models map. gemini-cli fills it from the API's usageMetadata:
-// input_tokens = promptTokenCount, output_tokens = candidatesTokenCount
-// (thoughts EXCLUDED), cached = cachedContentTokenCount, input =
-// prompt − cached, total_tokens = totalTokenCount (prompt + candidates +
-// thoughts + toolUsePrompt). The stream has no thoughts field, so thoughts
-// are derived as total − input_tokens − output_tokens.
-type geminiModelStats struct {
-	TotalTokens  int  `json:"total_tokens"`
-	InputTokens  int  `json:"input_tokens"`
-	OutputTokens int  `json:"output_tokens"`
-	Cached       int  `json:"cached"`
-	Input        *int `json:"input"`
-}
-
-// uncached returns the non-cached prompt tokens.
-func (s geminiModelStats) uncached() int {
-	n := s.InputTokens - s.Cached
-	if s.Input != nil {
-		n = *s.Input
-	}
-	if n < 0 {
-		n = 0
-	}
-	return n
-}
-
-// thoughts returns the thinking tokens implied by total_tokens. Any
-// toolUsePromptTokenCount (server-side tools only; gemini-cli's own
-// function calls are client-side and report 0) lands here too and is
-// billed at the output rate, a slight overestimate in that rare case.
-func (s geminiModelStats) thoughts() int {
-	n := s.TotalTokens - s.InputTokens - s.OutputTokens
-	if n < 0 {
-		n = 0
-	}
-	return n
-}
-
-// geminiCostUSD prices one invocation from the per-model stats. Returns 0
-// (cost unset → the UI shows none) when there are no per-model stats or
-// when any model that consumed tokens has no known price: a partial sum
-// would be presented as the turn's real cost.
-func geminiCostUSD(models map[string]geminiModelStats, at time.Time) float64 {
-	if len(models) == 0 {
+// geminiUsageCostUSD prices one turn's summed usage for model (the
+// concrete id kojo sent). OpenCode's step_finish tokens split the prompt
+// into uncached input, cache reads and cache writes; parseGeminiStream
+// folds cache writes into InputTokens and reasoning into OutputTokens.
+// Returns 0 (cost unset: the UI shows none) for a model without a known
+// price rather than a guess. OpenCode's own cost field is not used: it
+// comes from its bundled model catalogue, which does not track the
+// step-up dates in geminiPriceTable.
+func geminiUsageCostUSD(model string, u *Usage, at time.Time) float64 {
+	if u == nil {
 		return 0
 	}
-	var total float64
-	for model, s := range models {
-		if s.TotalTokens == 0 && s.InputTokens == 0 && s.OutputTokens == 0 {
-			continue
-		}
-		p, ok := geminiPriceAt(model, at)
-		if !ok {
-			return 0
-		}
-		total += float64(s.uncached())*p.input/1e6 +
-			float64(s.Cached)*p.cacheRead/1e6 +
-			float64(s.OutputTokens+s.thoughts())*p.output/1e6
+	p, ok := geminiPriceAt(resolveGeminiModel(model), at)
+	if !ok {
+		return 0
 	}
-	return total
+	return float64(u.InputTokens)*p.input/1e6 +
+		float64(u.CacheReadInputTokens)*p.cacheRead/1e6 +
+		float64(u.OutputTokens)*p.output/1e6
 }

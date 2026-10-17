@@ -104,6 +104,8 @@ type Manager struct {
 	// launchers isolate user tools that must not run bare (see
 	// SetToolLauncher / toolGemini).
 	launchers map[string]ToolLauncher
+	// reapers clean up after a user tool's run (see SetToolReaper).
+	reapers map[string]ToolReaper
 
 	// callback for session events
 	OnSessionExit func(s *Session)
@@ -193,6 +195,11 @@ func (m *Manager) Create(tool, workDir string, args []string, yoloMode bool, par
 		launchPath, launchArgs, cleanup, lerr := m.prepareLaunch(tool, toolPath, workDir, runArgs)
 		if lerr != nil {
 			return nil, lerr
+		}
+		if actualTool == toolGemini {
+			if sid := launchedGeminiSessionID(launchArgs); sid != "" {
+				toolSessionID = sid
+			}
 		}
 		res, err = m.platformStartUserTool(id, workDir, launchPath, launchArgs, 0, 0, extraEnv)
 		if err != nil && cleanup != nil {
@@ -322,6 +329,11 @@ func (m *Manager) Restart(id string) (*Session, error) {
 			clearRestarting()
 			return nil, lerr
 		}
+		if actualTool == toolGemini {
+			if sid := launchedGeminiSessionID(launchArgs); sid != "" {
+				toolSessionID = sid
+			}
+		}
 		res, err = m.platformStartUserTool(id, workDir, launchPath, launchArgs, cols, rows, extraEnv)
 		if err != nil && cleanup != nil {
 			cleanup()
@@ -338,6 +350,7 @@ func (m *Manager) Restart(id string) (*Session, error) {
 	s.PTY = res.pty
 	s.Cmd = res.cmd
 	s.Args = args // Keep original args (without --resume), not restartArgs
+	s.ToolSessionID = toolSessionID
 	s.TmuxSessionName = res.tmuxName
 	s.rawPipe = res.rawPipe
 	s.rawPipePath = res.rawPipePath
@@ -638,6 +651,10 @@ func (m *Manager) completeExit(s *Session, exitCode int) {
 		scrollback = scrollback[len(scrollback)-maxLastOutput:]
 	}
 
+	// The tool is gone; clean up what it left behind before the session
+	// counts as exited (a Restart waits for that).
+	m.reapTool(s)
+
 	s.mu.Lock()
 	s.Status = StatusExited
 	s.lastOutput = scrollback
@@ -719,9 +736,9 @@ func resolveToolPath(tool, actualTool string) (string, error) {
 	if !userTools[tool] {
 		return "", nil
 	}
-	toolPath, err := exec.LookPath(actualTool)
+	toolPath, err := exec.LookPath(toolBinary(actualTool))
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", ErrToolNotFound, actualTool)
+		return "", fmt.Errorf("%w: %s", ErrToolNotFound, toolBinary(actualTool))
 	}
 	return toolPath, nil
 }
@@ -736,7 +753,7 @@ func yoloNativeFlag(tool string) string {
 	case "codex":
 		return "--dangerously-bypass-approvals-and-sandbox"
 	case toolGemini:
-		return "--yolo"
+		return "--auto"
 	default:
 		return ""
 	}
@@ -755,8 +772,8 @@ func appendYoloFlag(tool string, args []string, yoloMode bool) []string {
 		return args
 	}
 	if tool == toolGemini && geminiHasApprovalMode(args) {
-		// The user picked an approval mode (or -y) already; adding
-		// --yolo would make gemini-cli reject the combination.
+		// The user already turned auto-approval on (--auto or one of
+		// its aliases); a second flag would be redundant.
 		return args
 	}
 	for _, a := range args {
@@ -917,11 +934,12 @@ func ToolAvailability() map[string]ToolInfo {
 			continue
 		}
 		if tool == toolGemini && runtime.GOOS == "windows" {
-			// The isolated launcher is a POSIX sh wrapper (see toolGemini).
+			// The isolated launcher is a POSIX sh wrapper with a key FIFO
+			// (see toolGemini).
 			result[tool] = ToolInfo{}
 			continue
 		}
-		path, err := exec.LookPath(tool)
+		path, err := exec.LookPath(toolBinary(tool))
 		result[tool] = ToolInfo{
 			Available: err == nil,
 			Path:      path,

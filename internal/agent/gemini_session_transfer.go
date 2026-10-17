@@ -1,46 +1,38 @@
 package agent
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 )
 
-// gemini session transfer for §3.7 device switch.
+// gemini (OpenCode) session transfer for §3.7 device switch.
 //
-// gemini-cli keeps one JSONL per conversation inside the agent's own
-// GEMINI_CLI_HOME (geminiCLIHome = <agentDir>/.gemini-cli-home):
+// OpenCode keeps every session of the agent in one SQLite DB inside the
+// agent's own OpenCode home (<agentDir>/.opencode-home/data/opencode/
+// opencode.db). kojo's resume refs live next to it under kojo/
+// (session_id for the main conversation, threads/key-<uuid> per
+// SessionKey).
 //
-//	.gemini/tmp/<slug>/chats/session-<ts>-<id[:8]>.jsonl   (main sessions)
-//	.gemini/tmp/<slug>/chats/<sessionId>/<subagentId>.jsonl (subagent logs)
-//
-// <slug> is the CLI's short project id: slugify(basename(cwd)) as recorded
-// in .gemini/projects.json and the .project_root ownership markers. kojo's
-// resume refs live next to it under kojo/ (session_id for the main
-// conversation, threads/key-<uuid> per SessionKey).
-//
-// Verified against gemini-cli 0.64.0: copying ONLY the session JSONL into
-// a fresh home under tmp/<slug>/chats/ is enough for `--resume <id>` from
-// a different absolute cwd with the same basename — projects.json, the
-// .project_root markers and the header's projectHash are not consulted
-// for the lookup (the CLI registers the new path on first use). The
-// markers must NOT be copied: they hold source's absolute path and would
-// make target's CLI treat the slug as owned by another project and claim
-// "<slug>-1" instead, losing the session.
-//
-// A handoff therefore carries every kojo ref (main + per-SessionKey
-// threads) whose session file exists, plus those sessions' JSONLs and
-// subagent logs. Target swaps in a fresh .gemini/tmp holding exactly
-// those files under its own slug, and replaces its refs. OneShot sessions
-// (no ref) stay behind, as for grok.
+// The DB itself is not shipped: it holds every session (OneShot ones
+// included) bound to source's absolute paths and is written concurrently
+// by running OpenCode processes. A handoff instead carries, for every kojo
+// ref, OpenCode's own export of that session (`opencode export <id>`:
+// session info plus all messages and parts as JSON). Target stages the
+// exports under kojo/pending-import/<id>.json and swaps in the shipped
+// refs; the next chat turn or PTY launch imports them with
+// `opencode import` (which re-homes the session to target's agent dir;
+// verified against opencode 1.19.3: `-s <id>` resumes an imported session
+// from a different absolute path) before resolving the ref. OneShot
+// sessions (no ref) stay behind, as for grok.
 
 // GeminiSessionRef is one kojo resume ref. Name is "" for the main
 // conversation (kojo/session_id) or the threads/ file name
@@ -50,9 +42,8 @@ type GeminiSessionRef struct {
 	SessionID string
 }
 
-// GeminiSessionFile is one file from source's chats dir. RelPath is
-// relative to chats/: "session-<ts>-<short>.jsonl" or
-// "<sessionId>/<name>.jsonl" for a subagent log.
+// GeminiSessionFile is one OpenCode session export. RelPath is
+// "<sessionID>.json"; Content is the `opencode export` JSON.
 type GeminiSessionFile struct {
 	RelPath string
 	Content []byte
@@ -73,15 +64,17 @@ const geminiSessionTransferMaxFiles = 1024
 
 var (
 	geminiThreadRefNamePattern = regexp.MustCompile(`^key-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	geminiMainFilePattern      = regexp.MustCompile(`^session-[0-9A-Za-z_\-]+\.jsonl$`)
-	geminiSubagentFilePattern  = regexp.MustCompile(`^[0-9A-Za-z_\-]+\.jsonl$`)
+	geminiExportFilePattern    = regexp.MustCompile(`^(ses_[0-9a-f]{12}[0-9A-Za-z]{14})\.json$`)
 )
 
 var geminiSessionTransferLocks keyedMutex
 
+// exportOpenCodeSessionFn is swapped by tests (no opencode binary).
+var exportOpenCodeSessionFn = exportOpenCodeSession
+
 // geminiRefuseSymlinks errors when any existing path in paths is a
 // symlink or not a directory; missing paths are fine. The agent can
-// write its own dir, and a planted link inside its gemini home would
+// write its own dir, and a planted link inside its OpenCode home would
 // otherwise redirect kojo's reads, writes and swaps (rename aside +
 // RemoveAll on commit) outside it.
 func geminiRefuseSymlinks(paths ...string) error {
@@ -100,19 +93,24 @@ func geminiRefuseSymlinks(paths ...string) error {
 	return nil
 }
 
-// geminiCheckRealDirs applies geminiRefuseSymlinks to the fixed gemini
-// state directories under the agent dir: GEMINI_CLI_HOME, its .gemini
-// and .gemini/tmp, and the kojo ref dirs. Per-project tmp/<slug>/chats
-// dirs are checked where they are walked (geminiCollectSession).
+// geminiCheckRealDirs applies geminiRefuseSymlinks to the fixed
+// OpenCode/kojo state directories under the agent dir and refuses any
+// symlink inside the OpenCode home (refuseOpenCodeHomeLinks).
 func geminiCheckRealDirs(absAgentDir string) error {
-	home := geminiCLIHome(absAgentDir)
-	return geminiRefuseSymlinks(
+	home := openCodeHome(absAgentDir)
+	if err := geminiRefuseSymlinks(
 		home,
-		filepath.Join(home, ".gemini"),
-		filepath.Join(home, ".gemini", "tmp"),
+		filepath.Join(home, "data"),
+		openCodeDataDir(home),
 		geminiKojoDir(absAgentDir),
 		geminiThreadRefDir(absAgentDir),
-	)
+		geminiPendingImportDir(absAgentDir),
+	); err != nil {
+		return err
+	}
+	// A file link deeper down (opencode.db-wal, a session file) would be
+	// followed by the DB reads and the export/import the transfer runs.
+	return refuseOpenCodeHomeLinks(home)
 }
 
 func lockGeminiSessionTransfer(agentID string) func() {
@@ -158,58 +156,127 @@ func listGeminiRefs(absAgentDir string) []GeminiSessionRef {
 	return refs
 }
 
-// geminiSessionTransferFiles collects one session's files: its main
-// JSONL(s) plus regular *.jsonl files in chats/<id>/ (subagent logs).
-type geminiCollected struct {
-	rel  string
-	path string
-	size int64
-	core bool
+// validateOpenCodeExport checks that body is an OpenCode session export
+// of sessionID.
+func validateOpenCodeExport(body []byte, sessionID string) error {
+	var exp struct {
+		Info *struct {
+			ID string `json:"id"`
+		} `json:"info"`
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &exp); err != nil {
+		return fmt.Errorf("opencode export of %s is not JSON: %w", sessionID, err)
+	}
+	if exp.Info == nil || exp.Info.ID != sessionID {
+		return fmt.Errorf("opencode export does not describe session %s", sessionID)
+	}
+	if exp.Messages == nil {
+		return fmt.Errorf("opencode export of %s has no messages", sessionID)
+	}
+	return nil
 }
 
-func geminiCollectSession(absAgentDir, sessionID string) []geminiCollected {
-	var out []geminiCollected
-	for _, p := range geminiSessionFiles(absAgentDir, sessionID) {
-		chats := filepath.Dir(p)
-		if geminiRefuseSymlinks(filepath.Dir(chats), chats) != nil {
-			continue // tmp/<slug> or chats is a link: not ours to ship
+// geminiSessionExport returns the export for sessionID: a still-pending
+// import (the session came from another device and has not been imported
+// here yet) is shipped as is (or fails when it is unreadable or invalid),
+// anything else is exported from the DB.
+// errGeminiNoSession means the ref is stale.
+var errGeminiNoSession = errors.New("session not found")
+
+func geminiSessionExport(agentID, absAgentDir, sessionID string) ([]byte, error) {
+	pending := filepath.Join(geminiPendingImportDir(absAgentDir), sessionID+".json")
+	if fi, err := os.Lstat(pending); err == nil && fi.Mode().IsRegular() {
+		if fi.Size() > geminiSessionFileMaxBytes {
+			return nil, errGeminiOversized{size: fi.Size()}
 		}
-		fi, err := os.Lstat(p)
-		if err != nil || !fi.Mode().IsRegular() {
-			continue
+		// The pending export is the newest copy of the session (the
+		// local DB, if it has one, predates the switch): failing to read
+		// it skips the session instead of shipping the stale DB copy.
+		body, rerr := os.ReadFile(pending)
+		if rerr != nil {
+			return nil, fmt.Errorf("read pending export of %s: %w", sessionID, rerr)
 		}
-		out = append(out, geminiCollected{rel: filepath.Base(p), path: p, size: fi.Size(), core: true})
-		sub := filepath.Join(chats, sessionID)
-		if geminiRefuseSymlinks(sub) != nil {
-			continue
+		if verr := validateOpenCodeExport(body, sessionID); verr != nil {
+			return nil, fmt.Errorf("pending export: %w", verr)
 		}
-		entries, err := os.ReadDir(sub)
-		if err != nil {
-			continue
+		return body, nil
+	}
+	if exists, known := openCodeSessionExists(openCodeHome(absAgentDir), sessionID); known && !exists {
+		return nil, errGeminiNoSession
+	}
+	return exportOpenCodeSessionFn(context.Background(), agentID, sessionID)
+}
+
+// geminiExportParallelism bounds the concurrent `opencode export`
+// processes (each takes about half a second to start).
+const geminiExportParallelism = 4
+
+type geminiExportResult struct {
+	body []byte
+	err  error
+}
+
+// exportGeminiSessions exports every distinct session the refs point at,
+// in ref order, geminiExportParallelism at a time. Once the exports so far
+// fill the transfer budget the remaining sessions are not exported (their
+// result is errGeminiOverBudget), which bounds memory to the budget plus
+// one batch.
+func exportGeminiSessions(agentID, absAgentDir string, refs []GeminiSessionRef) map[string]geminiExportResult {
+	var ids []string
+	seen := map[string]bool{}
+	for _, r := range refs {
+		if !seen[r.SessionID] {
+			seen[r.SessionID] = true
+			ids = append(ids, r.SessionID)
 		}
-		for _, e := range entries {
-			if !e.Type().IsRegular() || !geminiSubagentFilePattern.MatchString(e.Name()) {
-				continue
+	}
+	out := make(map[string]geminiExportResult, len(ids))
+	var total int64
+	for start := 0; start < len(ids); start += geminiExportParallelism {
+		batch := ids[start:min(start+geminiExportParallelism, len(ids))]
+		if total >= geminiSessionTransferMaxTotalBytes {
+			for _, id := range batch {
+				out[id] = geminiExportResult{err: errGeminiOverBudget}
 			}
-			info, ierr := e.Info()
-			if ierr != nil {
-				continue
-			}
-			out = append(out, geminiCollected{
-				rel: sessionID + "/" + e.Name(), path: filepath.Join(sub, e.Name()), size: info.Size(),
-			})
+			continue
+		}
+		results := make([]geminiExportResult, len(batch))
+		var wg sync.WaitGroup
+		for i, id := range batch {
+			wg.Add(1)
+			go func(i int, id string) {
+				defer wg.Done()
+				body, err := geminiSessionExport(agentID, absAgentDir, id)
+				if err == nil && int64(len(body)) > geminiSessionFileMaxBytes {
+					body, err = nil, errGeminiOversized{size: int64(len(body))}
+				}
+				results[i] = geminiExportResult{body: body, err: err}
+			}(i, id)
+		}
+		wg.Wait()
+		for i, id := range batch {
+			out[id] = results[i]
+			total += int64(len(results[i].body))
 		}
 	}
 	return out
 }
 
-// ReadGeminiSessionFiles collects the agent's referenced gemini sessions
+// errGeminiOverBudget marks a session not exported because earlier ones
+// already filled the transfer budget.
+var errGeminiOverBudget = errors.New("transfer budget exhausted")
+
+type errGeminiOversized struct{ size int64 }
+
+func (e errGeminiOversized) Error() string { return fmt.Sprintf("export is %d bytes", e.size) }
+
+// ReadGeminiSessionFiles collects the agent's referenced OpenCode sessions
 // for handoff. Returns (nil, skipped, nil) when there is nothing to move.
-// A session whose main JSONL is oversized (or whose inclusion would
-// exceed the total budget) is dropped together with every ref pointing
-// at it and reported in skipped; target then starts that conversation
-// fresh with the recent-messages bootstrap. Oversized subagent logs are
-// skipped individually.
+// A session whose export is oversized (or whose inclusion would exceed the
+// total budget) or cannot be produced is dropped together with every ref
+// pointing at it and reported in skipped; target then starts that
+// conversation fresh with the recent-messages bootstrap.
 func ReadGeminiSessionFiles(agentID string) (*GeminiSessionTransfer, []SkippedSessionFile, error) {
 	if agentID == "" {
 		return nil, nil, nil
@@ -229,11 +296,12 @@ func ReadGeminiSessionFiles(agentID string) (*GeminiSessionTransfer, []SkippedSe
 		return nil, nil, nil
 	}
 
+	exports := exportGeminiSessions(agentID, absAgentDir, refs)
+
 	out := &GeminiSessionTransfer{}
 	var skipped []SkippedSessionFile
 	var total int64
-	shipped := map[string]bool{} // sessionID → files shipped
-	seenRel := map[string]bool{}
+	shipped := map[string]bool{} // sessionID → export shipped
 	for _, ref := range refs {
 		wasShipped, seenBefore := shipped[ref.SessionID]
 		if seenBefore {
@@ -242,67 +310,40 @@ func ReadGeminiSessionFiles(agentID string) (*GeminiSessionTransfer, []SkippedSe
 			}
 			continue
 		}
-		collected := geminiCollectSession(absAgentDir, ref.SessionID)
-		var mainSize int64
-		hasMain := false
-		for _, c := range collected {
-			if c.core {
-				hasMain = true
-				mainSize += c.size
-			}
-		}
-		if !hasMain {
-			// Stale ref (session file deleted / GC'd): nothing to resume.
-			shipped[ref.SessionID] = false
+		shipped[ref.SessionID] = false
+		label := "gemini-session/" + ref.SessionID
+		body, eerr := exports[ref.SessionID].body, exports[ref.SessionID].err
+		var big errGeminiOversized
+		switch {
+		case errors.Is(eerr, errGeminiNoSession):
+			continue // stale ref: nothing to resume
+		case errors.As(eerr, &big):
+			skipped = append(skipped, SkippedSessionFile{Path: label, Reason: "oversized", SizeBytes: big.size})
+			continue
+		case errors.Is(eerr, errGeminiOverBudget):
+			skipped = append(skipped, SkippedSessionFile{Path: label, Reason: "capacity"})
+			continue
+		case eerr != nil:
+			slog.Default().Warn("gemini session transfer: export failed",
+				"agent", agentID, "sessionId", ref.SessionID, "err", eerr)
+			skipped = append(skipped, SkippedSessionFile{Path: label, Reason: "unreadable"})
 			continue
 		}
-		oversized := false
-		for _, c := range collected {
-			if c.core && c.size > geminiSessionFileMaxBytes {
-				oversized = true
-			}
-		}
-		if oversized || total+mainSize > geminiSessionTransferMaxTotalBytes {
+		size := int64(len(body))
+		if size > geminiSessionFileMaxBytes || total+size > geminiSessionTransferMaxTotalBytes {
 			reason := "oversized"
-			if !oversized {
+			if size <= geminiSessionFileMaxBytes {
 				reason = "capacity"
 			}
-			skipped = append(skipped, SkippedSessionFile{
-				Path: "gemini-session/" + ref.SessionID, Reason: reason, SizeBytes: mainSize,
-			})
-			shipped[ref.SessionID] = false
+			skipped = append(skipped, SkippedSessionFile{Path: label, Reason: reason, SizeBytes: size})
 			continue
 		}
-		var files []GeminiSessionFile
-		var sessionBytes int64
-		for _, c := range collected {
-			if seenRel[strings.ToLower(c.rel)] {
-				continue
-			}
-			if !c.core && (c.size > geminiSessionFileMaxBytes ||
-				total+sessionBytes+c.size > geminiSessionTransferMaxTotalBytes) {
-				skipped = append(skipped, SkippedSessionFile{Path: c.rel, Reason: "oversized", SizeBytes: c.size})
-				continue
-			}
-			body, rerr := os.ReadFile(c.path)
-			if rerr != nil {
-				if c.core {
-					return nil, skipped, fmt.Errorf("agent.ReadGeminiSessionFiles: read %s: %w", c.rel, rerr)
-				}
-				skipped = append(skipped, SkippedSessionFile{Path: c.rel, Reason: "unreadable"})
-				continue
-			}
-			files = append(files, GeminiSessionFile{RelPath: c.rel, Content: body})
-			sessionBytes += int64(len(body))
+		if len(out.Files)+1 > geminiSessionTransferMaxFiles {
+			skipped = append(skipped, SkippedSessionFile{Path: label, Reason: "capacity", SizeBytes: size})
+			continue
 		}
-		if len(out.Files)+len(files) > geminiSessionTransferMaxFiles {
-			return nil, skipped, fmt.Errorf("agent.ReadGeminiSessionFiles: more than %d files", geminiSessionTransferMaxFiles)
-		}
-		for _, f := range files {
-			seenRel[strings.ToLower(f.RelPath)] = true
-		}
-		out.Files = append(out.Files, files...)
-		total += sessionBytes
+		out.Files = append(out.Files, GeminiSessionFile{RelPath: ref.SessionID + ".json", Content: body})
+		total += size
 		shipped[ref.SessionID] = true
 		out.Refs = append(out.Refs, ref)
 	}
@@ -310,138 +351,6 @@ func ReadGeminiSessionFiles(agentID string) (*GeminiSessionTransfer, []SkippedSe
 		return nil, skipped, nil
 	}
 	return out, skipped, nil
-}
-
-// geminiNormalizeProjectPath mirrors gemini-cli's normalizePath: absolute,
-// lower-cased on case-insensitive platforms.
-func geminiNormalizeProjectPath(p string) string {
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		return strings.ToLower(p)
-	}
-	return p
-}
-
-// geminiSlugify mirrors gemini-cli's ProjectRegistry.slugify.
-func geminiSlugify(s string) string {
-	var b strings.Builder
-	prevDash := false
-	for _, r := range strings.ToLower(s) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-			continue
-		}
-		if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "project"
-	}
-	return out
-}
-
-// geminiProjectSlug predicts the short project id target's CLI will use
-// for cwd absAgentDir inside its GEMINI_CLI_HOME, following
-// ProjectRegistry.getShortId: an existing projects.json mapping for the
-// path wins (gemini-cli 0.64 verifies it only against markers we never
-// write), otherwise a marker already owned by the path, otherwise the
-// first free slugify(basename)[-N] that no other path maps to or marks.
-// excludeTmp ignores the tmp/ markers (they are about to be swapped out).
-func geminiProjectSlug(home, absAgentDir string, excludeTmp bool) string {
-	candidates := []string{absAgentDir}
-	if real, err := filepath.EvalSymlinks(absAgentDir); err == nil && real != absAgentDir {
-		candidates = append([]string{real}, candidates...)
-	}
-	norm := map[string]bool{}
-	for _, c := range candidates {
-		norm[geminiNormalizeProjectPath(c)] = true
-	}
-	gdir := filepath.Join(home, ".gemini")
-
-	var reg struct {
-		Projects map[string]string `json:"projects"`
-	}
-	if data, err := os.ReadFile(filepath.Join(gdir, "projects.json")); err == nil {
-		_ = json.Unmarshal(data, &reg)
-	}
-	baseDirs := []string{filepath.Join(gdir, "history")}
-	if !excludeTmp {
-		baseDirs = append(baseDirs, filepath.Join(gdir, "tmp"))
-	}
-	markerOwner := func(slug string) (owner string, found bool) {
-		for _, bd := range baseDirs {
-			data, err := os.ReadFile(filepath.Join(bd, slug, ".project_root"))
-			if err == nil {
-				o := geminiNormalizeProjectPath(strings.TrimSpace(string(data)))
-				if !norm[o] {
-					return o, true
-				}
-				owner, found = o, true
-			}
-		}
-		return owner, found
-	}
-	taken := map[string]bool{}
-	for path, slug := range reg.Projects {
-		if !norm[geminiNormalizeProjectPath(path)] {
-			taken[slug] = true
-			continue
-		}
-		if slug == "" || strings.ContainsAny(slug, `/\`) || slug == "." || slug == ".." {
-			continue
-		}
-		// getShortId drops a mapping whose marker another path owns.
-		if owner, ok := markerOwner(slug); ok && !norm[owner] {
-			continue
-		}
-		return slug
-	}
-	for _, bd := range baseDirs {
-		entries, err := os.ReadDir(bd)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			if owner, ok := markerOwner(e.Name()); ok && norm[owner] {
-				return e.Name()
-			}
-		}
-	}
-	base := geminiSlugify(filepath.Base(absAgentDir))
-	for i := 0; ; i++ {
-		cand := base
-		if i > 0 {
-			cand = fmt.Sprintf("%s-%d", base, i)
-		}
-		if taken[cand] {
-			continue
-		}
-		if owner, ok := markerOwner(cand); ok && !norm[owner] {
-			continue
-		}
-		return cand
-	}
-}
-
-// geminiSessionHeaderID reads the sessionId from a JSONL body's first line.
-func geminiSessionHeaderID(body []byte) string {
-	line := body
-	if i := bytes.IndexByte(line, '\n'); i >= 0 {
-		line = line[:i]
-	}
-	var hdr struct {
-		SessionID string `json:"sessionId"`
-	}
-	if json.Unmarshal(line, &hdr) != nil {
-		return ""
-	}
-	return hdr.SessionID
 }
 
 // geminiSwap is one path replacement inside a staged transfer: final is
@@ -499,7 +408,7 @@ func applyGeminiSwaps(agentID string, swaps []*geminiSwap, release func()) (comm
 			s.backup = bk
 		}
 		if s.staged != "" {
-			if err := os.MkdirAll(filepath.Dir(s.final), 0o755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(s.final), 0o700); err != nil {
 				undo()
 				cleanupStaged()
 				return nil, nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(s.final), err)
@@ -540,11 +449,12 @@ func applyGeminiSwaps(agentID string, swaps []*geminiSwap, release func()) (comm
 }
 
 // StageGeminiSession materialises transfer under target's agent dir:
-// a fresh .gemini/tmp/<slug>/chats/ holding exactly the shipped files
-// (the previous tmp/ is moved aside), plus kojo/session_id and
-// kojo/threads/ replaced by the shipped refs. Two-phase like
-// StageGrokSession: commit drops the backups, rollback restores them.
-// Returns (nil, nil, nil) for an empty transfer.
+// a fresh kojo/pending-import/ holding exactly the shipped exports (the
+// previous one is moved aside), plus kojo/session_id and kojo/threads/
+// replaced by the shipped refs. The exports are imported into OpenCode's
+// DB before the agent's next turn. Two-phase like StageGrokSession:
+// commit drops the backups, rollback restores them. Returns (nil, nil,
+// nil) for an empty transfer.
 func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit func(), rollback func(), err error) {
 	if agentID == "" {
 		return nil, nil, fmt.Errorf("agent.StageGeminiSession: agent_id required")
@@ -580,36 +490,32 @@ func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit
 		refNames[r.Name] = true
 	}
 
-	// Validate files: flat main JSONLs or one-level <sessionId>/<x>.jsonl.
-	seen := map[string]bool{}
-	mainIDs := map[string]bool{}
+	// Validate files: flat <sessionID>.json exports of that session.
+	ids := map[string]bool{}
 	var total int64
 	for _, f := range transfer.Files {
-		rel := f.RelPath
-		parts := strings.Split(rel, "/")
-		switch {
-		case len(parts) == 1 && geminiMainFilePattern.MatchString(parts[0]):
-			mainIDs[geminiSessionHeaderID(f.Content)] = true
-		case len(parts) == 2 && isGeminiSessionID(parts[0]) && geminiSubagentFilePattern.MatchString(parts[1]):
-		default:
-			return nil, nil, fmt.Errorf("agent.StageGeminiSession: refusing relpath %q", rel)
+		m := geminiExportFilePattern.FindStringSubmatch(f.RelPath)
+		if m == nil {
+			return nil, nil, fmt.Errorf("agent.StageGeminiSession: refusing relpath %q", f.RelPath)
 		}
-		key := strings.ToLower(rel)
-		if seen[key] {
-			return nil, nil, fmt.Errorf("agent.StageGeminiSession: duplicate relpath %q", rel)
+		if ids[m[1]] {
+			return nil, nil, fmt.Errorf("agent.StageGeminiSession: duplicate relpath %q", f.RelPath)
 		}
-		seen[key] = true
+		ids[m[1]] = true
 		if int64(len(f.Content)) > geminiSessionFileMaxBytes {
-			return nil, nil, fmt.Errorf("agent.StageGeminiSession: file %q exceeds per-file cap", rel)
+			return nil, nil, fmt.Errorf("agent.StageGeminiSession: file %q exceeds per-file cap", f.RelPath)
 		}
 		total += int64(len(f.Content))
 		if total > geminiSessionTransferMaxTotalBytes {
 			return nil, nil, fmt.Errorf("agent.StageGeminiSession: total payload exceeds %d bytes",
 				geminiSessionTransferMaxTotalBytes)
 		}
+		if err := validateOpenCodeExport(f.Content, m[1]); err != nil {
+			return nil, nil, fmt.Errorf("agent.StageGeminiSession: %w", err)
+		}
 	}
 	for _, r := range transfer.Refs {
-		if !mainIDs[r.SessionID] {
+		if !ids[r.SessionID] {
 			return nil, nil, fmt.Errorf("agent.StageGeminiSession: ref %q has no session file for %s", r.Name, r.SessionID)
 		}
 	}
@@ -624,15 +530,13 @@ func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit
 	if err := geminiCheckRealDirs(absAgentDir); err != nil {
 		return nil, nil, fmt.Errorf("agent.StageGeminiSession: %w", err)
 	}
-	home := geminiCLIHome(absAgentDir)
-	gdir := filepath.Join(home, ".gemini")
 	kojoDir := geminiKojoDir(absAgentDir)
-	for _, d := range []string{gdir, kojoDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return nil, nil, fmt.Errorf("agent.StageGeminiSession: mkdir %s: %w", d, err)
-		}
+	if err := os.MkdirAll(kojoDir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("agent.StageGeminiSession: mkdir %s: %w", kojoDir, err)
 	}
-	slug := geminiProjectSlug(home, absAgentDir, true)
+	if err := geminiCheckRealDirs(absAgentDir); err != nil {
+		return nil, nil, fmt.Errorf("agent.StageGeminiSession: %w", err)
+	}
 
 	var staged []string
 	fail := func(format string, a ...any) (func(), func(), error) {
@@ -642,18 +546,13 @@ func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit
 		return nil, nil, fmt.Errorf("agent.StageGeminiSession: "+format, a...)
 	}
 
-	tmpStage, err := os.MkdirTemp(gdir, ".tmp-staging-*")
+	importStage, err := os.MkdirTemp(kojoDir, ".pending-import-staging-*")
 	if err != nil {
 		return fail("mkdir staging: %w", err)
 	}
-	staged = append(staged, tmpStage)
-	chats := filepath.Join(tmpStage, slug, "chats")
+	staged = append(staged, importStage)
 	for _, f := range transfer.Files {
-		dst := filepath.Join(chats, filepath.FromSlash(f.RelPath))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return fail("mkdir %s: %w", filepath.Dir(dst), err)
-		}
-		if err := os.WriteFile(dst, f.Content, 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(importStage, f.RelPath), f.Content, 0o600); err != nil {
 			return fail("write %s: %w", f.RelPath, err)
 		}
 	}
@@ -681,13 +580,13 @@ func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit
 			}
 			staged = append(staged, threadsStage)
 		}
-		if err := os.WriteFile(filepath.Join(threadsStage, r.Name), []byte(r.SessionID), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(threadsStage, r.Name), []byte(r.SessionID), 0o600); err != nil {
 			return fail("write thread ref: %w", err)
 		}
 	}
 
 	swaps := []*geminiSwap{
-		{final: filepath.Join(gdir, "tmp"), staged: tmpStage},
+		{final: geminiPendingImportDir(absAgentDir), staged: importStage},
 		{final: geminiSessionIDFile(absAgentDir), staged: mainStage},
 		{final: geminiThreadRefDir(absAgentDir), staged: threadsStage},
 	}
@@ -699,10 +598,12 @@ func StageGeminiSession(agentID string, transfer *GeminiSessionTransfer) (commit
 	return commit, rollback, nil
 }
 
-// StageGeminiSessionCleanup purges target-local gemini session state
-// (.gemini/tmp and every kojo ref) when the authoritative inbound
-// snapshot carries no gemini block. Same two-phase contract as
-// StageGrokSessionCleanup; (nil, nil, nil) when there is nothing to purge.
+// StageGeminiSessionCleanup purges target-local gemini resume state (every
+// kojo ref and staged import) when the authoritative inbound snapshot
+// carries no gemini block, so the next turn starts a fresh OpenCode
+// session. Sessions already in OpenCode's DB are left in place
+// (unreferenced). Same two-phase contract as StageGrokSessionCleanup;
+// (nil, nil, nil) when there is nothing to purge.
 func StageGeminiSessionCleanup(agentID string) (commit func(), rollback func(), err error) {
 	if agentID == "" {
 		return nil, nil, fmt.Errorf("agent.StageGeminiSessionCleanup: agent_id required")
@@ -723,7 +624,7 @@ func StageGeminiSessionCleanup(agentID string) (commit func(), rollback func(), 
 	}
 	var swaps []*geminiSwap
 	for _, p := range []string{
-		filepath.Join(geminiCLIHome(absAgentDir), ".gemini", "tmp"),
+		geminiPendingImportDir(absAgentDir),
 		geminiSessionIDFile(absAgentDir),
 		geminiThreadRefDir(absAgentDir),
 	} {

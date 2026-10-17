@@ -89,9 +89,10 @@ func (m *Manager) ResetData(id string) error {
 	clearClaudeSession(id, m.logger)
 	clearGrokSession(id)
 	clearCodexSession(id)
-	// Gemini CLI home: sessions, kojo session refs and the per-turn
-	// settings.json (regenerated on the next turn). Under the gemini
-	// transfer lock, hence here rather than in the memorySyncMu region.
+	// OpenCode home (sessions, kojo session refs and the config,
+	// regenerated on the next turn) and the pre-OpenCode
+	// .gemini-cli-home. Under the gemini transfer lock, hence here
+	// rather than in the memorySyncMu region.
 	clearGeminiHome(id, m.logger)
 
 	// Hold the per-agent memory-sync lock around the entire on-

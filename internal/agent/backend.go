@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -203,7 +204,7 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 	switch b.Name() {
 	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGemini:
 		// gemini keeps the same per-key ref layout as grok under
-		// agentDir/.gemini-cli-home/kojo/threads.
+		// agentDir/.opencode-home/kojo/threads.
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
 		// CodexBackend.Chat; codex stores a deterministic per-key thread ref
 		// under agentDir/.codex/threads, and grok the equivalent under
@@ -266,11 +267,12 @@ func backendLoadsClaudeSkills(tool string) bool {
 //     app-server `thread/resume`.
 //
 //   - gemini: the orchestrator transfers the kojo resume refs
-//     (main + per-SessionKey threads) and their session JSONLs from
-//     the per-agent GEMINI_CLI_HOME via GeminiSession (see
-//     gemini_session_transfer.go); backend_gemini.go on target
-//     resumes with `gemini --resume <id>`. The skill installs under
-//     `.gemini/skills`.
+//     (main + per-SessionKey threads) and an `opencode export` of each
+//     session they point at from the per-agent OpenCode home via
+//     GeminiSession (see gemini_session_transfer.go); the target
+//     `opencode import`s them before the next turn and
+//     backend_opencode.go resumes with `opencode run -s <id>`. The
+//     skill installs under `.opencode/skills`.
 //
 // custom-bare has no session state to transfer: every turn is a fresh
 // stateless request, and its continuity comes from kojo replaying the
@@ -367,6 +369,16 @@ func LookupAgentToken(agentID string) (string, bool) {
 	return agentTokenLookup(agentID)
 }
 
+// hasEnvPrefix matches an environment entry against a strip prefix. On
+// Windows env names are case-insensitive (a child reading OPENCODE_CONFIG
+// also sees opencode_config), so the match is too.
+func hasEnvPrefix(entry, prefix string) bool {
+	if runtime.GOOS == "windows" {
+		return len(entry) >= len(prefix) && strings.EqualFold(entry[:len(prefix)], prefix)
+	}
+	return strings.HasPrefix(entry, prefix)
+}
+
 // filterEnv returns a copy of os.Environ() with entries matching any of the
 // given prefixes removed, and AGENT_BROWSER_SESSION / AGENT_BROWSER_COOKIE_DIR
 // vars set to agentID / dataDir. KOJO_AGENT_ID, KOJO_AGENT_TOKEN and
@@ -386,7 +398,7 @@ func filterEnv(removePrefixes []string, agentID, dataDir string) []string {
 	for _, e := range env {
 		skip := false
 		for _, prefix := range stripPrefixes {
-			if strings.HasPrefix(e, prefix) {
+			if hasEnvPrefix(e, prefix) {
 				skip = true
 				break
 			}

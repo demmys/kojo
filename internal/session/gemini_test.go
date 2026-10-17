@@ -8,21 +8,28 @@ import (
 	"testing"
 )
 
-func TestAssignGeminiSessionID(t *testing.T) {
-	id, args := assignGeminiSessionID([]string{"--model", "x"})
-	if len(id) != 36 || !reflect.DeepEqual(args, []string{"--model", "x", "--session-id", id}) {
-		t.Fatalf("generated: id=%q args=%q", id, args)
+const ocTestSID = "ses_eb96caae1ffeNQtLNqB50oU8p4"
+
+func TestToolBinary(t *testing.T) {
+	for in, want := range map[string]string{"gemini": "opencode", "claude": "claude", "codex": "codex", "grok": "grok"} {
+		if got := toolBinary(in); got != want {
+			t.Errorf("toolBinary(%q) = %q, want %q", in, got, want)
+		}
 	}
+}
+
+func TestAssignGeminiSessionID(t *testing.T) {
 	for _, c := range []struct {
 		in     []string
 		wantID string
 	}{
-		{[]string{"--session-id", "abc"}, "abc"},
-		{[]string{"--session-id=abc"}, "abc"},
-		{[]string{"--resume", "latest"}, ""},
-		{[]string{"-r", "3"}, ""},
-		{[]string{"--resume=latest"}, ""},
-		{[]string{"--session-file", "f.json"}, ""},
+		{[]string{"--model", "x"}, ""}, // OpenCode assigns ids itself
+		{[]string{"-s", ocTestSID}, ocTestSID},
+		{[]string{"--session", ocTestSID, "--auto"}, ocTestSID},
+		{[]string{"--session=" + ocTestSID}, ocTestSID},
+		{[]string{"-s", "--auto"}, ""},
+		{[]string{"--continue"}, ""},
+		{[]string{"--session-id", "abc"}, ""}, // gemini-cli flag, not OpenCode's
 	} {
 		id, args := assignGeminiSessionID(c.in)
 		if id != c.wantID || !reflect.DeepEqual(args, c.in) {
@@ -38,12 +45,12 @@ func TestBuildGeminiRestartArgs(t *testing.T) {
 		tsid string
 		want []string
 	}{
-		{"pinned id", []string{"--model", "m", "--session-id", "S1"}, "S1", []string{"--model", "m", "--resume", "S1"}},
-		{"user resume preserved", []string{"--resume", "U1", "--model", "m"}, "", []string{"--model", "m", "--resume", "U1"}},
-		{"joined resume preserved", []string{"-r=5"}, "", []string{"--resume", "5"}},
-		{"bare resume → latest", []string{"--resume", "--yolo"}, "", []string{"--yolo", "--resume", "latest"}},
-		{"session-file dropped", []string{"--session-file", "f.json", "-m", "x"}, "", []string{"-m", "x", "--resume", "latest"}},
-		{"nothing", nil, "", []string{"--resume", "latest"}},
+		{"pinned id", []string{"--model", "m", "-s", ocTestSID}, ocTestSID, []string{"--model", "m", "-s", ocTestSID}},
+		{"joined session replaced", []string{"--session=" + ocTestSID, "-m", "x"}, ocTestSID, []string{"-m", "x", "-s", ocTestSID}},
+		{"fork dropped", []string{"-s", ocTestSID, "--fork"}, ocTestSID, []string{"-s", ocTestSID}},
+		{"continue kept once", []string{"-c", "--auto", "--continue"}, "", []string{"--auto", "--continue"}},
+		{"nothing", nil, "", []string{"--continue"}},
+		{"legacy uuid id", []string{"-m", "x"}, "6b0f37f5-5d76-47ea-9d50-3a3add9c3936", []string{"-m", "x", "--continue"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if got := buildRestartArgs("gemini", c.in, c.tsid); !reflect.DeepEqual(got, c.want) {
@@ -54,12 +61,12 @@ func TestBuildGeminiRestartArgs(t *testing.T) {
 }
 
 func TestAppendYoloFlagGemini(t *testing.T) {
-	if got := appendYoloFlag("gemini", []string{"-m", "x"}, true); !reflect.DeepEqual(got, []string{"-m", "x", "--yolo"}) {
+	if got := appendYoloFlag("gemini", []string{"-m", "x"}, true); !reflect.DeepEqual(got, []string{"-m", "x", "--auto"}) {
 		t.Fatalf("got %q", got)
 	}
-	for _, in := range [][]string{{"--approval-mode", "plan"}, {"--approval-mode=auto_edit"}, {"-y"}, {"--yolo"}} {
+	for _, in := range [][]string{{"--auto"}, {"--yolo"}, {"--dangerously-skip-permissions"}} {
 		if got := appendYoloFlag("gemini", in, true); !reflect.DeepEqual(got, in) {
-			t.Errorf("appendYoloFlag(%q) = %q; must not add --yolo", in, got)
+			t.Errorf("appendYoloFlag(%q) = %q; must not add --auto", in, got)
 		}
 	}
 }
@@ -68,7 +75,7 @@ func TestPrepareLaunch(t *testing.T) {
 	m := &Manager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	// gemini fails closed without a launcher.
-	if _, _, _, err := m.prepareLaunch("gemini", "/bin/gemini", "/tmp", nil); !errors.Is(err, ErrToolNotFound) {
+	if _, _, _, err := m.prepareLaunch("gemini", "/bin/opencode", "/tmp", nil); !errors.Is(err, ErrToolNotFound) {
 		t.Fatalf("gemini without launcher: err=%v", err)
 	}
 	// Other tools pass through untouched.
@@ -81,13 +88,13 @@ func TestPrepareLaunch(t *testing.T) {
 	cleaned := false
 	m.SetToolLauncher("gemini", func(req ToolLaunchRequest) (ToolLaunch, error) {
 		gotReq = req
-		return ToolLaunch{Path: "/w.sh", Args: []string{"--skip-trust"}, Cleanup: func() { cleaned = true }}, nil
+		return ToolLaunch{Path: "/w.sh", Args: []string{"-m", "google/gemini-4-argon"}, Cleanup: func() { cleaned = true }}, nil
 	})
-	p, a, c, err = m.prepareLaunch("gemini", "/bin/gemini", "/work", []string{"--effort", "high"})
-	if err != nil || p != "/w.sh" || !reflect.DeepEqual(a, []string{"--skip-trust"}) {
+	p, a, c, err = m.prepareLaunch("gemini", "/bin/opencode", "/work", []string{"--effort", "high"})
+	if err != nil || p != "/w.sh" || !reflect.DeepEqual(a, []string{"-m", "google/gemini-4-argon"}) {
 		t.Fatalf("launcher result: %q %q %v", p, a, err)
 	}
-	if gotReq.ToolPath != "/bin/gemini" || gotReq.WorkDir != "/work" || !reflect.DeepEqual(gotReq.Args, []string{"--effort", "high"}) {
+	if gotReq.ToolPath != "/bin/opencode" || gotReq.WorkDir != "/work" || !reflect.DeepEqual(gotReq.Args, []string{"--effort", "high"}) {
 		t.Fatalf("launcher request: %+v", gotReq)
 	}
 	c()
@@ -96,7 +103,46 @@ func TestPrepareLaunch(t *testing.T) {
 	}
 
 	m.SetToolLauncher("gemini", func(ToolLaunchRequest) (ToolLaunch, error) { return ToolLaunch{}, errors.New("no key") })
-	if _, _, _, err := m.prepareLaunch("gemini", "/bin/gemini", "/work", nil); err == nil {
+	if _, _, _, err := m.prepareLaunch("gemini", "/bin/opencode", "/work", nil); err == nil {
 		t.Fatal("launcher error swallowed")
+	}
+}
+
+func TestLaunchedGeminiSessionID(t *testing.T) {
+	for _, c := range []struct {
+		in   []string
+		want string
+	}{
+		{[]string{"-m", "google/x", "-s", ocTestSID}, ocTestSID},
+		{[]string{"-m", "google/x", "--auto"}, ""},
+		{[]string{"-s", "not-an-id"}, ""},
+		{[]string{"-s"}, ""},
+		{[]string{"-s", "ses_eb96caae1ffeAAAAAAAAAAAAAA", "-s", ocTestSID}, ocTestSID},
+	} {
+		if got := launchedGeminiSessionID(c.in); got != c.want {
+			t.Fatalf("launchedGeminiSessionID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestReapTool(t *testing.T) {
+	m := &Manager{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &Session{Tool: "gemini", WorkDir: "/work", ToolSessionID: "ses_eb8ffdbd0ffe067Bl9pwxaAw03"}
+	m.reapTool(s) // no reaper: no-op
+
+	var calls [][2]string
+	m.SetToolReaper("gemini", func(workDir, toolSessionID string) {
+		calls = append(calls, [2]string{workDir, toolSessionID})
+	})
+	m.reapTool(s)
+	m.reapTool(&Session{Tool: "claude", WorkDir: "/w", ToolSessionID: "x"})
+	m.reapTool(&Session{Tool: "gemini", WorkDir: "/w"}) // no tool session
+	if !reflect.DeepEqual(calls, [][2]string{{"/work", "ses_eb8ffdbd0ffe067Bl9pwxaAw03"}}) {
+		t.Fatalf("reaper calls = %v", calls)
+	}
+	m.SetToolReaper("gemini", nil)
+	m.reapTool(s)
+	if len(calls) != 1 {
+		t.Fatal("removed reaper still called")
 	}
 }

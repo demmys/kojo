@@ -49,8 +49,8 @@ func TestBackendLoadsClaudeSkills(t *testing.T) {
 // `<agentDir>/.grok/session_id` plus the
 // $GROK_HOME/sessions/<encoded(absAgentDir)>/<uuid>/ subtree (see
 // grok_session_transfer.go); codex transfers .codex thread refs,
-// rollout JSONLs, and Codex state rows; gemini transfers its session refs
-// plus the chat JSONLs under $GEMINI_CLI_HOME/.gemini/tmp/<slug>/chats/
+// rollout JSONLs, and Codex state rows; gemini transfers its OpenCode
+// session refs plus `opencode export` dumps of the sessions they name
 // (gemini_session_transfer.go). custom-bare has no session
 // state at all and must stay false.
 func TestBackendSupportsDeviceSwitch(t *testing.T) {

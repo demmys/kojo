@@ -601,30 +601,33 @@ func codexDeviceSwitchSkillBody(body string) string {
 }
 
 // SyncGeminiDeviceSwitchSkill installs the gemini-flavored skill under
-// `.gemini/skills` (gemini-cli's project skill root, see
-// extensionSkillRoot). Like Codex it derives from the grok body: no
-// inline-exec substitution, curl run through the shell tool.
+// `.opencode/skills` (the skills.paths entry the OpenCode backend
+// configures, see extensionSkillRoot). Like Codex it derives from the
+// grok body: no inline-exec substitution, curl run through the shell
+// tool. The copy the gemini-cli backend kept under `.gemini/skills` is
+// kojo-owned and removed.
 func SyncGeminiDeviceSwitchSkill(agentID string, enabled bool, logger *slog.Logger) {
 	body := geminiDeviceSwitchSkillBody(deviceSwitchSkillBodyGrokPOSIX)
 	if runtime.GOOS == "windows" {
 		body = geminiDeviceSwitchSkillBody(deviceSwitchSkillBodyGrokWindows)
 	}
-	syncDeviceSwitchSkillBodyAt(agentID, ".gemini", body, enabled, logger)
+	syncDeviceSwitchSkillBodyAt(agentID, legacyGeminiSkillRoot, "", false, logger)
+	syncDeviceSwitchSkillBodyAt(agentID, ".opencode", body, enabled, logger)
 }
 
-// geminiDeviceSwitchSkillBody rewrites the grok body for gemini-cli.
-// gemini skills take no arguments ($ARGUMENTS is not substituted), so
+// geminiDeviceSwitchSkillBody rewrites the grok body for OpenCode.
+// OpenCode skills take no arguments ($ARGUMENTS is not substituted), so
 // the target is whatever the user named in the conversation.
 func geminiDeviceSwitchSkillBody(body string) string {
 	repl := strings.NewReplacer(
 		"argument-hint: <peer-name-or-device-id>\n", "",
 		"User asked to migrate this agent to: $ARGUMENTS", "The user asked to migrate this agent to another peer; the target is the peer name or device_id they named in the conversation.",
 		`"$ARGUMENTS"`, "the target the user named",
-		"grok --resume", "gemini --resume",
+		"grok --resume", "opencode session resume",
 		"grok shows inline-backticked text literally", "the skill body is not executed, only read",
-		"your Bash tool", "your shell tool (run_shell_command)",
-		"grok session state", "gemini session state",
-		"grok process", "gemini process",
+		"your Bash tool", "your bash tool",
+		"grok session state", "OpenCode session state",
+		"grok process", "opencode process",
 		"Grok", "Gemini",
 		"grok", "gemini",
 	)
@@ -701,7 +704,7 @@ func syncDeviceSwitchSkillBodyAt(agentID, root, body string, enabled bool, logge
 //     `.codex/skills` when enabled, remove otherwise
 //     (SyncCodexDeviceSwitchSkill).
 //
-//   - "gemini": install the gemini-flavored body under `.gemini/skills`
+//   - "gemini": install the gemini-flavored body under `.opencode/skills`
 //     when enabled, remove otherwise (SyncGeminiDeviceSwitchSkill).
 //
 //   - any other tool (custom-bare): no-op.

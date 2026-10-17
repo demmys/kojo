@@ -1079,6 +1079,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		SilentStart:          silentStart,
 		SilentEnd:            silentEnd,
 		NotifyDuringSilent:   notifyDuringSilent,
+		AutoEffort:           new(bool), // new agents: auto effort off; nil (legacy) = on
 		CronMessage:          cronMessage,
 		// DeviceSwitchEnabled stays nil here when the caller didn't
 		// provide one — IsDeviceSwitchEnabled() returns true for nil

@@ -87,8 +87,8 @@ func TestTurnStopCause(t *testing.T) {
 }
 
 func TestStopNoteText(t *testing.T) {
-	if got, want := stopNoteText(&StopCause{ByUser: true}), "[kojo] 直前のターンはユーザーの明示的な操作で停止されました。"; got != want {
-		t.Fatalf("user note = %q, want %q", got, want)
+	if got := stopNoteText(&StopCause{ByUser: true}); got != "" {
+		t.Fatalf("user stop must leave no note, got %q", got)
 	}
 	want := "[kojo] 直前のターンはユーザーではなく kojo が停止しました（理由: エージェントのリセット）。会話ログに \"interrupted by user\" 等とあってもユーザーの操作ではありません。"
 	if got := stopNoteText(&StopCause{Reason: stopReasonReset}); got != want {
@@ -245,13 +245,15 @@ func mainTurn(t *testing.T, m *Manager, b *stopNoteBackend, id string, block boo
 	return <-b.msgs, <-b.ctxs, events
 }
 
-// The WebUI stop button: the main turn is a user stop, the external turns it
-// takes down with it are kojo stops. The main note is delivered once.
+// The WebUI stop button: the main turn is a user stop (no note, and it clears
+// an undelivered older one), the external turns it takes down with it are
+// kojo stops. Notes are delivered once.
 func TestAbortByUserNotesAndOneTimeDelivery(t *testing.T) {
 	m, b, id := newStopNoteManager(t, t.TempDir())
 	t.Cleanup(func() { _ = m.Close() })
 	key := id + ":ext.test:k1"
 
+	m.putMainStopNote(id, stopNoteText(&StopCause{Reason: stopReasonReset}))
 	_, mainCtx, mainEvents := mainTurn(t, m, b, id, true)
 	b.block <- true
 	osEvents, err := m.ChatOneShot(context.Background(), id, "external", OneShotOpts{SessionKey: key})
@@ -272,28 +274,15 @@ func TestAbortByUserNotesAndOneTimeDelivery(t *testing.T) {
 	if c, ok := stopCauseOf(osCtx); !ok || c.ByUser || c.Reason != stopReasonMainChatAbort {
 		t.Fatalf("one-shot cause = %+v, %v", c, ok)
 	}
-	userNote := stopNoteText(&StopCause{ByUser: true})
-	if got := m.PendingMainStopNote(id); got != userNote {
-		t.Fatalf("main note = %q, want %q", got, userNote)
+	if got := m.PendingMainStopNote(id); got != "" {
+		t.Fatalf("user stop left a main note: %q", got)
 	}
 	if got := m.peekKeyedNote(id, key); got != stopNoteText(&StopCause{Reason: stopReasonMainChatAbort}) {
 		t.Fatalf("keyed note = %q", got)
 	}
 
-	// Next main turn carries the note once.
+	// Next main turn carries no note.
 	msg, _, events := mainTurn(t, m, b, id, false)
-	drainEvents(events)
-	waitIdle(t, m, id)
-	if !strings.Contains(msg, userNote) {
-		t.Fatalf("next turn message lacks the note: %q", msg)
-	}
-	if strings.HasPrefix(msg, userNote) && strings.Contains(msg, "<context>") {
-		t.Fatalf("note must sit inside the context block: %q", msg)
-	}
-	if got := m.PendingMainStopNote(id); got != "" {
-		t.Fatalf("note not consumed: %q", got)
-	}
-	msg, _, events = mainTurn(t, m, b, id, false)
 	drainEvents(events)
 	waitIdle(t, m, id)
 	if strings.Contains(msg, stopNotePrefix) {
@@ -356,7 +345,12 @@ func TestKeyedTurnStopNotes(t *testing.T) {
 	}
 	// A second stop before any delivery replaces the first.
 	m.commitKeyedNote(id, key, want)
+	run(OneShotOpts{SessionKey: key}, func() { m.CancelOneShotsForAgent(id, KojoStop(stopReasonSwitch)) })
+	// A user stop leaves no note and clears the undelivered one.
 	run(OneShotOpts{SessionKey: key}, func() { m.CancelOneShotsForAgent(id, UserStop()) })
+	if got := m.peekKeyedNote(id, key); got != "" {
+		t.Fatalf("user stop left a note: %q", got)
+	}
 	run(OneShotOpts{SessionKey: key + "x"}, nil) // unrelated key
 	m.RecordKeyedStopCause(id, key, KojoStop(stopReasonReset))
 	if got := m.peekKeyedNote(id, key); got != stopNoteText(&StopCause{Reason: stopReasonReset}) {
@@ -480,8 +474,8 @@ func TestKeyedStopNoteSkipsDeletedThread(t *testing.T) {
 	if got := m.peekKeyedNote(id, "groupdm:g1"); got != "" {
 		t.Fatalf("deleted thread got a note: %q", got)
 	}
-	m.RecordKeyedStopCause(id, "groupdm:g1", UserStop())
-	if got := m.peekKeyedNote(id, "groupdm:g1"); got != stopNoteText(&StopCause{ByUser: true}) {
+	m.RecordKeyedStopCause(id, "groupdm:g1", KojoStop(stopReasonReset))
+	if got := m.peekKeyedNote(id, "groupdm:g1"); got != stopNoteText(&StopCause{Reason: stopReasonReset}) {
 		t.Fatalf("user stop note = %q", got)
 	}
 }
@@ -535,13 +529,34 @@ func TestStopBeforeStreamIsNoted(t *testing.T) {
 	}()
 	<-b.msgs
 	<-b.ctxs
-	m.AbortByUser(id)
+	m.Abort(id, KojoStop(stopReasonReset))
 	if err := <-chatErr; err == nil {
 		t.Fatal("Chat succeeded")
 	}
 	waitIdle(t, m, id)
-	if got, want := m.PendingMainStopNote(id), stopNoteText(&StopCause{ByUser: true}); got != want {
-		t.Fatalf("main note = %q, want %q", got, want)
+	mainNote := stopNoteText(&StopCause{Reason: stopReasonReset})
+	if got := m.PendingMainStopNote(id); got != mainNote {
+		t.Fatalf("main note = %q, want %q", got, mainNote)
+	}
+
+	// Next main turn carries the note once, inside the context block.
+	msg, _, events := mainTurn(t, m, b, id, false)
+	drainEvents(events)
+	waitIdle(t, m, id)
+	if !strings.Contains(msg, mainNote) {
+		t.Fatalf("next turn message lacks the note: %q", msg)
+	}
+	if strings.HasPrefix(msg, mainNote) && strings.Contains(msg, "<context>") {
+		t.Fatalf("note must sit inside the context block: %q", msg)
+	}
+	if got := m.PendingMainStopNote(id); got != "" {
+		t.Fatalf("note not consumed: %q", got)
+	}
+	msg, _, events = mainTurn(t, m, b, id, false)
+	drainEvents(events)
+	waitIdle(t, m, id)
+	if strings.Contains(msg, stopNotePrefix) {
+		t.Fatalf("note delivered twice: %q", msg)
 	}
 
 	key := id + ":ext.test:k1"
@@ -572,8 +587,8 @@ func TestGoalRequestKeepsStopNote(t *testing.T) {
 	m.backends[ToolCodex] = b
 	m.mu.Unlock()
 	key := id + ":ext.test:k1"
-	m.RecordKeyedStopCause(id, key, UserStop())
-	want := stopNoteText(&StopCause{ByUser: true})
+	m.RecordKeyedStopCause(id, key, KojoStop(stopReasonReset))
+	want := stopNoteText(&StopCause{Reason: stopReasonReset})
 	events, err := m.ChatOneShot(context.Background(), id, "setup", OneShotOpts{
 		SessionKey: key, Goal: &GoalRequest{Action: "start", Objective: "x"}, TurnNote: want,
 	})
@@ -599,11 +614,14 @@ func TestShutdownKeepsEarlierStopCause(t *testing.T) {
 	m.busyMu.Lock()
 	m.busy[id] = busyEntry{cancelCause: cancel, ctx: ctx}
 	m.busyMu.Unlock()
+	m.putMainStopNote(id, stopNoteText(&StopCause{Reason: stopReasonReset}))
 	cancel(UserStop())
 	m.schedulersStarted = true
 	m.Shutdown()
-	if got, want := m.PendingMainStopNote(id), stopNoteText(&StopCause{ByUser: true}); got != want {
-		t.Fatalf("note = %q, want %q", got, want)
+	// The user stop leaves no note (clearing the older one); Shutdown must
+	// not add one.
+	if got := m.PendingMainStopNote(id); got != "" {
+		t.Fatalf("note = %q, want none", got)
 	}
 }
 
@@ -660,12 +678,12 @@ func TestRelayedStopNoteWithoutLocalAgent(t *testing.T) {
 	delete(m.agents, id)
 	m.mu.Unlock()
 	key := id + ":slack:C1:1.0"
-	m.recordKeyedTurnStop(id, key, cancelledWith(UserStop()), turnEnd{})
+	m.recordKeyedTurnStop(id, key, cancelledWith(KojoStop(stopReasonReset)), turnEnd{})
 	if got := m.peekKeyedNote(id, key); got != "" {
 		t.Fatalf("local record for a missing agent: %q", got)
 	}
-	m.RecordKeyedStop(id, key, cancelledWith(UserStop()), false, "")
-	if got, want := m.PeekKeyedNote(id, key), stopNoteText(&StopCause{ByUser: true}); got != want {
+	m.RecordKeyedStop(id, key, cancelledWith(KojoStop(stopReasonReset)), false, "")
+	if got, want := m.PeekKeyedNote(id, key), stopNoteText(&StopCause{Reason: stopReasonReset}); got != want {
 		t.Fatalf("relayed stop note = %q, want %q", got, want)
 	}
 	m.RecordKeyedStopCause(id, key, KojoStop(stopReasonSwitch))
@@ -683,8 +701,8 @@ func TestGoalControlStopKeepsNote(t *testing.T) {
 	m.backends[ToolCodex] = b
 	m.mu.Unlock()
 	key := id + ":ext.test:k1"
-	m.RecordKeyedStopCause(id, key, UserStop())
-	want := stopNoteText(&StopCause{ByUser: true})
+	m.RecordKeyedStopCause(id, key, KojoStop(stopReasonReset))
+	want := stopNoteText(&StopCause{Reason: stopReasonReset})
 
 	b.block <- true
 	events, err := m.ChatOneShot(context.Background(), id, "status", OneShotOpts{SessionKey: key, Goal: &GoalRequest{Action: "status"}})

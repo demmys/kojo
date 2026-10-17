@@ -1118,29 +1118,31 @@ func TestExternalChatRouterHubStopNotes(t *testing.T) {
 		}
 		return <-seen
 	}
-	userNote := "[kojo] 直前のターンはユーザーの明示的な操作で停止されました。"
-	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	seededNote := "[kojo] 直前のターンはユーザーではなく kojo が停止しました（理由: テスト）。会話ログに \"interrupted by user\" 等とあってもユーザーの操作ではありません。"
+	seed := func() { srv.agents.RecordKeyedStopCause(agentID, key, agent.KojoStop("テスト")) }
+	seed()
 
 	// Stream lost: the pending note travels once, the loss is noted.
 	next.Store(int32(modeLost))
-	if req := turn(context.Background(), nil); !req.HubStopNotes || req.StopNote != userNote {
+	if req := turn(context.Background(), nil); !req.HubStopNotes || req.StopNote != seededNote {
 		t.Fatalf("request = hubStopNotes %v stopNote %q", req.HubStopNotes, req.StopNote)
 	}
-	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, userNote) {
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, seededNote) {
 		t.Fatalf("note after lost stream = %q", got)
 	}
 
-	// A user stop on the Hub is noted as one.
+	// A user stop on the Hub leaves no note (and clears the older one).
 	next.Store(int32(modeBlock))
 	ctx, cancel := context.WithCancelCause(context.Background())
 	turn(ctx, func() { cancel(agent.UserStop()) })
-	if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != "" {
 		t.Fatalf("note after user stop = %q", got)
 	}
+	seed()
 
 	// A normal end consumes the note and leaves none.
 	next.Store(int32(modeDone))
-	if req := turn(context.Background(), nil); req.StopNote != userNote {
+	if req := turn(context.Background(), nil); req.StopNote != seededNote {
 		t.Fatalf("stopNote = %q", req.StopNote)
 	}
 	if got := srv.agents.PeekKeyedNote(agentID, key); got != "" {
@@ -1149,20 +1151,20 @@ func TestExternalChatRouterHubStopNotes(t *testing.T) {
 
 	// Lost after the request went out: the sent note is replaced by the loss.
 	next.Store(int32(modeHangup))
-	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	seed()
 	if _, err := router.ChatOneShot(context.Background(), agentID, "hi", agent.OneShotOpts{SessionKey: key}); err == nil {
 		t.Fatal("hung-up POST succeeded")
 	}
-	if req := <-seen; req.StopNote != userNote {
+	if req := <-seen; req.StopNote != seededNote {
 		t.Fatalf("stopNote = %q", req.StopNote)
 	}
-	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, userNote) {
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, seededNote) {
 		t.Fatalf("note after hang-up = %q", got)
 	}
 	srv.agents.CommitKeyedNote(agentID, key, srv.agents.PeekKeyedNote(agentID, key))
 
 	// A goal request is no turn the model reads: the note stays.
-	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	seed()
 	next.Store(int32(modeDone))
 	if events, err := router.ChatOneShot(context.Background(), agentID, "setup", agent.OneShotOpts{
 		SessionKey: key, Goal: &agent.GoalRequest{Action: "status"},
@@ -1175,7 +1177,7 @@ func TestExternalChatRouterHubStopNotes(t *testing.T) {
 	if req := <-seen; !req.HubStopNotes || req.StopNote != "" || req.Goal == nil {
 		t.Fatalf("goal request = hubStopNotes %v stopNote %q goal %v", req.HubStopNotes, req.StopNote, req.Goal)
 	}
-	if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
 		t.Fatalf("note after goal request = %q", got)
 	}
 
@@ -1195,11 +1197,11 @@ func TestExternalChatRouterHubStopNotes(t *testing.T) {
 		}
 		cancel(nil)
 		<-seen
-		if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+		if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
 			t.Fatalf("note after goal control (mode %d) = %q", m, got)
 		}
 	}
-	srv.agents.CommitKeyedNote(agentID, key, userNote)
+	srv.agents.CommitKeyedNote(agentID, key, seededNote)
 
 	// A stop on the holder is noted as kojo's, not lost or ignored.
 	next.Store(int32(modeHolderStop))
@@ -1222,12 +1224,12 @@ func TestExternalChatRouterHubStopNotes(t *testing.T) {
 
 	// An old holder records its own notes: nothing is sent or noted here.
 	stopNotes.Store(false)
-	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	seed()
 	next.Store(int32(modeLost))
 	if req := turn(context.Background(), nil); req.HubStopNotes || req.StopNote != "" {
 		t.Fatalf("old holder request = %#v", req)
 	}
-	if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
 		t.Fatalf("old holder: Hub note = %q", got)
 	}
 }

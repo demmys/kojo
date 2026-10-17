@@ -4999,11 +4999,14 @@ func (m *Manager) Shutdown() {
 			// The note the chat goroutine will record: a turn already
 			// stopped by another cause (e.g. the user) keeps that cause.
 			note := stopNoteText(&StopCause{Reason: stopReasonShutdown})
+			userStop := false
 			if entry.ctx != nil && entry.ctx.Err() != nil {
 				c, _ := stopCauseOf(entry.ctx)
 				note = stopNoteText(c)
+				userStop = c != nil && c.ByUser
 			}
-			if note != "" {
+			// A user stop's "" still clears an undelivered older note.
+			if note != "" || userStop {
 				notes[id] = note
 			}
 		}

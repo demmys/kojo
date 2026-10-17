@@ -17,7 +17,7 @@ import (
 // user" either way.
 type StopCause struct {
 	// ByUser is true only for an explicit human stop (WebUI stop button,
-	// Slack `!stop`).
+	// Slack `!stop`). A user stop leaves no note.
 	ByUser bool
 	// Reason is a short Japanese reason shown to the agent for kojo stops.
 	Reason string
@@ -145,7 +145,10 @@ func stopNoteText(c *StopCause) string {
 		return ""
 	}
 	if c.ByUser {
-		return stopNotePrefix + "ユーザーの明示的な操作で停止されました。"
+		// The user knows they stopped it: no note. Recording "" still
+		// clears an undelivered older kojo note (only the latest stop
+		// matters).
+		return ""
 	}
 	reason := c.Reason
 	if reason == "" {
@@ -210,10 +213,9 @@ func (m *Manager) RecordKeyedStopCause(agentID, sessionKey string, cause error) 
 //
 // relayed: recorded by the dispatching Hub, whose agent may run only on
 // the holder (not in this Manager): no liveness check.
+//
+// An empty note (a user stop) only clears the older stop note.
 func (m *Manager) setKeyedStopNote(agentID, sessionKey, note string, relayed bool) {
-	if note == "" {
-		return
-	}
 	if _, live := m.Get(agentID); !live && !relayed {
 		return
 	}
@@ -230,7 +232,9 @@ func (m *Manager) setKeyedStopNote(agentID, sessionKey, note string, relayed boo
 			}
 		}
 	}
-	m.setKeyedNoteLocked(agentID, sessionKey, note)
+	if note != "" {
+		m.setKeyedNoteLocked(agentID, sessionKey, note)
+	}
 }
 
 func withoutStopNotes(text string) string {
@@ -267,12 +271,17 @@ func (m *Manager) recordMainTurnStop(agentID string, ctx context.Context, end tu
 	}
 }
 
+// An empty text (a user stop) drops the undelivered older note instead.
 func (m *Manager) putMainStopNote(agentID, text string) {
 	st := m.Store()
-	if st == nil || text == "" {
+	if st == nil {
 		return
 	}
 	if _, live := m.Get(agentID); !live {
+		return
+	}
+	if text == "" {
+		m.dropMainStopNote(agentID)
 		return
 	}
 	val, err := json.Marshal(mainStopNote{Text: text, At: time.Now().Unix()})

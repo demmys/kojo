@@ -100,6 +100,10 @@ const externalChatStopNoteLimit = 16 << 10
 // stream broke while the Hub still wanted it.
 const externalChatStopReasonLost = "実行デバイスとの接続断"
 
+// externalChatTurnStoppedCode is the holder's error code for a relayed turn
+// it stopped before the stream started (agent.ErrTurnStopped).
+const externalChatTurnStoppedCode = "turn_stopped"
+
 type externalChatSteerRequest struct {
 	GoalUserID string                `json:"goalUserId,omitempty"`
 	SessionKey string                `json:"sessionKey"`
@@ -796,19 +800,22 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 	hubStopNotes := ready.StopNotesV1 && req.SessionKey != ""
 	stopNote := ""
 	req.HubStopNotes, req.StopNote = hubStopNotes, ""
-	if hubStopNotes && req.AttachBackgroundToken == "" {
+	if hubStopNotes && req.AttachBackgroundToken == "" && req.Goal == nil {
+		// Not for a goal request: its message is no turn the model reads.
 		stopNote = s.agents.PeekKeyedNote(agentID, req.SessionKey)
 		req.StopNote = stopNote
 	}
+	// A goal control request runs no turn: its stop is no stopped turn.
+	recordStops := hubStopNotes && !agent.GoalControlOnly(req.Goal)
 	resp, attempted, err := r.postRemote(turnCtx, agentID, holder, req)
 	if err != nil {
 		if turnCtx.Err() != nil {
 			stopGoal()
-			if hubStopNotes && attempted {
+			if recordStops && attempted {
 				// The holder may have started it; it records no note itself.
 				s.agents.RecordKeyedStop(agentID, req.SessionKey, turnCtx, false, "")
 			}
-		} else if hubStopNotes && attempted {
+		} else if recordStops && attempted {
 			// Lost after the request went out: the holder may be running it
 			// (with stopNote) and records nothing. This replaces stopNote.
 			s.agents.RecordKeyedStopCause(agentID, req.SessionKey, agent.KojoStop(externalChatStopReasonLost))
@@ -844,6 +851,11 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			return externalChatDispatchResult{state: externalChatDispatchStale,
 				nextHolder: resp.Header.Get("X-Kojo-Holder-Peer"), err: errors.New(msg)}
 		default:
+			if body.Error.Code == externalChatTurnStoppedCode && recordStops {
+				// Stopped on the holder before it streamed (a Hub cancel
+				// would have ended the request instead).
+				s.agents.RecordKeyedStop(agentID, req.SessionKey, turnCtx, turnCtx.Err() == nil, agent.ErrMsgCancelled)
+			}
 			return externalChatDispatchResult{state: externalChatDispatchDone,
 				err: fmt.Errorf("holder rejected Slack turn (%s): %s", resp.Status, msg)}
 		}
@@ -851,10 +863,10 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 
 	r.rememberRouteFrom(routeCtx, agentID, holder)
 	var onEnd func(terminal bool, errMsg string)
-	if hubStopNotes {
-		if stopNote != "" {
-			s.agents.CommitKeyedNote(agentID, req.SessionKey, stopNote)
-		}
+	if stopNote != "" {
+		s.agents.CommitKeyedNote(agentID, req.SessionKey, stopNote)
+	}
+	if recordStops {
 		onEnd = func(terminal bool, errMsg string) {
 			if !terminal && turnCtx.Err() == nil {
 				s.agents.RecordKeyedStopCause(agentID, req.SessionKey, agent.KojoStop(externalChatStopReasonLost))
@@ -1210,7 +1222,7 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
 			StopNotedByCaller:                 req.HubStopNotes,
 		}
-		if req.HubStopNotes && len(req.StopNote) <= externalChatStopNoteLimit {
+		if req.HubStopNotes && req.Goal == nil && len(req.StopNote) <= externalChatStopNoteLimit {
 			opts.TurnNote = req.StopNote
 		}
 		if req.LingerBackgroundTasks && strings.TrimSpace(req.SessionKey) != "" && s.peerID != nil && hubAddr != "" {
@@ -1253,6 +1265,9 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusConflict, code, err.Error())
 		case errors.Is(err, agent.ErrAgentArchived):
 			writeError(w, http.StatusConflict, "archived", err.Error())
+		case errors.Is(err, agent.ErrTurnStopped):
+			// Stopped here before it streamed: the Hub notes it.
+			writeError(w, http.StatusConflict, externalChatTurnStoppedCode, err.Error())
 		default:
 			writeError(w, http.StatusConflict, "chat_rejected", err.Error())
 		}

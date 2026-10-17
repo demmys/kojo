@@ -126,14 +126,21 @@ func TestWithoutStopNotesAndCommitRewritten(t *testing.T) {
 
 // stopNoteBackend records each turn's message and context. A blocking turn
 // runs until its context is cancelled; otherwise it finishes at once.
+//
+// waitStart makes the next Chat call wait for its context and fail before
+// any stream (a backend still waiting for response headers); hold makes the
+// next turn keep its stream open after done until the channel is closed.
 type stopNoteBackend struct {
-	msgs  chan string
-	ctxs  chan context.Context
-	block chan bool
+	msgs      chan string
+	ctxs      chan context.Context
+	block     chan bool
+	waitStart chan bool
+	hold      chan chan struct{}
 }
 
 func newStopNoteBackend() *stopNoteBackend {
-	return &stopNoteBackend{msgs: make(chan string, 16), ctxs: make(chan context.Context, 16), block: make(chan bool, 16)}
+	return &stopNoteBackend{msgs: make(chan string, 16), ctxs: make(chan context.Context, 16), block: make(chan bool, 16),
+		waitStart: make(chan bool, 16), hold: make(chan chan struct{}, 16)}
 }
 
 func (b *stopNoteBackend) Name() string    { return "stopnote-test" }
@@ -144,8 +151,21 @@ func (b *stopNoteBackend) Chat(ctx context.Context, _ *Agent, msg, _ string, _ C
 	case block = <-b.block:
 	default:
 	}
+	var hold chan struct{}
+	select {
+	case hold = <-b.hold:
+	default:
+	}
 	b.msgs <- msg
 	b.ctxs <- ctx
+	select {
+	case w := <-b.waitStart:
+		if w {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	default:
+	}
 	out := make(chan ChatEvent, 1)
 	go func() {
 		defer close(out)
@@ -156,6 +176,9 @@ func (b *stopNoteBackend) Chat(ctx context.Context, _ *Agent, msg, _ string, _ C
 		m := newAssistantMessage()
 		m.Content = "ok"
 		out <- ChatEvent{Type: "done", Message: m}
+		if hold != nil {
+			<-hold
+		}
 	}()
 	return out, nil
 }
@@ -460,5 +483,420 @@ func TestKeyedStopNoteSkipsDeletedThread(t *testing.T) {
 	m.RecordKeyedStopCause(id, "groupdm:g1", UserStop())
 	if got := m.peekKeyedNote(id, "groupdm:g1"); got != stopNoteText(&StopCause{ByUser: true}) {
 		t.Fatalf("user stop note = %q", got)
+	}
+}
+
+// Shutdown after the turn's done arrived (attachment persistence, indexing
+// still running) leaves no stop note.
+func TestShutdownAfterDoneLeavesNoNote(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	release := make(chan struct{})
+	b.hold <- release
+	_, _, events := mainTurn(t, m, b, id, false)
+	for evt := range events {
+		if evt.Type == "done" {
+			break
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.busyMu.Lock()
+		ended := m.busy[id].turnEnded
+		m.busyMu.Unlock()
+		if ended {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn not marked ended at done")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.schedulersStarted = true
+	m.Shutdown()
+	close(release)
+	drainEvents(events)
+	waitIdle(t, m, id)
+	if got := m.PendingMainStopNote(id); got != "" {
+		t.Fatalf("finished turn got a note: %q", got)
+	}
+}
+
+// A stop while the backend is still starting (no stream yet) is noted too.
+func TestStopBeforeStreamIsNoted(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+
+	b.waitStart <- true
+	chatErr := make(chan error, 1)
+	go func() {
+		_, err := m.Chat(context.Background(), id, "hello", "user", nil, BusySourceUser)
+		chatErr <- err
+	}()
+	<-b.msgs
+	<-b.ctxs
+	m.AbortByUser(id)
+	if err := <-chatErr; err == nil {
+		t.Fatal("Chat succeeded")
+	}
+	waitIdle(t, m, id)
+	if got, want := m.PendingMainStopNote(id), stopNoteText(&StopCause{ByUser: true}); got != want {
+		t.Fatalf("main note = %q, want %q", got, want)
+	}
+
+	key := id + ":ext.test:k1"
+	b.waitStart <- true
+	osErr := make(chan error, 1)
+	go func() {
+		_, err := m.ChatOneShot(context.Background(), id, "external", OneShotOpts{SessionKey: key})
+		osErr <- err
+	}()
+	<-b.msgs
+	<-b.ctxs
+	m.cancelOneShots(id, KojoStop(stopReasonSwitch))
+	if err := <-osErr; err == nil {
+		t.Fatal("ChatOneShot succeeded")
+	}
+	if got, want := m.peekKeyedNote(id, key), stopNoteText(&StopCause{Reason: stopReasonSwitch}); got != want {
+		t.Fatalf("keyed note = %q, want %q", got, want)
+	}
+}
+
+// A goal request's message is no turn the model reads: the pending note is
+// neither injected nor consumed.
+func TestGoalRequestKeepsStopNote(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	m.mu.Lock()
+	m.agents[id].Tool = ToolCodex
+	m.backends[ToolCodex] = b
+	m.mu.Unlock()
+	key := id + ":ext.test:k1"
+	m.RecordKeyedStopCause(id, key, UserStop())
+	want := stopNoteText(&StopCause{ByUser: true})
+	events, err := m.ChatOneShot(context.Background(), id, "setup", OneShotOpts{
+		SessionKey: key, Goal: &GoalRequest{Action: "start", Objective: "x"}, TurnNote: want,
+	})
+	if err != nil {
+		t.Fatalf("ChatOneShot: %v", err)
+	}
+	if msg := <-b.msgs; strings.Contains(msg, stopNotePrefix) {
+		t.Fatalf("goal request carried the note: %q", msg)
+	}
+	<-b.ctxs
+	drainEvents(events)
+	if got := m.peekKeyedNote(id, key); got != want {
+		t.Fatalf("note consumed by a goal request: %q", got)
+	}
+}
+
+// Shutdown keeps the cause of a turn another stop already cancelled (its
+// goroutine still draining): its note is not overwritten by a shutdown one.
+func TestShutdownKeepsEarlierStopCause(t *testing.T) {
+	m, _, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	m.busyMu.Lock()
+	m.busy[id] = busyEntry{cancelCause: cancel, ctx: ctx}
+	m.busyMu.Unlock()
+	cancel(UserStop())
+	m.schedulersStarted = true
+	m.Shutdown()
+	if got, want := m.PendingMainStopNote(id), stopNoteText(&StopCause{ByUser: true}); got != want {
+		t.Fatalf("note = %q, want %q", got, want)
+	}
+}
+
+// A relayed turn (StopNotedByCaller) stopped on this side ends with a
+// cancelled terminal for the Hub; the Hub's own cancel adds none.
+func TestRelayedTurnStopEndsWithCancelledTerminal(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	key := id + ":ext.test:k1"
+	last := func(events <-chan ChatEvent) (ChatEvent, bool) {
+		var evt ChatEvent
+		seen := false
+		for e := range events {
+			evt, seen = e, true
+		}
+		return evt, seen
+	}
+
+	b.block <- true
+	events, err := m.ChatOneShot(context.Background(), id, "hi", OneShotOpts{SessionKey: key, StopNotedByCaller: true})
+	if err != nil {
+		t.Fatalf("ChatOneShot: %v", err)
+	}
+	<-b.msgs
+	<-b.ctxs
+	m.cancelOneShots(id, KojoStop(stopReasonFork))
+	if evt, ok := last(events); !ok || evt.Type != "error" || evt.ErrorMessage != ErrMsgCancelled {
+		t.Fatalf("last event = %+v (%v)", evt, ok)
+	}
+	if got := m.peekKeyedNote(id, key); got != "" {
+		t.Fatalf("holder recorded a note: %q", got)
+	}
+
+	b.block <- true
+	ctx, cancel := context.WithCancelCause(context.Background())
+	events, err = m.ChatOneShot(ctx, id, "hi", OneShotOpts{SessionKey: key, StopNotedByCaller: true})
+	if err != nil {
+		t.Fatalf("ChatOneShot: %v", err)
+	}
+	<-b.msgs
+	<-b.ctxs
+	cancel(ErrStopNotedByCaller)
+	if evt, ok := last(events); ok {
+		t.Fatalf("caller cancel produced %+v", evt)
+	}
+}
+
+// The Hub records a relayed turn's stop even when the agent runs only on
+// the holder (not in the Hub's Manager); a local record needs it live.
+func TestRelayedStopNoteWithoutLocalAgent(t *testing.T) {
+	m, _, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	m.mu.Lock()
+	delete(m.agents, id)
+	m.mu.Unlock()
+	key := id + ":slack:C1:1.0"
+	m.recordKeyedTurnStop(id, key, cancelledWith(UserStop()), turnEnd{})
+	if got := m.peekKeyedNote(id, key); got != "" {
+		t.Fatalf("local record for a missing agent: %q", got)
+	}
+	m.RecordKeyedStop(id, key, cancelledWith(UserStop()), false, "")
+	if got, want := m.PeekKeyedNote(id, key), stopNoteText(&StopCause{ByUser: true}); got != want {
+		t.Fatalf("relayed stop note = %q, want %q", got, want)
+	}
+	m.RecordKeyedStopCause(id, key, KojoStop(stopReasonSwitch))
+	if got, want := m.PeekKeyedNote(id, key), stopNoteText(&StopCause{Reason: stopReasonSwitch}); got != want {
+		t.Fatalf("relayed stop cause note = %q, want %q", got, want)
+	}
+}
+
+// A goal control request stopped mid-way leaves the pending note alone.
+func TestGoalControlStopKeepsNote(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	m.mu.Lock()
+	m.agents[id].Tool = ToolCodex
+	m.backends[ToolCodex] = b
+	m.mu.Unlock()
+	key := id + ":ext.test:k1"
+	m.RecordKeyedStopCause(id, key, UserStop())
+	want := stopNoteText(&StopCause{ByUser: true})
+
+	b.block <- true
+	events, err := m.ChatOneShot(context.Background(), id, "status", OneShotOpts{SessionKey: key, Goal: &GoalRequest{Action: "status"}})
+	if err != nil {
+		t.Fatalf("ChatOneShot: %v", err)
+	}
+	<-b.msgs
+	<-b.ctxs
+	m.cancelOneShots(id, KojoStop(stopReasonSwitch))
+	drainEvents(events)
+
+	b.waitStart <- true
+	osErr := make(chan error, 1)
+	go func() {
+		_, err := m.ChatOneShot(context.Background(), id, "status", OneShotOpts{SessionKey: key, Goal: &GoalRequest{Action: "status"}})
+		osErr <- err
+	}()
+	<-b.msgs
+	<-b.ctxs
+	m.cancelOneShots(id, KojoStop(stopReasonSwitch))
+	<-osErr
+	if got := m.peekKeyedNote(id, key); got != want {
+		t.Fatalf("note after goal control stop = %q", got)
+	}
+}
+
+// A relayed turn stopped here before its stream started tells the caller
+// so (ErrTurnStopped); the caller's own cancel does not.
+func TestRelayedTurnStopBeforeStream(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	key := id + ":ext.test:k1"
+	start := func(ctx context.Context, stop func()) error {
+		b.waitStart <- true
+		errc := make(chan error, 1)
+		go func() {
+			_, err := m.ChatOneShot(ctx, id, "hi", OneShotOpts{SessionKey: key, StopNotedByCaller: true})
+			errc <- err
+		}()
+		<-b.msgs
+		<-b.ctxs
+		stop()
+		return <-errc
+	}
+	if err := start(context.Background(), func() { m.cancelOneShots(id, KojoStop(stopReasonFork)) }); !errors.Is(err, ErrTurnStopped) {
+		t.Fatalf("holder stop err = %v", err)
+	}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	if err := start(ctx, func() { cancel(ErrStopNotedByCaller) }); err == nil || errors.Is(err, ErrTurnStopped) {
+		t.Fatalf("caller cancel err = %v", err)
+	}
+	if got := m.peekKeyedNote(id, key); got != "" {
+		t.Fatalf("relayed turn noted here: %q", got)
+	}
+}
+
+func TestMarkStoppedTerminals(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+		want  string
+	}{
+		{"alive", nil, ""},
+		{"kojo stop", KojoStop(stopReasonFork), ErrMsgCancelled},
+		{"user stop", UserStop(), ErrMsgCancelled},
+		{"caller end", ErrStopNotedByCaller, ""},
+		{"agent stop", AgentRequestedStop(), ""},
+	} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		if tc.cause != nil {
+			cancel(tc.cause)
+		}
+		in := make(chan ChatEvent, 2)
+		in <- ChatEvent{Type: "text", Delta: "x"}
+		in <- ChatEvent{Type: "done"}
+		close(in)
+		var got []ChatEvent
+		for e := range markStoppedTerminals(ctx, in) {
+			got = append(got, e)
+		}
+		cancel(nil)
+		if len(got) != 2 || got[0].ErrorMessage != "" || got[1].ErrorMessage != tc.want {
+			t.Fatalf("%s: events = %+v", tc.name, got)
+		}
+	}
+}
+
+// A holder background turn relayed to a remote surface and stopped here
+// ends with a cancelled terminal, whether its backend sent one or none.
+func TestRemoteKeyedBackgroundStopTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stop     bool
+		terminal *ChatEvent
+		want     *ChatEvent
+	}{
+		{"stopped, no terminal", true, nil, &ChatEvent{Type: "error", ErrorMessage: ErrMsgCancelled}},
+		{"stopped, plain done", true, &ChatEvent{Type: "done"}, &ChatEvent{Type: "done", ErrorMessage: ErrMsgCancelled}},
+		{"finished", false, &ChatEvent{Type: "done"}, &ChatEvent{Type: "done"}},
+		{"closed early", false, nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestManager(t)
+			initOneShotMaps(m)
+			key := "ag1:slack:C1:9.0"
+			sf := newFakeKeyedSurface("hub-a")
+			events := make(chan ChatEvent, 2)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				m.handleKeyedBackgroundTurn("ag1", key, events, nil, nil, nil, sf)
+			}()
+			waitFor(t, "background turn tracked", func() bool {
+				_, ok := m.InFlightOneShotOrigin("ag1", key)
+				return ok
+			})
+			if tc.stop {
+				m.cancelOneShots("ag1", KojoStop(stopReasonFork))
+			}
+			if tc.terminal != nil {
+				events <- *tc.terminal
+			}
+			close(events)
+			<-done
+			evs := <-sf.turns
+			var last *ChatEvent
+			if len(evs) > 0 {
+				last = &evs[len(evs)-1]
+			}
+			if (last == nil) != (tc.want == nil) || (last != nil && (last.Type != tc.want.Type || last.ErrorMessage != tc.want.ErrorMessage)) {
+				t.Fatalf("events = %+v, want last %+v", evs, tc.want)
+			}
+		})
+	}
+}
+
+// A relayed turn whose backend still sends a terminal after a stop here:
+// the first terminal the caller sees says it was cancelled.
+func TestRelayedTurnStopMarksBackendTerminal(t *testing.T) {
+	m, b, id := newStopNoteManager(t, t.TempDir())
+	t.Cleanup(func() { _ = m.Close() })
+	m.mu.Lock()
+	m.backends[b.Name()] = &doneOnCancelBackend{stopNoteBackend: b}
+	m.mu.Unlock()
+	key := id + ":ext.test:k1"
+	for i := 0; i < 20; i++ {
+		events, err := m.ChatOneShot(context.Background(), id, "hi", OneShotOpts{SessionKey: key, StopNotedByCaller: true})
+		if err != nil {
+			t.Fatalf("ChatOneShot: %v", err)
+		}
+		<-b.msgs
+		<-b.ctxs
+		m.cancelOneShots(id, KojoStop(stopReasonFork))
+		var first *ChatEvent
+		for e := range events {
+			if first == nil && (e.Type == "done" || e.Type == "error") {
+				e := e
+				first = &e
+			}
+		}
+		if first == nil || first.ErrorMessage != ErrMsgCancelled {
+			t.Fatalf("first terminal = %+v", first)
+		}
+	}
+}
+
+// doneOnCancelBackend runs until cancelled, then ends with a plain done.
+type doneOnCancelBackend struct{ *stopNoteBackend }
+
+func (b *doneOnCancelBackend) Chat(ctx context.Context, _ *Agent, msg, _ string, _ ChatOptions) (<-chan ChatEvent, error) {
+	b.msgs <- msg
+	b.ctxs <- ctx
+	out := make(chan ChatEvent, 1)
+	go func() {
+		defer close(out)
+		<-ctx.Done()
+		out <- ChatEvent{Type: "done", Message: newAssistantMessage()}
+	}()
+	return out, nil
+}
+
+// The race behind a relayed stop: the backend's terminal and the stop are
+// both ready. Whichever wins, a terminal that reaches the caller says it was
+// cancelled, and sent tells ChatOneShot whether to add one.
+func TestOneShotTerminalAfterStopIsMarked(t *testing.T) {
+	m := newTestManager(t)
+	sentSeen, droppedSeen := false, false
+	for i := 0; i < 200 && !(sentSeen && droppedSeen); i++ {
+		ctx := cancelledWith(KojoStop(stopReasonFork))
+		in := make(chan ChatEvent, 1)
+		in <- ChatEvent{Type: "done"}
+		close(in)
+		out := make(chan ChatEvent, 4)
+		end := m.processOneShotEvents(ctx, "ag1", markStoppedTerminals(ctx, in), out, false)
+		close(out)
+		var got []ChatEvent
+		for e := range out {
+			got = append(got, e)
+		}
+		if end.sent != (len(got) > 0) {
+			t.Fatalf("sent = %v, events = %+v", end.sent, got)
+		}
+		if end.sent {
+			sentSeen = true
+			if got[0].ErrorMessage != ErrMsgCancelled {
+				t.Fatalf("forwarded terminal = %+v", got[0])
+			}
+		} else {
+			droppedSeen = true
+		}
+	}
+	if !sentSeen || !droppedSeen {
+		t.Logf("paths covered: sent %v dropped %v", sentSeen, droppedSeen)
 	}
 }

@@ -216,14 +216,25 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	if isSlackConversationKey(agentID, sessionKey) {
 		backendCh = filterSlackNoReplyEvents(backendCh)
 	}
+	if surface != nil {
+		// The Hub sees only the stream, and the backend's terminal of a
+		// turn stopped here may look like a normal end: mark it cancelled.
+		// The Hub's own end of the attach is silent and keeps it as is.
+		backendCh = markStoppedTerminals(lifeCtx, backendCh)
+	}
 	out := make(chan ChatEvent, 64)
 	go func() {
 		defer close(out)
 		defer cancel()
 		end := m.processOneShotEvents(ctx, agentID, backendCh, out, true)
 		if surface == nil {
-			// A remote surface's Hub notes the stop on its side.
 			m.recordKeyedTurnStop(agentID, sessionKey, ctx, end)
+		} else if !end.sent && lifeCtx.Err() != nil {
+			// A remote surface's Hub notes the stop on its side: a stopped
+			// turn that closed without a terminal says so, too.
+			if _, stopped := stopCauseOf(lifeCtx); stopped {
+				out <- ChatEvent{Type: "error", ErrorMessage: ErrMsgCancelled}
+			}
 		}
 	}()
 	if surface != nil {
@@ -237,6 +248,24 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	// the relay goroutine (and the session's readLoop behind it) never wedge.
 	for range out {
 	}
+}
+
+// markStoppedTerminals relays in, giving a terminal that arrives after a
+// noted stop of ctx the cancelled message. It drains in to its close.
+func markStoppedTerminals(ctx context.Context, in <-chan ChatEvent) <-chan ChatEvent {
+	out := make(chan ChatEvent)
+	go func() {
+		defer close(out)
+		for event := range in {
+			if (event.Type == "done" || event.Type == "error") && ctx.Err() != nil {
+				if _, stopped := stopCauseOf(ctx); stopped {
+					event.ErrorMessage = ErrMsgCancelled
+				}
+			}
+			out <- event
+		}
+	}()
+	return out
 }
 
 // handleKeyedTasksAbandoned forwards a keyed session's abandoned-tasks notice

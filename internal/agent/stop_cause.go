@@ -50,6 +50,10 @@ func AgentRequestedStop() error { return &StopCause{Silent: true} }
 // records the stop note itself.
 var ErrStopNotedByCaller = errors.New("turn stop is recorded by the caller")
 
+// ErrTurnStopped wraps ChatOneShot's error for a StopNotedByCaller turn
+// stopped on this side before its stream started, so the caller notes it.
+var ErrTurnStopped = errors.New("turn stopped before its stream started")
+
 // Default reasons for stops that carry no typed cause.
 const (
 	stopReasonTimeout  = "制限時間超過"
@@ -105,6 +109,9 @@ type turnEnd struct {
 	terminal bool
 	// errMsg is that terminal's ErrorMessage.
 	errMsg string
+	// sent (one-shot only): some terminal reached the caller, possibly
+	// after a stop (see markStoppedTerminals).
+	sent bool
 }
 
 // turnStopCause decides whether the turn was stopped before a normal end and
@@ -150,14 +157,25 @@ func stopNoteText(c *StopCause) string {
 // recordKeyedTurnStop leaves the stop note for the next turn on sessionKey
 // when the turn ended by a stop.
 func (m *Manager) recordKeyedTurnStop(agentID, sessionKey string, ctx context.Context, end turnEnd) {
+	m.recordKeyedTurnStopAs(agentID, sessionKey, ctx, end, false)
+}
+
+func (m *Manager) recordKeyedTurnStopAs(agentID, sessionKey string, ctx context.Context, end turnEnd, relayed bool) {
 	if sessionKey == "" {
 		return
 	}
 	if c, ok := turnStopCause(ctx, end); ok {
 		if keyedStopNoteReadable(c) {
-			m.setKeyedStopNote(agentID, sessionKey, stopNoteText(c))
+			m.setKeyedStopNote(agentID, sessionKey, stopNoteText(c), relayed)
 		}
 	}
+}
+
+// GoalControlOnly: a goal request that runs no model turn (status, pause,
+// clear, budget...). Stopping it stops no turn, so it leaves no stop note
+// (and must not replace a pending one).
+func GoalControlOnly(g *GoalRequest) bool {
+	return g != nil && g.Action != "start" && g.Action != "resume"
 }
 
 // keyedStopNoteReadable: a deleted thread room has no later turn to read
@@ -169,7 +187,7 @@ func keyedStopNoteReadable(c *StopCause) bool {
 // RecordKeyedStop leaves the stop note for the next turn on sessionKey from
 // a cancelled turn context (the Hub side of a relayed turn).
 func (m *Manager) RecordKeyedStop(agentID, sessionKey string, ctx context.Context, terminal bool, errMsg string) {
-	m.recordKeyedTurnStop(agentID, sessionKey, ctx, turnEnd{terminal: terminal, errMsg: errMsg})
+	m.recordKeyedTurnStopAs(agentID, sessionKey, ctx, turnEnd{terminal: terminal, errMsg: errMsg}, true)
 }
 
 // RecordKeyedStopCause leaves the stop note for cause (a StopCause; nil or
@@ -182,18 +200,21 @@ func (m *Manager) RecordKeyedStopCause(agentID, sessionKey string, cause error) 
 	cancel(cause)
 	if c, ok := stopCauseOf(ctx); ok {
 		if keyedStopNoteReadable(c) {
-			m.setKeyedStopNote(agentID, sessionKey, stopNoteText(c))
+			m.setKeyedStopNote(agentID, sessionKey, stopNoteText(c), true)
 		}
 	}
 }
 
 // setKeyedStopNote stores a stop note, replacing an undelivered older one:
 // only the latest stop matters to the agent.
-func (m *Manager) setKeyedStopNote(agentID, sessionKey, note string) {
+//
+// relayed: recorded by the dispatching Hub, whose agent may run only on
+// the holder (not in this Manager): no liveness check.
+func (m *Manager) setKeyedStopNote(agentID, sessionKey, note string, relayed bool) {
 	if note == "" {
 		return
 	}
-	if _, live := m.Get(agentID); !live {
+	if _, live := m.Get(agentID); !live && !relayed {
 		return
 	}
 	m.keyedBgMu.Lock()
@@ -342,6 +363,22 @@ func (m *Manager) markMainTurnEnded(agentID string) {
 		m.busy[agentID] = e
 	}
 	m.busyMu.Unlock()
+}
+
+// endMainTurnIfLive marks the main chat's turn ended on its terminal event
+// unless it was already stopped. Shutdown cancels under the same busyMu, so
+// a turn is either stopped (and noted) or ended (and not), never both.
+func (m *Manager) endMainTurnIfLive(agentID string, ctx context.Context) bool {
+	m.busyMu.Lock()
+	defer m.busyMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	if e, ok := m.busy[agentID]; ok {
+		e.turnEnded = true
+		m.busy[agentID] = e
+	}
+	return true
 }
 
 // stop cancels the busy turn with cause (plain cancel for entries without a

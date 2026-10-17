@@ -12,7 +12,10 @@ Stopping: when a user stops your turn (Slack `!stop`, the WebUI stop button),
 only the current turn ends — your background tasks keep running and still
 report back in the thread. Slack `!stop all` also stops every background task
 of the thread; you are told on your next turn there. To stop tasks yourself, use
-the API below.
+the API below. A turn stopped by the user or by kojo (timeout, restart, device
+switch, …) is followed by a `[kojo] 直前のターンは…` note on your next turn
+there saying who stopped it; trust it over an "interrupted by user" line in the
+transcript.
 
 Limits:
 - At most 50 threads per agent can linger with tasks pending at once. A normal

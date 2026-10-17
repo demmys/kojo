@@ -228,7 +228,7 @@ type recordingKeyedHandler struct {
 	got chan []ChatEvent
 }
 
-func (h *recordingKeyedHandler) HandleKeyedBackgroundTurn(agentID, key string, events <-chan ChatEvent, _ func()) {
+func (h *recordingKeyedHandler) HandleKeyedBackgroundTurn(agentID, key string, events <-chan ChatEvent, _ context.CancelCauseFunc) {
 	var evs []ChatEvent
 	for e := range events {
 		evs = append(evs, e)
@@ -240,7 +240,7 @@ func (h *recordingKeyedHandler) KeyedBackgroundTasksAbandoned(string, string, in
 
 func TestManagerRoutesKeyedBackgroundTurnToHandler(t *testing.T) {
 	m := newTestManager(t)
-	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
 	m.oneShotOrigins = make(map[string]map[int64]string)
 	m.oneShotHandoffCaps = make(map[string]map[int64]string)

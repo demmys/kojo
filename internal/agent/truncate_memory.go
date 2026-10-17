@@ -211,7 +211,7 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
 
-	cleanup, err := m.acquireResetGuard(agentID)
+	cleanup, err := m.acquireResetGuard(agentID, KojoStop(stopReasonTruncate))
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +221,7 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 	// (Slack, Discord, Group DM) which can keep writing to MEMORY.md /
 	// memory/*.md / persona / index. Match Fork's pattern so we don't
 	// race those writers against the rewrites below.
-	m.cancelOneShots(agentID)
+	m.cancelOneShots(agentID, KojoStop(stopReasonTruncate))
 
 	if err := m.waitBusyClear(agentID); err != nil {
 		return nil, err

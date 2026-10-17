@@ -22,6 +22,11 @@ const cronMinInterval = 50 * time.Second // minimum interval between runs for sa
 // working uniformly at every call site). The returned duration is 0 for the
 // unbounded case — callers that log or report the effective timeout treat
 // 0 as "none".
+// cronTimeoutCause is the stop cause of a turn that ran past timeout.
+func cronTimeoutCause(timeout time.Duration) error {
+	return KojoStop(fmt.Sprintf("制限時間 %d 分超過", int(timeout/time.Minute)))
+}
+
 func cronRunContext(timeoutMinutes int) (context.Context, context.CancelFunc, time.Duration) {
 	if timeoutMinutes < 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -31,7 +36,8 @@ func cronRunContext(timeoutMinutes int) (context.Context, context.CancelFunc, ti
 	if timeoutMinutes > 0 {
 		timeout = time.Duration(timeoutMinutes) * time.Minute
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// The cause tells the stopped turn it was a kojo timeout (StopCause).
+	ctx, cancel := context.WithTimeoutCause(context.Background(), timeout, cronTimeoutCause(timeout))
 	return ctx, cancel, timeout
 }
 

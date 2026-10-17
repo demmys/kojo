@@ -501,12 +501,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		defer s.agents.SetSwitching(agentID, false)
 		if selfCall {
 			if callerOneShot.ID != 0 {
-				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID, agent.KojoStop(agent.StopReasonSwitch))
 			} else {
-				s.agents.CancelOneShotsForAgent(agentID)
+				s.agents.CancelOneShotsForAgent(agentID, agent.KojoStop(agent.StopReasonSwitch))
 			}
 		} else {
-			s.agents.Abort(agentID)
+			s.agents.Abort(agentID, agent.KojoStop(agent.StopReasonSwitch))
 		}
 		quiesceCtx, quiesceCancel := context.WithTimeout(ctx, 3*time.Second)
 		var err error
@@ -1146,12 +1146,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// the curl before writeJSONResponse reaches it.
 		if selfCall {
 			if callerOneShot.ID != 0 {
-				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID, agent.KojoStop(agent.StopReasonSwitch))
 			} else {
-				s.agents.CancelOneShotsForAgent(agentID)
+				s.agents.CancelOneShotsForAgent(agentID, agent.KojoStop(agent.StopReasonSwitch))
 			}
 		} else {
-			s.agents.Abort(agentID)
+			s.agents.Abort(agentID, agent.KojoStop(agent.StopReasonSwitch))
 		}
 		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
 		if selfCall {

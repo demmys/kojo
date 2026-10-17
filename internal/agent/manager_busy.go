@@ -75,32 +75,39 @@ func (m *Manager) Subscribe(agentID string) (startedAt time.Time, past []ChatEve
 // waitOneShotClear / WaitChatIdle can observe completion as each
 // goroutine removes itself via untrackOneShot. Idempotent — a
 // second Abort on a finished chat is a no-op for both halves.
-func (m *Manager) Abort(agentID string) {
-	m.abortExceptOneShot(agentID, 0)
+//
+// cause (a StopCause, see KojoStop) tells the stopped turns who stopped them;
+// nil means an unclassified kojo stop.
+func (m *Manager) Abort(agentID string, cause error) {
+	m.abortExceptOneShot(agentID, 0, cause, cause)
+}
+
+// AbortByUser is the WebUI main-chat stop button: the main chat is stopped by
+// the user; the external turns cancelled with it are told kojo stopped them
+// (nobody asked to stop those).
+func (m *Manager) AbortByUser(agentID string) {
+	m.abortExceptOneShot(agentID, 0, UserStop(), KojoStop(stopReasonMainChatAbort))
 }
 
 // AbortExceptOneShot cancels the main chat and every external turn except the
 // one-shot that is itself blocked on the handoff HTTP response.
-func (m *Manager) AbortExceptOneShot(agentID string, preserveOneShotID int64) {
-	m.abortExceptOneShot(agentID, preserveOneShotID)
+func (m *Manager) AbortExceptOneShot(agentID string, preserveOneShotID int64, cause error) {
+	m.abortExceptOneShot(agentID, preserveOneShotID, cause, cause)
 }
 
-func (m *Manager) abortExceptOneShot(agentID string, preserveOneShotID int64) {
+func (m *Manager) abortExceptOneShot(agentID string, preserveOneShotID int64, mainCause, oneShotCause error) {
 	// Call the cancel OUTSIDE busyMu: an unsolicited turn's cancel is
 	// wrapped with the backend abort (session mutex + stdin write) — running
 	// it under the global busy lock would let one wedged session stall every
 	// agent in the daemon, and invites lock-order inversions against code
 	// that takes the session mutex before busyMu.
 	m.busyMu.Lock()
-	var cancel context.CancelFunc
-	if entry, ok := m.busy[agentID]; ok {
-		cancel = entry.cancel
-	}
+	entry, ok := m.busy[agentID]
 	m.busyMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if ok {
+		entry.stop(mainCause)
 	}
-	m.cancelOneShotsExcept(agentID, preserveOneShotID)
+	m.cancelOneShotsExcept(agentID, preserveOneShotID, oneShotCause)
 }
 
 // Steer injects an additional user message into the agent's currently
@@ -785,8 +792,8 @@ func (m *Manager) WaitAllChatsIdle(ctx context.Context) error {
 // orchestrator calls this on the agent-self-call path where
 // Abort()'s busy-cancel would kill the curl that initiated the
 // switch. Pairs with WaitChatIdleSelfCall.
-func (m *Manager) CancelOneShotsForAgent(agentID string) {
-	m.cancelOneShots(agentID)
+func (m *Manager) CancelOneShotsForAgent(agentID string, cause error) {
+	m.cancelOneShots(agentID, cause)
 }
 
 // acquirePreparing marks the agent as inside prepareChat. Returns
@@ -966,7 +973,7 @@ func (m *Manager) AcquireMutation(agentID string) (func(), error) {
 // acquireResetGuard marks the agent as resetting, cancels any active chat,
 // and returns a cleanup function that removes the resetting flag.
 // Returns ErrAgentBusy if the agent is already being reset.
-func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
+func (m *Manager) acquireResetGuard(agentID string, cause error) (func(), error) {
 	m.busyMu.Lock()
 	if m.quiescing {
 		m.busyMu.Unlock()
@@ -989,7 +996,7 @@ func (m *Manager) acquireResetGuard(agentID string) (func(), error) {
 	}
 	m.resetting[agentID] = true
 	if entry, busy := m.busy[agentID]; busy {
-		entry.cancel()
+		entry.stop(cause)
 	}
 	m.busyMu.Unlock()
 

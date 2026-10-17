@@ -25,7 +25,7 @@ func (m *Manager) ResetData(id string) error {
 	name := a.Name
 	m.mu.Unlock()
 
-	cleanup, err := m.acquireResetGuard(id)
+	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonReset))
 	if err != nil {
 		return err
 	}
@@ -60,10 +60,12 @@ func (m *Manager) ResetData(id string) error {
 	// could resurrect just-reset conversation content into
 	// memory/recent.md. Nothing destructive has happened yet, so a
 	// drain timeout aborts the reset cleanly.
-	m.cancelOneShots(id)
+	m.cancelOneShots(id, KojoStop(stopReasonReset))
 	if err := m.waitOneShotClear(id); err != nil {
 		return err
 	}
+	// The reset conversation has no "previous turn" left to explain.
+	m.dropMainStopNote(id)
 
 	dir := agentDir(id)
 
@@ -301,7 +303,7 @@ func (m *Manager) Archive(id string) error {
 	}
 	m.mu.Unlock()
 
-	cleanup, err := m.acquireResetGuard(id)
+	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonArchive))
 	if err != nil {
 		return err
 	}
@@ -325,7 +327,7 @@ func (m *Manager) Archive(id string) error {
 	m.mu.Unlock()
 
 	m.cron.Remove(id)
-	m.cancelOneShots(id)
+	m.cancelOneShots(id, KojoStop(stopReasonArchive))
 	// Wait for in-flight one-shot chats (Slack, Discord, Group DM) to drain
 	// before touching group DM membership. Best-effort: if they don't drain
 	// within the timeout we log and continue — the chats are cancelled and
@@ -382,7 +384,7 @@ func (m *Manager) Unarchive(id string) error {
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
-	cleanup, err := m.acquireResetGuard(id)
+	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonUnarch))
 	if err != nil {
 		return err
 	}
@@ -447,7 +449,7 @@ func (m *Manager) Delete(id string) error {
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 
-	cleanup, err := m.acquireResetGuard(id)
+	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonDelete))
 	if err != nil {
 		return err
 	}
@@ -481,7 +483,7 @@ func (m *Manager) Delete(id string) error {
 	// its session JSONL after clearClaudeSession below, and its late
 	// PreCompact hook fire — still authenticated at that point — could
 	// resurrect memory files for the deleted agent.
-	m.cancelOneShots(id)
+	m.cancelOneShots(id, KojoStop(stopReasonDelete))
 	if err := m.waitOneShotClear(id); err != nil {
 		return err
 	}
@@ -516,7 +518,7 @@ func (m *Manager) Delete(id string) error {
 	m.cron.Remove(id)
 	// (One-shot chats were cancelled and drained before the tombstone
 	// above; cancel again to catch any that started in between.)
-	m.cancelOneShots(id)
+	m.cancelOneShots(id, KojoStop(stopReasonDelete))
 
 	// Remove agent from group DMs
 	if m.groupdms != nil {
@@ -584,6 +586,7 @@ func (m *Manager) Delete(id string) error {
 	// abandoned notice sees the agent gone and sets none; one that checked
 	// just before is covered by the second drop).
 	m.dropKeyedNotesAfterExitNotices(id, "")
+	m.dropMainStopNote(id)
 	// Drop any outstanding page. Nothing else expires it, so a deleted
 	// agent would otherwise leak its entry for the life of the process.
 	m.ClearAttention(id)
@@ -725,7 +728,7 @@ var arrivalNotified sync.Map
 // as duplicate / "ghost" assistant turns. Keyed by agent_id
 // (only the latest arrival chat per agent needs cancelling; a
 // duplicate finalize is deduped upstream by arrivalNotified).
-var arrivalCancels sync.Map // map[string]context.CancelFunc
+var arrivalCancels sync.Map // map[string]*context.CancelCauseFunc
 
 type arrivalDedupKey struct {
 	agentID string
@@ -1175,11 +1178,12 @@ func (m *Manager) NotifyDeviceSwitchArrival(agentID, sourcePeerName, opID string
 	// to completion if a fresh switch lands while it's still
 	// drafting the recap. The displaced goroutine's m.Chat will
 	// return ctx.Err() and exit cleanly.
-	ctx, cancel := context.WithCancel(context.Background())
-	myEntry := &cancel
+	ctx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(nil) }
+	myEntry := &cancelCause
 	if prev, loaded := arrivalCancels.Swap(agentID, myEntry); loaded {
-		if pf, ok := prev.(*context.CancelFunc); ok && pf != nil && *pf != nil {
-			(*pf)()
+		if pf, ok := prev.(*context.CancelCauseFunc); ok && pf != nil && *pf != nil {
+			(*pf)(KojoStop(stopReasonSwitch))
 		}
 	}
 	go func() {
@@ -1948,7 +1952,10 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, markReleased bool) {
 	if m.cron != nil {
 		m.cron.Remove(agentID)
 	}
-	m.cancelOneShots(agentID)
+	m.cancelOneShots(agentID, KojoStop(stopReasonSwitch))
+	// The note would not follow the agent to its new holder; a stale one
+	// must not greet it if it ever comes back here.
+	m.dropMainStopNote(agentID)
 	// Stop any in-flight arrival chat. It runs under
 	// context.Background until WithCancel; without this it
 	// outlives every teardown path (source-release, target-
@@ -1958,8 +1965,8 @@ func (m *Manager) releaseAgentLocallyCore(agentID string, markReleased bool) {
 	// newer arrival uses CompareAndDelete to keep its own
 	// cancel registered.
 	if v, ok := arrivalCancels.LoadAndDelete(agentID); ok {
-		if cfp, ok := v.(*context.CancelFunc); ok && cfp != nil && *cfp != nil {
-			(*cfp)()
+		if cfp, ok := v.(*context.CancelCauseFunc); ok && cfp != nil && *cfp != nil {
+			(*cfp)(KojoStop(stopReasonSwitch))
 		}
 	}
 	m.closeIndex(agentID)

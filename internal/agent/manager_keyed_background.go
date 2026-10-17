@@ -19,7 +19,8 @@ type KeyedBackgroundHandler interface {
 	// a single terminal done/error); a done carrying BackgroundTasksPending>0
 	// means more tasks are still running on the lingering process.
 	// cancel aborts the background turn (e.g. a user !stop).
-	HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, cancel func())
+	// cancel's cause says who stopped it (UserStop for a user !stop).
+	HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, cancel context.CancelCauseFunc)
 	// KeyedBackgroundTasksAbandoned reports that the keyed session exited
 	// while `pending` background tasks were still running (best-effort
 	// notice; their completion will never arrive).
@@ -36,7 +37,7 @@ type KeyedSessionSurface interface {
 	// HandleKeyedSessionTurn is HandleKeyedBackgroundTurn with the turn's
 	// lifecycle context (cancelled by reset / delete / shutdown / handoff
 	// quiesce), so the surface can stop waiting on remote I/O promptly.
-	HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func())
+	HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel context.CancelCauseFunc)
 	KeyedBackgroundTasksAbandoned(agentID, sessionKey string, pending int, reason string)
 	// OriginPeerID is the peer allowed to steer the surface's background
 	// turns ("" for none / unsafe local mode).
@@ -50,7 +51,7 @@ type KeyedSessionSurface interface {
 // when the tracked one-shot is cancelled (reset / delete / shutdown), so the
 // handler can discard instead of posting a partial reply.
 type keyedBackgroundCtxHandler interface {
-	handleKeyedBackgroundTurnCtx(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func())
+	handleKeyedBackgroundTurnCtx(ctx context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel context.CancelCauseFunc)
 }
 
 type keyedBgRegistration struct {
@@ -179,11 +180,11 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	// lifeCtx is cancelled only by the tracked one-shot's cancel (reset /
 	// delete / shutdown / explicit abort), never by normal completion, so the
 	// handler can tell a lifecycle cancel from a finished stream.
-	lifeCtx, lifeCancel := context.WithCancel(context.Background())
-	defer lifeCancel()
+	lifeCtx, lifeCancel := context.WithCancelCause(context.Background())
+	defer lifeCancel(nil)
 	ctx, cancel := context.WithCancel(lifeCtx)
-	entryCancel := func() {
-		lifeCancel()
+	entryCancel := func(cause error) {
+		lifeCancel(cause)
 		if abort != nil {
 			// Async: cancelOneShots callers may hold locks; abort writes to
 			// the CLI stdin and is identity-guarded by the session.
@@ -198,7 +199,7 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 		drain()
 		return
 	}
-	osID := m.trackOneShot(agentID, entryCancel, sessionKey, origin, "")
+	osID := m.trackOneShotCause(agentID, entryCancel, sessionKey, origin, "")
 	m.busyMu.Unlock()
 	// Untracked only after the handler has finished posting, so a reset /
 	// delete drain (waitOneShotClear) cannot complete while a reply is still
@@ -219,7 +220,11 @@ func (m *Manager) handleKeyedBackgroundTurn(agentID, sessionKey string, events <
 	go func() {
 		defer close(out)
 		defer cancel()
-		m.processOneShotEvents(ctx, agentID, backendCh, out, true)
+		end := m.processOneShotEvents(ctx, agentID, backendCh, out, true)
+		if surface == nil {
+			// A remote surface's Hub notes the stop on its side.
+			m.recordKeyedTurnStop(agentID, sessionKey, ctx, end)
+		}
 	}()
 	if surface != nil {
 		surface.HandleKeyedSessionTurn(lifeCtx, agentID, sessionKey, out, entryCancel)
@@ -307,6 +312,17 @@ func (m *Manager) SetKeyedBackgroundNote(agentID, sessionKey, note string) {
 	m.setKeyedNote(agentID, sessionKey, note)
 }
 
+// PeekKeyedNote / CommitKeyedNote let a Hub hand its pending one-time note
+// for the key to a turn it relays to the holder, consuming it once the
+// holder accepted the turn.
+func (m *Manager) PeekKeyedNote(agentID, sessionKey string) string {
+	return m.peekKeyedNote(agentID, sessionKey)
+}
+
+func (m *Manager) CommitKeyedNote(agentID, sessionKey, delivered string) {
+	m.commitKeyedNote(agentID, sessionKey, delivered)
+}
+
 // PeekKeyedBackgroundNote returns the pending one-time note for the key
 // without consuming it.
 func (m *Manager) PeekKeyedBackgroundNote(agentID, sessionKey string) string {
@@ -340,6 +356,11 @@ const (
 func (m *Manager) setKeyedNote(agentID, sessionKey, note string) {
 	m.keyedBgMu.Lock()
 	defer m.keyedBgMu.Unlock()
+	m.setKeyedNoteLocked(agentID, sessionKey, note)
+}
+
+// setKeyedNoteLocked is setKeyedNote with keyedBgMu held.
+func (m *Manager) setKeyedNoteLocked(agentID, sessionKey, note string) {
 	if m.keyedNotes == nil {
 		m.keyedNotes = make(map[string]keyedNote)
 	}
@@ -397,7 +418,34 @@ func (m *Manager) commitKeyedNote(agentID, sessionKey, delivered string) {
 		// A newer note was appended meanwhile: keep only that part.
 		n.text = strings.TrimPrefix(n.text, delivered+"\n")
 		m.keyedNotes[k] = n
+	case n.text != "":
+		// Rewritten meanwhile (a newer stop note replaced an older one):
+		// drop the delivered lines that are still pending.
+		if kept := withoutLines(n.text, delivered); kept == "" {
+			delete(m.keyedNotes, k)
+		} else if kept != n.text {
+			n.text = kept
+			m.keyedNotes[k] = n
+		}
 	}
+}
+
+// withoutLines removes from text one occurrence of each line of drop.
+func withoutLines(text, drop string) string {
+	remove := map[string]int{}
+	for _, l := range strings.Split(drop, "\n") {
+		remove[l]++
+	}
+	lines := strings.Split(text, "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if remove[l] > 0 {
+			remove[l]--
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return strings.Join(kept, "\n")
 }
 
 // keyedNoteRedropWait bounds how long a deletion waits for the agent's
@@ -467,8 +515,8 @@ func (m *Manager) DeliverRemoteKeyedBackgroundTurn(agentID, sessionKey string, o
 	if h == nil {
 		return ErrNoKeyedBackgroundSurface
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	events, err := open(ctx, "", "")
 	if err != nil {
 		return err

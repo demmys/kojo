@@ -153,6 +153,29 @@ type extensionChatSessionRequest struct {
 	SessionKey string `json:"sessionKey"`
 }
 
+// extensionChatCancelRequest is the ext-chat/cancel body. ByUser marks an
+// explicit stop by a person (Slack `!stop`); without it the stop is
+// reported to the agent as one kojo made.
+type extensionChatCancelRequest struct {
+	SessionKey string `json:"sessionKey"`
+	ByUser     bool   `json:"byUser,omitempty"`
+}
+
+// Stop reasons the agent is told for extension turns kojo stopped.
+const (
+	extensionStopReasonDisconnect = "拡張との接続断"
+	extensionStopReasonPackage    = "拡張パッケージからの停止要求"
+	extensionStopReasonNoOutput   = "出力の届け先なし"
+)
+
+// extensionStopCause is the cancel cause of a package-requested stop.
+func extensionStopCause(byUser bool) error {
+	if byUser {
+		return agent.UserStop()
+	}
+	return agent.KojoStop(extensionStopReasonPackage)
+}
+
 type extensionChatQuestionRequest struct {
 	SessionKey string               `json:"sessionKey"`
 	Answer     agent.QuestionAnswer `json:"answer"`
@@ -193,32 +216,32 @@ func (s *Server) extensionChatRouter() extensionChatBackend {
 // first for one backend session. The caller is expected to steer.
 type extensionChatSessions struct {
 	mu     sync.Mutex
-	active map[string]context.CancelFunc
+	active map[string]context.CancelCauseFunc
 }
 
 // acquire claims key for one turn. cancel stops that turn; it is what
 // ext-chat/cancel calls.
-func (e *extensionChatSessions) acquire(key string, cancel context.CancelFunc) bool {
+func (e *extensionChatSessions) acquire(key string, cancel context.CancelCauseFunc) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if _, busy := e.active[key]; busy {
 		return false
 	}
 	if e.active == nil {
-		e.active = map[string]context.CancelFunc{}
+		e.active = map[string]context.CancelCauseFunc{}
 	}
 	e.active[key] = cancel
 	return true
 }
 
-// cancel stops the turn holding key and reports whether there was one.
-// The key stays held until the turn's stream has ended.
-func (e *extensionChatSessions) cancel(key string) bool {
+// cancel stops the turn holding key with cause and reports whether there
+// was one. The key stays held until the turn's stream has ended.
+func (e *extensionChatSessions) cancel(key string, cause error) bool {
 	e.mu.Lock()
 	cancel, busy := e.active[key]
 	e.mu.Unlock()
 	if busy && cancel != nil {
-		cancel()
+		cancel(cause)
 	}
 	return busy
 }
@@ -338,8 +361,14 @@ func (s *Server) handleExtensionChat(w http.ResponseWriter, r *http.Request) {
 	// The turn ends with the request, or earlier through ext-chat/cancel.
 	// The second way exists because a disconnect cannot deliver the
 	// terminal event a stopped turn still has to report.
-	turnCtx, cancelTurn := context.WithCancel(r.Context())
-	defer cancelTurn()
+	// The turn context is detached from r.Context() so a disconnect stops
+	// the turn with its own cause rather than a bare Canceled.
+	turnCtx, cancelTurn := context.WithCancelCause(context.WithoutCancel(r.Context()))
+	defer cancelTurn(nil)
+	stopOnDisconnect := context.AfterFunc(r.Context(), func() {
+		cancelTurn(agent.KojoStop(extensionStopReasonDisconnect))
+	})
+	defer stopOnDisconnect()
 	if !s.extensionChats.acquire(sessionKey, cancelTurn) {
 		writeError(w, http.StatusConflict, "busy", "a turn is already running for this session; steer it instead")
 		return
@@ -426,6 +455,8 @@ func (s *Server) handleExtensionChat(w http.ResponseWriter, r *http.Request) {
 		return err == nil
 	}
 	drain := func() {
+		// The package went away: stop the turn (first cause wins).
+		cancelTurn(agent.KojoStop(extensionStopReasonDisconnect))
 		handedOff = true
 		go func() {
 			defer s.extensionChats.release(sessionKey)
@@ -495,6 +526,7 @@ func (s *Server) handleExtensionChatSteer(w http.ResponseWriter, r *http.Request
 
 func (r *extensionChatSteerRequest) sessionKey() string    { return r.SessionKey }
 func (r *extensionChatSessionRequest) sessionKey() string  { return r.SessionKey }
+func (r *extensionChatCancelRequest) sessionKey() string   { return r.SessionKey }
 func (r *extensionChatQuestionRequest) sessionKey() string { return r.SessionKey }
 func (r *extensionChatGoalStopRequest) sessionKey() string { return r.SessionKey }
 
@@ -576,11 +608,11 @@ func (s *Server) handleExtensionChatCancel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	agentID := r.PathValue("id")
-	var req extensionChatSessionRequest
+	var req extensionChatCancelRequest
 	if !decodeExtensionChatBody(w, r, &req, req.sessionKey) {
 		return
 	}
-	if !s.extensionChats.cancel(extensionSessionKey(agentID, p.ExtensionID, req.SessionKey)) {
+	if !s.extensionChats.cancel(extensionSessionKey(agentID, p.ExtensionID, req.SessionKey), extensionStopCause(req.ByUser)) {
 		writeError(w, http.StatusConflict, "not_busy", "no turn is running for this session")
 		return
 	}

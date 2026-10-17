@@ -1936,7 +1936,7 @@ func TestGroupDMManager_Steer_UncertainRemoteDeliveryRetainsMessage(t *testing.T
 func TestManager_SteerOneShotFromOriginFencesHub(t *testing.T) {
 	_, mgr := setupGroupDMTest(t)
 	const sessionKey = "groupdm:g_fenced"
-	mgr.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	mgr.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 	mgr.oneShotSessions = make(map[string]map[int64]string)
 	mgr.oneShotOrigins = make(map[string]map[int64]string)
 	mgr.oneShotHandoffCaps = make(map[string]map[int64]string)

@@ -15,8 +15,10 @@ import (
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
-// notifyTimeout is the maximum time allowed for a notification-triggered chat.
-const notifyTimeout = 10 * time.Minute
+// Notification-triggered chats run without a deadline, like a user turn: a
+// long reply to a group/thread notification must not be cut off by kojo. The
+// turn still ends on the agent's own completion, a user stop, or a lifecycle
+// cancel (reset / delete / shutdown).
 
 // defaultMaxHops is the default agent-to-agent notification relay depth per
 // room. A message whose hop reaches the room's effective max is still stored
@@ -213,7 +215,7 @@ type GroupDMManager struct {
 	// room so Delete (archive) can abort a running turn. Guarded by
 	// threadCancelMu.
 	threadCancelMu sync.Mutex
-	threadCancels  map[string]context.CancelFunc
+	threadCancels  map[string]context.CancelCauseFunc
 	// threadFinalizeCancels aborts attachment finalization when Delete archives
 	// a room after its model stream has ended. StopThreadTurn intentionally
 	// ignores this map: once the stream ends, operator stop must return false
@@ -581,7 +583,7 @@ func NewGroupDMManager(agentMgr *Manager, logger *slog.Logger) *GroupDMManager {
 		latestMsgID:           make(map[string]string),
 		deleting:              make(map[string]bool),
 		persistGen:            make(map[string]int64),
-		threadCancels:         make(map[string]context.CancelFunc),
+		threadCancels:         make(map[string]context.CancelCauseFunc),
 		threadFinalizeCancels: make(map[string]context.CancelFunc),
 		threadStopped:         make(map[string]bool),
 		threadLive:            make(map[string]*threadLiveState),
@@ -1067,7 +1069,7 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 // sendSystemNotification sends a system message to an agent and drains the response.
 // Errors from busy/resetting agents are silently ignored; other errors are logged.
 func (m *GroupDMManager) sendSystemNotification(agentID, notification, logContext string) {
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	events, err := m.agentMgr.Chat(ctx, agentID, notification, "system", nil, BusySourceNotification)
@@ -1703,8 +1705,8 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 
 	// Match the main WebUI chat: an interactive turn has no fixed deadline.
 	// It remains cancellable via StopThreadTurn or room archival.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 
 	// Capture the source turn's canonical snapshot when this ticket reaches the
 	// FIFO head. Later queued user posts are filtered out, while a reply from the
@@ -2361,7 +2363,7 @@ func deriveThreadTitle(content string) string {
 func (m *GroupDMManager) cancelThreadTurn(groupID string) {
 	m.threadCancelMu.Lock()
 	if cancel := m.threadCancels[groupID]; cancel != nil {
-		cancel()
+		cancel(KojoStop(keyedThreadDeletedReason))
 	}
 	if cancel := m.threadFinalizeCancels[groupID]; cancel != nil {
 		cancel()
@@ -2382,7 +2384,7 @@ func (m *GroupDMManager) StopThreadTurn(groupID string) bool {
 		return false
 	}
 	m.threadStopped[groupID] = true
-	cancel()
+	cancel(UserStop())
 	return true
 }
 
@@ -3413,7 +3415,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 	latestMsgID := m.LatestMessageID(groupID)
 	notification := m.renderNotification(agentID, groupID, groupName, latestMsgID, pending)
 
-	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Publish the batch's relay depth (max hop of the messages being
@@ -3451,7 +3453,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 		// Key was cleaned up while we were delivering — drop silently.
 		m.notifyMu.Unlock()
 		if err == nil {
-			m.auditNotificationStream(ctx, events, groupID, agentID, notification)
+			m.auditNotificationStream(events, groupID, agentID, notification)
 			restoreTrigger()
 		}
 		return
@@ -3536,12 +3538,12 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 
 	// Drain events — the recipient's turn runs during this window, with
 	// triggerHop published for hop stamping. The stream is audited: an
-	// error event (backend failure, 10-minute notifyTimeout) is recorded
+	// error event (backend failure) is recorded
 	// as a dead letter rather than silently counting as success. The turn
 	// is NOT retried — the notification was delivered into the agent's
 	// transcript when Chat accepted it, and re-delivering a delivered
 	// turn would duplicate it.
-	m.auditNotificationStream(ctx, events, groupID, agentID, notification)
+	m.auditNotificationStream(events, groupID, agentID, notification)
 	restoreTrigger()
 }
 
@@ -3549,7 +3551,7 @@ func (m *GroupDMManager) deliverNotification(key string, gen uint64, agentID, gr
 // dead-letters (log + persisted record) any stream-level error. No retry:
 // the turn was already delivered; the record exists so a failed turn is
 // visible instead of silently passing as success.
-func (m *GroupDMManager) auditNotificationStream(ctx context.Context, events <-chan ChatEvent, groupID, agentID, notification string) {
+func (m *GroupDMManager) auditNotificationStream(events <-chan ChatEvent, groupID, agentID, notification string) {
 	var streamErr string
 	for ev := range events {
 		if ev.Type == "error" && streamErr == "" {
@@ -3558,12 +3560,6 @@ func (m *GroupDMManager) auditNotificationStream(ctx context.Context, events <-c
 				streamErr = "chat stream reported an error"
 			}
 		}
-	}
-	// A notifyTimeout can end the stream without an error event — the
-	// context cancellation kills the turn and the channel just closes.
-	// Detect it via the deadline so the timeout is dead-lettered too.
-	if streamErr == "" && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		streamErr = fmt.Sprintf("notification turn timed out after %s", notifyTimeout)
 	}
 	if streamErr != "" {
 		m.logger.Warn("group notification turn failed after delivery",

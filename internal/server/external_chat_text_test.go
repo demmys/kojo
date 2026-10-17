@@ -1044,3 +1044,119 @@ func TestExternalChatRouterRelaysStopThreadBackgroundTasks(t *testing.T) {
 		t.Fatalf("err = %v, want ErrBackgroundSessionNotFound", err)
 	}
 }
+
+// The Hub records relayed keyed turns' stop notes itself when the holder
+// advertises stopNotesV1: it forwards its pending note once and notes the
+// stop from the stream end.
+func TestExternalChatRouterHubStopNotes(t *testing.T) {
+	const key = "ag:slack:C1:1.2"
+	var stopNotes atomic.Bool
+	stopNotes.Store(true)
+	type mode int
+	const (
+		modeLost mode = iota
+		modeBlock
+		modeDone
+		modeHangup
+	)
+	var next atomic.Int32
+	seen := make(chan externalChatTextRequest, 4)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder", StopNotesV1: stopNotes.Load()})
+			return
+		}
+		var req externalChatTextRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		seen <- req
+		switch mode(next.Load()) {
+		case modeLost:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "text", Delta: "partial"})
+		case modeBlock:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "text", Delta: "started"})
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		case modeDone:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "done"})
+		case modeHangup:
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	t.Cleanup(holder.Close)
+	srv, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	turn := func(ctx context.Context, cancel func()) externalChatTextRequest {
+		t.Helper()
+		events, err := router.ChatOneShot(ctx, agentID, "hi", agent.OneShotOpts{SessionKey: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := true
+		for range events {
+			if first && cancel != nil {
+				cancel()
+			}
+			first = false
+		}
+		return <-seen
+	}
+	userNote := "[kojo] 直前のターンはユーザーの明示的な操作で停止されました。"
+	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+
+	// Stream lost: the pending note travels once, the loss is noted.
+	next.Store(int32(modeLost))
+	if req := turn(context.Background(), nil); !req.HubStopNotes || req.StopNote != userNote {
+		t.Fatalf("request = hubStopNotes %v stopNote %q", req.HubStopNotes, req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, userNote) {
+		t.Fatalf("note after lost stream = %q", got)
+	}
+
+	// A user stop on the Hub is noted as one.
+	next.Store(int32(modeBlock))
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turn(ctx, func() { cancel(agent.UserStop()) })
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+		t.Fatalf("note after user stop = %q", got)
+	}
+
+	// A normal end consumes the note and leaves none.
+	next.Store(int32(modeDone))
+	if req := turn(context.Background(), nil); req.StopNote != userNote {
+		t.Fatalf("stopNote = %q", req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != "" {
+		t.Fatalf("note after done = %q", got)
+	}
+
+	// Lost after the request went out: the sent note is replaced by the loss.
+	next.Store(int32(modeHangup))
+	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	if _, err := router.ChatOneShot(context.Background(), agentID, "hi", agent.OneShotOpts{SessionKey: key}); err == nil {
+		t.Fatal("hung-up POST succeeded")
+	}
+	if req := <-seen; req.StopNote != userNote {
+		t.Fatalf("stopNote = %q", req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, userNote) {
+		t.Fatalf("note after hang-up = %q", got)
+	}
+	srv.agents.CommitKeyedNote(agentID, key, srv.agents.PeekKeyedNote(agentID, key))
+
+	// An old holder records its own notes: nothing is sent or noted here.
+	stopNotes.Store(false)
+	srv.agents.RecordKeyedStopCause(agentID, key, agent.UserStop())
+	next.Store(int32(modeLost))
+	if req := turn(context.Background(), nil); req.HubStopNotes || req.StopNote != "" {
+		t.Fatalf("old holder request = %#v", req)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != userNote {
+		t.Fatalf("old holder: Hub note = %q", got)
+	}
+}

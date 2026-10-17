@@ -44,7 +44,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 
 	// Hold the source through a reset guard so concurrent chat/edit cannot
 	// mutate its files while we copy. The source itself is not reset.
-	cleanup, err := m.acquireResetGuard(srcID)
+	cleanup, err := m.acquireResetGuard(srcID, KojoStop(stopReasonFork))
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +54,7 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	// Discord, Group DM) which can keep writing to MEMORY.md/persona/index.
 	// Cancel them explicitly and wait for the goroutines to finish winding
 	// down before copying files.
-	m.cancelOneShots(srcID)
+	m.cancelOneShots(srcID, KojoStop(stopReasonFork))
 
 	if err := m.waitBusyClear(srcID); err != nil {
 		return nil, err

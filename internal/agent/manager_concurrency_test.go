@@ -49,7 +49,7 @@ func TestWaitBusyClear_Timeout(t *testing.T) {
 
 func TestAcquireResetGuard_Success(t *testing.T) {
 	m := newTestManager(t)
-	cleanup, err := m.acquireResetGuard("ag_1")
+	cleanup, err := m.acquireResetGuard("ag_1", nil)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -74,7 +74,7 @@ func TestAcquireResetGuard_AlreadyResetting(t *testing.T) {
 	m := newTestManager(t)
 	m.resetting["ag_1"] = true
 
-	_, err := m.acquireResetGuard("ag_1")
+	_, err := m.acquireResetGuard("ag_1", nil)
 	if err == nil {
 		t.Error("expected error when already resetting")
 	}
@@ -85,7 +85,7 @@ func TestAcquireResetGuard_CancelsBusy(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.busy["ag_1"] = busyEntry{cancel: cancel, startedAt: time.Now()}
 
-	cleanup, err := m.acquireResetGuard("ag_1")
+	cleanup, err := m.acquireResetGuard("ag_1", nil)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}

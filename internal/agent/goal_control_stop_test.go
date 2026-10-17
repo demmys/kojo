@@ -66,7 +66,7 @@ func TestGoalSteerChecksUserForLocalAndPeer(t *testing.T) {
 	m := newTestManager(t)
 	a := &Agent{ID: "ag_goal_owner", Tool: ToolCodex}
 	m.agents[a.ID] = a
-	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
 	m.oneShotArmed = make(map[string]map[int64]time.Time)
 	key := a.ID + ":slack:C:T"

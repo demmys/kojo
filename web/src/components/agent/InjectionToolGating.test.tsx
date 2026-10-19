@@ -75,6 +75,7 @@ function renderSettings() {
 
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
+  Element.prototype.scrollTo = vi.fn() as unknown as typeof Element.prototype.scrollTo;
   mocks.checkinFile.mockResolvedValue({ value: { content: "", isDefault: true, etag: "" }, etag: "" });
   mocks.userContext.mockResolvedValue({ value: { content: "", isDefault: true, etag: "" }, etag: "" });
   mocks.credentialsList.mockResolvedValue([]);

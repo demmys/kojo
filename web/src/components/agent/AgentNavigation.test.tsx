@@ -101,6 +101,7 @@ function BrowserHomeRoute() {
 
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
+  Element.prototype.scrollTo = vi.fn() as unknown as typeof Element.prototype.scrollTo;
   mocks.agentGet.mockResolvedValue(demoAgent());
   mocks.agentMessages.mockResolvedValue({ messages: [], hasMore: false });
   mocks.checkinFile.mockResolvedValue({

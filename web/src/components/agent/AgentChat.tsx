@@ -102,7 +102,7 @@ export function AgentChat() {
   // Canonical auto-scroll + pagination shared with GroupDMChat. The suppress /
   // restore refs are owned by useChatScroll; the holder-peer refetch effect
   // below and the pager both drive them through the same layout effect.
-  const { messagesEndRef, scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
+  const { scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
     useChatScroll(messages, id);
   const fetchOlder = useCallback(
     (oldestId: string) => agentApi.messages(id!, PAGE_SIZE, oldestId),
@@ -1103,8 +1103,10 @@ export function AgentChat() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-[760px] space-y-4 px-4 py-4">
+      {/* `relative`: absolutely positioned descendants must be clipped here,
+          not resolve against the page (see .md-content in index.css). */}
+      <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-[760px] space-y-4 px-4 pt-4 pb-8">
         {/* Load more button */}
         {hasMore && <LoadMoreButton onClick={loadOlderMessages} loading={loadingMoreRef.current} />}
 
@@ -1385,7 +1387,6 @@ export function AgentChat() {
             }}
           />
         ))}
-        <div ref={messagesEndRef} />
         </div>
       </div>
 

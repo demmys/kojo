@@ -57,7 +57,7 @@ export function GroupDMChat() {
   const [messages, setMessages] = useState<GroupMessage[]>([]);
   const [hasMore, setHasMore] = useState(false);
   // Canonical auto-scroll + pagination shared with AgentChat.
-  const { messagesEndRef, scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
+  const { scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef } =
     useChatScroll(messages, id);
   const fetchOlder = useCallback(
     (oldestId: string) => groupdmApi.messages(id!, PAGE_SIZE, oldestId),
@@ -911,8 +911,10 @@ export function GroupDMChat() {
       </header>
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-[760px] space-y-4 px-4 py-4">
+      {/* `relative`: absolutely positioned descendants must be clipped here,
+          not resolve against the page (see .md-content in index.css). */}
+      <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-[760px] space-y-4 px-4 pt-4 pb-8">
         {hasMore && <LoadMoreButton onClick={loadOlderMessages} loading={loadingMoreRef.current} />}
 
         {messages.length === 0 && (
@@ -1076,7 +1078,6 @@ export function GroupDMChat() {
             </div>
           );
         })()}
-        <div ref={messagesEndRef} />
         </div>
       </div>
 

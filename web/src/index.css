@@ -115,8 +115,16 @@ html, body, #root {
  * roughly one glyph and the max-width clamp actually wins. Prose still
  * prefers wrapping at spaces — `anywhere` only kicks in when nothing else
  * fits.
+ *
+ * position:relative keeps absolutely positioned descendants inside the
+ * block. remark-gfm renders footnotes with an sr-only (position:absolute)
+ * "Footnotes" heading; without a positioned ancestor it resolves against
+ * the page, escapes every overflow clip in between and makes the document
+ * itself scrollable, so the whole layout can scroll out from under the
+ * fixed shell (chat, file preview, …).
  */
 .md-content {
+  position: relative;
   font-size: 0.875rem;
   line-height: 1.65;
   overflow-wrap: anywhere;

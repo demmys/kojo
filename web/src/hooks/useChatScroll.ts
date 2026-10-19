@@ -24,9 +24,14 @@ const NEAR_BOTTOM_PX = 120;
  *
  * `resetKey` (the conversation id) clears the "first paint" latch so switching
  * conversations re-pins to the bottom.
+ *
+ * Scrolling is done on the container itself (scrollTop / scrollTo), never via
+ * Element.scrollIntoView(): scrollIntoView scrolls *every* scrollable
+ * ancestor, so if the document ever became scrollable (e.g. an absolutely
+ * positioned descendant overflowing the viewport) it would shift the whole
+ * page — header, sidebar and composer included — instead of just the chat.
  */
 export function useChatScroll(messages: readonly { id: string }[], resetKey?: string) {
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const suppressAutoScrollRef = useRef(false);
   const scrollRestoreRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
@@ -59,16 +64,16 @@ export function useChatScroll(messages: readonly { id: string }[], resetKey?: st
     // First populated paint: jump (no smooth) so the chat opens at the bottom.
     if (!hasAutoScrolledRef.current) {
       hasAutoScrolledRef.current = true;
-      messagesEndRef.current?.scrollIntoView();
+      container.scrollTop = container.scrollHeight;
       return;
     }
 
     // Otherwise follow only when the reader is already near the bottom.
     const distance = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (distance <= NEAR_BOTTOM_PX) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     }
   }, [messages]);
 
-  return { messagesEndRef, scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef };
+  return { scrollContainerRef, suppressAutoScrollRef, scrollRestoreRef };
 }

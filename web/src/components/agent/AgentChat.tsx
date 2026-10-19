@@ -1103,10 +1103,8 @@ export function AgentChat() {
       </header>
 
       {/* Messages */}
-      {/* `relative` makes this the containing block for absolutely positioned
-          descendants (e.g. remark-gfm's sr-only "Footnotes" heading). Without
-          it they resolve against the page, overflow the viewport, make the
-          document itself scrollable and the whole layout shifts up. */}
+      {/* `relative`: absolutely positioned descendants must be clipped here,
+          not resolve against the page (see .md-content in index.css). */}
       <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto">
         <div className="mx-auto max-w-[760px] space-y-4 px-4 pt-4 pb-8">
         {/* Load more button */}

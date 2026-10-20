@@ -501,12 +501,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		defer s.agents.SetSwitching(agentID, false)
 		if selfCall {
 			if callerOneShot.ID != 0 {
-				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID, agent.KojoStop(agent.StopReasonSwitch))
 			} else {
-				s.agents.CancelOneShotsForAgent(agentID)
+				s.agents.CancelOneShotsForAgent(agentID, agent.KojoStop(agent.StopReasonSwitch))
 			}
 		} else {
-			s.agents.Abort(agentID)
+			s.agents.Abort(agentID, agent.KojoStop(agent.StopReasonSwitch))
 		}
 		quiesceCtx, quiesceCancel := context.WithTimeout(ctx, 3*time.Second)
 		var err error
@@ -1146,12 +1146,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		// the curl before writeJSONResponse reaches it.
 		if selfCall {
 			if callerOneShot.ID != 0 {
-				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID)
+				s.agents.AbortExceptOneShot(agentID, callerOneShot.ID, agent.KojoStop(agent.StopReasonSwitch))
 			} else {
-				s.agents.CancelOneShotsForAgent(agentID)
+				s.agents.CancelOneShotsForAgent(agentID, agent.KojoStop(agent.StopReasonSwitch))
 			}
 		} else {
-			s.agents.Abort(agentID)
+			s.agents.Abort(agentID, agent.KojoStop(agent.StopReasonSwitch))
 		}
 		drainCtx, drainCancel := context.WithTimeout(ctx, 5*time.Second)
 		if selfCall {
@@ -2107,6 +2107,44 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 				})
 			}
 			req.GrokSession = gw
+		}
+	}
+
+	// gemini session: same tool gate and optional-artifact policy as
+	// grok. Each referenced OpenCode session is read with `opencode
+	// export` (a consistent snapshot from its SQLite DB, even mid-turn).
+	// Read failure degrades to the canonical-history fallback rather
+	// than blocking the switch.
+	if tool == agent.ToolGemini {
+		gemTransfer, gemSkipped, gmerr := agent.ReadGeminiSessionFiles(agentID)
+		if gmerr != nil {
+			s.logger.Warn("agent-sync: gemini session unavailable; using history fallback",
+				"agent", agentID, "err", gmerr)
+			req.TransferSkips = append(req.TransferSkips, agent.SkippedSessionFile{
+				Path: "gemini-session", Reason: "unreadable",
+			})
+			gemTransfer = nil
+		}
+		if len(gemSkipped) > 0 {
+			s.logger.Warn("agent-sync: skipped gemini session files",
+				"agent", agentID, "files", gemSkipped)
+			req.TransferSkips = append(req.TransferSkips, gemSkipped...)
+		}
+		if gemTransfer != nil && len(gemTransfer.Files) > 0 {
+			gw := &geminiSessionWire{
+				Refs:  make([]geminiSessionRefWire, 0, len(gemTransfer.Refs)),
+				Files: make([]geminiSessionFileWire, 0, len(gemTransfer.Files)),
+			}
+			for _, r := range gemTransfer.Refs {
+				gw.Refs = append(gw.Refs, geminiSessionRefWire{Name: r.Name, SessionID: r.SessionID})
+			}
+			for _, f := range gemTransfer.Files {
+				gw.Files = append(gw.Files, geminiSessionFileWire{
+					RelPath:    f.RelPath,
+					ContentB64: base64.StdEncoding.EncodeToString(f.Content),
+				})
+			}
+			req.GeminiSession = gw
 		}
 	}
 

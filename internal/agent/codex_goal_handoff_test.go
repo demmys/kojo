@@ -406,7 +406,7 @@ func TestGoalSteerRechecksReservationInsideAdmission(t *testing.T) {
 			var invoked atomic.Int32
 			fn := func(string) error { invoked.Add(1); return nil }
 			if surface == "slack" {
-				m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+				m.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 				m.oneShotSessions = make(map[string]map[int64]string)
 				m.oneShotArmed = make(map[string]map[int64]time.Time)
 				run := m.trackOneShot(id, func() {}, key, "hub", "")

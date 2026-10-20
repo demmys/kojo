@@ -28,7 +28,7 @@ func newRecordingSlackSurface() *recordingSlackSurface {
 	return &recordingSlackSurface{turns: make(chan []agent.ChatEvent, 4), abandoned: make(chan string, 4)}
 }
 
-func (h *recordingSlackSurface) HandleKeyedBackgroundTurn(_, _ string, events <-chan agent.ChatEvent, _ func()) {
+func (h *recordingSlackSurface) HandleKeyedBackgroundTurn(_, _ string, events <-chan agent.ChatEvent, _ context.CancelCauseFunc) {
 	var evs []agent.ChatEvent
 	for e := range events {
 		evs = append(evs, e)
@@ -295,7 +295,7 @@ func TestRemoteKeyedSurfaceNotifiesAndStreamsToAttach(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sf.HandleKeyedSessionTurn(context.Background(), agentID, key, events, func() { aborted.Do(func() { close(abortedCh) }) })
+		sf.HandleKeyedSessionTurn(context.Background(), agentID, key, events, func(error) { aborted.Do(func() { close(abortedCh) }) })
 	}()
 	var req keyedBgNotifyRequest
 	select {
@@ -366,7 +366,7 @@ func TestRemoteKeyedSurfaceDropsTurnWhenHubRejects(t *testing.T) {
 	defer sf.Release()
 	aborted := false
 	start := time.Now()
-	sf.HandleKeyedSessionTurn(context.Background(), agentID, "groupdm:g1", make(chan agent.ChatEvent), func() { aborted = true })
+	sf.HandleKeyedSessionTurn(context.Background(), agentID, "groupdm:g1", make(chan agent.ChatEvent), func(error) { aborted = true })
 	if time.Since(start) > 3*time.Second || aborted {
 		t.Fatalf("permanent rejection: took %s aborted=%v", time.Since(start), aborted)
 	}
@@ -403,7 +403,7 @@ func TestRemoteKeyedSurfaceRetriesThenStopsOnLifecycleCancel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sf.HandleKeyedSessionTurn(ctx, agentID, "groupdm:g1", make(chan agent.ChatEvent), func() {})
+		sf.HandleKeyedSessionTurn(ctx, agentID, "groupdm:g1", make(chan agent.ChatEvent), func(error) {})
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -461,7 +461,7 @@ func TestRemoteKeyedSurfaceSurvivesHubOutageLongerThanNotifyBudget(t *testing.T)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sf.HandleKeyedSessionTurn(ctx, agentID, "groupdm:g1", in, func() {})
+		sf.HandleKeyedSessionTurn(ctx, agentID, "groupdm:g1", in, func(error) {})
 	}()
 	// Several whole notify budgets fail; the turn must stay registered.
 	time.Sleep(200 * time.Millisecond)
@@ -601,7 +601,7 @@ func TestRemoteKeyedSurfaceRenotifiesUntilLingerBound(t *testing.T) {
 	in <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "x"}}
 	close(in)
 	start := time.Now()
-	sf.HandleKeyedSessionTurn(context.Background(), agentID, "groupdm:g1", in, func() {})
+	sf.HandleKeyedSessionTurn(context.Background(), agentID, "groupdm:g1", in, func(error) {})
 	if el := time.Since(start); el < keyedBgAttachMax || el > keyedBgAttachMax+3*time.Second {
 		t.Fatalf("claim wait = %s, want bounded by %s", el, keyedBgAttachMax)
 	}

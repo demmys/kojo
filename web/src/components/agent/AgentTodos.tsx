@@ -156,6 +156,23 @@ export function AgentTodos() {
     }
   };
 
+  const handleClearDone = async () => {
+    if (!id) return;
+    const reqId = id;
+    const targets = tasks.filter((x) => x.status === "done");
+    if (targets.length === 0) return;
+    if (!window.confirm(t("todos.clearDoneConfirm", { count: targets.length }))) return;
+    const ids = new Set(targets.map((x) => x.id));
+    setTasks((ts) => ts.filter((x) => !ids.has(x.id)));
+    if (editingId && ids.has(editingId)) cancelEdit();
+    setError("");
+    const results = await Promise.allSettled(
+      targets.map((task) => agentApi.tasks.delete(reqId, task.id, task.etag)),
+    );
+    const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) failMutation(reqId, failed.reason, t("todos.conflict"));
+  };
+
   const startEdit = (task: AgentTask) => {
     setEditingId(task.id);
     setEditTitle(task.title);
@@ -380,27 +397,39 @@ export function AgentTodos() {
 
           {tasksLoaded && doneTasks.length > 0 && (
             <div>
-              <button
-                type="button"
-                onClick={() => setDoneExpanded((v) => !v)}
-                aria-expanded={doneExpanded}
-                aria-controls="todos-done-list"
-                className="flex w-full items-center gap-2 px-4 py-3 text-left text-[13px] text-ink-faint transition-colors hover:text-ink-dim"
-              >
-                <svg
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  className={`h-4 w-4 transition-transform ${doneExpanded ? "rotate-90" : ""}`}
-                  aria-hidden
+              <div className="flex items-center">
+                <button
+                  type="button"
+                  onClick={() => setDoneExpanded((v) => !v)}
+                  aria-expanded={doneExpanded}
+                  aria-controls="todos-done-list"
+                  className="flex min-w-0 flex-1 items-center gap-2 px-4 py-3 text-left text-[13px] text-ink-faint transition-colors hover:text-ink-dim"
                 >
-                  <path
-                    fillRule="evenodd"
-                    d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
-                    clipRule="evenodd"
-                  />
-                </svg>
-                <span>{t("todos.doneSection", { count: doneTasks.length })}</span>
-              </button>
+                  <svg
+                    viewBox="0 0 20 20"
+                    fill="currentColor"
+                    className={`h-4 w-4 transition-transform ${doneExpanded ? "rotate-90" : ""}`}
+                    aria-hidden
+                  >
+                    <path
+                      fillRule="evenodd"
+                      d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
+                      clipRule="evenodd"
+                    />
+                  </svg>
+                  <span>{t("todos.doneSection", { count: doneTasks.length })}</span>
+                </button>
+                <button
+                  type="button"
+                  // Keep focus in an open title editor so its onBlur save
+                  // doesn't race the bulk delete with a stale etag.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => void handleClearDone()}
+                  className="mr-2 shrink-0 rounded-md px-2 py-1 text-[12px] text-ink-faint transition-colors hover:bg-lamp-err/10 hover:text-lamp-err"
+                >
+                  {t("todos.clearDone")}
+                </button>
+              </div>
               {doneExpanded && (
                 <div id="todos-done-list">{doneTasks.map((task) => renderRow(task, true))}</div>
               )}

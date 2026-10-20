@@ -31,6 +31,13 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "grok-4.7",
     models: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
   },
+  // gemini runs through OpenCode. Only concrete ids are listed; kojo maps
+  // effort onto the model's thinkingLevel via an OpenCode variant it
+  // defines for the concrete id (see geminiEffortModels below).
+  gemini: {
+    default: "gemini-4-argon",
+    models: ["gemini-4-argon", "gemini-3.8-flash"],
+  },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
   "custom-claude": {
@@ -95,6 +102,11 @@ const claudeMediumDefaultModels = new Set(["claude-opus-5-5"]);
 // [high,medium,low]. None advertises "max". Keep in sync with agent.go
 // grokEffortModels / xhighModels.
 const grokEffortModels = new Set(toolModels.grok.models);
+// Gemini thinkingLevel ladder: low/medium/high, API default medium.
+// "flash" is the legacy gemini-cli alias for gemini-3.8-flash; the backend
+// resolves it before picking the variant. Keep in sync with
+// internal/agent/backend_opencode.go geminiEffortModels.
+const geminiEffortModels = new Set([...toolModels.gemini.models, "flash"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
 /**
@@ -108,8 +120,14 @@ const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"])
  */
 const defaultXhighModels = new Set(["claude-opus-4-7"]);
 
+/** Tools whose per-turn effort the server's auto-effort classifier can
+ * drive (internal/agent/auto_effort.go toolSupportsAutoEffort). */
+export function supportsAutoEffort(tool: string): boolean {
+  return tool === "claude" || tool === "grok" || tool === "gemini";
+}
+
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude" || tool === "grok" || tool === "codex";
+  return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini";
 }
 
 // codex CLI 0.159.2: gpt-6.1-sol, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
@@ -141,6 +159,7 @@ export function effortLevelsForModel(model: string): readonly EffortLevel[] {
   if (codexEffortModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokXhighModels.has(model)) return ["low", "medium", "high", "xhigh"] as const;
   if (grokEffortModels.has(model)) return ["low", "medium", "high"] as const;
+  if (geminiEffortModels.has(model)) return ["low", "medium", "high"] as const;
   if (xhighModels.has(model)) return effortLevels;
   return effortLevels.filter((e) => e !== "xhigh");
 }
@@ -150,6 +169,7 @@ export function defaultEffortForModel(model: string): string {
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";
+  if (geminiEffortModels.has(model)) return "medium";
   if (claudeMediumDefaultModels.has(model)) return "medium";
   return defaultXhighModels.has(model) ? "xhigh" : "high";
 }

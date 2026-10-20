@@ -22,7 +22,7 @@ func TestDrainBlockers_ReportsEachBlockingItem(t *testing.T) {
 		resetting:       map[string]bool{"ag_reset": true},
 		switching:       map[string]bool{"ag_sw": true},
 		profileGen:      map[string]bool{"ag_prof": true},
-		oneShotCancels:  map[string]map[int64]context.CancelFunc{"ag_os": {7: func() {}}},
+		oneShotCancels:  map[string]map[int64]context.CancelCauseFunc{"ag_os": {7: func(error) {}}},
 		oneShotSessions: map[string]map[int64]string{"ag_os": {7: "groupdm:g_1"}},
 		oneShotArmed:    map[string]map[int64]time.Time{"ag_os": {7: time.Now().Add(-32 * time.Minute)}},
 	}

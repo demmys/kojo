@@ -35,6 +35,7 @@ function baseState(over: Partial<AgentSettingsFormState> = {}): AgentSettingsFor
     tts: { enabled: false, model: "", voice: "", stylePrompt: "" },
     disabledInjections: [],
     autoEffort: true,
+    maxOutputTokens: 0,
     ...over,
   };
 }
@@ -86,6 +87,12 @@ describe("buildAgentSavePayload", () => {
     expect(buildAgentSavePayload(baseState({ tool: "custom-codex", codexApps: true })).codexApps).toBe(true);
     expect(buildAgentSavePayload(baseState({ tool: "codex" })).codexApps).toBeUndefined();
     expect(buildAgentSavePayload(baseState({ tool: "claude", codexApps: false })).codexApps).toBeUndefined();
+  });
+
+  it("forwards maxOutputTokens only for gemini", () => {
+    expect(buildAgentSavePayload(baseState({ tool: "gemini", maxOutputTokens: 8192 })).maxOutputTokens).toBe(8192);
+    expect(buildAgentSavePayload(baseState({ tool: "gemini" })).maxOutputTokens).toBe(0);
+    expect(buildAgentSavePayload(baseState({ tool: "claude", maxOutputTokens: 8192 })).maxOutputTokens).toBeUndefined();
   });
 
   it("codexApps defaults: on for codex, off for custom-codex", () => {

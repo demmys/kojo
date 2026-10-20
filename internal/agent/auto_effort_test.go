@@ -425,3 +425,32 @@ func TestRunJevEffortClassifierRequestShape(t *testing.T) {
 		t.Fatal("expected error for missing effort answer")
 	}
 }
+
+func TestResolveTurnEffortGemini(t *testing.T) {
+	requireClaudeInPath(t)
+	cases := []struct {
+		model, static, classifier, want string
+	}{
+		{"gemini-4-argon", "high", "low", "low"},
+		{"gemini-4-argon", "", "medium", "medium"}, // "" = model default ≈ high
+		{"", "", "low", "low"},                     // "" model = GeminiDefaultModel
+		{"gemini-3.8-flash", "high", "medium", "medium"},
+		{"flash", "", "low", "low"},
+		{"gemini-4-argon", "low", "high", "high"},
+		{"pro", "", "low", ""}, // no effort ladder for the pro alias → static
+		{"auto", "", "medium", ""},
+	}
+	for _, c := range cases {
+		withFakeClassifier(t, fakeClassifierReturning(c.classifier))
+		a := &Agent{Tool: ToolGemini, Model: c.model, Effort: c.static}
+		eff, _ := resolveTurnEffort(context.Background(), a, "some question", false, "", "", testLogger())
+		if eff != c.want {
+			t.Fatalf("model %q static %q tier %q: got %q, want %q", c.model, c.static, c.classifier, eff, c.want)
+		}
+	}
+	// System turns pin gemini to low too.
+	a := &Agent{Tool: ToolGemini, Model: "gemini-4-argon", Effort: "high"}
+	if eff, src := resolveTurnEffort(context.Background(), a, "cron", true, "", "", testLogger()); eff != "low" || src != "rule" {
+		t.Fatalf("system turn: got (%q,%q)", eff, src)
+	}
+}

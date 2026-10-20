@@ -57,7 +57,13 @@ func (s BusySource) String() string {
 type busyEntry struct {
 	questionLifecycle *questionLifecycle
 
-	cancel      context.CancelFunc
+	cancel context.CancelFunc
+	// cancelCause, when set, cancels the turn with a StopCause (see stop);
+	// cancel stays the plain variant.
+	cancelCause context.CancelCauseFunc
+	// ctx is the turn's context (nil for hand-rolled entries): Shutdown
+	// pre-writes its note only for a turn it stops itself.
+	ctx         context.Context
 	startedAt   time.Time
 	broadcaster *chatBroadcaster // fan-out for reconnecting clients
 	source      BusySource
@@ -92,6 +98,11 @@ type busyEntry struct {
 	// such a turn is streaming must fall back to a queued normal send that
 	// opens a fresh turn once the notification turn ends.
 	unsolicited bool
+	// turnEnded: the turn's event stream is over (post-turn work such as
+	// indexing may still hold the slot); Shutdown leaves no stop note.
+	turnEnded bool
+	// noStopNote: a goal control request, which runs no turn to note.
+	noStopNote bool
 }
 
 // Manager manages agent CRUD, chat orchestration, and lifecycle.
@@ -252,12 +263,12 @@ type Manager struct {
 	// chats may run concurrently for the same agent.
 	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
 	oneShotSeq         int64
-	oneShotCancels     map[string]map[int64]context.CancelFunc // agentID → id → cancel
-	oneShotSessions    map[string]map[int64]string             // agentID → id → SessionKey (restart-wake thread routing)
-	oneShotOrigins     map[string]map[int64]string             // agentID → id → Hub peer that owns the response surface
-	oneShotHandoffCaps map[string]map[int64]string             // agentID → id → Hub-minted continuation capability
-	oneShotArmed       map[string]map[int64]time.Time          // agentID → id → armed-at (DrainBlockers age reporting)
-	oneShotDone        map[string]map[int64]chan struct{}      // agentID → id → closed when backend turn fully exits
+	oneShotCancels     map[string]map[int64]context.CancelCauseFunc // agentID → id → cancel
+	oneShotSessions    map[string]map[int64]string                  // agentID → id → SessionKey (restart-wake thread routing)
+	oneShotOrigins     map[string]map[int64]string                  // agentID → id → Hub peer that owns the response surface
+	oneShotHandoffCaps map[string]map[int64]string                  // agentID → id → Hub-minted continuation capability
+	oneShotArmed       map[string]map[int64]time.Time               // agentID → id → armed-at (DrainBlockers age reporting)
+	oneShotDone        map[string]map[int64]chan struct{}           // agentID → id → closed when backend turn fully exits
 	oneShotCancelsMu   sync.Mutex
 
 	// oneShotSteers tracks the steer handle for an in-flight ChatOneShot
@@ -506,6 +517,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			ToolClaude:       NewClaudeBackend(logger),
 			ToolCodex:        NewCodexBackend(logger),
 			ToolGrok:         NewGrokBackend(logger),
+			ToolGemini:       NewGeminiBackend(logger, creds),
 			ToolCustomClaude: NewCustomClaudeBackend(logger, creds),
 			ToolCustomCodex:  NewCustomCodexBackend(logger, creds),
 			ToolCustomBare:   NewCustomBareBackend(logger, creds),
@@ -523,7 +535,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		profileGen:         make(map[string]bool),
 		memIndexes:         make(map[string]*MemoryIndex),
 		chatWatchers:       make(map[string]map[*chatWatcher]struct{}),
-		oneShotCancels:     make(map[string]map[int64]context.CancelFunc),
+		oneShotCancels:     make(map[string]map[int64]context.CancelCauseFunc),
 		oneShotSessions:    make(map[string]map[int64]string),
 		oneShotOrigins:     make(map[string]map[int64]string),
 		oneShotHandoffCaps: make(map[string]map[int64]string),
@@ -632,6 +644,12 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		}
 		m.agents[a.ID] = a
 	}
+
+	// Gemini PTY wrappers and key FIFOs are normally consumed
+	// (self-deleted) within milliseconds; any still present at startup
+	// were orphaned by a previous process dying mid-launch. The legacy
+	// gemini-cli launch dir is swept too: its wrappers held the API key.
+	sweepGeminiPTYLaunchDirs(time.Now())
 
 	return m, nil
 }
@@ -1470,6 +1488,9 @@ func validateUpdateConfigPure(cfg *AgentUpdateConfig) (nextCronMessage string, c
 			return "", false, verr
 		}
 	}
+	if cfg.MaxOutputTokens != nil && !ValidMaxOutputTokens(*cfg.MaxOutputTokens) {
+		return "", false, fmt.Errorf("unsupported maxOutputTokens: %d (must be 0..%d)", *cfg.MaxOutputTokens, GeminiMaxOutputTokensLimit)
+	}
 	return nextCronMessage, cronMessageDirty, nil
 }
 
@@ -1801,6 +1822,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	}
 	if cfg.CodexApps != nil {
 		a.CodexApps = cfg.CodexApps
+	}
+	if cfg.MaxOutputTokens != nil {
+		// Validated upstream (validateUpdateConfigPure).
+		a.MaxOutputTokens = *cfg.MaxOutputTokens
 	}
 	if cfg.CustomBaseURL != nil {
 		// Validated upstream against the prospective (Tool, CustomBaseURL) combo.
@@ -2226,7 +2251,7 @@ func (m *Manager) resolveTurnEffortAsync(ctx context.Context, agentID, userMessa
 		var diary, jevKey string
 		// Diary/key reads only matter for the LLM path; skip the disk
 		// reads for system turns / disabled agents / other tools.
-		if !systemTurn && snap.IsAutoEffortEnabled() && (snap.Tool == "claude" || snap.Tool == "grok") {
+		if !systemTurn && snap.IsAutoEffortEnabled() && toolSupportsAutoEffort(snap.Tool) {
 			diary = RecentDiarySummary(agentID)
 			jevKey, _ = LoadTypeSafeAPIKey(m.creds) // "" → claude CLI classifier
 		}
@@ -2253,7 +2278,7 @@ func (m *Manager) applyTurnEffort(agentID string, prep *chatPrep, ch <-chan turn
 	// tool/model/effort change) must win over a classification computed
 	// against the stale settings.
 	if !prep.agentCopy.IsAutoEffortEnabled() ||
-		(prep.agentCopy.Tool != "claude" && prep.agentCopy.Tool != "grok") {
+		!toolSupportsAutoEffort(prep.agentCopy.Tool) {
 		return
 	}
 	// Recover the raw verdict: the classifier paths encode it as
@@ -2353,7 +2378,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		m.busyMu.Unlock()
 		return nil, ErrAgentBusy
 	}
-	chatCtx, cancel := context.WithCancel(ctx)
+	chatCtx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() { cancelCause(nil) }
 	// Create outCh and broadcaster upfront so they're available from the
 	// moment the busy entry is visible. This prevents a reconnecting
 	// WebSocket from falling back to polling during setup.
@@ -2364,7 +2390,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		src = source[0]
 	}
 	acc := newChatAccumulator()
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, source: src, accumulator: acc, outCh: outCh}
+	m.busy[agentID] = busyEntry{cancel: cancel, cancelCause: cancelCause, ctx: chatCtx, noStopNote: GoalControlOnly(goal), startedAt: time.Now(), broadcaster: bc, source: src, accumulator: acc, outCh: outCh}
 	// Hand off the preparing counter to the busy entry under
 	// the same lock so WaitChatIdle never observes a window
 	// where neither preparing nor busy is set for this chat.
@@ -2412,6 +2438,17 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
+	// One-time note when the previous main-chat turn was stopped (who
+	// stopped it); consumed once the backend accepted this turn. A goal
+	// request's message is goal setup / control, not a turn the model
+	// reads: the note waits for the next ordinary turn.
+	stopNote, stopNoteETag := "", ""
+	if goal == nil {
+		stopNote, stopNoteETag = m.peekMainStopNote(agentID)
+	}
+	if stopNote != "" {
+		effectiveMessage = injectRecentMessagesContext(effectiveMessage, stopNote+"\n")
+	}
 
 	// Start chat. role=="system" marks automated triggers (cron, groupdm,
 	// Slack one-shot) where there is no interactive user waiting on the
@@ -2447,6 +2484,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		},
 	})
 	if err != nil {
+		// Stopped before the stream started: still the turn the user sent.
+		// Otherwise the turn ended on its own failure (a later Shutdown must
+		// not note it).
+		if !m.endMainTurnIfLive(agentID, chatCtx) && !GoalControlOnly(goal) {
+			m.recordMainTurnStop(agentID, chatCtx, turnEnd{})
+		}
 		// Persist the failure like processChatEvents does for mid-stream
 		// errors: the input message already landed in the transcript
 		// above, so a backend that refuses to even start would otherwise
@@ -2477,6 +2520,8 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		return nil, err
 	}
 
+	m.commitMainStopNote(agentID, stopNoteETag)
+
 	// Return a subscriber channel for the immediate caller.
 	// The raw outCh is consumed exclusively by the broadcaster.
 	_, callerCh, _ := bc.Subscribe()
@@ -2486,7 +2531,12 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		defer close(outCh)
 		defer m.clearBusy(agentID)
 		defer cancel()
-		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		end := m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		m.markMainTurnEnded(agentID)
+		// Before clearBusy: the next turn must see the note.
+		if !GoalControlOnly(goal) {
+			m.recordMainTurnStop(agentID, chatCtx, end)
+		}
 		// Background callers keep draining after Abort cancels only chatCtx.
 		// processChatEvents deliberately stops forwarding on cancellation, so
 		// preserve that outcome for them before the broadcaster closes.
@@ -2648,6 +2698,12 @@ type OneShotOpts struct {
 	// keyed background turn identified by this one-time token instead of
 	// starting a new turn (Hub side of the remote background continuation).
 	AttachBackgroundToken string
+	// StopNotedByCaller: the caller (the dispatching Hub) records this
+	// turn's stop note, so none is recorded here.
+	StopNotedByCaller bool
+	// TurnNote is a one-time note from the caller injected like the local
+	// keyed note (the Hub's pending stop note for the key).
+	TurnNote string
 }
 
 type HandoffArrivalReservation interface {
@@ -2720,7 +2776,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	}
 	m.applyTurnEffort(agentID, prep, effortCh)
 
-	chatCtx, cancel := context.WithCancel(ctx)
+	chatCtx, cancelCause := context.WithCancelCause(ctx)
+	cancel := func() { cancelCause(nil) }
 	var responseAttachments *attachWatcher
 	var responseAttachmentStageDir string
 	if opts.ResponseAttachmentGroupID != "" && opts.ResponseAttachmentMessageID != "" {
@@ -2748,7 +2805,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	// after a reset/delete has already drained and started wiping.
 	// Lock nesting (busyMu → oneShotCancelsMu) is safe: no code path
 	// acquires them in the opposite order.
-	osID := m.trackOneShot(agentID, cancel, opts.SessionKey, opts.OriginPeerID, opts.HandoffCapability)
+	osID := m.trackOneShotCause(agentID, cancelCause, opts.SessionKey, opts.OriginPeerID, opts.HandoffCapability)
 	m.busyMu.Unlock()
 	if responseAttachmentStageDir != "" {
 		responseAttachments = m.watchAndStreamAttachmentsFromDir(chatCtx, agentID,
@@ -2829,6 +2886,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
 		case ToolGrok:
 			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
+		case ToolGemini:
+			resetErr = deleteGeminiThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
 			if responseAttachments != nil {
@@ -2864,14 +2923,32 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		chatOpts.KeyedSurface = opts.KeyedSurface
 	}
 	deliveredKeyedNote := ""
-	if chatOpts.LingerBackgroundTasks {
+	var turnNotes []string
+	// A goal request's message is goal setup / control (Codex keeps it as
+	// the goal's setup context), not a turn the model reads: its notes
+	// wait for the next ordinary turn.
+	noteable := opts.Goal == nil
+	if opts.TurnNote != "" && noteable {
+		turnNotes = append(turnNotes, opts.TurnNote)
+	}
+	if noteable && chatOpts.LingerBackgroundTasks {
 		// Cheap per-turn awareness: pending notes for this key (tasks that
-		// were abandoned / could not be continued) and the other threads
-		// still running background tasks.
+		// were abandoned / could not be continued, a stopped previous turn)
+		// and the other threads still running background tasks.
 		var note string
 		if note, deliveredKeyedNote = m.keyedTurnNote(agentID, sessionKey, prep.backend); note != "" {
-			effectiveMessage = injectRecentMessagesContext(effectiveMessage, note+"\n")
+			turnNotes = append(turnNotes, note)
 		}
+	} else if noteable && opts.SessionKey != "" {
+		// Every backend: the key's pending one-time notes (e.g. the
+		// previous turn was stopped).
+		if note := m.peekKeyedNote(agentID, opts.SessionKey); note != "" {
+			deliveredKeyedNote = note
+			turnNotes = append(turnNotes, note)
+		}
+	}
+	if len(turnNotes) > 0 {
+		effectiveMessage = injectRecentMessagesContext(effectiveMessage, strings.Join(turnNotes, "\n")+"\n")
 	}
 	chatOpts.FreshSessionContext = opts.FreshSessionContext
 	chatOpts.ResumeSessionContext = opts.ResumeSessionContext
@@ -2897,6 +2974,16 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	questionTurn := m.setupOneShotQuestions(chatCtx, agentID, osID, opts, &chatOpts)
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
+		if !GoalControlOnly(opts.Goal) {
+			// Stopped before the stream started (e.g. waiting for response
+			// headers): the session still holds an unanswered message.
+			if !opts.StopNotedByCaller {
+				m.recordKeyedTurnStop(agentID, opts.SessionKey, chatCtx, turnEnd{})
+			} else if _, stopped := turnStopCause(chatCtx, turnEnd{}); stopped {
+				// Stopped on this side: the caller learns it from the error.
+				err = fmt.Errorf("%w: %w", ErrTurnStopped, err)
+			}
+		}
 		if responseAttachments != nil {
 			m.deleteIngestedAttachments(responseAttachments.StopAndDrain())
 		}
@@ -2915,7 +3002,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		return nil, err
 	}
 	// The turn reached the backend: its one-time note is delivered.
-	m.commitKeyedNote(agentID, sessionKey, deliveredKeyedNote)
+	m.commitKeyedNote(agentID, opts.SessionKey, deliveredKeyedNote)
 	if isSlackConversationKey(agentID, opts.SessionKey) {
 		// Before any lossy forwarding: the filter must see every delta.
 		backendCh = filterSlackNoReplyEvents(backendCh)
@@ -2924,6 +3011,11 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 	if responseAttachments != nil {
 		backendCh = m.captureOneShotResponseAttachments(chatCtx, agentID,
 			opts.ResponseAttachmentMessageID, responseAttachmentStageDir, backendCh, responseAttachments)
+	}
+	if opts.StopNotedByCaller && !GoalControlOnly(opts.Goal) {
+		// The Hub ends at the first terminal: one that follows a stop on
+		// this side says it was cancelled.
+		backendCh = markStoppedTerminals(chatCtx, backendCh)
 	}
 
 	go func() {
@@ -2937,7 +3029,23 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 				m.oneShotSteersMu.Unlock()
 			}()
 		}
-		m.processOneShotEvents(chatCtx, agentID, backendCh, outCh, opts.PreserveTerminalOnCancel)
+		end := m.processOneShotEvents(chatCtx, agentID, backendCh, outCh, opts.PreserveTerminalOnCancel)
+		switch {
+		case GoalControlOnly(opts.Goal):
+		case !opts.StopNotedByCaller:
+			m.recordKeyedTurnStop(agentID, opts.SessionKey, chatCtx, end)
+		case !end.sent:
+			// A relayed turn is noted by the dispatching Hub, which ends at
+			// the first terminal. A stop on this side that dropped it (or
+			// had none): tell the Hub it was stopped here rather than lost
+			// (its own cancel carries no note).
+			if _, stopped := stopCauseOf(chatCtx); stopped && chatCtx.Err() != nil {
+				select {
+				case outCh <- ChatEvent{Type: "error", ErrorMessage: ErrMsgCancelled}:
+				case <-ctx.Done():
+				}
+			}
+		}
 	}()
 
 	return outCh, nil
@@ -3148,12 +3256,24 @@ func (m *Manager) SteerOneShotAsUser(agentID, sessionKey, originPeerID, text, us
 
 // processOneShotEvents is like processChatEvents but does not persist
 // messages to the transcript. It still forwards events to outCh.
-func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserveTerminalOnCancel bool) {
+//
+// The returned turnEnd tells whether the turn ended on its own (see
+// turnStopCause).
+func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserveTerminalOnCancel bool) (end turnEnd) {
+	sent := false
+	defer func() { end.sent = sent }()
 	for {
 		select {
 		case event, ok := <-backendCh:
 			if !ok {
 				return
+			}
+			if event.Type == "done" || event.Type == "error" {
+				// The latest terminal decides (a stream may carry several).
+				end = turnEnd{terminal: ctx.Err() == nil, errMsg: event.ErrorMessage}
+			} else {
+				// Output after a terminal: a later cancel stops a live turn.
+				end.terminal = false
 			}
 			// Terminal, question lifecycle and attachment events use blocking send. Attachments carry
 			// blob ownership: dropping one after the holder ingested it would leak
@@ -3163,7 +3283,7 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				case outCh <- event:
 				case <-ctx.Done():
 					event.rejectAttachmentOwnership()
-					m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
+					sent = m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel) || sent
 					return
 				}
 			} else if event.Type == "done" || event.Type == "error" {
@@ -3179,18 +3299,20 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				// available there; the Slack adapter preserves those separately.
 				select {
 				case outCh <- event:
+					sent = true
 					continue
 				default:
 				}
 				if ctx.Err() != nil {
-					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					sent = forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel) || sent
 					drainOneShotAfterCancel(backendCh)
 					return
 				}
 				select {
 				case outCh <- event:
+					sent = true
 				case <-ctx.Done():
-					forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel)
+					sent = forwardOneShotTerminalAfterCancel(outCh, event, preserveTerminalOnCancel) || sent
 					drainOneShotAfterCancel(backendCh)
 					return
 				}
@@ -3201,16 +3323,18 @@ func (m *Manager) processOneShotEvents(ctx context.Context, agentID string, back
 				}
 			}
 		case <-ctx.Done():
-			m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel)
+			sent = m.drainOneShotUntilTerminalAfterCancel(agentID, backendCh, outCh, preserveTerminalOnCancel) || sent
 			return
 		}
 	}
 }
 
-func forwardOneShotTerminalAfterCancel(outCh chan<- ChatEvent, event ChatEvent, preserve bool) {
+// forwardOneShotTerminalAfterCancel reports whether it forwarded event.
+func forwardOneShotTerminalAfterCancel(outCh chan<- ChatEvent, event ChatEvent, preserve bool) bool {
 	if preserve {
 		outCh <- event
 	}
+	return preserve
 }
 
 func drainOneShotAfterCancel(backendCh <-chan ChatEvent) {
@@ -3221,7 +3345,8 @@ func drainOneShotAfterCancel(backendCh <-chan ChatEvent) {
 	}
 }
 
-func (m *Manager) drainOneShotUntilTerminalAfterCancel(agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserve bool) {
+// drainOneShotUntilTerminalAfterCancel reports whether it forwarded a terminal.
+func (m *Manager) drainOneShotUntilTerminalAfterCancel(agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent, preserve bool) bool {
 	for event := range backendCh {
 		if event.Type == "attachment" {
 			event.rejectAttachmentOwnership()
@@ -3231,11 +3356,12 @@ func (m *Manager) drainOneShotUntilTerminalAfterCancel(agentID string, backendCh
 			if event.Type == "done" {
 				m.syncPersona(agentID)
 			}
-			forwardOneShotTerminalAfterCancel(outCh, event, preserve)
+			sent := forwardOneShotTerminalAfterCancel(outCh, event, preserve)
 			drainOneShotAfterCancel(backendCh)
-			return
+			return sent
 		}
 	}
+	return false
 }
 
 // handleBackgroundTurn persists + broadcasts an unsolicited turn produced by
@@ -3269,7 +3395,9 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 			return
 		}
 		if _, busy := m.busy[agentID]; !busy {
-			ctx, cancel = context.WithCancel(context.Background())
+			var cancelCause context.CancelCauseFunc
+			ctx, cancelCause = context.WithCancelCause(context.Background())
+			cancel = func() { cancelCause(nil) }
 			outCh = make(chan ChatEvent, 64)
 			bc := newChatBroadcaster(outCh)
 			acc := newChatAccumulator()
@@ -3281,10 +3409,10 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 			// guarded by the session (never lands on a successor turn), and
 			// the deferred plain cancel below keeps normal completion from
 			// sending a spurious interrupt.
-			entryCancel := cancel
+			entryCancel := cancelCause
 			if abort != nil {
-				entryCancel = func() {
-					cancel()
+				entryCancel = func(cause error) {
+					cancelCause(cause)
 					// Async: every entry.cancel() caller (Abort, the reset
 					// guard, Shutdown) holds busyMu, and abort takes the
 					// session mutex + writes to the CLI stdin — a wedged
@@ -3295,7 +3423,7 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 			}
 			// answer lets a watching human resolve an AskUserQuestion raised on
 			// this automated turn (surfaced as a card, held with a timeout).
-			m.busy[agentID] = busyEntry{cancel: entryCancel, startedAt: time.Now(), broadcaster: bc, source: BusySourceBackground, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
+			m.busy[agentID] = busyEntry{cancel: func() { entryCancel(nil) }, cancelCause: entryCancel, ctx: ctx, startedAt: time.Now(), broadcaster: bc, source: BusySourceBackground, accumulator: acc, outCh: outCh, unsolicited: true, answer: answer}
 			// Count this in-flight unsolicited turn so drains (waitChatIdle /
 			// WaitAllChatsIdle) don't observe idle while it is writing.
 			m.notifying[agentID]++
@@ -3328,11 +3456,17 @@ func (m *Manager) handleBackgroundTurn(agentID string, events <-chan ChatEvent, 
 	}()
 	defer m.clearBusy(agentID)
 	defer cancel()
-	m.processChatEvents(ctx, agentID, events, outCh)
+	end := m.processChatEvents(ctx, agentID, events, outCh)
+	m.markMainTurnEnded(agentID)
+	// No input message carries a note on this turn, but a stop of it is
+	// told to the next main-chat turn.
+	m.recordMainTurnStop(agentID, ctx, end)
 	m.updatePostChatIndex(agentID)
 }
 
-func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) {
+// The returned turnEnd tells whether the turn ended on its own (see
+// turnStopCause).
+func (m *Manager) processChatEvents(ctx context.Context, agentID string, backendCh <-chan ChatEvent, outCh chan<- ChatEvent) (end turnEnd) {
 	m.busyMu.Lock()
 	lifecycle := m.questionLifecycleLocked(agentID)
 	m.busyMu.Unlock()
@@ -3618,6 +3752,9 @@ func (m *Manager) processChatEvents(ctx context.Context, agentID string, backend
 			if !ok {
 				return
 			}
+			if (event.Type == "done" || event.Type == "error") && !end.terminal && m.endMainTurnIfLive(agentID, ctx) {
+				end = turnEnd{terminal: true, errMsg: event.ErrorMessage}
+			}
 
 			accumulate(&event)
 			handleTerminal(&event)
@@ -3800,6 +3937,8 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 		return codexCanResumeSession(agentID, sessionKey)
 	case ToolGrok:
 		return grokCanResumeSession(agentID, sessionKey)
+	case ToolGemini:
+		return geminiCanResumeSession(agentID, sessionKey)
 	}
 
 	// Probe the deterministic Claude session file. expectedClaudeSessionID is
@@ -4028,13 +4167,18 @@ func (m *Manager) IsAgentDMAvailable(agentID string) (bool, bool) {
 
 // trackOneShot registers a one-shot chat's cancel func so it can be
 // cleaned up on Shutdown or agent Delete. Returns an ID for untracking.
-func (m *Manager) trackOneShot(agentID string, cancel context.CancelFunc, sessionKey, originPeerID, handoffCapability string) int64 {
+func (m *Manager) trackOneShot(agentID string, cancel func(), sessionKey, originPeerID, handoffCapability string) int64 {
+	return m.trackOneShotCause(agentID, func(error) { cancel() }, sessionKey, originPeerID, handoffCapability)
+}
+
+// trackOneShotCause is trackOneShot with a cause-aware cancel (see StopCause).
+func (m *Manager) trackOneShotCause(agentID string, cancel context.CancelCauseFunc, sessionKey, originPeerID, handoffCapability string) int64 {
 	m.oneShotCancelsMu.Lock()
 	defer m.oneShotCancelsMu.Unlock()
 	m.oneShotSeq++
 	id := m.oneShotSeq
 	if m.oneShotCancels[agentID] == nil {
-		m.oneShotCancels[agentID] = make(map[int64]context.CancelFunc)
+		m.oneShotCancels[agentID] = make(map[int64]context.CancelCauseFunc)
 	}
 	m.oneShotCancels[agentID][id] = cancel
 	// Record the thread SessionKey (empty for legacy ephemeral one-shots)
@@ -4198,16 +4342,16 @@ func (m *Manager) WaitOneShotDone(ctx context.Context, agentID string, id int64)
 // The map entry is left intact so callers that need to wait for the
 // goroutines to finish (see waitOneShotClear) can observe completion as
 // each goroutine removes itself via untrackOneShot.
-func (m *Manager) cancelOneShots(agentID string) {
-	m.cancelOneShotsExcept(agentID, 0)
+func (m *Manager) cancelOneShots(agentID string, cause error) {
+	m.cancelOneShotsExcept(agentID, 0, cause)
 }
 
 // cancelOneShotsExcept cancels every one-shot except preserveID. A
 // self-initiated handoff keeps its own HTTP-driving turn alive long enough to
 // receive the switch result while still quiescing every other external turn.
-func (m *Manager) cancelOneShotsExcept(agentID string, preserveID int64) {
+func (m *Manager) cancelOneShotsExcept(agentID string, preserveID int64, cause error) {
 	m.oneShotCancelsMu.Lock()
-	cancels := make([]context.CancelFunc, 0, len(m.oneShotCancels[agentID]))
+	cancels := make([]context.CancelCauseFunc, 0, len(m.oneShotCancels[agentID]))
 	for id, cancel := range m.oneShotCancels[agentID] {
 		if id == preserveID {
 			continue
@@ -4216,7 +4360,7 @@ func (m *Manager) cancelOneShotsExcept(agentID string, preserveID int64) {
 	}
 	m.oneShotCancelsMu.Unlock()
 	for _, cancel := range cancels {
-		cancel()
+		cancel(cause)
 	}
 }
 
@@ -4239,10 +4383,10 @@ func (m *Manager) DetachOneShot(agentID string, id int64) {
 }
 
 // cancelAllOneShots cancels all in-flight one-shot chats across all agents.
-func (m *Manager) cancelAllOneShots() {
+func (m *Manager) cancelAllOneShots(cause error) {
 	m.oneShotCancelsMu.Lock()
 	all := m.oneShotCancels
-	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
 	m.oneShotOrigins = make(map[string]map[int64]string)
 	m.oneShotHandoffCaps = make(map[string]map[int64]string)
@@ -4250,7 +4394,7 @@ func (m *Manager) cancelAllOneShots() {
 	m.oneShotCancelsMu.Unlock()
 	for _, cancels := range all {
 		for _, cancel := range cancels {
-			cancel()
+			cancel(cause)
 		}
 	}
 }
@@ -4613,6 +4757,10 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	if prep.volatileContext != "" {
 		effectiveMessage = prep.volatileContext + effectiveMessage
 	}
+	stopNote, stopNoteETag := m.peekMainStopNote(agentID)
+	if stopNote != "" {
+		effectiveMessage = injectRecentMessagesContext(effectiveMessage, stopNote+"\n")
+	}
 
 	// Truncate atomically with the pivot AND source etag re-checks.
 	// If a racing edit landed between findRegenerateTarget's snapshot
@@ -4637,7 +4785,8 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		regenHistory = m.BuildHistoryTurnsBefore(ctx, agentID, rt.SourceID)
 	}
 
-	chatCtx, cancel := context.WithCancel(context.Background())
+	chatCtx, cancelCause := context.WithCancelCause(context.Background())
+	cancel := func() { cancelCause(nil) }
 	outCh := make(chan ChatEvent, 64)
 	bc := newChatBroadcaster(outCh)
 
@@ -4647,7 +4796,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	m.busyMu.Lock()
 	delete(m.editing, agentID)
 	editingReleased = true
-	m.busy[agentID] = busyEntry{cancel: cancel, startedAt: time.Now(), broadcaster: bc, accumulator: newChatAccumulator(), outCh: outCh}
+	m.busy[agentID] = busyEntry{cancel: cancel, cancelCause: cancelCause, ctx: chatCtx, startedAt: time.Now(), broadcaster: bc, accumulator: newChatAccumulator(), outCh: outCh}
 	m.busyMu.Unlock()
 	m.notifyChatStart(agentID)
 
@@ -4692,7 +4841,11 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		if err != nil {
 			// Abort before the stream started is not a failure —
 			// exit silently so no error surfaces in the transcript.
-			if errors.Is(err, context.Canceled) || chatCtx.Err() != nil {
+			if !m.endMainTurnIfLive(agentID, chatCtx) {
+				m.recordMainTurnStop(agentID, chatCtx, turnEnd{})
+				return
+			}
+			if errors.Is(err, context.Canceled) {
 				return
 			}
 			// Persist as a system message and fan out via the
@@ -4717,7 +4870,10 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			}
 			return
 		}
-		m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		m.commitMainStopNote(agentID, stopNoteETag)
+		end := m.processChatEvents(chatCtx, agentID, backendCh, outCh)
+		m.markMainTurnEnded(agentID)
+		m.recordMainTurnStop(agentID, chatCtx, end)
 		m.updatePostChatIndex(agentID)
 		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
 	}()
@@ -4835,13 +4991,35 @@ func (m *Manager) Shutdown() {
 	}
 	m.cron.Stop()
 
+	cause := KojoStop(stopReasonShutdown)
 	m.busyMu.Lock()
-	for _, entry := range m.busy {
-		entry.cancel()
+	notes := make(map[string]string, len(m.busy))
+	for id, entry := range m.busy {
+		if !entry.turnEnded && !entry.noStopNote {
+			// The note the chat goroutine will record: a turn already
+			// stopped by another cause (e.g. the user) keeps that cause.
+			note := stopNoteText(&StopCause{Reason: stopReasonShutdown})
+			userStop := false
+			if entry.ctx != nil && entry.ctx.Err() != nil {
+				c, _ := stopCauseOf(entry.ctx)
+				note = stopNoteText(c)
+				userStop = c != nil && c.ByUser
+			}
+			// A user stop's "" still clears an undelivered older note.
+			if note != "" || userStop {
+				notes[id] = note
+			}
+		}
+		entry.stop(cause)
 	}
 	m.busyMu.Unlock()
+	// The chat goroutines record the note too, but the store may already be
+	// closed by then: write it now.
+	for id, note := range notes {
+		m.putMainStopNote(id, note)
+	}
 
-	m.cancelAllOneShots()
+	m.cancelAllOneShots(cause)
 
 	m.save()
 }

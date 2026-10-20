@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -680,7 +681,7 @@ func (s *Server) drainQueueLocally(ctx context.Context, agentID string, msgs []*
 					break consume
 				}
 			case <-ctx.Done():
-				s.agents.Abort(agentID)
+				s.agents.Abort(agentID, agent.KojoStop(agent.StopReasonShutdown))
 				aborted = true
 				// Bounded wait for the chat goroutine to finish:
 				// Manager.Shutdown only CANCELS chat contexts (no

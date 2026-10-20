@@ -45,7 +45,14 @@ export interface AgentSettingsFormState {
    * stored value (and the per-tool default) untouched.
    */
   codexApps?: boolean;
+  /** gemini maxOutputTokens; 0 = server default. */
+  maxOutputTokens: number;
 }
+
+/** Server default for gemini maxOutputTokens (Go GeminiDefaultMaxOutputTokens). */
+export const GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+/** Server upper bound (Go GeminiMaxOutputTokensLimit). */
+export const GEMINI_MAX_OUTPUT_TOKENS_LIMIT = 65536;
 
 /** True for the backends driven by the codex CLI (codexApps applies). */
 export function isCodexCLITool(tool: string): boolean {
@@ -95,6 +102,7 @@ export function needsCustomURLFor(tool: string): boolean {
  *   - allowProtectedPaths: only emitted for claude / custom-claude — those
  *     are the only backends whose Bash/Edit gating respects the
  *     server-side allowlist.
+ *   - maxOutputTokens: only emitted for gemini (0 = default).
  *   - tts: nested object; empty strings collapse to undefined so the
  *     server treats them as "use default".
  */
@@ -144,5 +152,6 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     disabledInjections: state.disabledInjections,
     autoEffort: state.autoEffort,
     codexApps: isCodexCLITool(state.tool) ? state.codexApps : undefined,
+    maxOutputTokens: state.tool === "gemini" ? state.maxOutputTokens : undefined,
   };
 }

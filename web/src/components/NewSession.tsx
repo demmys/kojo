@@ -160,10 +160,13 @@ export function NewSession() {
         parsedArgs = ["--model", model, ...parsedArgs];
       }
       // Effort flag differs per CLI: claude/grok take --effort, codex takes
-      // a -c config override. Skip when the user already passed their own,
-      // and when a manual --model/-m overrides the dropdown model — the
-      // selected effort was validated against the dropdown model's ladder,
-      // which may not apply to the manually-typed one.
+      // a -c config override. gemini (OpenCode TUI) has no effort flag;
+      // kojo's launcher strips --effort and turns it into the OpenCode
+      // config's thinking variant.
+      // Skip when the user already passed their own, and when a manual
+      // --model/-m overrides the dropdown model — the selected effort was
+      // validated against the dropdown model's ladder, which may not apply
+      // to the manually-typed one.
       if (effort && model && !hasModelArg && supportsEffort(tool)) {
         const hasEffortArg = parsedArgs.some(
           (a) =>
@@ -239,7 +242,7 @@ export function NewSession() {
             )}
 
             {/* Tool selection */}
-            <Field label={t("field.tool")}>
+            <Field label={t("field.tool")} help={tool === "gemini" ? t("ns.geminiHelp") : undefined}>
               <div className="space-y-2">
                 {info &&
                   Object.entries(info.tools ?? {}).map(([name, toolInfo]) => (
@@ -265,6 +268,9 @@ export function NewSession() {
                         className="accent-[color:var(--color-copper)]"
                       />
                       <span className="font-mono text-[14px] text-ink">{name}</span>
+                      {name === "gemini" && (
+                        <span className="text-[11px] text-ink-faint">{t("tool.viaOpenCode")}</span>
+                      )}
                       {!toolInfo.available && (
                         <span className="text-[11px] text-ink-faint">{t("ns.notAvailable")}</span>
                       )}
@@ -364,7 +370,9 @@ export function NewSession() {
                     ? t("ns.yoloClaude")
                     : tool === "codex"
                       ? t("ns.yoloCodex")
-                      : t("ns.yoloOther")}
+                      : tool === "gemini"
+                        ? t("ns.yoloGemini")
+                        : t("ns.yoloOther")}
                 </div>
               </div>
               <span onClick={(e) => e.stopPropagation()}>

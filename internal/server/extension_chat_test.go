@@ -111,7 +111,7 @@ func TestExtensionChatRejectsNonExtensionsAndBadInput(t *testing.T) {
 func TestExtensionChatSessionsAreExclusive(t *testing.T) {
 	var e extensionChatSessions
 	cancelled := 0
-	if !e.acquire("k", func() { cancelled++ }) || e.acquire("k", nil) {
+	if !e.acquire("k", func(error) { cancelled++ }) || e.acquire("k", nil) {
 		t.Fatal("a session key must be held by one turn at a time")
 	}
 	if !e.acquire("other", nil) {
@@ -119,10 +119,10 @@ func TestExtensionChatSessionsAreExclusive(t *testing.T) {
 	}
 	// Cancelling stops the turn but leaves the key held: the turn is
 	// still winding down.
-	if !e.cancel("k") || cancelled != 1 || e.acquire("k", nil) {
+	if !e.cancel("k", nil) || cancelled != 1 || e.acquire("k", nil) {
 		t.Fatalf("cancel: cancelled=%d", cancelled)
 	}
-	if e.cancel("idle") {
+	if e.cancel("idle", nil) {
 		t.Fatal("cancel reported a turn for an idle key")
 	}
 	e.release("k")
@@ -529,6 +529,10 @@ func TestExtensionChatCancelKeepsTheStream(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancel did not stop the turn")
 	}
+	// Without byUser the package's stop is reported as a kojo stop.
+	if sc := stopCauseFrom(context.Cause(turnCtx)); sc == nil || sc.ByUser || sc.Reason != extensionStopReasonPackage {
+		t.Fatalf("cancel cause = %+v", sc)
+	}
 	f.chatEvents <- agent.ChatEvent{Type: "done", BackgroundTasksPending: 2}
 	close(f.chatEvents)
 	select {
@@ -541,6 +545,69 @@ func TestExtensionChatCancelKeepsTheStream(t *testing.T) {
 	}
 	if !s.extensionChats.acquire("ag_1:slack:C1:1.2", nil) {
 		t.Fatal("session key still held after the turn ended")
+	}
+}
+
+func stopCauseFrom(err error) *agent.StopCause {
+	var sc *agent.StopCause
+	if errors.As(err, &sc) {
+		return sc
+	}
+	return nil
+}
+
+// Slack `!stop` sends byUser: the turn is stopped as an explicit user stop.
+// A package that goes away stops it as a kojo disconnect.
+func TestExtensionChatCancelCauses(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		disconnect bool
+		byUser     bool
+		reason     string
+	}{
+		{"byUser", `{"sessionKey":"C1:1.2","byUser":true}`, false, true, ""},
+		{"package", `{"sessionKey":"C1:1.2","byUser":false}`, false, false, extensionStopReasonPackage},
+		{"disconnect", "", true, false, extensionStopReasonDisconnect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newExtChatTestServer(t)
+			f.chatEvents = make(chan agent.ChatEvent)
+			f.chatStarted = make(chan struct{})
+			pv := map[string]string{"id": "ag_1"}
+			reqCtx, disconnect := context.WithCancel(context.Background())
+			defer disconnect()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				req := httptest.NewRequest("POST", "/x", strings.NewReader(`{"sessionKey":"C1:1.2","message":"hi"}`)).WithContext(reqCtx)
+				for k, v := range pv {
+					req.SetPathValue(k, v)
+				}
+				req = req.WithContext(auth.WithPrincipal(req.Context(), slackExtPrincipal("ag_1")))
+				s.handleExtensionChat(httptest.NewRecorder(), req)
+			}()
+			<-f.chatStarted
+			f.mu.Lock()
+			turnCtx := f.chatCtx
+			f.mu.Unlock()
+			if tc.disconnect {
+				disconnect()
+			} else if rr := extChatCall(s.handleExtensionChatCancel, slackExtPrincipal("ag_1"), "POST", "/x", tc.body, pv); rr.Code != http.StatusOK {
+				t.Fatalf("cancel: %d %s", rr.Code, rr.Body.String())
+			}
+			select {
+			case <-turnCtx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("turn not stopped")
+			}
+			sc := stopCauseFrom(context.Cause(turnCtx))
+			if sc == nil || sc.ByUser != tc.byUser || (!tc.byUser && sc.Reason != tc.reason) {
+				t.Fatalf("cause = %+v", sc)
+			}
+			close(f.chatEvents)
+			<-done
+		})
 	}
 }
 

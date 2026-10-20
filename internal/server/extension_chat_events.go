@@ -186,7 +186,7 @@ type extensionEventStream struct {
 	mu         sync.Mutex
 	closed     bool
 	unregister func()
-	turns      map[string]func()
+	turns      map[string]context.CancelCauseFunc
 	acks       map[string]chan error
 }
 
@@ -259,10 +259,10 @@ func (st *extensionEventStream) sendContext(ctx context.Context, evt extensionCh
 	}
 }
 
-func (st *extensionEventStream) addTurn(turnID string, cancel func()) {
+func (st *extensionEventStream) addTurn(turnID string, cancel context.CancelCauseFunc) {
 	st.mu.Lock()
 	if st.turns == nil {
-		st.turns = map[string]func(){}
+		st.turns = map[string]context.CancelCauseFunc{}
 	}
 	st.turns[turnID] = cancel
 	st.mu.Unlock()
@@ -276,12 +276,12 @@ func (st *extensionEventStream) removeTurn(turnID string) {
 
 // cancelTurn stops a background turn the stream is relaying and reports
 // whether it was still running.
-func (st *extensionEventStream) cancelTurn(turnID string) bool {
+func (st *extensionEventStream) cancelTurn(turnID string, cause error) bool {
 	st.mu.Lock()
 	cancel, ok := st.turns[turnID]
 	st.mu.Unlock()
 	if ok {
-		cancel()
+		cancel(cause)
 	}
 	return ok
 }
@@ -381,30 +381,31 @@ type extensionBackgroundRelay struct {
 // read events until the channel closes whatever happens, so every exit
 // drains; an exit before the end also cancels the turn, because a turn
 // whose output reaches nobody should not keep running.
-func (h *extensionBackgroundRelay) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan agent.ChatEvent, cancel func()) {
+func (h *extensionBackgroundRelay) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan agent.ChatEvent, cancel context.CancelCauseFunc) {
 	defer func() {
 		for range events {
 		}
 	}()
-	stop := func() {
+	stop := func(cause error) {
 		if cancel != nil {
-			cancel()
+			cancel(cause)
 		}
 	}
+	lost := func() { stop(agent.KojoStop(extensionStopReasonDisconnect)) }
 	st := h.stream
 	suffix, ok := extensionSessionSuffix(agentID, st.key.extensionID, sessionKey)
 	if !ok || agentID != st.key.agentID {
 		// Not this package's session: the handler slot is per agent, not
 		// per namespace, so a keyed session of another surface can land
 		// here. The package has nowhere to post it.
-		stop()
+		stop(agent.KojoStop(extensionStopReasonNoOutput))
 		return
 	}
 	turnID := newExtensionEventID()
 	st.addTurn(turnID, stop)
 	defer st.removeTurn(turnID)
 	if !st.send(extensionChatEvent{Type: "background_turn", TurnID: turnID, SessionKey: suffix}) {
-		stop()
+		lost()
 		return
 	}
 	for {
@@ -415,11 +416,11 @@ func (h *extensionBackgroundRelay) HandleKeyedBackgroundTurn(agentID, sessionKey
 				return
 			}
 			if !st.send(extensionChatEvent{Type: "background_event", TurnID: turnID, Event: &evt}) {
-				stop()
+				lost()
 				return
 			}
 		case <-st.done:
-			stop()
+			lost()
 			return
 		}
 	}
@@ -639,6 +640,8 @@ func (s *Server) handleExtensionChatEvents(w http.ResponseWriter, r *http.Reques
 
 type extensionChatBackgroundCancelRequest struct {
 	TurnID string `json:"turnId"`
+	// ByUser marks an explicit stop by a person (Slack `!stop`).
+	ByUser bool `json:"byUser,omitempty"`
 }
 
 // handleExtensionChatBackgroundCancel stops a background turn the
@@ -659,7 +662,7 @@ func (s *Server) handleExtensionChatBackgroundCancel(w http.ResponseWriter, r *h
 	}
 	cancelled := false
 	if st := s.extensionEvents.get(extensionEventKey{extensionID: p.ExtensionID, agentID: r.PathValue("id")}); st != nil {
-		cancelled = st.cancelTurn(req.TurnID)
+		cancelled = st.cancelTurn(req.TurnID, extensionStopCause(req.ByUser))
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"ok": true, "cancelled": cancelled})
 }

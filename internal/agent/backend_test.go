@@ -49,7 +49,9 @@ func TestBackendLoadsClaudeSkills(t *testing.T) {
 // `<agentDir>/.grok/session_id` plus the
 // $GROK_HOME/sessions/<encoded(absAgentDir)>/<uuid>/ subtree (see
 // grok_session_transfer.go); codex transfers .codex thread refs,
-// rollout JSONLs, and Codex state rows. custom-bare has no session
+// rollout JSONLs, and Codex state rows; gemini transfers its OpenCode
+// session refs plus `opencode export` dumps of the sessions they name
+// (gemini_session_transfer.go). custom-bare has no session
 // state at all and must stay false.
 func TestBackendSupportsDeviceSwitch(t *testing.T) {
 	t.Parallel()
@@ -64,6 +66,7 @@ func TestBackendSupportsDeviceSwitch(t *testing.T) {
 		{"grok", true},
 		{"codex", true},
 		{"custom-codex", true},
+		{"gemini", true},
 		{"custom-bare", false},
 		{"llama.cpp", false},
 		{"", false},
@@ -81,9 +84,10 @@ func TestBackendSupportsDeviceSwitch(t *testing.T) {
 func TestDeviceSwitchHasSkillLoader(t *testing.T) {
 	t.Parallel()
 
-	for _, tool := range []string{"claude", "custom-claude", "grok", "codex", "custom-codex", "custom-bare", ""} {
+	for _, tool := range []string{"claude", "custom-claude", "grok", "codex", "custom-codex", "gemini", "custom-bare", ""} {
 		hasSkillLoader := backendLoadsClaudeSkills(tool) ||
-			NormalizeToolName(tool) == ToolCodex || NormalizeToolName(tool) == ToolCustomCodex
+			NormalizeToolName(tool) == ToolCodex || NormalizeToolName(tool) == ToolCustomCodex ||
+			NormalizeToolName(tool) == ToolGemini
 		if backendSupportsDeviceSwitch(tool) && !hasSkillLoader {
 			t.Errorf("backendSupportsDeviceSwitch(%q) is true but no skill loader is wired", tool)
 		}

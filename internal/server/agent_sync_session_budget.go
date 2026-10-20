@@ -26,6 +26,7 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 		codex   codexThreadWire
 		grok    grokSessionWire
 		hasGrok bool
+		gemini  geminiSessionWire
 	}
 	artifacts := make([]artifact, 0, len(req.ClaudeSessions))
 	for i := range req.ClaudeSessions {
@@ -54,6 +55,23 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 			kind: "grok", path: "grok-session/" + v.SessionID, size: size, grok: v, hasGrok: true,
 		})
 	}
+	if req.GeminiSession != nil {
+		// One artifact: refs and the chat logs they resume are only
+		// useful together (StageGeminiSession rejects refs whose log is
+		// missing), so the set is kept or skipped as a unit.
+		var size int64
+		for _, f := range req.GeminiSession.Files {
+			size += int64(base64.StdEncoding.DecodedLen(len(f.ContentB64)))
+		}
+		v := *req.GeminiSession
+		label := "gemini-session"
+		if len(v.Refs) > 0 {
+			label += "/" + v.Refs[0].SessionID
+		}
+		artifacts = append(artifacts, artifact{
+			kind: "gemini", path: label, size: size, gemini: v,
+		})
+	}
 	if len(artifacts) == 0 {
 		return 0, 0, nil
 	}
@@ -63,12 +81,14 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 	req.ClaudeSessions = nil
 	req.CodexSession = nil
 	req.GrokSession = nil
+	req.GeminiSession = nil
 	selected := make([]artifact, 0, len(artifacts))
 	rejected := make([]artifact, 0)
 	apply := func(items []artifact) {
 		req.ClaudeSessions = nil
 		req.CodexSession = nil
 		req.GrokSession = nil
+		req.GeminiSession = nil
 		for _, a := range items {
 			switch a.kind {
 			case "claude":
@@ -83,6 +103,9 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 					v := a.grok
 					req.GrokSession = &v
 				}
+			case "gemini":
+				v := a.gemini
+				req.GeminiSession = &v
 			}
 		}
 	}
@@ -112,6 +135,8 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 			encoded, e = json.Marshal(a.codex)
 		case "grok":
 			encoded, e = json.Marshal(a.grok)
+		case "gemini":
+			encoded, e = json.Marshal(a.gemini)
 		}
 		if e != nil {
 			return 0, 0, fmt.Errorf("measure session artifact %s: %w", a.path, e)
@@ -164,6 +189,8 @@ func fitAgentSyncSessions(req *peerAgentSyncRequest, maxRawBytes int64) (kept, s
 			}
 		case "grok":
 			addSessionBytes = int64(len(`,"grok_session":`)) + a.sessionJSONBytes
+		case "gemini":
+			addSessionBytes = int64(len(`,"opencode_session":`)) + a.sessionJSONBytes
 		}
 		if baseSize < maxRawBytes && currentSize-removeSkipBytes+addSessionBytes <= maxRawBytes {
 			selected = append(selected, a.artifact)

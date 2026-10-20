@@ -55,7 +55,7 @@ func syncSession(k *keyedTestSession) {
 }
 
 func initOneShotMaps(m *Manager) {
-	m.oneShotCancels = make(map[string]map[int64]context.CancelFunc)
+	m.oneShotCancels = make(map[string]map[int64]context.CancelCauseFunc)
 	m.oneShotSessions = make(map[string]map[int64]string)
 	m.oneShotOrigins = make(map[string]map[int64]string)
 	m.oneShotHandoffCaps = make(map[string]map[int64]string)
@@ -410,7 +410,7 @@ func TestWebUIThreadBackgroundTurnIgnoresForeignRoom(t *testing.T) {
 	events <- ChatEvent{Type: "done", Message: &Message{Role: "assistant", Content: "wrong agent"}}
 	close(events)
 	// ag_bob is not the thread's member: nothing is posted, the turn aborted.
-	gdm.HandleKeyedBackgroundTurn("ag_bob", "groupdm:"+groupID, events, func() { aborted <- struct{}{} })
+	gdm.HandleKeyedBackgroundTurn("ag_bob", "groupdm:"+groupID, events, func(error) { aborted <- struct{}{} })
 	select {
 	case <-aborted:
 	case <-time.After(time.Second):
@@ -500,7 +500,7 @@ func TestWebUIThreadBackgroundTurnLifecycleCancelPostsNothing(t *testing.T) {
 	}()
 	events <- ChatEvent{Type: "text", Delta: "partial"}
 	waitFor(t, "background turn tracked", func() bool { return oneShotCount(mgr, "ag_alice") > 0 })
-	mgr.cancelOneShots("ag_alice")
+	mgr.cancelOneShots("ag_alice", nil)
 	select {
 	case <-aborted:
 	case <-time.After(3 * time.Second):

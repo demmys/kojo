@@ -16,7 +16,7 @@ import { useT } from "../../lib/i18n";
 import { AgentAvatar } from "./AgentAvatar";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { SlackMigrationNotice, useSlackMigration } from "./SlackMigrationNotice";
-import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
+import { modelsForTool, supportsAutoEffort, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { useCustomModels } from "./fields/useCustomModels";
 import { PersonaField } from "./fields/PersonaField";
 import { ToolPicker } from "./fields/ToolPicker";
@@ -28,6 +28,8 @@ import { useAvatarImageProviders } from "./useAvatarImageProviders";
 import {
   buildAgentSavePayload,
   defaultCodexApps,
+  GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
+  GEMINI_MAX_OUTPUT_TOKENS_LIMIT,
   isCodexCLITool,
   needsCustomURLFor,
 } from "./agentSettingsPayload";
@@ -147,6 +149,8 @@ export function AgentSettings() {
   const [autoEffort, setAutoEffort] = useState(true);
   // Explicit codexApps choice; null = follow the per-tool default.
   const [codexAppsOverride, setCodexAppsOverride] = useState<boolean | null>(null);
+  // gemini maxOutputTokens; 0 = server default.
+  const [maxOutputTokens, setMaxOutputTokens] = useState(0);
   const [responseLanguage, setResponseLanguage] = useState("");
   const [tool, setTool] = useState("");
   const [customBaseURL, setCustomBaseURL] = useState("http://localhost:8080");
@@ -358,6 +362,7 @@ export function AgentSettings() {
     setEffort((a.effort || "") as EffortLevel | "");
     setAutoEffort(a.autoEffort ?? true);
     setCodexAppsOverride(a.codexApps ?? null);
+    setMaxOutputTokens(a.maxOutputTokens ?? 0);
     setResponseLanguage(a.responseLanguage ?? "");
     setTool(a.tool);
     setCustomBaseURL(a.customBaseURL ?? "http://localhost:8080");
@@ -716,6 +721,7 @@ export function AgentSettings() {
             codexAppsOverride !== null && codexAppsOverride !== agent?.codexApps
               ? codexAppsOverride
               : undefined,
+          maxOutputTokens,
           tool,
           customBaseURL,
           thinkingMode,
@@ -1300,6 +1306,7 @@ export function AgentSettings() {
       (supportsEffort(tool) && effort !== ((agent.effort || "") as EffortLevel | "")) ||
       autoEffort !== (agent.autoEffort ?? true) ||
       (isCodexCLITool(tool) && codexAppsOverride !== (agent.codexApps ?? null)) ||
+      (tool === "gemini" && maxOutputTokens !== (agent.maxOutputTokens ?? 0)) ||
       tool.trim() !== agent.tool ||
       (needsCustomURLFor(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
@@ -1744,13 +1751,36 @@ export function AgentSettings() {
 
             <EffortPicker tool={tool} effort={effort} setEffort={setEffort} model={model} />
 
-            {(tool === "claude" || tool === "grok") && (
+            {supportsAutoEffort(tool) && (
               <ToggleRow
                 checked={autoEffort}
                 onChange={setAutoEffort}
                 title={t("settings.autoEffort")}
                 desc={t("settings.autoEffortDesc")}
               />
+            )}
+
+            {tool === "gemini" && (
+              <Field label={t("settings.maxOutputTokens")} help={t("settings.maxOutputTokensDesc")}>
+                <div className="w-36">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={GEMINI_MAX_OUTPUT_TOKENS_LIMIT}
+                    step={1}
+                    value={maxOutputTokens > 0 ? String(maxOutputTokens) : ""}
+                    placeholder={String(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS)}
+                    aria-label={t("settings.maxOutputTokens")}
+                    onChange={(e) => {
+                      // Empty / invalid = server default (0).
+                      const v = Math.floor(e.target.valueAsNumber);
+                      setMaxOutputTokens(
+                        Number.isFinite(v) && v >= 1 ? Math.min(v, GEMINI_MAX_OUTPUT_TOKENS_LIMIT) : 0,
+                      );
+                    }}
+                  />
+                </div>
+              </Field>
             )}
 
             {isCodexCLITool(tool) && (

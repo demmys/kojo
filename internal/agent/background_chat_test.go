@@ -147,7 +147,7 @@ func TestCheckinManagerRetryScopeAndAbort(t *testing.T) {
 			if !busy {
 				t.Fatal("busy lock not held during backend wait")
 			}
-			m.Abort(a.ID)
+			m.Abort(a.ID, nil)
 			var log bytes.Buffer
 			drainBackgroundChat(ctx, events, slog.New(slog.NewTextHandler(&log, nil)), "cron job", a.ID, time.Minute)
 			if tc.source == BusySourceCron && !strings.Contains(log.String(), "cron job cancelled") {

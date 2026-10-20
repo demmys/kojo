@@ -155,6 +155,20 @@ type peerAgentSyncRequest struct {
 	// session starts on target).
 	GrokSession *grokSessionWire `json:"grok_session,omitempty"`
 
+	// GeminiSession carries the gemini agent's OpenCode session refs
+	// (main `.opencode-home/kojo/session_id` plus per-SessionKey thread
+	// refs) and an `opencode export` of each session they point at.
+	// Target stages the exports under .opencode-home/kojo/pending-import
+	// and `opencode import`s them (re-homed to ITS agent dir) before the
+	// next turn, so `opencode run -s <id>` continues the conversation.
+	// Absent for non-gemini agents and gemini agents with no live
+	// session; the receiver treats absence as authoritative and purges
+	// target-local gemini refs. The wire key is "opencode_session" (the
+	// gemini-cli era used "gemini_session" with incompatible contents,
+	// so a mixed-version pair degrades to a fresh session, never to a
+	// misparsed one).
+	GeminiSession *geminiSessionWire `json:"opencode_session,omitempty"`
+
 	// CodexSession carries Codex app-server thread refs plus their
 	// rollout JSONLs and sqlite metadata so `thread/resume` on target
 	// can continue the same conversation. Empty / absent for non-codex
@@ -312,6 +326,26 @@ type grokSessionWire struct {
 // but base64-everywhere insulates us from a future grok release
 // adding binary outputs (e.g. captured images) to the subtree.
 type grokSessionFileWire struct {
+	RelPath    string `json:"rel_path"`
+	ContentB64 string `json:"content_b64"`
+}
+
+// geminiSessionWire is the JSON shape of a transferred gemini (OpenCode)
+// session set. Refs name the resume pointers (Name "" = main ref,
+// "key-<uuid>" = per-SessionKey thread ref); Files carry one
+// `opencode export` JSON per referenced session, named "<sessionID>.json".
+// Content is base64 so the envelope stays text-only.
+type geminiSessionWire struct {
+	Refs  []geminiSessionRefWire  `json:"refs,omitempty"`
+	Files []geminiSessionFileWire `json:"files,omitempty"`
+}
+
+type geminiSessionRefWire struct {
+	Name      string `json:"name,omitempty"`
+	SessionID string `json:"session_id"`
+}
+
+type geminiSessionFileWire struct {
 	RelPath    string `json:"rel_path"`
 	ContentB64 string `json:"content_b64"`
 }
@@ -619,6 +653,30 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		}
 	}
 
+	// gemini session: optional; decode before touching disk / DB.
+	var decodedGemini *agent.GeminiSessionTransfer
+	if req.GeminiSession != nil && len(req.GeminiSession.Files) > 0 {
+		decodedGemini = &agent.GeminiSessionTransfer{
+			Refs:  make([]agent.GeminiSessionRef, 0, len(req.GeminiSession.Refs)),
+			Files: make([]agent.GeminiSessionFile, 0, len(req.GeminiSession.Files)),
+		}
+		for _, r := range req.GeminiSession.Refs {
+			decodedGemini.Refs = append(decodedGemini.Refs, agent.GeminiSessionRef{
+				Name: r.Name, SessionID: r.SessionID,
+			})
+		}
+		for i, gf := range req.GeminiSession.Files {
+			body, ok := decodeSyncB64(w, "opencode_session.files", i, gf.ContentB64)
+			if !ok {
+				return
+			}
+			decodedGemini.Files = append(decodedGemini.Files, agent.GeminiSessionFile{
+				RelPath: gf.RelPath,
+				Content: body,
+			})
+		}
+	}
+
 	// codex session: optional. Decode rollout JSONLs before any DB /
 	// disk state is touched so malformed base64 fails atomically.
 	var decodedCodex *agent.CodexSessionTransfer
@@ -728,6 +786,34 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
+	// Gemini follows the same authoritative-snapshot rule: absence purges
+	// target-local refs and chat logs so a later gemini turn starts fresh
+	// (with the canonical-history fallback) instead of resuming divergent
+	// target history.
+	var geminiCommit, geminiRollback func()
+	var gmerr error
+	if decodedGemini == nil {
+		geminiCommit, geminiRollback, gmerr = agent.StageGeminiSessionCleanup(req.Agent.ID)
+	} else {
+		geminiCommit, geminiRollback, gmerr = agent.StageGeminiSession(req.Agent.ID, decodedGemini)
+	}
+	if gmerr != nil {
+		if sessionRollback != nil {
+			sessionRollback()
+		}
+		if grokRollback != nil {
+			grokRollback()
+		}
+		if codexRollback != nil {
+			codexRollback()
+		}
+		s.logger.Error("peer agent-sync: gemini session stage failed",
+			"agent", req.Agent.ID, "err", gmerr)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"gemini session stage: "+gmerr.Error())
+		return
+	}
+
 	// Incremental message sync: SinceMessageSeq > 0 means source
 	// has consulted /agent-sync/state, confirmed source's
 	// transcript is append-only (no tombstones, no edits), and
@@ -755,6 +841,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		if codexRollback != nil {
 			codexRollback()
 		}
+		if geminiRollback != nil {
+			geminiRollback()
+		}
 		writeError(w, http.StatusBadRequest, "unsupported",
 			"since_memory_entry_seq is not a valid delta cursor; use since_memory_entry_updated_at")
 		return
@@ -777,6 +866,20 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	if err := s.applyReceiverOwnedSettingsToSyncRecord(r.Context(), req.Agent, req.OpID, req.TransferSkips); err != nil {
 		releasePatch()
 		releaseMemSync()
+		// Restore the staged session snapshots: their stage held the
+		// per-agent transfer locks, which only commit/rollback release.
+		if sessionRollback != nil {
+			sessionRollback()
+		}
+		if grokRollback != nil {
+			grokRollback()
+		}
+		if codexRollback != nil {
+			codexRollback()
+		}
+		if geminiRollback != nil {
+			geminiRollback()
+		}
 		writeError(w, http.StatusInternalServerError, "internal",
 			"merge receiver-owned settings: "+err.Error())
 		return
@@ -807,6 +910,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 		if codexRollback != nil {
 			codexRollback()
 		}
+		if geminiRollback != nil {
+			geminiRollback()
+		}
 		s.logger.Error("peer agent-sync: store apply failed; rolled back session files",
 			"agent", req.Agent.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -822,6 +928,9 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	}
 	if codexCommit != nil {
 		codexCommit()
+	}
+	if geminiCommit != nil {
+		geminiCommit()
 	}
 
 	// Hub-local settings overrides (internal/agent/hub_local_update.go):

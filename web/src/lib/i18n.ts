@@ -397,6 +397,11 @@ const messages = {
     en: "Add one above — the agent can also add todos via its API",
   },
   "todos.doneSection": { ja: "完了 {count}", en: "Done {count}" },
+  "todos.clearDone": { ja: "完了を全削除", en: "Delete all done" },
+  "todos.clearDoneConfirm": {
+    ja: "完了済みのToDo {count} 件をすべて削除する？",
+    en: "Delete all {count} done todos?",
+  },
   "todos.markDone": { ja: "完了にする", en: "Mark done" },
   "todos.reopen": { ja: "未完了に戻す", en: "Reopen" },
   "todos.delete": { ja: "削除", en: "Delete" },
@@ -650,6 +655,15 @@ const messages = {
   "settings.autoEffortDesc": {
     ja: "タスクの難易度に応じて毎ターンの effort を自動で選ぶ。Effort 設定は上限 / フォールバックになる。",
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
+  },
+  "settings.maxOutputTokens": { ja: "最大出力トークン", en: "Max output tokens" },
+  "field.toolGeminiHelp": {
+    ja: "gemini は Gemini モデルを OpenCode (opencode CLI) 経由で動かす。opencode のインストールと Global Settings の Gemini API キーが必要。",
+    en: "gemini runs Gemini models through OpenCode (the opencode CLI). Requires opencode to be installed and a Gemini API key in Global Settings.",
+  },
+  "settings.maxOutputTokensDesc": {
+    ja: "1 ターンの応答で生成できるトークン数の上限 (思考トークンを含む)。空欄で既定値 65536。",
+    en: "Upper bound on tokens generated per response (thinking included). Leave empty for the default (65536).",
   },
   "settings.codexApps": { ja: "Codex apps（ChatGPT コネクタ）", en: "Codex apps (ChatGPT connectors)" },
   "settings.codexAppsDesc": {
@@ -1843,6 +1857,15 @@ const messages = {
     ja: "--dangerously-bypass-approvals-and-sandbox 付きで起動する",
     en: "Launches with --dangerously-bypass-approvals-and-sandbox",
   },
+  "ns.yoloGemini": {
+    ja: "--auto 付きで起動する",
+    en: "Launches with --auto",
+  },
+  "ns.geminiHelp": {
+    ja: "Gemini モデルを OpenCode (opencode CLI) の TUI で動かす。Global Settings の Gemini API キーを使い、~/.config/opencode などの個人設定・ログインは読まない。",
+    en: "Runs Gemini models in the OpenCode (opencode CLI) TUI, using the Gemini API key from Global Settings; your own ~/.config/opencode settings and logins are never read.",
+  },
+  "tool.viaOpenCode": { ja: "OpenCode 経由", en: "via OpenCode" },
   "ns.yoloOther": {
     ja: "権限確認をスキップする",
     en: "Skip permission prompts",

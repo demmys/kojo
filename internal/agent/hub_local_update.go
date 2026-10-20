@@ -53,6 +53,7 @@ import (
 //   - tts                   (holder-side synthesis config)
 //   - deviceSwitchEnabled   (installs/removes SKILL.md on holder disk)
 //   - codexApps             (codex app-server launch flags on the holder)
+//   - maxOutputTokens       (gemini OpenCode config written on the holder)
 //   - cronMessage           (persisted via agent_workspace_files
 //     kind=checkin — NOT in the agents settings_json row, so a
 //     hub-row-only write would silently no-op)
@@ -107,7 +108,8 @@ func (cfg *AgentUpdateConfig) HubLocalOnly() bool {
 		cfg.AllowProtectedPaths == nil &&
 		cfg.TTS == nil &&
 		cfg.DeviceSwitchEnabled == nil &&
-		cfg.CodexApps == nil
+		cfg.CodexApps == nil &&
+		cfg.MaxOutputTokens == nil
 }
 
 // UpdateRemoteHubRow applies a hub-local-safe PATCH to the hub's own

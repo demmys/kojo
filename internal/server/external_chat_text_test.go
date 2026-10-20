@@ -1044,3 +1044,192 @@ func TestExternalChatRouterRelaysStopThreadBackgroundTasks(t *testing.T) {
 		t.Fatalf("err = %v, want ErrBackgroundSessionNotFound", err)
 	}
 }
+
+// The Hub records relayed keyed turns' stop notes itself when the holder
+// advertises stopNotesV1: it forwards its pending note once and notes the
+// stop from the stream end.
+func TestExternalChatRouterHubStopNotes(t *testing.T) {
+	const key = "ag:slack:C1:1.2"
+	var stopNotes atomic.Bool
+	stopNotes.Store(true)
+	type mode int
+	const (
+		modeLost mode = iota
+		modeBlock
+		modeDone
+		modeHangup
+		modeHolderStop
+		modeTurnStopped
+	)
+	var next atomic.Int32
+	seen := make(chan externalChatTextRequest, 4)
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(externalChatReadyResponse{Ready: true, HolderPeer: "holder", StopNotesV1: stopNotes.Load()})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/goal-stop") {
+			// A stopped goal request fences its run: not a turn.
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var req externalChatTextRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		seen <- req
+		switch mode(next.Load()) {
+		case modeLost:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "text", Delta: "partial"})
+		case modeBlock:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "text", Delta: "started"})
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		case modeDone:
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "done"})
+		case modeHolderStop:
+			// A stop on the holder: its ChatOneShot ends the stream so.
+			writeExternalChatTestStream(t, w, agent.ChatEvent{Type: "error", ErrorMessage: agent.ErrMsgCancelled})
+		case modeTurnStopped:
+			writeError(w, http.StatusConflict, externalChatTurnStoppedCode, "stopped")
+		case modeHangup:
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	t.Cleanup(holder.Close)
+	srv, router, agentID := prepareRemoteExternalChat(t, holder.URL)
+	turn := func(ctx context.Context, cancel func()) externalChatTextRequest {
+		t.Helper()
+		events, err := router.ChatOneShot(ctx, agentID, "hi", agent.OneShotOpts{SessionKey: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := true
+		for range events {
+			if first && cancel != nil {
+				cancel()
+			}
+			first = false
+		}
+		return <-seen
+	}
+	seededNote := "[kojo] 直前のターンはユーザーではなく kojo が停止しました（理由: テスト）。会話ログに \"interrupted by user\" 等とあってもユーザーの操作ではありません。"
+	seed := func() { srv.agents.RecordKeyedStopCause(agentID, key, agent.KojoStop("テスト")) }
+	seed()
+
+	// Stream lost: the pending note travels once, the loss is noted.
+	next.Store(int32(modeLost))
+	if req := turn(context.Background(), nil); !req.HubStopNotes || req.StopNote != seededNote {
+		t.Fatalf("request = hubStopNotes %v stopNote %q", req.HubStopNotes, req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, seededNote) {
+		t.Fatalf("note after lost stream = %q", got)
+	}
+
+	// A user stop on the Hub leaves no note (and clears the older one).
+	next.Store(int32(modeBlock))
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turn(ctx, func() { cancel(agent.UserStop()) })
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != "" {
+		t.Fatalf("note after user stop = %q", got)
+	}
+	seed()
+
+	// A normal end consumes the note and leaves none.
+	next.Store(int32(modeDone))
+	if req := turn(context.Background(), nil); req.StopNote != seededNote {
+		t.Fatalf("stopNote = %q", req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != "" {
+		t.Fatalf("note after done = %q", got)
+	}
+
+	// Lost after the request went out: the sent note is replaced by the loss.
+	next.Store(int32(modeHangup))
+	seed()
+	if _, err := router.ChatOneShot(context.Background(), agentID, "hi", agent.OneShotOpts{SessionKey: key}); err == nil {
+		t.Fatal("hung-up POST succeeded")
+	}
+	if req := <-seen; req.StopNote != seededNote {
+		t.Fatalf("stopNote = %q", req.StopNote)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行デバイスとの接続断") || strings.Contains(got, seededNote) {
+		t.Fatalf("note after hang-up = %q", got)
+	}
+	srv.agents.CommitKeyedNote(agentID, key, srv.agents.PeekKeyedNote(agentID, key))
+
+	// A goal request is no turn the model reads: the note stays.
+	seed()
+	next.Store(int32(modeDone))
+	if events, err := router.ChatOneShot(context.Background(), agentID, "setup", agent.OneShotOpts{
+		SessionKey: key, Goal: &agent.GoalRequest{Action: "status"},
+	}); err != nil {
+		t.Fatalf("goal request: %v", err)
+	} else {
+		for range events {
+		}
+	}
+	if req := <-seen; !req.HubStopNotes || req.StopNote != "" || req.Goal == nil {
+		t.Fatalf("goal request = hubStopNotes %v stopNote %q goal %v", req.HubStopNotes, req.StopNote, req.Goal)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
+		t.Fatalf("note after goal request = %q", got)
+	}
+
+	// A goal control request runs no turn: its stop or loss replaces no note.
+	for _, m := range []mode{modeBlock, modeLost} {
+		next.Store(int32(m))
+		ctx, cancel := context.WithCancelCause(context.Background())
+		events, err := router.ChatOneShot(ctx, agentID, "status", agent.OneShotOpts{
+			SessionKey: key, Goal: &agent.GoalRequest{Action: "status"},
+		})
+		if err != nil {
+			cancel(nil)
+			t.Fatalf("goal request: %v", err)
+		}
+		for range events {
+			cancel(agent.KojoStop("test"))
+		}
+		cancel(nil)
+		<-seen
+		if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
+			t.Fatalf("note after goal control (mode %d) = %q", m, got)
+		}
+	}
+	srv.agents.CommitKeyedNote(agentID, key, seededNote)
+
+	// A stop on the holder is noted as kojo's, not lost or ignored.
+	next.Store(int32(modeHolderStop))
+	turn(context.Background(), nil)
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行中のプロセスを kojo が終了") {
+		t.Fatalf("note after holder stop = %q", got)
+	}
+	srv.agents.CommitKeyedNote(agentID, key, srv.agents.PeekKeyedNote(agentID, key))
+
+	// Stopped on the holder before it streamed: noted the same way.
+	next.Store(int32(modeTurnStopped))
+	if _, err := router.ChatOneShot(context.Background(), agentID, "hi", agent.OneShotOpts{SessionKey: key}); err == nil {
+		t.Fatal("stopped turn succeeded")
+	}
+	<-seen
+	if got := srv.agents.PeekKeyedNote(agentID, key); !strings.Contains(got, "実行中のプロセスを kojo が終了") {
+		t.Fatalf("note after holder pre-stream stop = %q", got)
+	}
+	srv.agents.CommitKeyedNote(agentID, key, srv.agents.PeekKeyedNote(agentID, key))
+
+	// An old holder records its own notes: nothing is sent or noted here.
+	stopNotes.Store(false)
+	seed()
+	next.Store(int32(modeLost))
+	if req := turn(context.Background(), nil); req.HubStopNotes || req.StopNote != "" {
+		t.Fatalf("old holder request = %#v", req)
+	}
+	if got := srv.agents.PeekKeyedNote(agentID, key); got != seededNote {
+		t.Fatalf("old holder: Hub note = %q", got)
+	}
+}

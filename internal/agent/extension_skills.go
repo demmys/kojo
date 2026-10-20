@@ -58,14 +58,18 @@ func SetExtensionSkillLookup(fn func(string) []ExtensionSkill) { extensionSkillL
 
 // extensionSkillRoot maps a backend tool onto the project config
 // directory whose skills/ subtree it reads. Codex has its own; claude,
-// custom-claude and grok all walk `.claude`. custom-bare runs no CLI
-// with a skill concept, so it gets nothing.
+// custom-claude and grok all walk `.claude`; gemini (OpenCode) reads
+// `.opencode` (the backend lists <agentDir>/.opencode/skills in the
+// config's skills.paths). custom-bare runs no CLI with a skill concept,
+// so it gets nothing.
 func extensionSkillRoot(tool string) string {
 	switch NormalizeToolName(tool) {
 	case ToolClaude, ToolCustomClaude, ToolGrok:
 		return ".claude"
 	case ToolCodex, ToolCustomCodex:
 		return ".codex"
+	case ToolGemini:
+		return ".opencode"
 	}
 	return ""
 }
@@ -94,8 +98,16 @@ func SyncExtensionSkillsForTool(agentID, tool string, logger *slog.Logger) {
 	// concurrent tool switch cannot interleave with this sweep.
 	unlock := lockDeviceSwitchSkill(agentID)
 	defer unlock()
+	if NormalizeToolName(tool) == ToolGemini {
+		// Copies kojo installed for the pre-OpenCode gemini backend
+		// (marker-owned only; hand-written skills stay).
+		syncExtensionSkills(filepath.Join(agentDir(agentID), legacyGeminiSkillRoot, "skills"), nil, logger)
+	}
 	syncExtensionSkills(filepath.Join(agentDir(agentID), root, "skills"), want, logger)
 }
+
+// legacyGeminiSkillRoot is where the gemini-cli backend installed skills.
+const legacyGeminiSkillRoot = ".gemini"
 
 // syncExtensionSkills is the lock-free core, split out so tests can
 // drive it against a temp directory.

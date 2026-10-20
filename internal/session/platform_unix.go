@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/creack/pty/v2"
+	"github.com/loppo-llc/kojo/internal/proctree"
 )
 
 func init() {
@@ -94,7 +97,8 @@ func (m *Manager) platformStop(s *Session, id string) error {
 
 	// Kill tmux session backing this session (sends SIGHUP to the CLI process)
 	if tmuxName != "" {
-		_ = tmuxKillSession(tmuxName)
+		tmuxKillSessionFor(tool, tmuxName)
+		m.reapTool(s)
 	}
 
 	// Kill tmux session for internal tmux tool
@@ -210,10 +214,56 @@ func (m *Manager) platformPrepareRestart(s *Session) {
 	s.mu.Lock()
 	s.cleanupPipePane()
 	tmuxName := s.TmuxSessionName
+	tool := s.Tool
 	s.mu.Unlock()
 	if tmuxName != "" && tmuxHasSession(tmuxName) {
-		_ = tmuxKillSession(tmuxName)
+		tmuxKillSessionFor(tool, tmuxName)
 	}
+	m.reapTool(s)
+}
+
+// treeKillGrace bounds how long Stop/Restart waits for a tree-killed
+// tool's processes to exit before force-killing them.
+const treeKillGrace = 3 * time.Second
+
+// tmuxKillSessionFor kills a tmux session. For gemini (OpenCode) the pane
+// process tree is snapshotted (and frozen, see proctree.Snapshot) first
+// and terminated afterwards: OpenCode starts every shell-tool command
+// detached in its own process group, so the SIGHUP tmux sends reaches
+// only the TUI and a command the model left running (a dev server,
+// `sleep`) would be orphaned. The call returns only once the old tree is
+// gone (at most treeKillGrace plus the listings), for Stop as well as
+// Restart: a Restart issued right after Stop must not start a TUI that
+// shares the session DB with the old one, and kojo exiting right after
+// Stop must not cut a background reap short.
+func tmuxKillSessionFor(tool, name string) {
+	if tool != toolGemini {
+		_ = tmuxKillSession(name)
+		return
+	}
+	var trees []*proctree.Tree
+	for _, pid := range tmuxPanePIDs(name) {
+		trees = append(trees, proctree.Snapshot(pid))
+	}
+	_ = tmuxKillSession(name)
+	for _, t := range trees {
+		t.TerminateThenKill(treeKillGrace)
+	}
+}
+
+// tmuxPanePIDs returns the pids of every pane process in the session.
+func tmuxPanePIDs(name string) []int {
+	out, err := exec.Command("tmux", "list-panes", "-s", "-t", name, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, f := range strings.Fields(string(out)) {
+		if pid, err := strconv.Atoi(f); err == nil && pid > 1 {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
 }
 
 // buildInternalToolRestartArgs builds restart arguments for internal tools (tmux).

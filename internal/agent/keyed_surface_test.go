@@ -23,7 +23,7 @@ func newFakeKeyedSurface(origin string) *fakeKeyedSurface {
 	return &fakeKeyedSurface{origin: origin, turns: make(chan []ChatEvent, 4), ctxs: make(chan context.Context, 4), abandoned: make(chan int, 4)}
 }
 
-func (f *fakeKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, _, _ string, events <-chan ChatEvent, _ func()) {
+func (f *fakeKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, _, _ string, events <-chan ChatEvent, _ context.CancelCauseFunc) {
 	f.ctxs <- ctx
 	if f.onTurn != nil {
 		f.onTurn()

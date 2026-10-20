@@ -175,6 +175,9 @@ export interface AgentInfo {
   // Absent = per-tool default: on for codex, off for custom-codex.
   // codex / custom-codex tools only.
   codexApps?: boolean;
+  // maxOutputTokens caps the Gemini request's maxOutputTokens for the
+  // gemini tool (sent through OpenCode). Absent / 0 = server default (65536).
+  maxOutputTokens?: number;
   // busy is a runtime-only flag: true while the agent has an in-flight
   // interactive/cron chat (server-side Manager.IsBusy). The dashboard
   // folds it into the "N running" figure so a chatting agent counts even
@@ -322,6 +325,8 @@ export interface AgentUpdateParams extends Partial<AgentConfig> {
   disabledInjections?: string[];
   autoEffort?: boolean;
   codexApps?: boolean;
+  // gemini only; 0 resets to the default (65536).
+  maxOutputTokens?: number;
 }
 
 export interface AgentMessageAttachment {

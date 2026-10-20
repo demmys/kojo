@@ -214,6 +214,19 @@ func mapTierToEffort(a *Agent, tier string) string {
 	return tier
 }
 
+// toolSupportsAutoEffort reports whether the per-turn effort classifier
+// applies to tool. Each listed backend maps the chosen tier onto its own
+// effort flag/setting; mapTierToEffort clamps through ValidToolModelEffort,
+// so models without an effort ladder (e.g. gemini's pro/auto aliases) keep
+// their static value.
+func toolSupportsAutoEffort(tool string) bool {
+	switch tool {
+	case ToolClaude, ToolGrok, ToolGemini:
+		return true
+	}
+	return false
+}
+
 // resolveTurnEffort picks the effort level for a single turn.
 //
 // Returns the effort string to launch the backend with, and a source tag
@@ -227,7 +240,7 @@ func mapTierToEffort(a *Agent, tier string) string {
 // context so an aborted turn kills the classifier too. Never returns an
 // error: any failure degrades to the agent's static Effort.
 func resolveTurnEffort(ctx context.Context, a *Agent, userMessage string, systemTurn bool, recentDiary string, jevKey string, logger *slog.Logger) (effort string, source string) {
-	if !a.IsAutoEffortEnabled() || (a.Tool != "claude" && a.Tool != "grok") {
+	if !a.IsAutoEffortEnabled() || !toolSupportsAutoEffort(a.Tool) {
 		return a.Effort, "static"
 	}
 	// System turns (cron check-in, wake turn, group DM notification,

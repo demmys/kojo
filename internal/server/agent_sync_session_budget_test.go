@@ -156,3 +156,94 @@ func TestFitAgentSyncSessions_RejectsUnfinishedNativeGoalRowWhenOverCap(t *testi
 		t.Fatalf("err=%v, want unfinished-goal capacity rejection", err)
 	}
 }
+
+func geminiWireForTest(body string) *geminiSessionWire {
+	return &geminiSessionWire{
+		Refs: []geminiSessionRefWire{
+			{SessionID: "6b0f37f5-5d76-47ea-9d50-3a3add9c3936"},
+			{Name: "key-0c1d2e3f-4a5b-4c6d-8e7f-901234567890", SessionID: "6b0f37f5-5d76-47ea-9d50-3a3add9c3936"},
+		},
+		Files: []geminiSessionFileWire{{
+			RelPath:    "session-2026-10-15T09-13-6b0f37f5.jsonl",
+			ContentB64: base64.StdEncoding.EncodeToString([]byte(body)),
+		}},
+	}
+}
+
+func TestFitAgentSyncSessions_GeminiIsOneArtifact(t *testing.T) {
+	base := func() *peerAgentSyncRequest {
+		return &peerAgentSyncRequest{
+			SourceDeviceID: "src", Agent: &store.AgentRecord{ID: "ag_x"},
+			Messages:      []*store.MessageRecord{{ID: "m1", AgentID: "ag_x", Role: "user", Content: "hi"}},
+			GeminiSession: geminiWireForTest(strings.Repeat("g", 2048)),
+		}
+	}
+	full, err := json.Marshal(base())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly at the cap: kept whole, nothing skipped, exact size.
+	req := base()
+	kept, skipped, err := fitAgentSyncSessions(req, int64(len(full)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept != 1 || skipped != 0 || req.GeminiSession == nil || len(req.GeminiSession.Refs) != 2 || len(req.GeminiSession.Files) != 1 {
+		t.Fatalf("kept=%d skipped=%d gemini=%+v", kept, skipped, req.GeminiSession)
+	}
+	if got, _ := json.Marshal(req); len(got) != len(full) {
+		t.Fatalf("size changed: %d != %d", len(got), len(full))
+	}
+
+	// One byte short: the whole set (refs + files) is skipped together.
+	req = base()
+	kept, skipped, err = fitAgentSyncSessions(req, int64(len(full)-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kept != 0 || skipped != 1 || req.GeminiSession != nil {
+		t.Fatalf("kept=%d skipped=%d gemini=%+v", kept, skipped, req.GeminiSession)
+	}
+	if len(req.TransferSkips) != 1 || req.TransferSkips[0].Path != "gemini-session/6b0f37f5-5d76-47ea-9d50-3a3add9c3936" ||
+		req.TransferSkips[0].SizeBytes < 2048 || req.TransferSkips[0].SizeBytes > 2050 { // base64 DecodedLen upper bound
+		t.Fatalf("skips=%+v", req.TransferSkips)
+	}
+	if got, _ := json.Marshal(req); int64(len(got)) > int64(len(full)-1) {
+		t.Fatalf("over cap: %d", len(got))
+	}
+}
+
+func TestSplitAgentSyncIntoChunks_GeminiRidesBegin(t *testing.T) {
+	payload := &peerAgentSyncRequest{
+		SourceDeviceID: "src", OpID: "op", Agent: &store.AgentRecord{ID: "ag_x"},
+		GeminiSession: geminiWireForTest(strings.Repeat("g", 4096)),
+	}
+	est, err := estimateAgentSyncRawSize(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est < 4096 {
+		t.Fatalf("estimate %d ignores gemini files", est)
+	}
+	begin, _, err := splitAgentSyncIntoChunks(payload, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if begin.GeminiSession == nil || len(begin.GeminiSession.Files) != 1 || len(begin.GeminiSession.Refs) != 2 {
+		t.Fatalf("begin gemini = %+v", begin.GeminiSession)
+	}
+	raw, err := json.Marshal(begin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	var back peerAgentSyncChunkedBeginRequest
+	if err := dec.Decode(&back); err != nil {
+		t.Fatalf("strict decode of begin: %v", err)
+	}
+	if back.GeminiSession == nil || back.GeminiSession.Refs[1].Name != payload.GeminiSession.Refs[1].Name {
+		t.Fatalf("round trip lost gemini: %+v", back.GeminiSession)
+	}
+}

@@ -84,7 +84,25 @@ type externalChatTextRequest struct {
 	// AttachBackgroundToken (Hub -> holder) attaches this request's stream to
 	// the holder's buffered keyed background turn instead of starting a turn.
 	AttachBackgroundToken string `json:"attachBackgroundToken,omitempty"`
+	// HubStopNotes (Hub -> holder advertising stopNotesV1): the Hub records
+	// the stop note of this keyed turn itself, since only it knows who
+	// stopped it; the holder records none. StopNote is the Hub's pending
+	// one-time note for the key, injected into this turn.
+	HubStopNotes bool   `json:"hubStopNotes,omitempty"`
+	StopNote     string `json:"stopNote,omitempty"`
 }
+
+// externalChatStopNoteLimit bounds a relayed StopNote (the Hub's own notes
+// are capped well below it).
+const externalChatStopNoteLimit = 16 << 10
+
+// externalChatStopReasonLost is the stop reason of a relayed turn whose
+// stream broke while the Hub still wanted it.
+const externalChatStopReasonLost = "実行デバイスとの接続断"
+
+// externalChatTurnStoppedCode is the holder's error code for a relayed turn
+// it stopped before the stream started (agent.ErrTurnStopped).
+const externalChatTurnStoppedCode = "turn_stopped"
 
 type externalChatSteerRequest struct {
 	GoalUserID string                `json:"goalUserId,omitempty"`
@@ -194,6 +212,8 @@ type externalChatReadyResponse struct {
 	// KeyedBackgroundV1: the holder accepts lingerBackgroundTasks /
 	// attachBackgroundToken and reports keyed background turns to the Hub.
 	KeyedBackgroundV1 bool `json:"keyedBackgroundV1,omitempty"`
+	// StopNotesV1: the holder accepts hubStopNotes / stopNote.
+	StopNotesV1 bool `json:"stopNotesV1,omitempty"`
 }
 
 type externalChatDispatchState int
@@ -775,10 +795,30 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 	if err := r.checkRouteVersion(routeCtx, agentID); err != nil {
 		return externalChatVersionFailure(err)
 	}
+	// Who stopped a relayed keyed turn is known here, not on the holder, so
+	// the Hub keeps its stop notes and hands the pending one to the turn.
+	hubStopNotes := ready.StopNotesV1 && req.SessionKey != ""
+	stopNote := ""
+	req.HubStopNotes, req.StopNote = hubStopNotes, ""
+	if hubStopNotes && req.AttachBackgroundToken == "" && req.Goal == nil {
+		// Not for a goal request: its message is no turn the model reads.
+		stopNote = s.agents.PeekKeyedNote(agentID, req.SessionKey)
+		req.StopNote = stopNote
+	}
+	// A goal control request runs no turn: its stop is no stopped turn.
+	recordStops := hubStopNotes && !agent.GoalControlOnly(req.Goal)
 	resp, attempted, err := r.postRemote(turnCtx, agentID, holder, req)
 	if err != nil {
 		if turnCtx.Err() != nil {
 			stopGoal()
+			if recordStops && attempted {
+				// The holder may have started it; it records no note itself.
+				s.agents.RecordKeyedStop(agentID, req.SessionKey, turnCtx, false, "")
+			}
+		} else if recordStops && attempted {
+			// Lost after the request went out: the holder may be running it
+			// (with stopNote) and records nothing. This replaces stopNote.
+			s.agents.RecordKeyedStopCause(agentID, req.SessionKey, agent.KojoStop(externalChatStopReasonLost))
 		}
 		// The POST may have reached ChatOneShot before the connection failed.
 		// Never retry this turn on another holder.
@@ -811,14 +851,32 @@ func (r *externalChatRouter) dispatch(routeCtx, turnCtx context.Context, agentID
 			return externalChatDispatchResult{state: externalChatDispatchStale,
 				nextHolder: resp.Header.Get("X-Kojo-Holder-Peer"), err: errors.New(msg)}
 		default:
+			if body.Error.Code == externalChatTurnStoppedCode && recordStops {
+				// Stopped on the holder before it streamed (a Hub cancel
+				// would have ended the request instead).
+				s.agents.RecordKeyedStop(agentID, req.SessionKey, turnCtx, turnCtx.Err() == nil, agent.ErrMsgCancelled)
+			}
 			return externalChatDispatchResult{state: externalChatDispatchDone,
 				err: fmt.Errorf("holder rejected Slack turn (%s): %s", resp.Status, msg)}
 		}
 	}
 
 	r.rememberRouteFrom(routeCtx, agentID, holder)
+	var onEnd func(terminal bool, errMsg string)
+	if stopNote != "" {
+		s.agents.CommitKeyedNote(agentID, req.SessionKey, stopNote)
+	}
+	if recordStops {
+		onEnd = func(terminal bool, errMsg string) {
+			if !terminal && turnCtx.Err() == nil {
+				s.agents.RecordKeyedStopCause(agentID, req.SessionKey, agent.KojoStop(externalChatStopReasonLost))
+				return
+			}
+			s.agents.RecordKeyedStop(agentID, req.SessionKey, turnCtx, terminal, errMsg)
+		}
+	}
 	out := make(chan agent.ChatEvent, 64)
-	go r.decodeExternalChatTextStream(turnCtx, agentID, holder, resp.Body, out, stopGoal)
+	go r.decodeExternalChatTextStream(turnCtx, agentID, holder, resp.Body, out, onEnd, stopGoal)
 	return externalChatDispatchResult{events: out, state: externalChatDispatchDone}
 }
 
@@ -1058,6 +1116,7 @@ func (s *Server) handleExternalChatReady(w http.ResponseWriter, r *http.Request)
 	// legacy main-WebUI arrival before it transfers the lock.
 	ready.OriginAwareArrivalV1 = true
 	ready.KeyedBackgroundV1 = true
+	ready.StopNotesV1 = true
 	writeJSONResponse(w, http.StatusOK, ready)
 }
 
@@ -1161,6 +1220,10 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			HandoffCapability:                 strings.TrimSpace(r.Header.Get("X-Kojo-Handoff-Capability")),
 			ResponseAttachmentGroupID:         req.ResponseAttachmentGroupID,
 			ResponseAttachmentMessageID:       req.ResponseAttachmentMessageID,
+			StopNotedByCaller:                 req.HubStopNotes,
+		}
+		if req.HubStopNotes && req.Goal == nil && len(req.StopNote) <= externalChatStopNoteLimit {
+			opts.TurnNote = req.StopNote
 		}
 		if req.LingerBackgroundTasks && strings.TrimSpace(req.SessionKey) != "" && s.peerID != nil && hubAddr != "" {
 			// The session may outlive this request (max linger); its surface
@@ -1170,7 +1233,14 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			opts.LingerBackgroundTasks = true
 			opts.KeyedSurface = surface
 		}
-		events, err = s.agents.ChatOneShot(r.Context(), agentID, req.Message, opts)
+		// A Hub-side end of the request (its user's `!stop`, its own stop,
+		// a lost connection) reaches us as a plain cancel we cannot
+		// classify: leave its note to the Hub (or none, for an old Hub)
+		// rather than claim a kojo stop. Our own stops keep their cause.
+		turnCtx, cancelTurn := context.WithCancelCause(context.WithoutCancel(r.Context()))
+		defer cancelTurn(agent.ErrStopNotedByCaller)
+		defer context.AfterFunc(r.Context(), func() { cancelTurn(agent.ErrStopNotedByCaller) })()
+		events, err = s.agents.ChatOneShot(turnCtx, agentID, req.Message, opts)
 	}
 	if err != nil {
 		switch {
@@ -1195,6 +1265,9 @@ func (s *Server) handleExternalChatText(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusConflict, code, err.Error())
 		case errors.Is(err, agent.ErrAgentArchived):
 			writeError(w, http.StatusConflict, "archived", err.Error())
+		case errors.Is(err, agent.ErrTurnStopped):
+			// Stopped here before it streamed: the Hub notes it.
+			writeError(w, http.StatusConflict, externalChatTurnStoppedCode, err.Error())
 		default:
 			writeError(w, http.StatusConflict, "chat_rejected", err.Error())
 		}
@@ -1440,8 +1513,11 @@ func (s *Server) externalChatPeerAllowed(w http.ResponseWriter, r *http.Request)
 	return false
 }
 
-func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, agentID, holder string, body io.ReadCloser, out chan<- agent.ChatEvent, onCancel ...func()) {
+// onEnd (optional) is told, once the stream is over, whether a terminal event
+// arrived while ctx was alive and its error message.
+func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, agentID, holder string, body io.ReadCloser, out chan<- agent.ChatEvent, onEnd func(terminal bool, errMsg string), onCancel ...func()) {
 	defer body.Close()
+	aliveTerminal, aliveErr := false, ""
 	// json.Decoder can otherwise remain blocked in Read after the Slack turn
 	// is cancelled. Closing the response body tears down the HTTP stream and,
 	// on the holder, cancels the request context passed to ChatOneShot.
@@ -1462,6 +1538,11 @@ func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, a
 			cancelOnce()
 		}
 		if !closed {
+			// Note the stop before the adapter sees the end: its next turn
+			// must find the note.
+			if onEnd != nil {
+				onEnd(aliveTerminal, aliveErr)
+			}
 			close(out)
 			closed = true
 		}
@@ -1516,6 +1597,9 @@ func (r *externalChatRouter) decodeExternalChatTextStream(ctx context.Context, a
 		evt := *env.Event
 		if evt.Type == "done" || evt.Type == "error" {
 			terminal = true
+			if ctx.Err() == nil {
+				aliveTerminal, aliveErr = true, evt.ErrorMessage
+			}
 		}
 		if evt.Type == "attachment" && env.AttachmentAckToken != "" {
 			evt.PrepareAttachmentOwnership()

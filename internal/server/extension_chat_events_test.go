@@ -163,7 +163,7 @@ func TestExtensionEventsRelayBackgroundTurn(t *testing.T) {
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
-		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func() { close(cancelled) })
+		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func(error) { close(cancelled) })
 	}()
 	turn := c.expect("background_turn")
 	if turn.TurnID == "" || turn.SessionKey != "C1:1.2" {
@@ -199,9 +199,13 @@ func TestExtensionEventsRelayBackgroundTurn(t *testing.T) {
 	foreign <- agent.ChatEvent{Type: "text"}
 	close(foreign)
 	foreignCancelled := false
-	h.HandleKeyedBackgroundTurn("ag_1", "ag_1:ext.demo:k", foreign, func() { foreignCancelled = true })
+	var foreignCause error
+	h.HandleKeyedBackgroundTurn("ag_1", "ag_1:ext.demo:k", foreign, func(c error) { foreignCancelled, foreignCause = true, c })
 	if _, open := <-foreign; open || !foreignCancelled {
 		t.Fatalf("foreign session: drained=%v cancelled=%v", !open, foreignCancelled)
+	}
+	if sc := stopCauseFrom(foreignCause); sc == nil || sc.ByUser || sc.Reason != extensionStopReasonNoOutput {
+		t.Fatalf("foreign session cause = %+v", sc)
 	}
 	h.KeyedBackgroundTasksAbandoned("ag_1", "ag_1:ext.demo:k", 1, "x")
 
@@ -217,6 +221,7 @@ func TestExtensionEventsRelayBackgroundTurn(t *testing.T) {
 // events are still read to the end: the producer must never block on a
 // handler that stopped listening.
 func TestExtensionEventsDisconnectCancelsAndDrains(t *testing.T) {
+	var lostCause error
 	s, f := newExtChatTestServer(t)
 	srv := newExtEventsHTTP(t, s)
 	c := connectExtEvents(t, srv, extensionSlackPackageID, "ag_1")
@@ -227,7 +232,7 @@ func TestExtensionEventsDisconnectCancelsAndDrains(t *testing.T) {
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
-		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func() { close(cancelled) })
+		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func(c error) { lostCause = c; close(cancelled) })
 	}()
 	c.expect("background_turn")
 	events <- agent.ChatEvent{Type: "text", Delta: "partial"}
@@ -238,6 +243,9 @@ func TestExtensionEventsDisconnectCancelsAndDrains(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(extEventsTestTimeout):
 		t.Fatal("the turn was not cancelled when the stream closed")
+	}
+	if sc := stopCauseFrom(lostCause); sc == nil || sc.ByUser || sc.Reason != extensionStopReasonDisconnect {
+		t.Fatalf("stream-loss cause = %+v", sc)
 	}
 	// Unbuffered sends only complete if the handler keeps reading.
 	for i := 0; i < 3; i++ {
@@ -280,9 +288,10 @@ func TestExtensionEventsBackgroundCancel(t *testing.T) {
 	events := make(chan agent.ChatEvent)
 	cancelled := make(chan struct{})
 	returned := make(chan struct{})
+	var cause error
 	go func() {
 		defer close(returned)
-		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func() { close(cancelled) })
+		h.HandleKeyedBackgroundTurn("ag_1", "ag_1:slack:C1:1.2", events, func(c error) { cause = c; close(cancelled) })
 	}()
 	turn := c.expect("background_turn")
 
@@ -299,7 +308,7 @@ func TestExtensionEventsBackgroundCancel(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("cancel without a turn: %d", rr.Code)
 	}
-	rr = extChatCall(s.handleExtensionChatBackgroundCancel, slackExtPrincipal("ag_1"), "POST", "/x", `{"turnId":"`+turn.TurnID+`"}`, pv)
+	rr = extChatCall(s.handleExtensionChatBackgroundCancel, slackExtPrincipal("ag_1"), "POST", "/x", `{"turnId":"`+turn.TurnID+`","byUser":true}`, pv)
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"cancelled":true`) {
 		t.Fatalf("cancel: %d %s", rr.Code, rr.Body.String())
 	}
@@ -307,6 +316,9 @@ func TestExtensionEventsBackgroundCancel(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(extEventsTestTimeout):
 		t.Fatal("background-cancel did not cancel the turn")
+	}
+	if sc := stopCauseFrom(cause); sc == nil || !sc.ByUser {
+		t.Fatalf("background-cancel byUser cause = %+v", sc)
 	}
 	// The backend answers a cancel with a terminal event; it is relayed.
 	events <- agent.ChatEvent{Type: "done"}

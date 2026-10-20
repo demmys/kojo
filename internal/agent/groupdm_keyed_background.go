@@ -51,26 +51,26 @@ func (m *GroupDMManager) liveAgentThread(groupID, agentID string) bool {
 // HandleKeyedBackgroundTurn implements KeyedBackgroundHandler for WebUI thread
 // rooms: it waits for the room's thread FIFO, exposes the turn as the room's
 // live/stoppable turn, and posts the result daemon-authored.
-func (m *GroupDMManager) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, cancel func()) {
+func (m *GroupDMManager) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan ChatEvent, cancel context.CancelCauseFunc) {
 	m.handleKeyedBackgroundTurnCtx(context.Background(), agentID, sessionKey, events, cancel)
 }
 
 // handleKeyedBackgroundTurnCtx is HandleKeyedBackgroundTurn with the turn's
 // lifecycle context: when parent is cancelled (reset / delete / shutdown) the
 // turn is treated like an archive cancel — nothing is posted.
-func (m *GroupDMManager) handleKeyedBackgroundTurnCtx(parent context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel func()) {
+func (m *GroupDMManager) handleKeyedBackgroundTurnCtx(parent context.Context, agentID, sessionKey string, events <-chan ChatEvent, cancel context.CancelCauseFunc) {
 	defer func() {
 		for range events {
 		}
 	}()
-	abort := func() {
+	abort := func(cause error) {
 		if cancel != nil {
-			cancel()
+			cancel(cause)
 		}
 	}
 	groupID, ok := strings.CutPrefix(sessionKey, webUIThreadKeyPrefix)
 	if !ok || groupID == "" || !m.liveAgentThread(groupID, agentID) {
-		abort()
+		abort(KojoStop(keyedThreadDeletedReason))
 		return
 	}
 	// A lingering keyed session only exists on the node running the agent, so
@@ -86,8 +86,8 @@ func (m *GroupDMManager) deliverRemoteKeyedBackgroundTurn(agentID, sessionKey st
 	if !ok || groupID == "" || !m.liveAgentThread(groupID, agentID) {
 		return ErrNoKeyedBackgroundSurface
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 	replyMessageID := generateGroupMessageID()
 	// Attach before waiting for the thread FIFO: the holder's turn is already
 	// running and its stream must be drained promptly.
@@ -106,25 +106,25 @@ func (m *GroupDMManager) deliverRemoteKeyedBackgroundTurn(agentID, sessionKey st
 // runKeyedBackgroundTurn waits for the thread FIFO and posts the background
 // turn's result. holderCapture: response attachments are captured by the
 // remote holder, so no local stage-dir watcher runs.
-func (m *GroupDMManager) runKeyedBackgroundTurn(parent context.Context, agentID, groupID string, events <-chan ChatEvent, abort func(), replyMessageID string, holderCapture bool) {
+func (m *GroupDMManager) runKeyedBackgroundTurn(parent context.Context, agentID, groupID string, events <-chan ChatEvent, abort context.CancelCauseFunc, replyMessageID string, holderCapture bool) {
 	reservation := m.threadTurns.Reserve(groupID)
 	defer reservation.Release()
 	reservation.Wait()
 	if !m.liveAgentThread(groupID, agentID) {
-		abort()
+		abort(KojoStop(keyedThreadDeletedReason))
 		return
 	}
 
 	if parent.Err() != nil {
-		abort()
+		abort(context.Cause(parent))
 		return
 	}
 	ctx, ctxCancel := context.WithCancel(parent)
 	defer ctxCancel()
 	m.threadCancelMu.Lock()
-	m.threadCancels[groupID] = func() {
+	m.threadCancels[groupID] = func(cause error) {
 		ctxCancel()
-		abort()
+		abort(cause)
 	}
 	delete(m.threadStopped, groupID)
 	m.threadCancelMu.Unlock()

@@ -113,7 +113,7 @@ type keyedBgAttachEntry struct {
 	sessionKey string
 	hubPeerID  string
 	events     <-chan agent.ChatEvent
-	cancel     func()
+	cancel     context.CancelCauseFunc
 	claimed    chan struct{}
 	finished   chan struct{}
 	finishOnce sync.Once
@@ -315,7 +315,8 @@ func bufferKeyedBgEvents(in <-chan agent.ChatEvent) (<-chan agent.ChatEvent, fun
 func (e *keyedBgAttachEntry) finish(terminal bool) {
 	e.finishOnce.Do(func() {
 		if !terminal && e.cancel != nil {
-			e.cancel()
+			// The Hub's side of the attach records the stop note.
+			e.cancel(agent.ErrStopNotedByCaller)
 		}
 		close(e.finished)
 	})
@@ -377,7 +378,7 @@ func (sf *remoteKeyedSurface) holderID() string {
 // HandleKeyedSessionTurn buffers the unsolicited turn for the Hub's attach.
 // Returning leaves any unconsumed events to the caller's drain (the turn then
 // finishes unobserved; it is not aborted).
-func (sf *remoteKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan agent.ChatEvent, cancel func()) {
+func (sf *remoteKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, agentID, sessionKey string, events <-chan agent.ChatEvent, cancel context.CancelCauseFunc) {
 	buffered, discard := bufferKeyedBgEvents(events)
 	// However this returns, the rest of the turn is drained (never replayed).
 	defer discard()
@@ -448,7 +449,7 @@ func (sf *remoteKeyedSurface) HandleKeyedSessionTurn(ctx context.Context, agentI
 	}
 }
 
-func (sf *remoteKeyedSurface) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan agent.ChatEvent, cancel func()) {
+func (sf *remoteKeyedSurface) HandleKeyedBackgroundTurn(agentID, sessionKey string, events <-chan agent.ChatEvent, cancel context.CancelCauseFunc) {
 	sf.HandleKeyedSessionTurn(context.Background(), agentID, sessionKey, events, cancel)
 }
 

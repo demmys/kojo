@@ -258,6 +258,22 @@ func ValidModelEffort(model, effort string) bool {
 // assumptions about that built-in model's effort ladder.
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
+	case ToolGemini:
+		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
+		// only set it (as an OpenCode variant) for the models in
+		// geminiEffortModels (an empty model means GeminiDefaultModel).
+		// Unknown ids accept no effort rather than one that would
+		// silently not apply.
+		switch effort {
+		case "":
+			return true
+		case "low", "medium", "high":
+			if model == "" {
+				model = GeminiDefaultModel
+			}
+			return geminiEffortModels[model] != ""
+		}
+		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
 		if !ValidEffort(effort) {
 			return false
@@ -538,6 +554,12 @@ type Agent struct {
 	// operator's ChatGPT account from an agent meant to stay local.
 	CodexApps *bool `json:"codexApps,omitempty"`
 
+	// MaxOutputTokens is the maxOutputTokens OpenCode sends to Gemini for
+	// the gemini backend (headless turns and PTY sessions). 0 = default
+	// (GeminiDefaultMaxOutputTokens). Persisted inside
+	// agents.settings_json — absent key decodes to 0, no migration.
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+
 	// LastTransferSkips records the session files the most recent
 	// inbound §3.7 device-switch transfer skipped (oversized JSONL,
 	// unreadable codex ref, …). Stamped into settings_json by the
@@ -774,6 +796,8 @@ type AgentConfig struct {
 	// CodexApps toggles the codex CLI "apps" feature. nil = per-tool
 	// default (see Agent.IsCodexAppsEnabled).
 	CodexApps *bool `json:"codexApps"`
+	// MaxOutputTokens: gemini maxOutputTokens; nil/0 = default.
+	MaxOutputTokens *int `json:"maxOutputTokens"`
 }
 
 // AgentUpdateConfig is the request body for PATCH updates.
@@ -834,6 +858,12 @@ type AgentUpdateConfig struct {
 	// as-is"; explicit true/false overwrites. Holder-only: it changes
 	// the app-server launch flags of the live backend.
 	CodexApps *bool `json:"codexApps"`
+	// MaxOutputTokens sets the gemini backend's maxOutputTokens. nil =
+	// "not provided; leave as-is"; 0 = reset to default
+	// (GeminiDefaultMaxOutputTokens); 1..GeminiMaxOutputTokensLimit
+	// otherwise. Holder-only: it changes the OpenCode config written on
+	// the holder each turn.
+	MaxOutputTokens *int `json:"maxOutputTokens"`
 }
 
 // Context-injection section keys togglable via Agent.DisabledInjections.
@@ -1009,6 +1039,13 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	if !ValidThinkingMode(cfg.ThinkingMode) {
 		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)
 	}
+	maxOut := 0
+	if cfg.MaxOutputTokens != nil {
+		if !ValidMaxOutputTokens(*cfg.MaxOutputTokens) {
+			return nil, fmt.Errorf("unsupported maxOutputTokens: %d (must be 0..%d)", *cfg.MaxOutputTokens, GeminiMaxOutputTokensLimit)
+		}
+		maxOut = *cfg.MaxOutputTokens
+	}
 	if cfg.WorkDir != "" {
 		if !filepath.IsAbs(cfg.WorkDir) {
 			return nil, fmt.Errorf("workDir must be an absolute path: %s", cfg.WorkDir)
@@ -1042,6 +1079,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		SilentStart:          silentStart,
 		SilentEnd:            silentEnd,
 		NotifyDuringSilent:   notifyDuringSilent,
+		AutoEffort:           new(bool), // new agents: auto effort off; nil (legacy) = on
 		CronMessage:          cronMessage,
 		// DeviceSwitchEnabled stays nil here when the caller didn't
 		// provide one — IsDeviceSwitchEnabled() returns true for nil
@@ -1049,6 +1087,7 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 		// stamping a sentinel into the row.
 		DeviceSwitchEnabled: cfg.DeviceSwitchEnabled,
 		CodexApps:           cfg.CodexApps,
+		MaxOutputTokens:     maxOut,
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}

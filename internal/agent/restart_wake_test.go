@@ -170,7 +170,7 @@ func TestInFlightOneShotSessionKey(t *testing.T) {
 func TestOneShotOriginAndSelectiveCancellation(t *testing.T) {
 	m := &Manager{
 		busy:            make(map[string]busyEntry),
-		oneShotCancels:  make(map[string]map[int64]context.CancelFunc),
+		oneShotCancels:  make(map[string]map[int64]context.CancelCauseFunc),
 		oneShotSessions: make(map[string]map[int64]string),
 		oneShotOrigins:  make(map[string]map[int64]string),
 		oneShotArmed:    make(map[string]map[int64]time.Time),
@@ -186,7 +186,7 @@ func TestOneShotOriginAndSelectiveCancellation(t *testing.T) {
 	if !ok || origin.ID != id || origin.OriginPeerID != "hub" {
 		t.Fatalf("origin = %#v, ok=%v", origin, ok)
 	}
-	m.AbortExceptOneShot("ag_x", id)
+	m.AbortExceptOneShot("ag_x", id, nil)
 	select {
 	case <-mainCancelled:
 	default:

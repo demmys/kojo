@@ -410,7 +410,7 @@ func loadGeminiAPIKey(creds *CredentialStore) (string, error) {
 
 	// 2. Environment variables. Keep all historical names because existing
 	// deployments use different Google SDK conventions.
-	for _, envName := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
+	for _, envName := range []string{"KOJO_GEMINI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"} {
 		if key := strings.TrimSpace(os.Getenv(envName)); key != "" {
 			return key, nil
 		}

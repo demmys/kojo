@@ -605,6 +605,7 @@ func buildSystemPrompt(a *Agent, logger *slog.Logger, apiBase string, groups []*
 	}
 	sb.WriteString("- Speak naturally, as yourself.\n")
 	sb.WriteString("- The current date and time is supplied at the top of each user message in a `<context>` block. Read it from there when you need it — it intentionally is NOT in this system prompt so the prompt cache stays warm across turns.\n")
+	sb.WriteString("- If your previous turn was stopped, the next message carries a one-time `[kojo] 直前のターンは…` note saying whether the user or kojo stopped it. Trust it: the transcript may say \"interrupted by user\" even when kojo stopped the turn.\n")
 
 	// kojo response-attachment contract. This lives only in the system
 	// prompt (not a project skill) so transport-specific one-shot turns can

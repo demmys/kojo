@@ -14,11 +14,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
 // claudeStdinWriter guards writes to a running Claude CLI process's stdin
@@ -2499,15 +2502,28 @@ func buildProtectedPathAllowRules(paths []string) string {
 
 // bashCaptureHookScript is the PreToolUse hook installed for every claude
 // agent session. It rewrites Bash tool_input.command so that the original
-// command runs to completion in a sub-script, full stdout+stderr are
-// persisted to a capture log, and only head + tail (≤8KB) are returned to
-// the agent when the output is large. Token consumption is bounded without
-// losing the full output for later inspection.
+// command runs in a sub-script (via bashCaptureRunScript), full
+// stdout+stderr are persisted to a capture log, and only head + tail (≤8KB)
+// are returned to the agent when the output is large. Token consumption is
+// bounded without losing the full output for later inspection.
 //
 // __CAP_DIR__ is replaced at write time with the absolute path of the
-// per-agent captures directory. The script is intentionally tolerant of
-// missing jq / write failures: any error path emits `{}` so claude proceeds
-// with the original command (degrading to BASH_MAX_OUTPUT_LENGTH default).
+// per-agent captures directory, __RUN_SCRIPT__ with the absolute path of
+// the runner script and __MAX_BYTES__ with the capture size limit. The
+// script is intentionally tolerant of missing jq / write failures: any
+// error path emits `{}` so claude proceeds with the original command
+// (degrading to BASH_MAX_OUTPUT_LENGTH default).
+//
+// The captures directory deliberately lives OUTSIDE the agent directory
+// (see bashCaptureDir). The agent's cwd is its agent directory, so a
+// capture log under it is inside the agent's natural search scope: a
+// `grep -r PAT <agentDir> | grep -v ...` reads its own capture log, finds
+// its own (longer, path-prefixed) match lines, and appends them again —
+// the log outgrows the reader and never hits EOF. GNU grep's
+// "input file is also the output" guard does not fire because the first
+// grep writes to a pipe. This once produced a 644GB capture log and
+// filled the disk. The runner's size limit is the second line of defense
+// for runaway output that no directory choice can prevent.
 //
 // Trust boundary: the agent runs Bash with bypassPermissions, so it could
 // in principle modify the hook script or read capture files. This hook
@@ -2530,6 +2546,10 @@ orig=$(printf '%s' "$input" | "$JQ" -r '.tool_input.command // empty' 2>/dev/nul
 if [ -z "$orig" ]; then echo '{}'; exit 0; fi
 
 cap_dir='__CAP_DIR__'
+run_script='__RUN_SCRIPT__'
+# Without the runner the wrapper would fail with "No such file" and the
+# original command would silently not run; fall back to no capture instead.
+[ -r "$run_script" ] || { echo '{}'; exit 0; }
 mkdir -p "$cap_dir" || { echo '{}'; exit 0; }
 
 # Best-effort TTL prune (silent failures OK). Removes capture pairs older
@@ -2556,11 +2576,12 @@ orig_json=$(printf '%s' "$input" | "$JQ" -c '.tool_input // {}' 2>/dev/null) || 
 # path with whitespace.
 script_q=$(printf '%q' "$script")
 log_q=$(printf '%q' "$log")
+run_q=$(printf '%q' "$run_script")
 
 # Wrapper command returned to claude as updatedInput.command.
 # \$ escapes apply to the OUTER bash (this hook); the INNER bash (executed
 # by claude) sees plain $ec / $sz.
-wrapper="LC_ALL=C bash $script_q >$log_q 2>&1
+wrapper="LC_ALL=C bash $run_q $script_q $log_q __MAX_BYTES__
 ec=\$?
 sz=\$(LC_ALL=C wc -c <$log_q | tr -d ' ')
 if [ \"\$sz\" -le 8192 ]; then
@@ -2585,14 +2606,195 @@ exit \$ec"
 }'
 `
 
+// bashCaptureRunScript is the runner the capture wrapper invokes as
+// `bash <runner> <script> <log> <max_bytes>`. It runs <script> with
+// stdout+stderr redirected to <log> and a watchdog that kills the
+// command's processes once <log> exceeds <max_bytes>, so a runaway
+// command can no longer fill the disk.
+//
+// Why a watchdog instead of `| head -c N > log`: a pipe stays open while
+// any process holding it is alive, so `server &` inside the command would
+// keep the wrapper blocked until the server exits. Redirecting straight to
+// the file (as before) keeps the "returns when the script exits"
+// semantics. `ulimit -f` was rejected too: it limits every file the
+// command writes (large build artifacts, downloads), not just the capture.
+//
+// The command is started as a job-control job (set -m) so it gets its own
+// process group. Background children it leaves behind stay in that group
+// even after being reparented, which lets the watchdog keep enforcing the
+// limit on them after the runner has returned, and kill all of them at
+// once. The watchdog exits by itself once the group is empty. Claude
+// Code's interrupt/timeout kill walks descendants as well as the process
+// group, and the TERM/INT/HUP trap forwards the kill, so the separate
+// group does not let the command outlive an interrupt.
+//
+// stdin is passed through explicitly because bash otherwise points a
+// background job's stdin at /dev/null. When stdin is a terminal the job
+// stays in the caller's process group instead: a background group reading
+// the tty would be stopped by SIGTTIN. kojo runs claude without a tty, so
+// this only matters for hand-run sessions, which lose the leftover-child
+// coverage but keep the foreground limit.
+//
+// The watchdog measures the log through its own descriptor (/dev/fd/3),
+// not by path: agent reset/delete or the hook's TTL prune may unlink the
+// log while a leftover child still writes to it, and a by-path check would
+// then lose sight of a still-growing file. The size comes from stat
+// (ls -lLn), not by reading: on macOS opening /dev/fd/N dups the
+// descriptor, so a reader such as GNU wc would advance the shared offset
+// and later polls would only count the bytes appended since the last one.
+const bashCaptureRunScript = `#!/bin/bash
+# kojo bash capture runner. Generated per-agent by kojo. Do not edit manually.
+# Usage: bash-capture-run.sh <script> <log> <max_bytes>
+script=$1
+log=$2
+max=$3
+
+# Freeze each process before walking its children so it cannot fork new
+# ones mid-walk, then kill it. Catches descendants that moved to another
+# process group. ps -A -o pid= -o ppid= works on Linux and macOS alike
+# (pgrep is not guaranteed to be installed).
+killtree() {
+  local p=$1 c
+  kill -STOP "$p" 2>/dev/null
+  for c in $(ps -A -o pid= -o ppid= 2>/dev/null | awk -v p="$p" '$2 == p { print $1 }'); do
+    killtree "$c"
+  done
+  kill -KILL "$p" 2>/dev/null
+}
+
+killjob() {
+  [ -n "$jc" ] && kill -STOP -- "-$pid" 2>/dev/null
+  killtree "$pid"
+  [ -n "$jc" ] && kill -KILL -- "-$pid" 2>/dev/null
+}
+
+# alive: is anything of the command left? With job control that is the
+# whole process group (covers reparented background children).
+alive() {
+  if [ -n "$jc" ]; then kill -0 -- "-$pid" 2>/dev/null; else kill -0 "$pid" 2>/dev/null; fi
+}
+
+# Create the log and hold a descriptor to it before anything can unlink it.
+: >"$log" || exit 126
+exec 3<"$log"
+
+jc=
+[ -t 0 ] || jc=1
+[ -n "$jc" ] && set -m
+bash "$script" <&0 3<&- >"$log" 2>&1 &
+pid=$!
+set +m
+
+trap 'killjob; exit 130' INT
+trap 'killjob; exit 143' TERM
+trap 'killjob; exit 129' HUP
+
+# Watchdog, polled every 0.5s: at disk-write speed (~1GB/s) the overshoot
+# past max_bytes stays well under a gigabyte. Its stdio is detached so a
+# lingering watchdog never holds the caller's output pipe open.
+(
+  while :; do
+    sz=$(LC_ALL=C ls -lLn /dev/fd/3 2>/dev/null | awk '{ print $5 }')
+    if [ -n "$sz" ] && [ "$sz" -gt "$max" ]; then
+      if alive; then
+        killjob
+        printf '\n...[KOJO_CAPTURE_LIMIT output exceeded %d bytes; command killed]...\n' "$max" >>"$log"
+      fi
+      exit 0
+    fi
+    alive || exit 0
+    sleep 0.5
+  done
+) </dev/null >/dev/null 2>&1 &
+wd=$!
+exec 3<&-
+
+# stderr dropped: bash would otherwise print a "Killed" job notice into the
+# agent's output; the limit marker in the log already explains it.
+wait "$pid" 2>/dev/null
+ec=$?
+# Over the limit: the watchdog is about to exit (killing whatever is left
+# and appending the marker). Wait so the caller's tail shows the marker.
+# Otherwise leave it running in the background to cover leftover children.
+sz=$(LC_ALL=C wc -c <"$log" 2>/dev/null | tr -d ' ')
+if [ -n "$sz" ] && [ "$sz" -gt "$max" ]; then
+  wait "$wd" 2>/dev/null
+fi
+exit $ec
+`
+
+// bashCaptureMaxBytes caps a single capture log. Far above anything an
+// agent can usefully read back (it only ever sees head+tail 8KB), far
+// below "fills the disk".
+const bashCaptureMaxBytes int64 = 1 << 30
+
+// bashCaptureBaseDir returns the root under which per-agent capture
+// directories live. Overridable for tests.
+var bashCaptureBaseDir = defaultBashCaptureBaseDir
+
+// defaultBashCaptureBaseDir places captures in the user cache directory
+// (XDG_CACHE_HOME / ~/.cache on Linux, ~/Library/Caches on macOS): the
+// data is disposable, and it is outside every agent's cwd. os.TempDir is
+// avoided because it is often a RAM-backed tmpfs. Falls back to a cache
+// subdirectory of the kojo config dir — still outside agents/.
+func defaultBashCaptureBaseDir() string {
+	if d, err := os.UserCacheDir(); err == nil && d != "" {
+		return filepath.Join(d, "kojo", "captures")
+	}
+	return filepath.Join(configdir.Path(), "cache", "captures")
+}
+
+// bashCaptureDir returns the capture directory for one agent. It must
+// stay outside agentDir(agentID); see bashCaptureHookScript.
+func bashCaptureDir(agentID string) string {
+	return filepath.Join(bashCaptureBaseDir(), agentID)
+}
+
+// removeBashCaptureDir deletes an agent's captures (reset / delete). Before
+// captures moved out of the agent dir this happened implicitly via the
+// .claude/ or agent dir RemoveAll.
+func removeBashCaptureDir(agentID string, logger *slog.Logger) {
+	if err := os.RemoveAll(bashCaptureDir(agentID)); err != nil && logger != nil {
+		logger.Warn("failed to remove bash capture dir", "agent", agentID, "err", err)
+	}
+}
+
+// legacyBashCaptureTTL matches the hook's own prune window.
+const legacyBashCaptureTTL = 24 * time.Hour
+
+// pruneLegacyBashCaptures drains the pre-relocation <agentDir>/.claude/captures
+// directory. Only entries older than the hook's TTL are removed — a claude
+// process started before the upgrade may still be writing there — and the
+// directory itself goes once it is empty. Best-effort.
+func pruneLegacyBashCaptures(claudeDir string) {
+	dir := filepath.Join(claudeDir, "captures")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-legacyBashCaptureTTL)
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
+	_ = os.Remove(dir) // fails (harmlessly) while non-empty
+}
+
 // hostOS is overridable for tests. Initialized to runtime.GOOS at startup.
 var hostOS = runtime.GOOS
 
 // writeBashCaptureHook materializes the per-agent PreToolUse hook script
-// and creates the captures directory. Returns the absolute path of the
-// hook script, suitable for embedding in settings.local.json.
+// and its runner, and creates the captures directory. Returns the absolute
+// path of the hook script, suitable for embedding in settings.local.json.
 func writeBashCaptureHook(claudeDir, captureDir string) (string, error) {
-	if err := os.MkdirAll(captureDir, 0o755); err != nil {
+	// 0o700: captures hold raw command output, which can include secrets.
+	if err := os.MkdirAll(captureDir, 0o700); err != nil {
 		return "", fmt.Errorf("create capture dir: %w", err)
 	}
 	hooksDir := filepath.Join(claudeDir, "hooks")
@@ -2605,7 +2807,18 @@ func writeBashCaptureHook(claudeDir, captureDir string) (string, error) {
 	// canonical '\'' close-open-close pattern. agentDir today never contains
 	// quotes, but defensive escaping prevents future surprises.
 	capDirSafe := strings.ReplaceAll(captureDir, `'`, `'\''`)
-	script := strings.ReplaceAll(bashCaptureHookScript, "__CAP_DIR__", capDirSafe)
+	runPath := filepath.Join(hooksDir, "bash-capture-run.sh")
+	runPathSafe := strings.ReplaceAll(runPath, `'`, `'\''`)
+	// The runner must exist before the hook that references it; the hook
+	// also checks for it and degrades to no-capture when it is missing.
+	if err := atomicWriteFile(runPath, []byte(bashCaptureRunScript), 0o755); err != nil {
+		return "", fmt.Errorf("write capture runner: %w", err)
+	}
+	script := strings.NewReplacer(
+		"__CAP_DIR__", capDirSafe,
+		"__RUN_SCRIPT__", runPathSafe,
+		"__MAX_BYTES__", strconv.FormatInt(bashCaptureMaxBytes, 10),
+	).Replace(bashCaptureHookScript)
 	hookPath := filepath.Join(hooksDir, "bash-capture.sh")
 	// Atomic write: an in-flight bash hook invocation could be mid-read on
 	// the existing file. os.WriteFile would truncate it and corrupt that
@@ -2665,14 +2878,20 @@ func PrepareClaudeSettings(agentID, apiBase string, allowProtectedPaths []string
 		return
 	}
 
-	captureDir := filepath.Join(claudeDir, "captures")
+	// Captures live outside the agent dir (see bashCaptureHookScript for
+	// the self-feeding grep that motivated this).
+	captureDir := bashCaptureDir(agentID)
 	// Captures are NOT pruned here. PrepareClaudeSettings is called from
 	// prepareChat *before* the busy lock is acquired and can also fire
 	// concurrently from multiple ChatOneShot invocations for the same agent
 	// — a RemoveAll here would race against an in-flight claude process and
 	// nuke its live capture files. Instead, captures are bounded by:
 	//   1) per-call cleanup of stale entries (TTL) inside the hook itself,
-	//   2) full wipe of .claude/ on agent reset (manager_lifecycle.go).
+	//   2) the per-capture size limit enforced by the runner,
+	//   3) removeBashCaptureDir on agent reset / delete.
+	// The pre-relocation <agentDir>/.claude/captures is drained with the
+	// same TTL so nothing in-flight is removed.
+	pruneLegacyBashCaptures(claudeDir)
 	//
 	// Skip on Windows: the hook script is POSIX bash and depends on
 	// mktemp / find / jq / wc / tr / head -c / tail -c / printf %q. Whether

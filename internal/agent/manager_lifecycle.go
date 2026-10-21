@@ -192,6 +192,8 @@ func (m *Manager) ResetData(id string) error {
 	if err := os.RemoveAll(filepath.Join(dir, ".claude")); err != nil {
 		m.logger.Warn("reset: failed to remove .claude dir", "agent", id, "err", err)
 	}
+	// Bash captures live outside the agent dir; wipe them alongside .claude.
+	removeBashCaptureDir(id, m.logger)
 	// (Global CLI session stores cleared above, BEFORE lockMemorySync,
 	// to avoid the lock-order inversion against the peer-agent-sync
 	// handler. See the comment at the top of this function for detail.)
@@ -568,6 +570,9 @@ func (m *Manager) Delete(id string) error {
 	if err := os.RemoveAll(dir); err != nil {
 		m.logger.Warn("failed to remove agent dir", "agent", id, "err", err)
 	}
+	// Bash captures live outside the agent dir, so the RemoveAll above
+	// doesn't reach them.
+	removeBashCaptureDir(id, m.logger)
 
 	// Drop auth token before removing from the in-memory map so a
 	// concurrent request can't temporarily resolve to a deleted agent.

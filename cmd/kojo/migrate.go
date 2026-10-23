@@ -201,11 +201,23 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 		// without explicit confirmation. The operator can either remove
 		// the dir manually or run `--migrate-restart` to wipe it under
 		// the same guards used by migration.
+		//
+		// Two benign exceptions keep `--fresh` usable as a recovery /
+		// habitual flag:
+		//   - the dir already carries a fresh-install marker: --fresh is
+		//     a no-op, fall through to the normal completed-v1 boot.
+		//   - the dir is an unmarked v1 install left by an earlier fresh
+		//     boot (pre-fix builds never wrote the marker): adopt it.
 		if st.v1Complete {
-			fmt.Fprintf(os.Stderr, "kojo: --fresh refuses to start: %s already contains a completed v1 install.\n", st.v1Path)
-			os.Exit(1)
-		}
-		if st.v1Exists {
+			if cf, err := readCompleteFile(st.v1Path); err != nil || !cf.FreshInstall {
+				fmt.Fprintf(os.Stderr, "kojo: --fresh refuses to start: %s already contains a completed v1 install.\n", st.v1Path)
+				os.Exit(1)
+			}
+		} else if isUnmarkedV1Install(st.v1Path) {
+			logger.Warn("adopting unmarked v1 install as fresh", "path", st.v1Path)
+			markFreshOrExit(st.v1Path, logger, version)
+			st = probeDirs()
+		} else if st.v1Exists {
 			entries, err := os.ReadDir(st.v1Path)
 			if err != nil {
 				logger.Error("could not read v1 dir for --fresh check", "path", st.v1Path, "err", err)
@@ -225,11 +237,16 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 				os.Exit(1)
 			}
 		}
-		if err := os.MkdirAll(st.v1Path, 0o755); err != nil {
-			logger.Error("could not create v1 dir", "path", st.v1Path, "err", err)
-			os.Exit(1)
+		if !st.v1Complete {
+			if err := os.MkdirAll(st.v1Path, 0o755); err != nil {
+				logger.Error("could not create v1 dir", "path", st.v1Path, "err", err)
+				os.Exit(1)
+			}
+			markFreshOrExit(st.v1Path, logger, version)
+			return true
 		}
-		return true
+		// Fresh-marked install: continue into the normal completed-v1
+		// branch below so the marker still gets verified.
 	}
 
 	// 5.3 trigger table:
@@ -250,7 +267,11 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 		// every boot so the operator doesn't forget. The UI banner is
 		// the canonical channel; this stderr nudge covers CLI / headless
 		// invocations until that banner ships.
-		if st.v0Exists {
+		freshInstall := false
+		if cf, err := readCompleteFile(st.v1Path); err == nil {
+			freshInstall = cf.FreshInstall
+		}
+		if st.v0Exists && !freshInstall {
 			fmt.Fprintf(os.Stderr,
 				"kojo: v0 data is still present at %s. "+
 					"Once you no longer need v0 rollback, run "+
@@ -280,6 +301,15 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 			}
 		}
 		return true
+	case st.v1Exists && !st.v0Exists && isUnmarkedV1Install(st.v1Path):
+		// kojo.db present, no migration lock, no v0: this is a v1 dir
+		// that a first-time install already booted from, but a pre-fix
+		// build never published the completion marker. No migration can
+		// be in flight (migrate.Run writes its lock before creating
+		// kojo.db and v0 is required for it), so adopt it.
+		logger.Warn("adopting unmarked v1 install as fresh", "path", st.v1Path)
+		markFreshOrExit(st.v1Path, logger, version)
+		return true
 	case st.v1Exists && !st.v0Exists:
 		// v1 dir present but no completion marker. Either a previous
 		// migration crashed (lock file should be there) or someone made
@@ -296,16 +326,66 @@ func applyStartupGate(ctx context.Context, flags migrationFlags, logger *slog.Lo
 		// v0 found but no v1 yet — refuse to silently start fresh, which
 		// would orphan the user's data.
 		fmt.Fprintf(os.Stderr, "kojo: v0 data detected at %s.\n", st.v0Path)
-		fmt.Fprintln(os.Stderr, "       run `kojo --migrate` to import it, or `kojo --fresh` for a new install.")
+		if isUnmarkedV1Install(st.v1Path) {
+			fmt.Fprintf(os.Stderr, "       %s already holds v1 data from an earlier --fresh boot.\n", st.v1Path)
+			fmt.Fprintln(os.Stderr, "       run `kojo --fresh` once to keep it and ignore v0.")
+		} else {
+			fmt.Fprintln(os.Stderr, "       run `kojo --migrate` to import it, or `kojo --fresh` for a new install.")
+		}
 		os.Exit(1)
 		return false // unreachable
 	default:
-		// First-time install. Create the v1 dir and proceed.
+		// First-time install. Create the v1 dir, publish the
+		// fresh-install marker so the next boot takes the completed-v1
+		// path, and proceed.
 		if err := os.MkdirAll(st.v1Path, 0o755); err != nil {
 			logger.Error("could not create v1 dir", "path", st.v1Path, "err", err)
 			os.Exit(1)
 		}
+		markFreshOrExit(st.v1Path, logger, version)
 		return true
+	}
+}
+
+// readCompleteFile parses migration_complete.json under v1Path.
+func readCompleteFile(v1Path string) (*migrate.CompleteFile, error) {
+	body, err := os.ReadFile(filepath.Join(v1Path, migrate.CompleteFileName))
+	if err != nil {
+		return nil, err
+	}
+	var cf migrate.CompleteFile
+	if err := json.Unmarshal(body, &cf); err != nil {
+		return nil, err
+	}
+	return &cf, nil
+}
+
+// isUnmarkedV1Install reports whether v1Path holds a v1 install that
+// was booted fresh but never got a completion marker: kojo.db exists,
+// and neither migration_complete.json nor migration_in_progress.lock
+// does. migrate.Run writes its lock before it creates kojo.db, so an
+// interrupted migration always leaves the lock behind and never matches.
+func isUnmarkedV1Install(v1Path string) bool {
+	if fi, err := os.Stat(filepath.Join(v1Path, store.DBFileName)); err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	for _, name := range []string{migrate.CompleteFileName, migrate.LockFileName} {
+		if _, err := os.Lstat(filepath.Join(v1Path, name)); !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+	}
+	return true
+}
+
+// markFreshOrExit publishes the fresh-install completion marker, exiting
+// the process on failure (startup-gate convention).
+func markFreshOrExit(v1Path string, logger *slog.Logger, version string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := migrate.MarkFreshInstall(ctx, v1Path, version, time.Now()); err != nil {
+		logger.Error("could not initialize v1 dir", "path", v1Path, "err", err)
+		fmt.Fprintf(os.Stderr, "kojo: could not initialize %s: %v\n", v1Path, err)
+		os.Exit(1)
 	}
 }
 

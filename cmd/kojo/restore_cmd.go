@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/loppo-llc/kojo/internal/configdir"
+	"github.com/loppo-llc/kojo/internal/migrate"
 	"github.com/loppo-llc/kojo/internal/snapshot"
 )
 
@@ -75,6 +78,14 @@ func runRestoreCommand(logger *slog.Logger, srcDir, targetConfigDir string, forc
 	if err := snapshot.Apply(srcDir, targetConfigDir, opts); err != nil {
 		logger.Error("restore: failed", "src", srcDir, "target", targetConfigDir, "err", err)
 		fmt.Fprintf(os.Stderr, "\nrestore failed: %v\n\n", err)
+		return 1
+	}
+	rebaseCtx, rebaseCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = migrate.RebaseFreshInstallSchema(rebaseCtx, targetConfigDir)
+	rebaseCancel()
+	if err != nil {
+		logger.Error("restore: could not update fresh-install marker", "target", targetConfigDir, "err", err)
+		fmt.Fprintf(os.Stderr, "\nrestore applied, but updating %s failed: %v\n\n", migrate.CompleteFileName, err)
 		return 1
 	}
 	logger.Info("restore: complete", "src", srcDir, "target", targetConfigDir)

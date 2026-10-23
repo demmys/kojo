@@ -160,6 +160,10 @@ func planV0Cleanup(configDirPath string, logger *slog.Logger) (*v0CleanPlan, err
 		plan.PartialReason = fmt.Sprintf("v1 %s parse failed: %v", migrate.CompleteFileName, err)
 		return plan, nil
 	}
+	if cf.FreshInstall {
+		plan.PartialReason = fmt.Sprintf("v1 %s records a fresh install; v0 was never migrated, so it is not safe to soft-delete", migrate.CompleteFileName)
+		return plan, nil
+	}
 	if cf.V0SHA256Manifest == "" {
 		plan.PartialReason = fmt.Sprintf("v1 %s has empty v0_sha256_manifest", migrate.CompleteFileName)
 		return plan, nil

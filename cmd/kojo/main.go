@@ -285,7 +285,9 @@ func main() {
 	// also honor.
 	sessionV0LegacyDir := ""
 	if probe := probeDirs(); probe.v1Complete && probe.v0Exists {
-		sessionV0LegacyDir = probe.v0Path
+		if cf, err := readCompleteFile(probe.v1Path); err == nil && !cf.FreshInstall {
+			sessionV0LegacyDir = probe.v0Path
+		}
 	}
 
 	// Acquire an exclusive advisory lock on the config dir so a second kojo

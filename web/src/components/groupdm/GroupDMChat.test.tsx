@@ -84,6 +84,7 @@ function renderGroup() {
 
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn();
+  Element.prototype.scrollTo = vi.fn() as unknown as typeof Element.prototype.scrollTo;
   mocks.groupGet.mockResolvedValue({
     id: "g1",
     name: "Team",

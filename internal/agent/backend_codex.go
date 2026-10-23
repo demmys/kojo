@@ -643,7 +643,7 @@ func (b *CodexBackend) Chat(ctx context.Context, agent *Agent, userMessage strin
 		// Context fallback selection is centralized here because only the
 		// backend knows whether thread/resume actually succeeded or
 		// thread/start was used.
-		userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumed)
+		userMessage = injectSessionContexts(userMessage, opts, resumed)
 
 		// Step 4: Start turn with user message.
 		// System prompt is NOT prepended here — it flows through

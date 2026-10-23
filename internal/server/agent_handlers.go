@@ -2785,6 +2785,12 @@ func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 	if err := agent.PreCompactSummarize(id, a.Tool, payload.TranscriptPath, s.logger); err != nil {
 		s.logger.Warn("pre-compact summarize failed", "agent", id, "err", err)
 		// Return 200 anyway — don't block compaction on summary failure
+	} else if agent.IsMainClaudeSession(id, payload.SessionID, payload.TranscriptPath) {
+		// The diary is otherwise injected only on a fresh session; the
+		// compacted main session gets the fresh summary once more. Keyed
+		// (thread / Slack) sessions are not tracked: their next fresh
+		// start carries it anyway.
+		s.agents.MarkDiaryReinject(id)
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }

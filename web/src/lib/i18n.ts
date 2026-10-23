@@ -522,8 +522,8 @@ const messages = {
   },
   "settings.inj.diary_notes.label": { ja: "日誌ノート", en: "Diary Notes" },
   "settings.inj.diary_notes.desc": {
-    ja: "最近の活動日誌 (毎ターン)",
-    en: "Recent activity diary (per turn)",
+    ja: "最近の活動日誌 (セッション開始時・圧縮直後のみ)",
+    en: "Recent activity diary (session start and right after compaction only)",
   },
   "settings.inj.memory_search.label": { ja: "メモリ検索", en: "Memory Search" },
   "settings.inj.memory_search.desc": {

@@ -346,7 +346,7 @@ func (b *ClaudeBackend) chatViaSession(ctx context.Context, agent *Agent, userMe
 	// A live reused process carries context even when its JSONL has not been
 	// flushed yet; only a newly spawned --session-id process is fresh.
 	fresh := spawned && inv.bootstrapRecentContext
-	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, !fresh)
+	userMessage = injectSessionContexts(userMessage, opts, !fresh)
 	if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}

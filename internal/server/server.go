@@ -95,6 +95,7 @@ type Server struct {
 	sessions            *session.Manager
 	agents              *agent.Manager
 	groupdms            *agent.GroupDMManager
+	external            *externalState
 	externalChat        *externalChatRouter
 	// extensions is the kojo extension-package registry (packages
 	// installed from a git URL). Nil on PeerOnly daemons and when
@@ -527,6 +528,7 @@ func New(cfg Config) *Server {
 	}
 
 	s := &Server{
+		external:             newExternalState(),
 		peerOnly:             cfg.PeerOnly,
 		sessions:             sessMgr,
 		agents:               cfg.AgentManager,
@@ -741,6 +743,7 @@ func New(cfg Config) *Server {
 		PromoteUnknownTailnetToOwner: !cfg.PeerOnly,
 		Unsafe:                       cfg.Unsafe,
 		UnsafeAsHub:                  !cfg.PeerOnly,
+		DenyAddr:                     s.externalDeniedAddr,
 		Logger:                       logger,
 	})(publicHandler)
 	s.httpSrv = &http.Server{
@@ -754,6 +757,7 @@ func New(cfg Config) *Server {
 		// error" spam — route it through slog and demote those lines.
 		ErrorLog: httpServerErrorLog(logger),
 	}
+	s.refreshExternalDeny(context.Background())
 
 	return s
 }
@@ -828,6 +832,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	// most privileged operation kojo exposes, so no agent or peer
 	// token may reach it. Registered unconditionally; the handlers
 	// answer 503 when the registry is nil.
+	mux.HandleFunc("GET /api/v1/external-agents", s.handleListExternalAgents)
+	mux.HandleFunc("POST /api/v1/external-agents", s.handleCreateExternalAgent)
+	mux.HandleFunc("GET /api/v1/external-agents/{id}", s.handleGetExternalAgent)
+	mux.HandleFunc("PATCH /api/v1/external-agents/{id}", s.handlePatchExternalAgent)
+	mux.HandleFunc("DELETE /api/v1/external-agents/{id}", s.handleDeleteExternalAgent)
+	mux.HandleFunc("POST /api/v1/external-agents/{id}/pairing-code", s.handleExternalPairingCode)
+	mux.HandleFunc("POST /api/v1/external-agents/{id}/revoke", s.handleRevokeExternalAgent)
+	mux.HandleFunc("GET /api/v1/external-nodes", s.handleListExternalNodes)
+	mux.HandleFunc("DELETE /api/v1/external-nodes/{node}", s.handleDeleteExternalNode)
 	mux.HandleFunc("GET /api/v1/extensions", s.handleListExtensions)
 	mux.HandleFunc("POST /api/v1/extensions", s.handleInstallExtension)
 	mux.HandleFunc("POST /api/v1/extensions/preview", s.handlePreviewExtension)
@@ -1863,6 +1876,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// them. End them first; the packages themselves are stopped after
 	// the drain.
 	s.extensionEvents.shutdown()
+	s.shutdownExternal(ctx)
 
 	// Drain HTTP listeners first so no new requests can land while the
 	// rest of the system tears down. Otherwise an in-flight agent chat

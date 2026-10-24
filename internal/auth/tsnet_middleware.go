@@ -81,8 +81,15 @@ type TailnetIdentityConfig struct {
 	PromoteUnknownTailnetToOwner bool
 	// Unsafe collapses the entire WhoIs path. Every caller is
 	// stamped RoleOwner (UnsafeAsHub=true) or RolePeer (false).
-	Unsafe       bool
-	UnsafeAsHub  bool // true on Hub binary (RoleOwner), false on --peer (RolePeer)
+	Unsafe      bool
+	UnsafeAsHub bool // true on Hub binary (RoleOwner), false on --peer (RolePeer)
+	// DenyAddr, when set, refuses (403) a caller before any role is
+	// stamped — including the Hub's WhoIs-failure Owner fallback. The
+	// Hub wires it to the external-agent node denylist so a tailnet
+	// node paired as an external agent can never reach the Owner
+	// surface. Matching is by the caller's tailnet IP, which needs no
+	// WhoIs, so a WhoIs outage cannot open the gate.
+	DenyAddr     func(remoteAddr string) bool
 	ResolveDelay time.Duration
 	Logger       *slog.Logger
 	// SelfDeviceID, when non-empty, demotes a peer_registry hit
@@ -145,6 +152,10 @@ func TailnetIdentityMiddleware(cfg TailnetIdentityConfig) func(http.Handler) htt
 				// Earlier middleware already stamped a principal —
 				// don't clobber.
 				next.ServeHTTP(w, r)
+				return
+			}
+			if cfg.DenyAddr != nil && cfg.DenyAddr(r.RemoteAddr) {
+				writeJSONError(w, http.StatusForbidden, "forbidden", "forbidden")
 				return
 			}
 			if cfg.Unsafe {

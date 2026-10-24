@@ -64,6 +64,15 @@ type externalState struct {
 	conns  map[*trackedConn]netip.Addr
 
 	hub *externalHub
+
+	cache externalCache
+
+	// credMu: credential changes hold it exclusively; posts hold it
+	// shared across validate + append.
+	credMu sync.RWMutex
+
+	rateMu  sync.Mutex
+	buckets map[string]*externalBucket
 }
 
 func newExternalState() *externalState {
@@ -73,6 +82,7 @@ func newExternalState() *externalState {
 		lastTouch:    map[string]time.Time{},
 		conns:        map[*trackedConn]netip.Addr{},
 		hub:          newExternalHub(),
+		buckets:      map[string]*externalBucket{},
 	}
 }
 
@@ -411,6 +421,7 @@ func (s *Server) handleCreateExternalAgent(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	s.onExternalAgentChanged(rec.ID)
 	writeJSONResponse(w, http.StatusCreated, s.externalView(rec))
 }
 
@@ -444,6 +455,8 @@ func (s *Server) handlePatchExternalAgent(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	s.external.credMu.Lock()
+	defer s.external.credMu.Unlock()
 	var req struct {
 		Name        *string `json:"name"`
 		Description *string `json:"description"`
@@ -481,10 +494,10 @@ func (s *Server) handlePatchExternalAgent(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	s.onExternalAgentChanged(out.ID)
 	if !out.Enabled {
 		s.external.hub.disconnect(out.ID, "disabled")
 	}
-	s.onExternalAgentChanged(out.ID)
 	writeJSONResponse(w, http.StatusOK, s.externalView(out))
 }
 
@@ -493,12 +506,14 @@ func (s *Server) handleDeleteExternalAgent(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	s.external.credMu.Lock()
+	defer s.external.credMu.Unlock()
 	if err := st.SoftDeleteExternalAgent(r.Context(), rec.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	s.external.hub.disconnect(rec.ID, "deleted")
 	s.onExternalAgentDeleted(rec.ID)
+	s.external.hub.disconnect(rec.ID, "deleted")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -529,11 +544,14 @@ func (s *Server) handleRevokeExternalAgent(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	s.external.credMu.Lock()
+	defer s.external.credMu.Unlock()
 	out, err := st.RevokeExternalToken(r.Context(), rec.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	s.onExternalAgentChanged(rec.ID)
 	s.external.hub.disconnect(rec.ID, "revoked")
 	writeJSONResponse(w, http.StatusOK, s.externalView(out))
 }
@@ -681,7 +699,17 @@ func (s *Server) handleExternalPair(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
+	// Hold credMu across redeem + cache reload + disconnect so no post
+	// validated against the old token can land afterwards.
+	s.external.credMu.Lock()
 	rec, err := st.RedeemExternalPairing(r.Context(), hashExternalSecret(code), node, hashExternalSecret(token))
+	if err == nil {
+		s.onExternalAgentChanged(rec.ID)
+		s.external.hub.disconnect(rec.ID, "re-paired")
+	} else if !errors.Is(err, store.ErrPairingInvalid) && !errors.Is(err, store.ErrExternalNodeBound) {
+		s.reloadExternalCache(r.Context())
+	}
+	s.external.credMu.Unlock()
 	switch {
 	case errors.Is(err, store.ErrPairingInvalid):
 		writeError(w, http.StatusBadRequest, "invalid_code", "pairing code invalid or expired")
@@ -697,8 +725,6 @@ func (s *Server) handleExternalPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.denyIPsNow(node.TailnetIPs)
-	// The previous token (if any) is dead: drop its live stream.
-	s.external.hub.disconnect(rec.ID, "re-paired")
 	s.refreshExternalDeny(r.Context())
 	s.closePublicConnsFrom(node.TailnetIPs)
 	s.logger.Info("external agent paired", "id", rec.ID, "node", node.NodeName)

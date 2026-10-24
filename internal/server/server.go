@@ -758,6 +758,7 @@ func New(cfg Config) *Server {
 		ErrorLog: httpServerErrorLog(logger),
 	}
 	s.refreshExternalDeny(context.Background())
+	s.initExternalBridge()
 
 	return s
 }
@@ -839,6 +840,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("DELETE /api/v1/external-agents/{id}", s.handleDeleteExternalAgent)
 	mux.HandleFunc("POST /api/v1/external-agents/{id}/pairing-code", s.handleExternalPairingCode)
 	mux.HandleFunc("POST /api/v1/external-agents/{id}/revoke", s.handleRevokeExternalAgent)
+	mux.HandleFunc("PUT /api/v1/groupdms/{id}/external-trust", s.handleSetGroupExternalTrust)
 	mux.HandleFunc("GET /api/v1/external-nodes", s.handleListExternalNodes)
 	mux.HandleFunc("DELETE /api/v1/external-nodes/{node}", s.handleDeleteExternalNode)
 	mux.HandleFunc("GET /api/v1/extensions", s.handleListExtensions)

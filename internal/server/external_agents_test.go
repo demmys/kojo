@@ -31,6 +31,7 @@ func newExternalTestServer(t *testing.T) (*Server, *fakeWhoIs, http.Handler) {
 		"100.64.0.6:4000": {StableNodeID: "nB", NodeName: "bot-b", TailnetIPs: []string{"100.64.0.6"}},
 	}}
 	srv.SetExternalWhoIs(w.fn)
+	srv.initExternalBridge()
 	return srv, w, srv.ExternalHandler()
 }
 

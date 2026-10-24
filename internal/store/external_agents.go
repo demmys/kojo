@@ -448,3 +448,35 @@ func (s *Store) DeleteExternalCursor(ctx context.Context, externalID, groupID st
 		`DELETE FROM external_agent_cursors WHERE external_id = ? AND groupdm_id = ?`, externalID, groupID)
 	return err
 }
+
+// ListGroupDMExternalTrust returns every room's non-default trust level.
+func (s *Store) ListGroupDMExternalTrust(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT groupdm_id, trust FROM groupdm_external_trust`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, t string
+		if err := rows.Scan(&id, &t); err != nil {
+			return nil, err
+		}
+		out[id] = t
+	}
+	return out, rows.Err()
+}
+
+// SetGroupDMExternalTrust sets a room's trust level; "" or "untrusted"
+// clears the row (back to the default).
+func (s *Store) SetGroupDMExternalTrust(ctx context.Context, groupID, trust string) error {
+	if trust == "" || trust == "untrusted" {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM groupdm_external_trust WHERE groupdm_id = ?`, groupID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO groupdm_external_trust (groupdm_id, trust, updated_at) VALUES (?, ?, ?)
+ON CONFLICT(groupdm_id) DO UPDATE SET trust = excluded.trust, updated_at = excluded.updated_at`,
+		groupID, trust, NowMillis())
+	return err
+}

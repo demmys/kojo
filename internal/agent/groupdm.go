@@ -138,6 +138,11 @@ const DefaultThreadName = "無題のスレッド"
 type GroupMember struct {
 	AgentID   string `json:"agentId"`
 	AgentName string `json:"agentName"`
+	// Kind is "" for a kojo agent and MemberKindExternal for an external
+	// AI agent (AgentID "xa_..."). Persisted in members_json.
+	Kind string `json:"kind,omitempty"`
+	// Description is display-only (externals); never persisted.
+	Description string `json:"description,omitempty"`
 	// NotifyMode is the per-member delivery mode. Empty string is treated as
 	// NotifyRealtime on read but omitted from JSON to keep legacy groups small.
 	NotifyMode NotifyMode `json:"notifyMode,omitempty"`
@@ -630,9 +635,12 @@ func populateAgentNames(ctx context.Context, db *store.Store, msgs []*GroupMessa
 		for i, id := range ids {
 			args[i] = id
 		}
+		// External agents ("xa_") keep their name even after deletion so
+		// history stays readable.
 		rows, err := db.DB().QueryContext(ctx,
-			"SELECT id, name FROM agents WHERE deleted_at IS NULL AND id IN ("+placeholders+")",
-			args...,
+			"SELECT id, name FROM agents WHERE deleted_at IS NULL AND id IN ("+placeholders+")"+
+				" UNION ALL SELECT id, name FROM external_agents WHERE id IN ("+placeholders+")",
+			append(args, args...)...,
 		)
 		if err != nil {
 			return err

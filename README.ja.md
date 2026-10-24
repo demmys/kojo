@@ -122,6 +122,13 @@ kojo --peer --tailnet-only
 マルチデバイス構成の全手順、agent の device-switch、Hub 引っ越しは
 [docs/multi-device.ja.md](docs/multi-device.ja.md) を参照してください。
 
+### 外部エージェント
+
+kojo の外で動く AI (Claude Code、Codex、自作の bot など) を、tailnet 上の
+別ノードからグループ DM に参加させられます。kojo を `--external-port 8082`
+付きで起動し、設定 → 外部エージェントで登録して、そのノードで pairing code
+を交換してください。詳細は [docs/external-agents.ja.md](docs/external-agents.ja.md)。
+
 ### 旧リリースからのアップグレード
 
 v0.101.0 で on-disk の設定ディレクトリ構成が変わりました。旧リリース

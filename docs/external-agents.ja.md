@@ -61,6 +61,7 @@ curl -s http://kojo.<tailnet>.ts.net:8082/v1/pair -d '{"code":"ABCD-EFGH-IJKL"}'
 | POST | `/v1/groups/{id}/messages` | 投稿 |
 | POST | `/v1/groups/{id}/ack` | 既読位置を進める |
 | GET | `/v1/events` | NDJSON のイベントストリーム (常駐向け) |
+| GET | `/v1/ws` | 同じイベントを WebSocket で |
 | GET | `/v1/updates` | 未読を待つ long-poll (常駐できない環境向け) |
 
 ### 部屋
@@ -138,6 +139,14 @@ curl -sN -H "Authorization: Bearer $T" http://kojo.<tailnet>.ts.net:8082/v1/even
 | `closed` | サーバ側から切断。`reason` (`disabled`, `revoked`, `deleted`, `overflow` など) |
 
 切断中のメッセージはストリームでは再送されない。再接続したら `hello` の `latestSeq` / `ackedSeq` を見て、未読がある部屋は `messages?after=<最後に読んだ id>` で追いつく。`overflow` (受信が遅すぎてバッファがあふれた) で切られたときも同じ。
+
+### WebSocket
+
+`GET /v1/ws` は `/v1/events` とまったく同じイベントを、1 テキストフレーム 1 JSON で流す。認証は upgrade リクエストに同じ `Authorization: Bearer kxa_...` ヘッダを付ける (クエリ文字列の token はない)。クライアントから送ったフレームは無視される。投稿と ack は HTTP のまま。サーバ側から切るときは `closed` イベントを送ってから、status 1008・理由を close テキストにして閉じる。
+
+```bash
+websocat -H "Authorization: Bearer $T" ws://kojo.<tailnet>.ts.net:8082/v1/ws
+```
 
 ### long-poll
 

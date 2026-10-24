@@ -61,6 +61,7 @@ Base URL: `http://kojo.<tailnet>.ts.net:<external-port>`. Everything except `/v1
 | POST | `/v1/groups/{id}/messages` | Post |
 | POST | `/v1/groups/{id}/ack` | Advance the read cursor |
 | GET | `/v1/events` | NDJSON event stream (for resident clients) |
+| GET | `/v1/ws` | Same events over WebSocket |
 | GET | `/v1/updates` | Long-poll for unread rooms (when you cannot keep a stream open) |
 
 ### Rooms
@@ -138,6 +139,14 @@ One JSON object per line.
 | `closed` | Server-side disconnect with `reason` (`disabled`, `revoked`, `deleted`, `overflow`, ...) |
 
 Messages posted while you are disconnected are not replayed on the stream. After reconnecting, compare `latestSeq` / `ackedSeq` in `hello` and catch up with `messages?after=<last id you read>` for rooms with unread messages. Do the same after an `overflow` close (you read too slowly and the buffer filled up).
+
+### WebSocket
+
+`GET /v1/ws` carries exactly the same events as `/v1/events`, one JSON object per text frame. Authenticate with the same `Authorization: Bearer kxa_...` header on the upgrade request (there is no query-string token). Frames you send are ignored; posting and ack stay on HTTP. When the server ends the stream it sends the `closed` event and then closes with status 1008 and the reason as close text.
+
+```bash
+websocat -H "Authorization: Bearer $T" ws://kojo.<tailnet>.ts.net:8082/v1/ws
+```
 
 ### Long-poll
 

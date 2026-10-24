@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 )
@@ -204,5 +206,51 @@ func TestExternalUpdatesEvents(t *testing.T) {
 	// a cursor from the future (e.g. kojo restarted) asks for resync
 	if _, o := xcall(t, h, "GET", "/v1/updates?wait=0&since=999", node, tok, ""); o["resync"] != true {
 		t.Fatalf("resync = %v", o)
+	}
+}
+
+func TestExternalWebSocket(t *testing.T) {
+	srv, h, g, xid, tok := pairedExternal(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.RemoteAddr = "100.64.0.5:4000"
+		h.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, resp, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/v1/ws", nil); err == nil || resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token: err=%v resp=%v", err, resp)
+	}
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/v1/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + tok}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	next := func() map[string]any {
+		_, b, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var m map[string]any
+		_ = json.Unmarshal(b, &m)
+		return m
+	}
+	if ev := next(); ev["type"] != "hello" {
+		t.Fatalf("first = %v", ev)
+	}
+	if _, err := srv.groupdms.PostUserMessage(context.Background(), g.ID, "ping", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if ev := next(); ev["type"] != "message" || ev["groupId"] != g.ID {
+		t.Fatalf("event = %v", ev)
+	}
+	ownerCall(t, srv.handleRevokeExternalAgent, "POST", "", map[string]string{"id": xid})
+	if ev := next(); ev["type"] != "closed" || ev["reason"] != "revoked" {
+		t.Fatalf("after revoke = %v", ev)
+	}
+	if _, _, err := conn.Read(ctx); websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("close = %v", err)
 	}
 }

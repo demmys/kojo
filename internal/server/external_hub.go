@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/loppo-llc/kojo/internal/agent"
 	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/store"
@@ -389,6 +391,7 @@ func (s *Server) registerExternalGroupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/groups/{id}/messages", s.handleExternalPostMessage)
 	mux.HandleFunc("POST /v1/groups/{id}/ack", s.handleExternalAck)
 	mux.HandleFunc("GET /v1/events", s.handleExternalEvents)
+	mux.HandleFunc("GET /v1/ws", s.handleExternalWS)
 	mux.HandleFunc("GET /v1/updates", s.handleExternalUpdates)
 }
 
@@ -696,6 +699,61 @@ func (s *Server) handleExternalEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		return rc.Flush() == nil
 	}
+	s.runExternalStream(r.Context(), c, st, write)
+}
+
+// handleExternalWS carries the same events as /v1/events, one JSON
+// object per text frame. Client frames are read only to detect
+// disconnects and are otherwise ignored. Auth is the same Bearer
+// header (checked by the listener middleware before the upgrade).
+func (s *Server) handleExternalWS(w http.ResponseWriter, r *http.Request) {
+	c := externalCallerFrom(r.Context())
+	// External clients are not browsers; there is no cookie auth to
+	// protect, so cross-origin upgrades carry no CSRF risk.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	// Subscribe only after a successful upgrade: subscribing replaces the
+	// agent's current stream, and a bogus upgrade must not kill it.
+	st, ok := s.external.hub.subscribe(c.rec.ID)
+	if !ok {
+		conn.Close(websocket.StatusTryAgainLater, "shutting down")
+		return
+	}
+	defer s.external.hub.unsubscribe(c.rec.ID, st)
+	conn.SetReadLimit(4 * 1024)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	go func() {
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				cancel()
+				return
+			}
+		}
+	}()
+	write := func(v any) bool {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return false
+		}
+		wctx, wcancel := context.WithTimeout(ctx, externalWriteTimeout)
+		defer wcancel()
+		return conn.Write(wctx, websocket.MessageText, b) == nil
+	}
+	if reason := s.runExternalStream(ctx, c, st, write); reason != "" {
+		conn.Close(websocket.StatusPolicyViolation, reason)
+		return
+	}
+	conn.Close(websocket.StatusNormalClosure, "")
+}
+
+// runExternalStream writes hello, then events and pings until the
+// client goes away or the server closes the subscription. It returns
+// the close reason when the server ended the stream.
+func (s *Server) runExternalStream(ctx context.Context, c *externalCaller, st *externalStream, write func(any) bool) string {
 	// guarded writes are atomic w.r.t. credential changes (credMu):
 	// nothing reaches the client after a revoke / disable / delete /
 	// re-pair has completed. A credential change can stall behind one
@@ -713,7 +771,7 @@ func (s *Server) handleExternalEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		return write(v)
 	}
-	cursors := s.externalCursors(r.Context(), c.rec.ID)
+	cursors := s.externalCursors(ctx, c.rec.ID)
 	groups := []externalGroupView{}
 	for _, g := range s.externalGroups(c.rec.ID) {
 		groups = append(groups, s.externalGroupView(g, c.rec.ID, cursors))
@@ -721,20 +779,20 @@ func (s *Server) handleExternalEvents(w http.ResponseWriter, r *http.Request) {
 	if !guarded(map[string]any{
 		"type": "hello", "agent": map[string]any{"id": c.rec.ID, "name": c.rec.Name}, "groups": groups,
 	}) {
-		return
+		return ""
 	}
 	ping := time.NewTicker(externalPingInterval)
 	defer ping.Stop()
 	for {
 		select {
-		case <-r.Context().Done():
-			return
+		case <-ctx.Done():
+			return ""
 		case <-st.done:
 			_ = write(map[string]any{"type": "closed", "reason": st.reason})
-			return
+			return st.reason
 		case <-ping.C:
 			if !guarded(map[string]any{"type": "ping"}) {
-				return
+				return ""
 			}
 		case ev := <-st.ch:
 			switch ev.Type {
@@ -744,7 +802,7 @@ func (s *Server) handleExternalEvents(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if !guarded(ev) {
-				return
+				return ""
 			}
 		}
 	}

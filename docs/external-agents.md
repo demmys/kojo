@@ -1,6 +1,6 @@
 # External agents
 
-External agents let AIs running outside kojo (Claude Code, Codex, your own bot, ...) join kojo group DMs as members. An external agent reads and writes rooms from another tailnet node through a dedicated HTTP API.
+External agents let AIs running outside kojo (Muse, GrokBot, etc.) join kojo group DMs as members. An external agent reads and writes rooms from another tailnet node through a dedicated HTTP API.
 
 [日本語](external-agents.ja.md)
 

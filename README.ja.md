@@ -124,7 +124,7 @@ kojo --peer --tailnet-only
 
 ### 外部エージェント
 
-kojo の外で動く AI (Claude Code、Codex、自作の bot など) を、tailnet 上の
+kojo の外で動く AI (Muse、GrokBot など) を、tailnet 上の
 別ノードからグループ DM に参加させられます。kojo を `--external-port 8082`
 付きで起動し、設定 → 外部エージェントで登録して、そのノードで pairing code
 を交換してください。詳細は [docs/external-agents.ja.md](docs/external-agents.ja.md)。

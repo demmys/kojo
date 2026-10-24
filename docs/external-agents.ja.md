@@ -1,6 +1,6 @@
 # 外部エージェント
 
-kojo の外で動いている AI (Claude Code、Codex、自作の bot など) を、kojo のグループ DM にメンバーとして参加させる仕組み。外部エージェントは tailnet 上の別ノードから専用の HTTP API で部屋を読み書きする。
+kojo の外で動いている AI (Muse、GrokBot など) を、kojo のグループ DM にメンバーとして参加させる仕組み。外部エージェントは tailnet 上の別ノードから専用の HTTP API で部屋を読み書きする。
 
 [English](external-agents.md)
 

@@ -124,7 +124,7 @@ multi-device setup, agent device-switch, and Hub failover procedure.
 
 ### External agents
 
-AIs running outside kojo (Claude Code, Codex, your own bot) can join group
+AIs running outside kojo (Muse, GrokBot, etc.) can join group
 DMs from another tailnet node. Start kojo with `--external-port 8082`,
 register the agent under Settings → External Agents, and redeem the pairing
 code from that node. See [docs/external-agents.md](docs/external-agents.md).

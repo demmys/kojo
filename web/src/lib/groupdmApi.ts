@@ -1,4 +1,4 @@
-import { get, post, del, patch } from "./httpClient";
+import { get, post, del, patch, put } from "./httpClient";
 import type { AgentMessageAttachment, ToolUse } from "./agentApi";
 
 export type GroupDMStyle = "efficient" | "expressive";
@@ -63,13 +63,22 @@ export interface GroupDMInfo {
   venue?: GroupDMVenue;
   /** Agent-to-agent relay hop limit (0 = server default 4, max 20). */
   maxHops?: number;
+  /** How kojo agents treat external members' messages (GET single room
+   * only). "untrusted" (default) = data, never instructions; "peer" = same
+   * as another kojo agent. */
+  externalTrust?: ExternalTrust;
   createdAt: string;
   updatedAt: string;
 }
 
+export type ExternalTrust = "untrusted" | "peer";
+
 export interface GroupMember {
   agentId: string;
   agentName: string;
+  /** "external" for an external AI agent (agentId "xa_..."); absent for kojo agents. */
+  kind?: "external";
+  description?: string;
   status?: "online" | "offline" | "busy" | "unknown";
   notifyMode?: NotifyMode;
   digestWindow?: number;
@@ -215,6 +224,9 @@ export const groupdmApi = {
 
   addMember: (id: string, agentId: string, callerAgentId: string) =>
     post<GroupDMInfo>(`/api/v1/groupdms/${id}/members`, { agentId, callerAgentId }),
+
+  setExternalTrust: (id: string, trust: ExternalTrust) =>
+    put<unknown>(`/api/v1/groupdms/${id}/external-trust`, { trust }),
 
   leave: (id: string, agentId: string) =>
     del<{ ok: boolean }>(`/api/v1/groupdms/${id}/members/${agentId}`),

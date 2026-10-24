@@ -16,6 +16,7 @@ import { Lamp, type LampState } from "./ui/Lamp";
 import { Chip } from "./ui/Chip";
 import { RelTime } from "./ui/RelTime";
 import { Button } from "./ui/Button";
+import { externalAgentApi, type ExternalAgent } from "../lib/externalAgentApi";
 
 function sessionLampState(s: SessionInfo): LampState {
   if (s.status === "running") return "run";
@@ -388,6 +389,18 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     if (showCreateGroupDialog) createGroupDialogRef.current?.focus();
   }, [showCreateGroupDialog]);
 
+  // External agents are offered in the create dialog as a separate section.
+  // Fetched on open (not on mount) so the dashboard pays nothing for a
+  // feature most installs never use; failures just hide the section.
+  const [externalAgents, setExternalAgents] = useState<ExternalAgent[]>([]);
+  useEffect(() => {
+    if (!showCreateGroupDialog) return;
+    externalAgentApi
+      .list()
+      .then((r) => setExternalAgents(r.agents.filter((a) => a.enabled)))
+      .catch(() => setExternalAgents([]));
+  }, [showCreateGroupDialog]);
+
   useEffect(() => {
     const loadPaused = () => agentApi.cronPaused().then(setCronPaused).catch(console.error);
     loadPaused();
@@ -531,7 +544,10 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     if (cdiff !== 0 && !Number.isNaN(cdiff)) return cdiff;
     return a.id.localeCompare(b.id);
   });
-  const selectedNewGroupMembers = sortedAgents.filter((a) => newGroupMemberIds.has(a.id));
+  const selectedNewGroupMembers = [
+    ...sortedAgents.filter((a) => newGroupMemberIds.has(a.id)),
+    ...externalAgents.filter((a) => newGroupMemberIds.has(a.id)),
+  ];
 
   const resetCreateGroupForm = () => {
     setNewGroupName("");
@@ -1134,6 +1150,46 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                     );
                   })}
                 </div>
+                {externalAgents.length > 0 && (
+                  <>
+                    <div className="mb-2 mt-3 text-xs text-ink-dim">{t("xa.pickerSection")}</div>
+                    <div className="space-y-1.5">
+                      {externalAgents.map((xa) => {
+                        const checked = newGroupMemberIds.has(xa.id);
+                        return (
+                          <label
+                            key={xa.id}
+                            className={`flex cursor-pointer select-none items-center gap-3 rounded-[10px] border p-2 transition-colors ${
+                              checked
+                                ? "border-copper/50 bg-copper/10"
+                                : "border-hairline bg-app hover:bg-hover"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleNewGroupMember(xa.id)}
+                              disabled={creatingGroup}
+                              className="rounded border-hairline bg-raised accent-[color:var(--color-copper)]"
+                            />
+                            <Lamp state={xa.online ? "run" : "off"} />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <span className="truncate text-sm text-ink">{xa.name}</span>
+                                <span className="shrink-0 rounded-full border border-hairline px-1.5 font-mono text-[10px] text-ink-faint">
+                                  {t("xa.badge")}
+                                </span>
+                              </div>
+                              <div className="truncate text-[10px] text-ink-faint">
+                                {xa.description || xa.nodeName || xa.id}
+                              </div>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
               </div>
 
               {createGroupError && (

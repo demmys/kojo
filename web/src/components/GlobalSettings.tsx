@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { ApiKeysSection } from "./globalsettings/ApiKeysSection";
 import { ArchivedAgentsSection } from "./globalsettings/ArchivedAgentsSection";
 import { ChatPreferencesSection } from "./globalsettings/ChatPreferencesSection";
+import { ExternalAgentsSection } from "./globalsettings/ExternalAgentsSection";
 import { ExtensionsSection } from "./globalsettings/ExtensionsSection";
 import { PeersSection } from "./globalsettings/PeersSection";
 import { PersonaTemplatesSection } from "./globalsettings/PersonaTemplatesSection";
@@ -72,6 +73,7 @@ export function GlobalSettings() {
         <PersonaTemplatesSection setError={setError} flashSuccess={flashSuccess} />
 
         <ExtensionsSection setError={setError} flashSuccess={flashSuccess} />
+        <ExternalAgentsSection setError={setError} flashSuccess={flashSuccess} />
         <PeersSection setError={setError} flashSuccess={flashSuccess} />
         <ArchivedAgentsSection setError={setError} flashSuccess={flashSuccess} />
         <SystemSection setError={setError} />

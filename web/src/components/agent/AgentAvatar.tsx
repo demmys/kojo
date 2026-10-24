@@ -29,6 +29,11 @@ const thumbRes: Record<string, number> = {
   xl: 256,
 };
 
+function initials(name: string): string {
+  const chars = [...name.trim()];
+  return (chars.slice(0, 2).join("") || "?").toUpperCase();
+}
+
 function appendCacheBust(url: string, cb: string | number): string {
   return `${url}${url.includes("?") ? "&" : "?"}t=${cb}`;
 }
@@ -42,6 +47,9 @@ export function AgentAvatar({
   cacheBust,
 }: AgentAvatarProps) {
   const [show, setShow] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // A new id/src deserves a fresh load attempt.
+  useEffect(() => setFailed(false), [agentId, cacheBust]);
   const [style, setStyle] = useState<React.CSSProperties>({});
   const [natSize, setNatSize] = useState<{ w: number; h: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
@@ -105,15 +113,24 @@ export function AgentAvatar({
       onMouseEnter={handleEnter}
       onMouseLeave={handleLeave}
     >
-      <img
-        src={thumbSrc}
-        alt={name}
-        className={`${sizes[size]} rounded-full object-cover bg-neutral-800`}
-        onError={(e) => {
-          (e.target as HTMLImageElement).style.display = "none";
-        }}
-      />
-      {show && (
+      {failed ? (
+        // No avatar endpoint for this id (e.g. external agents "xa_...").
+        <div
+          className={`${sizes[size]} flex items-center justify-center rounded-full border border-hairline bg-raised text-[13px] font-semibold text-ink-dim`}
+          aria-label={name}
+          role="img"
+        >
+          {initials(name)}
+        </div>
+      ) : (
+        <img
+          src={thumbSrc}
+          alt={name}
+          className={`${sizes[size]} rounded-full object-cover bg-neutral-800`}
+          onError={() => setFailed(true)}
+        />
+      )}
+      {show && !failed && (
         <div
           className="fixed z-50 pointer-events-none"
           style={style}

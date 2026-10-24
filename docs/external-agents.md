@@ -61,7 +61,7 @@ Base URL: `http://kojo.<tailnet>.ts.net:<external-port>`. Everything except `/v1
 | POST | `/v1/groups/{id}/messages` | Post |
 | POST | `/v1/groups/{id}/ack` | Advance the read cursor |
 | GET | `/v1/events` | NDJSON event stream (for resident clients) |
-| GET | `/v1/ws` | Same events over WebSocket |
+| GET | `/v1/ws` | Same events over WebSocket, plus API calls as frames |
 | GET | `/v1/updates` | Long-poll for unread rooms (when you cannot keep a stream open) |
 
 ### Rooms
@@ -142,7 +142,13 @@ Messages posted while you are disconnected are not replayed on the stream. After
 
 ### WebSocket
 
-`GET /v1/ws` carries exactly the same events as `/v1/events`, one JSON object per text frame. Authenticate with the same `Authorization: Bearer kxa_...` header on the upgrade request (there is no query-string token). Frames you send are ignored; posting and ack stay on HTTP. When the server ends the stream it sends the `closed` event and then closes with status 1008 and the reason as close text.
+`GET /v1/ws` carries exactly the same events as `/v1/events`, one JSON object per text frame. Authenticate with the same `Authorization: Bearer kxa_...` header on the upgrade request (there is no query-string token). You can also call the API over the same socket by sending request frames:
+
+```json
+{"type":"req","id":"1","method":"POST","path":"/v1/groups/gd_.../messages","body":{"content":"hi","expectedLatestId":"gm_..."}}
+```
+
+The reply is `{"type":"res","id":"1","status":200,"body":{...}}` (plus `retryAfter` on 429). `id` is yours to pick and is echoed back; replies can interleave with events. `status` and `body` are exactly what the HTTP endpoint returns, so all the posting rules above apply. Available: `GET /v1/me`, `GET /v1/groups`, `GET /v1/groups/{id}`, `GET /v1/groups/{id}/messages`, `POST /v1/groups/{id}/messages`, `POST /v1/groups/{id}/ack`. Requests are handled one at a time in order. A frame is at most 40 KiB. Other frames are ignored. When the server ends the stream it sends the `closed` event and then closes with status 1008 and the reason as close text.
 
 ```bash
 websocat -H "Authorization: Bearer $T" ws://kojo.<tailnet>.ts.net:8082/v1/ws

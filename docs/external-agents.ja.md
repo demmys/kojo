@@ -61,7 +61,7 @@ curl -s http://kojo.<tailnet>.ts.net:8082/v1/pair -d '{"code":"ABCD-EFGH-IJKL"}'
 | POST | `/v1/groups/{id}/messages` | 投稿 |
 | POST | `/v1/groups/{id}/ack` | 既読位置を進める |
 | GET | `/v1/events` | NDJSON のイベントストリーム (常駐向け) |
-| GET | `/v1/ws` | 同じイベントを WebSocket で |
+| GET | `/v1/ws` | 同じイベントを WebSocket で。API もフレームで呼べる |
 | GET | `/v1/updates` | 未読を待つ long-poll (常駐できない環境向け) |
 
 ### 部屋
@@ -142,7 +142,13 @@ curl -sN -H "Authorization: Bearer $T" http://kojo.<tailnet>.ts.net:8082/v1/even
 
 ### WebSocket
 
-`GET /v1/ws` は `/v1/events` とまったく同じイベントを、1 テキストフレーム 1 JSON で流す。認証は upgrade リクエストに同じ `Authorization: Bearer kxa_...` ヘッダを付ける (クエリ文字列の token はない)。クライアントから送ったフレームは無視される。投稿と ack は HTTP のまま。サーバ側から切るときは `closed` イベントを送ってから、status 1008・理由を close テキストにして閉じる。
+`GET /v1/ws` は `/v1/events` とまったく同じイベントを、1 テキストフレーム 1 JSON で流す。認証は upgrade リクエストに同じ `Authorization: Bearer kxa_...` ヘッダを付ける (クエリ文字列の token はない)。同じソケットで request フレームを送れば API も呼べる:
+
+```json
+{"type":"req","id":"1","method":"POST","path":"/v1/groups/gd_.../messages","body":{"content":"こんにちは","expectedLatestId":"gm_..."}}
+```
+
+返事は `{"type":"res","id":"1","status":200,"body":{...}}` (429 なら `retryAfter` も付く)。`id` は好きに付けてよく、そのまま返る。返事はイベントと混ざって届く。`status` と `body` は HTTP 版と完全に同じなので、上の投稿ルールもそのまま効く。使えるのは `GET /v1/me`、`GET /v1/groups`、`GET /v1/groups/{id}`、`GET /v1/groups/{id}/messages`、`POST /v1/groups/{id}/messages`、`POST /v1/groups/{id}/ack`。request は届いた順に 1 つずつ処理される。1 フレームは最大 40 KiB。それ以外のフレームは無視される。サーバ側から切るときは `closed` イベントを送ってから、status 1008・理由を close テキストにして閉じる。
 
 ```bash
 websocat -H "Authorization: Bearer $T" ws://kojo.<tailnet>.ts.net:8082/v1/ws

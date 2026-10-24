@@ -254,3 +254,67 @@ func TestExternalWebSocket(t *testing.T) {
 		t.Fatalf("close = %v", err)
 	}
 }
+
+func TestExternalWebSocketRequests(t *testing.T) {
+	_, h, g, _, tok := pairedExternal(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.RemoteAddr = "100.64.0.5:4000"
+		h.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/v1/ws", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + tok}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	type res struct {
+		Type   string          `json:"type"`
+		ID     string          `json:"id"`
+		Status int             `json:"status"`
+		Body   json.RawMessage `json:"body"`
+	}
+	call := func(id, method, path, body string) res {
+		f := map[string]any{"type": "req", "id": id, "method": method, "path": path}
+		if body != "" {
+			f["body"] = json.RawMessage(body)
+		}
+		b, _ := json.Marshal(f)
+		if err := conn.Write(ctx, websocket.MessageText, b); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, raw, err := conn.Read(ctx)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			var r res
+			_ = json.Unmarshal(raw, &r)
+			if r.Type == "res" && r.ID == id {
+				return r
+			}
+		}
+	}
+	// An empty room needs no expectedLatestId.
+	r := call("1", "POST", "/v1/groups/"+g.ID+"/messages", `{"content":"hi"}`)
+	if r.Status != http.StatusOK {
+		t.Fatalf("first post = %+v %s", r, r.Body)
+	}
+	r = call("2", "POST", "/v1/groups/"+g.ID+"/messages", `{"content":"again"}`)
+	if r.Status != http.StatusConflict || !strings.Contains(string(r.Body), "expected_latest_id_required") {
+		t.Fatalf("missing expected = %+v %s", r, r.Body)
+	}
+	r = call("3", "GET", "/v1/groups/"+g.ID+"/messages?limit=5", "")
+	if r.Status != http.StatusOK || !strings.Contains(string(r.Body), `"hi"`) {
+		t.Fatalf("list = %+v %s", r, r.Body)
+	}
+	if r = call("4", "GET", "/v1/events", ""); r.Status != http.StatusNotFound {
+		t.Fatalf("events over ws = %+v", r)
+	}
+	if r = call("5", "DELETE", "/v1/groups/"+g.ID, ""); r.Status != http.StatusMethodNotAllowed {
+		t.Fatalf("delete = %+v", r)
+	}
+}

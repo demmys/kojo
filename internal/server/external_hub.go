@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -669,7 +672,17 @@ func (s *Server) handleExternalAck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "unavailable", "store unavailable")
 		return
 	}
-	if err := st.AdvanceExternalCursor(r.Context(), c.rec.ID, g.ID, seq); err != nil {
+	// Like posts, an ack validated here must not land after a
+	// credential change completes.
+	s.external.credMu.RLock()
+	if !s.callerStillValid(c) {
+		s.external.credMu.RUnlock()
+		writeError(w, http.StatusUnauthorized, "unauthorized", "credentials no longer valid")
+		return
+	}
+	err = st.AdvanceExternalCursor(r.Context(), c.rec.ID, g.ID, seq)
+	s.external.credMu.RUnlock()
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
@@ -699,13 +712,18 @@ func (s *Server) handleExternalEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		return rc.Flush() == nil
 	}
-	s.runExternalStream(r.Context(), c, st, write)
+	s.runExternalStream(r.Context(), c, st, write, nil)
 }
 
 // handleExternalWS carries the same events as /v1/events, one JSON
-// object per text frame. Client frames are read only to detect
-// disconnects and are otherwise ignored. Auth is the same Bearer
-// header (checked by the listener middleware before the upgrade).
+// object per text frame, and also accepts API requests as frames:
+//
+//	{"type":"req","id":"1","method":"POST","path":"/v1/groups/gd_x/messages","body":{...}}
+//	→ {"type":"res","id":"1","status":200,"body":{...}}
+//
+// Requests run through the same handlers as HTTP, so validation, rate
+// limits and errors are identical. Auth is the Bearer header on the
+// upgrade (checked by the listener middleware).
 func (s *Server) handleExternalWS(w http.ResponseWriter, r *http.Request) {
 	c := externalCallerFrom(r.Context())
 	// External clients are not browsers; there is no cookie auth to
@@ -723,17 +741,9 @@ func (s *Server) handleExternalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.external.hub.unsubscribe(c.rec.ID, st)
-	conn.SetReadLimit(4 * 1024)
+	conn.SetReadLimit(externalMaxContent + 8*1024)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	go func() {
-		for {
-			if _, _, err := conn.Read(ctx); err != nil {
-				cancel()
-				return
-			}
-		}
-	}()
 	write := func(v any) bool {
 		b, err := json.Marshal(v)
 		if err != nil {
@@ -743,34 +753,145 @@ func (s *Server) handleExternalWS(w http.ResponseWriter, r *http.Request) {
 		defer wcancel()
 		return conn.Write(wctx, websocket.MessageText, b) == nil
 	}
-	if reason := s.runExternalStream(ctx, c, st, write); reason != "" {
+	// Requests are served one at a time on the read goroutine, which
+	// gives natural backpressure. conn.Write is safe for concurrent use
+	// with the event loop.
+	api := s.externalWSRoutes()
+	// hello is always the first frame: hold replies until it is out.
+	helloSent := make(chan struct{})
+	go func() {
+		defer cancel()
+		for {
+			typ, b, err := conn.Read(ctx)
+			if err != nil {
+				return
+			}
+			if typ != websocket.MessageText {
+				continue
+			}
+			select {
+			case <-helloSent:
+			case <-ctx.Done():
+				return
+			}
+			// After a credential change the event loop sends "closed";
+			// just drop requests here so it gets to.
+			if !s.externalStreamValid(c, st) {
+				continue
+			}
+			if res, ok := s.serveExternalWSRequest(ctx, r, api, b); ok {
+				s.externalGuardedWrite(c, st, write, res)
+			}
+		}
+	}()
+	if reason := s.runExternalStream(ctx, c, st, write, func() { close(helloSent) }); reason != "" {
 		conn.Close(websocket.StatusPolicyViolation, reason)
 		return
 	}
 	conn.Close(websocket.StatusNormalClosure, "")
 }
 
+// externalWSRoutes is the subset of the authenticated API reachable
+// over /v1/ws. Streaming endpoints are excluded.
+func (s *Server) externalWSRoutes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/me", s.handleExternalMe)
+	mux.HandleFunc("GET /v1/groups", s.handleExternalListGroups)
+	mux.HandleFunc("GET /v1/groups/{id}", s.handleExternalGetGroup)
+	mux.HandleFunc("GET /v1/groups/{id}/messages", s.handleExternalListMessages)
+	mux.HandleFunc("POST /v1/groups/{id}/messages", s.handleExternalPostMessage)
+	mux.HandleFunc("POST /v1/groups/{id}/ack", s.handleExternalAck)
+	return mux
+}
+
+type externalWSRequest struct {
+	Type   string          `json:"type"`
+	ID     string          `json:"id"`
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Body   json.RawMessage `json:"body,omitempty"`
+}
+
+// serveExternalWSRequest runs one request frame through api and returns
+// the response frame. Frames that are not requests are ignored (ok=false).
+func (s *Server) serveExternalWSRequest(ctx context.Context, up *http.Request, api *http.ServeMux, frame []byte) (map[string]any, bool) {
+	var req externalWSRequest
+	if err := json.Unmarshal(frame, &req); err != nil || req.Type != "req" {
+		return nil, false
+	}
+	res := map[string]any{"type": "res", "id": req.ID}
+	fail := func(status int, code, msg string) map[string]any {
+		res["status"] = status
+		res["body"] = map[string]any{"error": map[string]string{"code": code, "message": msg}}
+		return res
+	}
+	if !strings.HasPrefix(req.Path, "/v1/") {
+		return fail(http.StatusNotFound, "not_found", "unknown path"), true
+	}
+	var body io.Reader = http.NoBody
+	if len(req.Body) > 0 {
+		body = bytes.NewReader(req.Body)
+	}
+	hr, err := http.NewRequestWithContext(ctx, req.Method, req.Path, body)
+	if err != nil || hr.URL.IsAbs() {
+		return fail(http.StatusBadRequest, "invalid_request", "invalid path"), true
+	}
+	hr.RemoteAddr = up.RemoteAddr
+	hr.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.ServeHTTP(rec, hr)
+	res["status"] = rec.Code
+	if ra := rec.Header().Get("Retry-After"); ra != "" {
+		res["retryAfter"] = ra
+	}
+	// Handlers answer JSON; mux 404/405 answers plain text, which is
+	// passed through as a JSON string.
+	if b := bytes.TrimSpace(rec.Body.Bytes()); len(b) > 0 {
+		if json.Valid(b) {
+			res["body"] = json.RawMessage(b)
+		} else {
+			res["body"] = string(b)
+		}
+	}
+	return res, true
+}
+
+func (s *Server) externalStreamValid(c *externalCaller, st *externalStream) bool {
+	s.external.credMu.RLock()
+	defer s.external.credMu.RUnlock()
+	select {
+	case <-st.done:
+		return false
+	default:
+	}
+	return s.callerStillValid(c)
+}
+
+// externalGuardedWrite writes v only while the stream and credentials
+// are still valid, atomically w.r.t. credential changes (credMu).
+func (s *Server) externalGuardedWrite(c *externalCaller, st *externalStream, write func(any) bool, v any) bool {
+	s.external.credMu.RLock()
+	defer s.external.credMu.RUnlock()
+	select {
+	case <-st.done:
+		return false
+	default:
+	}
+	if !s.callerStillValid(c) {
+		return false
+	}
+	return write(v)
+}
+
 // runExternalStream writes hello, then events and pings until the
 // client goes away or the server closes the subscription. It returns
 // the close reason when the server ended the stream.
-func (s *Server) runExternalStream(ctx context.Context, c *externalCaller, st *externalStream, write func(any) bool) string {
+func (s *Server) runExternalStream(ctx context.Context, c *externalCaller, st *externalStream, write func(any) bool, afterHello func()) string {
 	// guarded writes are atomic w.r.t. credential changes (credMu):
 	// nothing reaches the client after a revoke / disable / delete /
 	// re-pair has completed. A credential change can stall behind one
 	// in-flight write for at most externalWriteTimeout.
-	guarded := func(v any) bool {
-		s.external.credMu.RLock()
-		defer s.external.credMu.RUnlock()
-		select {
-		case <-st.done:
-			return false
-		default:
-		}
-		if !s.callerStillValid(c) {
-			return false
-		}
-		return write(v)
-	}
+	guarded := func(v any) bool { return s.externalGuardedWrite(c, st, write, v) }
 	cursors := s.externalCursors(ctx, c.rec.ID)
 	groups := []externalGroupView{}
 	for _, g := range s.externalGroups(c.rec.ID) {
@@ -780,6 +901,9 @@ func (s *Server) runExternalStream(ctx context.Context, c *externalCaller, st *e
 		"type": "hello", "agent": map[string]any{"id": c.rec.ID, "name": c.rec.Name}, "groups": groups,
 	}) {
 		return ""
+	}
+	if afterHello != nil {
+		afterHello()
 	}
 	ping := time.NewTicker(externalPingInterval)
 	defer ping.Stop()

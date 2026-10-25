@@ -398,12 +398,17 @@ func (m *Manager) sealArchived(id, passcode string) error {
 		if err := os.RemoveAll(agentDir(id)); err != nil {
 			return fmt.Errorf("archive: remove leftover plaintext dir: %w", err)
 		}
+		removeBashCaptureDir(id, m.logger)
 		return nil
 	}
 	if err := sealAgentDir(id, passcode); err != nil {
 		m.logger.Error("archive: sealing agent dir failed", "agent", id, "err", err)
 		return err
 	}
+	// Bash captures live outside the agent dir, so sealing doesn't pack
+	// or remove them; drop them so no plaintext command output survives
+	// the seal. They are disposable (the hook prunes them after 24h).
+	removeBashCaptureDir(id, m.logger)
 	m.logger.Info("agent dir sealed", "id", id)
 	return nil
 }

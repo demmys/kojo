@@ -243,6 +243,9 @@ func deleteGrokThreadRefStrict(agentID, sessionKey string) error {
 	return err
 }
 
+// grokBackgroundWaitTimeout is effectively unlimited (100 years).
+const grokBackgroundWaitTimeout = "3153600000"
+
 func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string, trust bool) []string {
 	args := []string{
 		"--prompt-file", promptPath,
@@ -257,6 +260,10 @@ func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt 
 		// Skip plan mode + subagent spawning to keep behaviour predictable.
 		"--no-plan",
 		"--no-subagents",
+		// grok stops background work (and exits 1) 10 minutes after the
+		// last turn by default. Kojo's own turn timeout already bounds the
+		// run, so let background tasks finish.
+		"--background-wait-timeout", grokBackgroundWaitTimeout,
 	}
 	if trust {
 		// Folder trust gates the MCP servers of <dir>/.grok/config.toml.

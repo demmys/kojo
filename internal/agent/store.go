@@ -705,6 +705,11 @@ func (st *agentStore) upsertAgentRow(ctx context.Context, a *Agent, created, upd
 func (st *agentStore) syncAgentPersonaRow(ctx context.Context, a *Agent, updated int64) error {
 	releaseSync := lockPersonaSync(a.ID)
 	defer releaseSync()
+	if AgentSealed(a.ID) {
+		// Directory is encrypted away: neither hydrate persona.md
+		// back nor treat the missing file as a cleared persona.
+		return nil
+	}
 
 	// Stale-snapshot defeat: m.save() captures `a` early (under
 	// m.mu) and releases the manager mutex before this call lands.

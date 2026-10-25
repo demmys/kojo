@@ -624,6 +624,10 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 						strings.TrimSpace(a.CronMessage), "",
 						store.AgentWorkspaceFileInsertOptions{AllowOverwrite: true}); uerr != nil {
 						logger.Warn("checkin migration: workspace upsert failed", "agent", a.ID, "err", uerr)
+					} else if AgentSealed(a.ID) {
+						// No disk mirror into the encrypted-away dir;
+						// Unarchive reconciles workspace files from DB.
+						migrated = true
 					} else {
 						checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
 						if werr := atomicfile.WriteBytes(checkinPath, []byte(strings.TrimSpace(a.CronMessage)), 0o644); werr != nil {
@@ -1665,6 +1669,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	// agentStore-internal paths take store.mu THEN personaSyncMu via
 	// upsertAgent; a path holding personaSyncMu and waiting for store.mu
 	// would invert that order and deadlock.
+	if cfg.Persona != nil && AgentSealed(id) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSealed, id)
+	}
 	if cfg.Persona != nil {
 		releasePersonaSync := lockPersonaSync(id)
 

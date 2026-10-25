@@ -32,7 +32,7 @@ import (
 // it removes the legacy CWD attach/ tree created by the prior broad
 // hydrate path, but it no longer copies blob_refs rows into the CWD.
 func hydrateAgentDirFromBlobs(ctx context.Context, st *store.Store, bs *blob.Store, agentID string, logger *slog.Logger) error {
-	if st == nil || bs == nil || agentID == "" {
+	if st == nil || bs == nil || agentID == "" || AgentSealed(agentID) {
 		return nil
 	}
 	dir := agentDir(agentID)

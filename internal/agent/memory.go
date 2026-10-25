@@ -181,6 +181,9 @@ func readPersonaFile(agentID string) (string, bool) {
 // (CLI process spawned by another goroutine) never observes a
 // partially-truncated body.
 func writePersonaFile(agentID string, content string) error {
+	if AgentSealed(agentID) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, agentID)
+	}
 	p := filepath.Join(agentDir(agentID), "persona.md")
 	if content == "" {
 		err := os.Remove(p)
@@ -422,6 +425,9 @@ func WriteWorkspaceFile(ctx context.Context, st *store.Store, agentID string, ki
 	// REST PUT.
 	release := LockAgentMemorySync(agentID)
 	defer release()
+	if AgentSealed(agentID) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSealed, agentID)
+	}
 
 	if trimmed == "" {
 		if err := st.SoftDeleteAgentWorkspaceFile(ctx, agentID, kind, ifMatchETag); err != nil {

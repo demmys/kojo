@@ -524,6 +524,11 @@ func (s *Server) validatePeerAgentSyncRequest(w http.ResponseWriter, r *http.Req
 			"agent.id contains characters not safe for on-disk paths")
 		return false
 	}
+	if agent.AgentSealed(req.Agent.ID) {
+		writeError(w, http.StatusConflict, "sealed",
+			"agent data is sealed in an encrypted archive here; refusing sync")
+		return false
+	}
 	if s.peerID != nil && req.SourceDeviceID == s.peerID.DeviceID {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"source_device_id must not equal the local peer")
@@ -863,6 +868,27 @@ func (s *Server) applyPeerAgentSync(w http.ResponseWriter, r *http.Request, req 
 	// disk materialize so prepareChat cannot scan stale disk between them and
 	// overwrite the freshly synced rows.
 	releaseMemSync := agent.LockAgentMemorySync(req.Agent.ID)
+	// Re-check under the locks: an Archive that sealed after the
+	// pre-validation must not have its DB rows replaced.
+	if agent.AgentSealed(req.Agent.ID) {
+		releasePatch()
+		releaseMemSync()
+		if sessionRollback != nil {
+			sessionRollback()
+		}
+		if grokRollback != nil {
+			grokRollback()
+		}
+		if codexRollback != nil {
+			codexRollback()
+		}
+		if geminiRollback != nil {
+			geminiRollback()
+		}
+		writeError(w, http.StatusConflict, "sealed",
+			"agent data is sealed in an encrypted archive here; refusing sync")
+		return
+	}
 	if err := s.applyReceiverOwnedSettingsToSyncRecord(r.Context(), req.Agent, req.OpID, req.TransferSkips); err != nil {
 		releasePatch()
 		releaseMemSync()

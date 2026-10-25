@@ -883,14 +883,26 @@ const messages = {
     ja: "人格とメモリを引き継いだコピーを作る。Slack・通知・認証情報は引き継がれない。",
     en: "Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.",
   },
+  "archive.passcode": { ja: "パスコード", en: "Passcode" },
+  "archive.passcodeConfirm": { ja: "パスコード (確認)", en: "Confirm passcode" },
+  "archive.passcodeMismatch": { ja: "パスコードが一致しない", en: "Passcodes do not match" },
+  "archive.passcodeTooShort": { ja: "{n} 文字以上にして", en: "Use at least {n} characters" },
+  "archive.invalidPasscode": { ja: "パスコードが違う", en: "Incorrect passcode" },
+  "archive.archiveTitle": { ja: "エージェントをアーカイブ", en: "Archive agent" },
+  "archive.unarchiveTitle": { ja: "アーカイブから復元", en: "Restore from archive" },
+  "archive.unarchiveDesc": {
+    ja: "「{name}」のデータは暗号化されている。アーカイブ時のパスコードを入力して。",
+    en: "\u201c{name}\u201d is encrypted. Enter the passcode used when archiving.",
+  },
+  "archive.sealedBadge": { ja: "暗号化済み", en: "encrypted" },
   "settings.archiving": { ja: "アーカイブ中...", en: "Archiving..." },
   "settings.archiveAgent": {
     ja: "エージェントをアーカイブ",
     en: "Archive Agent",
   },
   "settings.archiveAgentHelp": {
-    ja: "メインリストから隠してランタイム活動を止める。データは保持され、設定から復元できる。全グループ DM から外れる (アーカイブ解除しても復帰しない)。",
-    en: "Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).",
+    ja: "メインリストから隠してランタイム活動を止める。ディレクトリはパスコードで暗号化圧縮され、設定から同じパスコードで復元できる。全グループ DM から外れる (アーカイブ解除しても復帰しない)。",
+    en: "Hide from the main list and stop runtime activity. The directory is compressed and encrypted with a passcode; restore from Settings with the same passcode. Removes the agent from all group DMs (memberships are NOT restored on unarchive).",
   },
   "settings.deleting": { ja: "削除中...", en: "Deleting..." },
   "settings.deleteAgent": { ja: "エージェントを削除", en: "Delete Agent" },
@@ -952,8 +964,8 @@ const messages = {
     en: "Delete this agent? This cannot be undone.",
   },
   "settings.archiveConfirm": {
-    ja: "このエージェントをアーカイブする? ランタイム活動は止まるがデータは保持され、設定から復元できる。\n\n全グループ DM から外れ (2人グループは解散)、アーカイブ解除してもメンバーシップは復帰しない — 再招待が必要。",
-    en: "Archive this agent? Runtime activity stops; data is kept and can be restored from Settings.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
+    ja: "このエージェントをアーカイブする? ランタイム活動は止まり、エージェントのディレクトリはこのパスコードで暗号化圧縮される。設定から復元するときに同じパスコードが要る。パスコードを忘れたらディレクトリは復元できない。\n\n全グループ DM から外れ (2人グループは解散)、アーカイブ解除してもメンバーシップは復帰しない — 再招待が必要。",
+    en: "Archive this agent? Runtime activity stops and the agent's directory is compressed and encrypted with this passcode. Restoring from Settings needs the same passcode; if you forget it the directory cannot be recovered.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
   },
 
   // ── AgentDataBrowser ──

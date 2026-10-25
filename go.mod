@@ -3,6 +3,7 @@ module github.com/loppo-llc/kojo
 go 1.25.5
 
 require (
+	filippo.io/age v1.2.1
 	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/coder/websocket v1.8.14

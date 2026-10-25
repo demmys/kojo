@@ -88,7 +88,7 @@ var memoryDailyDateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 //     handleDeleteAgentMemory which calls SoftDeleteAgentMemory
 //     directly.
 func syncAgentMemoryToDB(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
-	if st == nil {
+	if st == nil || AgentSealed(agentID) {
 		return nil
 	}
 	path := filepath.Join(agentDir(agentID), "MEMORY.md")
@@ -296,7 +296,7 @@ func scanMemorySubdir(dir, kind, namePrefix string, logger *slog.Logger, agentID
 // prevent the rest from syncing. Returns the first error encountered for
 // the caller to log; the side-effects up to that point still apply.
 func syncMemoryEntriesToDB(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
-	if st == nil {
+	if st == nil || AgentSealed(agentID) {
 		return nil
 	}
 	disk, scanErr := scanMemoryDir(agentID, logger)
@@ -654,6 +654,11 @@ func dbContextWithCancel(_ context.Context, timeout time.Duration) (context.Cont
 // memorySyncMu[agentID]. Extracted so the blocking and best-effort
 // public entry points share one body.
 func syncAgentMemoryHeld(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
+	if AgentSealed(agentID) {
+		// The directory is encrypted away; an empty disk must not
+		// tombstone DB rows nor hydrate plaintext back.
+		return nil
+	}
 	var firstErr error
 	if err := syncAgentMemoryToDB(ctx, st, agentID, logger); err != nil {
 		if logger != nil {
@@ -776,7 +781,7 @@ func LockAgentMemorySync(agentID string) func() {
 // bug or attack attempt. The handler maps a non-nil return to
 // HTTP 500 so the orchestrator retries.
 func ReconcileAgentDiskFromDBHeld(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
-	if st == nil || agentID == "" {
+	if st == nil || agentID == "" || AgentSealed(agentID) {
 		return nil
 	}
 

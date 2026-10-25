@@ -48,7 +48,7 @@ func workspaceFilePath(agentID string, kind store.WorkspaceFileKind) string {
 // per-kind failures don't abort the loop so a single permission glitch
 // on user.md doesn't block checkin.md from reconciling.
 func ReconcileWorkspaceFilesDiskFromDBHeld(ctx context.Context, st *store.Store, agentID string, logger *slog.Logger) error {
-	if st == nil || agentID == "" {
+	if st == nil || agentID == "" || AgentSealed(agentID) {
 		return nil
 	}
 
@@ -226,4 +226,29 @@ func SyncWorkspaceFilesFromDisk(ctx context.Context, st *store.Store, agentID st
 		}
 	}
 	return firstErr
+}
+
+// fillMissingWorkspaceFilesFromDB writes the DB body of every live
+// workspace row whose disk file is absent. Existing files are never
+// touched. Caller holds memorySyncMu(agentID).
+func fillMissingWorkspaceFilesFromDB(ctx context.Context, st *store.Store, agentID string) error {
+	for _, kind := range workspaceFileKinds {
+		diskPath := workspaceFilePath(agentID, kind)
+		if _, err := os.Lstat(diskPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("stat %s: %w", diskPath, err)
+		}
+		rec, err := st.GetAgentWorkspaceFile(ctx, agentID, kind)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read workspace %s: %w", kind, err)
+		}
+		if err := atomicfile.WriteBytes(diskPath, []byte(rec.Body), 0o644); err != nil {
+			return fmt.Errorf("write workspace %s: %w", kind, err)
+		}
+	}
+	return nil
 }

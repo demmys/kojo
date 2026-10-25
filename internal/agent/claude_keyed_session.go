@@ -777,7 +777,7 @@ func (b *ClaudeBackend) chatViaKeyedSession(ctx context.Context, agent *Agent, u
 		// Same context-injection rule as the per-turn path for a fresh
 		// process; a reused live process already holds the thread context.
 		fresh := spawned && !opts.OneShot && inv.bootstrapRecentContext
-		msg := injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, !opts.OneShot && !fresh)
+		msg := injectSessionContexts(userMessage, opts, !opts.OneShot && !fresh)
 		if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 			msg = injectRecentMessagesContext(msg, opts.RecentMessagesContext)
 		}

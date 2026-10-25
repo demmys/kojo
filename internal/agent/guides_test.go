@@ -149,7 +149,8 @@ func TestBuildSystemPrompt_DisabledInjections(t *testing.T) {
 }
 
 // TestBuildVolatileContext_DisabledInjections verifies the volatile
-// per-turn block honors diary_notes / memory_search toggles.
+// per-turn block honors the memory_search toggle and that diary_notes
+// gates the session-start diary.
 func TestBuildVolatileContext_DisabledInjections(t *testing.T) {
 	m := newTestManager(t)
 	id := "ag_vol_disable"
@@ -162,8 +163,8 @@ func TestBuildVolatileContext_DisabledInjections(t *testing.T) {
 	m.agents[id] = &Agent{ID: id, DisabledInjections: []string{InjectionDiaryNotes, InjectionMemorySearch}}
 
 	out := m.BuildVolatileContext(t.Context(), id, "SEARCH_CANARY")
-	if strings.Contains(out, "DIARY_CANARY") {
-		t.Errorf("diary_notes disabled but diary summary injected: %q", out)
+	if got := m.BuildSessionStartContext(id); got != "" {
+		t.Errorf("diary_notes disabled but session-start diary built: %q", got)
 	}
 	if strings.Contains(out, "SEARCH_CANARY") {
 		t.Errorf("memory_search disabled but query context injected: %q", out)
@@ -172,11 +173,18 @@ func TestBuildVolatileContext_DisabledInjections(t *testing.T) {
 		t.Errorf("volatile context lost the wall-clock line")
 	}
 
-	// Sanity: with no toggles both blocks appear.
+	// Sanity: with no toggles both blocks appear — the diary only through
+	// the session-start path, never in the per-turn block itself.
 	m.agents[id] = &Agent{ID: id}
 	out = m.BuildVolatileContext(t.Context(), id, "SEARCH_CANARY")
-	if !strings.Contains(out, "DIARY_CANARY") || !strings.Contains(out, "SEARCH_CANARY") {
-		t.Errorf("enabled sections missing from volatile context: %q", out)
+	if strings.Contains(out, "DIARY_CANARY") {
+		t.Errorf("diary leaked into the per-turn volatile context: %q", out)
+	}
+	if !strings.Contains(out, "SEARCH_CANARY") {
+		t.Errorf("enabled query context missing from volatile context: %q", out)
+	}
+	if got := m.BuildSessionStartContext(id); !strings.Contains(got, "DIARY_CANARY") {
+		t.Errorf("session-start diary missing: %q", got)
 	}
 }
 

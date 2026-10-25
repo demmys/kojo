@@ -653,8 +653,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 	args := inv.args
 	fresh := !opts.OneShot && inv.bootstrapRecentContext
-	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext,
-		!opts.OneShot && !fresh)
+	userMessage = injectSessionContexts(userMessage, opts, !opts.OneShot && !fresh)
 	if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}

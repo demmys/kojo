@@ -25,6 +25,9 @@ func (m *Manager) ResetData(id string) error {
 	name := a.Name
 	m.mu.Unlock()
 
+	if AgentSealed(id) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, id)
+	}
 	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonReset))
 	if err != nil {
 		return err
@@ -289,7 +292,12 @@ func (m *Manager) ResetData(id string) error {
 // Takes Manager.LockPatch to serialize against in-flight PATCH-style
 // mutations on the same agent. Lock order is LockPatch → acquireResetGuard
 // → m.mu; PATCH handlers already take LockPatch first too.
-func (m *Manager) Archive(id string) error {
+//
+// passcode seals the agent directory into an encrypted archive (see
+// archive_seal.go). It is required for a fresh archive. On an agent that
+// is already archived but not sealed (archived before sealing existed,
+// or a previous seal attempt failed) a passcode seals it in place.
+func (m *Manager) Archive(id, passcode string) error {
 	release := m.LockPatch(id)
 	defer release()
 
@@ -299,17 +307,27 @@ func (m *Manager) Archive(id string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
-	if a.Archived {
-		m.mu.Unlock()
+	already := a.Archived
+	m.mu.Unlock()
+	if already && passcode == "" {
 		return nil
 	}
-	m.mu.Unlock()
+	if err := validateArchivePasscode(passcode); err != nil {
+		return err
+	}
 
 	cleanup, err := m.acquireResetGuard(id, KojoStop(stopReasonArchive))
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+
+	if already {
+		if err := m.waitOneShotClear(id); err != nil {
+			return fmt.Errorf("%w: chats are still draining; retry to encrypt", ErrAgentBusy)
+		}
+		return m.sealArchived(id, passcode)
+	}
 
 	if err := m.waitBusyClear(id); err != nil {
 		return err
@@ -338,8 +356,9 @@ func (m *Manager) Archive(id string) error {
 	// from posting into a group we're about to delete (which would either
 	// fail with ErrGroupNotFound or — worse — write transcript bytes to a
 	// directory that's seconds away from being os.RemoveAll'd).
-	if err := m.waitOneShotClear(id); err != nil {
-		m.logger.Warn("archive: one-shot chats did not drain in time", "agent", id, "err", err)
+	oneShotErr := m.waitOneShotClear(id)
+	if oneShotErr != nil {
+		m.logger.Warn("archive: one-shot chats did not drain in time", "agent", id, "err", oneShotErr)
 	}
 	// Remove from all group DMs so the agent doesn't keep showing up as a
 	// silent member that never replies. 2-person groups are dissolved (same
@@ -356,6 +375,36 @@ func (m *Manager) Archive(id string) error {
 
 	m.save()
 	m.logger.Info("agent archived", "id", id)
+	if oneShotErr != nil {
+		// A still-running chat could write into the tree while it is
+		// being packed. Leave it archived-but-unsealed; retrying
+		// Archive with the passcode seals it in place.
+		return fmt.Errorf("%w: archived, but chats are still draining; retry to encrypt", ErrAgentBusy)
+	}
+	return m.sealArchived(id, passcode)
+}
+
+// sealArchived encrypts an archived agent's directory under the
+// per-agent sync locks so no disk<->DB sync is mid-write while the
+// tree is packed and removed. Caller holds the reset guard.
+func (m *Manager) sealArchived(id, passcode string) error {
+	releaseMem := lockMemorySync(id)
+	defer releaseMem()
+	releasePersona := lockPersonaSync(id)
+	defer releasePersona()
+	if AgentSealed(id) {
+		// Already sealed: a previous seal may have failed to remove
+		// the plaintext tree. Finish that job.
+		if err := os.RemoveAll(agentDir(id)); err != nil {
+			return fmt.Errorf("archive: remove leftover plaintext dir: %w", err)
+		}
+		return nil
+	}
+	if err := sealAgentDir(id, passcode); err != nil {
+		m.logger.Error("archive: sealing agent dir failed", "agent", id, "err", err)
+		return err
+	}
+	m.logger.Info("agent dir sealed", "id", id)
 	return nil
 }
 
@@ -370,7 +419,10 @@ func (m *Manager) Archive(id string) error {
 // check happens INSIDE the guard so we can't observe a stale
 // "not archived" state while a concurrent Archive is mid-flight (the guard
 // blocks until that Archive's cleanup() releases it).
-func (m *Manager) Unarchive(id string) error {
+//
+// A sealed agent needs the archive passcode; a wrong passcode returns
+// ErrArchivePasscodeInvalid and leaves the agent archived.
+func (m *Manager) Unarchive(id, passcode string) error {
 	// LockPatch parity with Archive/Delete — keeps the per-agent
 	// lifecycle ordering consistent across all three transitions.
 	// Cheap to take; avoids future surprises if a new caller starts
@@ -403,6 +455,48 @@ func (m *Manager) Unarchive(id string) error {
 		// either way nothing more to do.
 		m.mu.Unlock()
 		return nil
+	}
+	m.mu.Unlock()
+
+	if AgentSealed(id) && passcode == "" {
+		return ErrArchivePasscodeRequired
+	}
+	releaseMem := lockMemorySync(id)
+	releasePersona := lockPersonaSync(id)
+	err = unsealAgentDir(id, passcode) // no-op when not sealed
+	releasePersona()
+	if err == nil {
+		// Workspace rows written while sealed (legacy CronMessage
+		// migration) have no disk mirror; fill only missing files so
+		// the disk->DB pass below cannot tombstone them. Restored files
+		// are kept as-is. Runs on every unarchive so a retry after a
+		// failure here (archive already removed) still completes it.
+		if st := getGlobalStore(); st != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = fillMissingWorkspaceFilesFromDB(ctx, st, id)
+			cancel()
+		}
+	}
+	releaseMem()
+	if err != nil {
+		return err
+	}
+	if st := getGlobalStore(); st != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := SyncAgentMemoryFromDisk(ctx, st, id, m.logger); err != nil {
+			m.logger.Warn("unarchive: memory sync failed", "agent", id, "err", err)
+		}
+		if err := SyncAgentPersonaFromDisk(ctx, st, id, m.logger); err != nil {
+			m.logger.Warn("unarchive: persona sync failed", "agent", id, "err", err)
+		}
+		cancel()
+	}
+
+	m.mu.Lock()
+	a, ok = m.agents[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
 	a.Archived = false
 	a.ArchivedAt = ""
@@ -573,6 +667,9 @@ func (m *Manager) Delete(id string) error {
 	// Bash captures live outside the agent dir, so the RemoveAll above
 	// doesn't reach them.
 	removeBashCaptureDir(id, m.logger)
+	if err := removeSealedArchive(id); err != nil {
+		m.logger.Warn("failed to remove sealed archive", "agent", id, "err", err)
+	}
 
 	// Drop auth token before removing from the in-memory map so a
 	// concurrent request can't temporarily resolve to a deleted agent.

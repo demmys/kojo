@@ -115,6 +115,8 @@ export interface AgentInfo {
   // the main list, but all data retained on disk for restore.
   archived?: boolean;
   archivedAt?: string;
+  /** Archived agent whose directory is passcode-encrypted. */
+  archiveSealed?: boolean;
   // Privileged grants the agent the ability to delete/reset other
   // agents (NOT to fork or read their full record). Owner-only mutation
   // via POST /api/v1/agents/{id}/privilege.
@@ -639,11 +641,16 @@ export const agentApi = {
 
   // archive: keeps all on-disk data but stops runtime activity. Reversible
   // via unarchive. Hidden from the main list; surfaced in global Settings.
-  archive: (id: string) =>
-    del<{ ok: boolean }>(`/api/v1/agents/${id}?archive=true`),
+  // passcode encrypts the agent directory into a sealed archive; the
+  // same passcode is required to unarchive.
+  archive: (id: string, passcode: string) =>
+    del<{ ok: boolean }>(`/api/v1/agents/${id}?archive=true`, { passcode }),
 
-  unarchive: (id: string) =>
-    post<AgentInfo>(`/api/v1/agents/${id}/unarchive`),
+  unarchive: (id: string, passcode?: string) =>
+    post<AgentInfo>(
+      `/api/v1/agents/${id}/unarchive`,
+      passcode ? { passcode } : undefined,
+    ),
 
   resetData: (id: string) => post<{ ok: boolean }>(`/api/v1/agents/${id}/reset`),
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -61,7 +62,15 @@ func newPackageLifecycleServer(t *testing.T) (srv *Server, agentID, transcript, 
 }
 
 func lifecycleCall(h http.HandlerFunc, method, target, agentID string) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(method, target, nil)
+	var body io.Reader
+	if strings.Contains(target, "archive=true") || strings.HasSuffix(target, "/unarchive") {
+		body = strings.NewReader(`{"passcode":"test-passcode"}`)
+	}
+	return lifecycleCallBody(h, method, target, agentID, body)
+}
+
+func lifecycleCallBody(h http.HandlerFunc, method, target, agentID string, body io.Reader) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, target, body)
 	r.SetPathValue("id", agentID)
 	r = authedRequest(r, auth.Principal{Role: auth.RoleOwner})
 	rr := httptest.NewRecorder()
@@ -225,5 +234,36 @@ func TestGoalResumeWithoutSlackPackage(t *testing.T) {
 	err := s.resumeGoalSurface(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "Slack extension is not connected") {
 		t.Fatalf("resume with nothing connected = %v", err)
+	}
+}
+
+func TestArchivePasscodeHTTP(t *testing.T) {
+	srv, agentID, _, _ := newPackageLifecycleServer(t)
+	del := func(body string) *httptest.ResponseRecorder {
+		return lifecycleCallBody(srv.handleDeleteAgent, http.MethodDelete, "/api/v1/agents/"+agentID+"?archive=true", agentID, strings.NewReader(body))
+	}
+	unarchive := func(body string) *httptest.ResponseRecorder {
+		return lifecycleCallBody(srv.handleUnarchiveAgent, http.MethodPost, "/api/v1/agents/"+agentID+"/unarchive", agentID, strings.NewReader(body))
+	}
+	if rr := del(""); rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "passcode_required") {
+		t.Fatalf("archive w/o passcode = %d %s", rr.Code, rr.Body)
+	}
+	if rr := del(`{"passcode":"secret-1"}`); rr.Code != http.StatusOK {
+		t.Fatalf("archive = %d %s", rr.Code, rr.Body)
+	}
+	if !agent.AgentSealed(agentID) {
+		t.Fatal("not sealed")
+	}
+	if rr := unarchive(""); rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "passcode_required") {
+		t.Fatalf("unarchive w/o passcode = %d %s", rr.Code, rr.Body)
+	}
+	if rr := unarchive(`{"passcode":"nope-nope"}`); rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "invalid_passcode") {
+		t.Fatalf("unarchive wrong passcode = %d %s", rr.Code, rr.Body)
+	}
+	if rr := unarchive(`{"passcode":"secret-1"}`); rr.Code != http.StatusOK {
+		t.Fatalf("unarchive = %d %s", rr.Code, rr.Body)
+	}
+	if agent.AgentSealed(agentID) {
+		t.Fatal("still sealed")
 	}
 }

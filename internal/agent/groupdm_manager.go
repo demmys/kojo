@@ -109,7 +109,9 @@ type pendingMsg struct {
 	content      string
 	timestamp    string // RFC3339
 	senderIsUser bool
-	attachments  []MessageAttachment
+	// senderIsExternal marks a post by an external AI agent ("xa_...").
+	senderIsExternal bool
+	attachments      []MessageAttachment
 	// hop is the relay depth of the buffered message; the recipient's
 	// notification-triggered turn posts at max(hop)+1.
 	hop int
@@ -138,6 +140,7 @@ type notifyState struct {
 
 // GroupDMManager manages group DM CRUD, message posting, and notifications.
 type GroupDMManager struct {
+	external externalBridgeHolder
 	mu       sync.Mutex
 	groups   map[string]*GroupDM
 	agentMgr *Manager
@@ -635,7 +638,7 @@ func (m *GroupDMManager) Create(name string, memberIDs []string, cooldown int, s
 // it separately. One member means a human↔agent DM (the human operator is
 // an implicit participant of every room); two members is an agent↔agent DM.
 func (m *GroupDMManager) FindOrCreateDM(memberIDs []string) (*GroupDM, bool, error) {
-	members, err := m.resolveMembers(memberIDs, uniqueMemberCount(memberIDs) == 1)
+	members, err := m.resolveMembers(memberIDs, uniqueMemberCount(memberIDs) == 1, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -717,7 +720,22 @@ func (m *GroupDMManager) CreateWithNotify(name string, memberIDs []string, coold
 	return m.create(name, memberIDs, cooldown, style, venue, GroupDMKindGroup, notifyMembers)
 }
 
+// CreateWithNotifyAs is CreateWithNotify with the caller's authority:
+// only an Owner / ownerDeputy caller may put external agents ("xa_...")
+// into a room. Enforced here (not in the handler) so every create path
+// shares the gate.
+func (m *GroupDMManager) CreateWithNotifyAs(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, notifyMembers, ownerAuthority bool) (*GroupDM, error) {
+	return m.createEx(name, memberIDs, cooldown, style, venue, GroupDMKindGroup, notifyMembers, ownerAuthority)
+}
+
 func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, kind GroupDMKind, notifyMembers bool) (*GroupDM, error) {
+	return m.createEx(name, memberIDs, cooldown, style, venue, kind, notifyMembers, false)
+}
+
+func (m *GroupDMManager) createEx(name string, memberIDs []string, cooldown int, style GroupDMStyle, venue GroupDMVenue, kind GroupDMKind, notifyMembers, allowExternal bool) (*GroupDM, error) {
+	if kind != GroupDMKindGroup {
+		allowExternal = false
+	}
 	// DMs (kind "dm") allow a single agent member — the human operator is
 	// an implicit participant. Classic groups keep the 2-member floor.
 	minMembers := 2
@@ -735,7 +753,7 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	// and must keep requiring a locally-running member.
 	allowRemote := kind == GroupDMKindThread ||
 		(kind == GroupDMKindDM && uniqueMemberCount(memberIDs) == 1)
-	members, err := m.resolveMembers(memberIDs, allowRemote)
+	members, err := m.resolveMembers(memberIDs, allowRemote, allowExternal)
 	if err != nil {
 		return nil, err
 	}
@@ -785,6 +803,13 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	// this re-check we'd publish a group containing a now-archived (and
 	// already-removed-from-other-groups) or now-deleted agent.
 	for _, mem := range members {
+		if IsExternalID(mem.AgentID) {
+			if _, err := m.resolveExternalMember(mem.AgentID, allowExternal); err != nil {
+				m.mu.Unlock()
+				return nil, err
+			}
+			continue
+		}
 		a, ok := m.lookupMember(mem.AgentID, allowRemote)
 		if !ok {
 			m.mu.Unlock()
@@ -815,8 +840,10 @@ func (m *GroupDMManager) create(name string, memberIDs []string, cooldown int, s
 	m.mu.Unlock()
 	m.logger.Info("group DM created", "id", g.ID, "name", g.Name)
 
-	if notifyMembers {
-		for _, mem := range snapshot.Members {
+	for _, mem := range snapshot.Members {
+		if IsExternalID(mem.AgentID) {
+			m.publishExternal(mem.AgentID, ExternalEvent{Type: ExternalEventMemberAdded, GroupID: snapshot.ID})
+		} else if notifyMembers {
 			go m.notifyGroupCreated(mem.AgentID, snapshot.ID, snapshot.Name, snapshot.Members)
 		}
 	}
@@ -993,11 +1020,11 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	// Collect members for notification before deleting
 	var members []GroupMember
 	var groupName string
-	if notify {
-		members = make([]GroupMember, len(g.Members))
-		copy(members, g.Members)
-		groupName = g.Name
-	}
+	// Always snapshot: external members get group_deleted regardless
+	// of notify.
+	members = make([]GroupMember, len(g.Members))
+	copy(members, g.Members)
+	groupName = g.Name
 	// Thread rooms (kind "dm", single agent member) get extra teardown:
 	// cancel any in-flight thread turn and drop the per-thread Claude
 	// session JSONL so the throwaway side-conversation leaves nothing behind.
@@ -1057,6 +1084,11 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 	m.logger.Info("group DM deleted", "id", id, "notify", notify)
 
 	// Notify members after deletion
+	for _, mem := range members {
+		if IsExternalID(mem.AgentID) {
+			m.publishExternal(mem.AgentID, ExternalEvent{Type: ExternalEventGroupDeleted, GroupID: id})
+		}
+	}
 	if notify {
 		for _, mem := range members {
 			go m.notifyGroupDeleted(mem.AgentID, id, groupName)
@@ -1069,6 +1101,11 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 // sendSystemNotification sends a system message to an agent and drains the response.
 // Errors from busy/resetting agents are silently ignored; other errors are logged.
 func (m *GroupDMManager) sendSystemNotification(agentID, notification, logContext string) {
+	if IsExternalID(agentID) {
+		// External agents get structured events (publishExternal), never
+		// a kojo chat turn.
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1127,7 +1164,7 @@ func (m *GroupDMManager) notifyGroupCreated(agentID, groupID, groupName string, 
 // through PostUserMessage; calls with that agentID are rejected so no
 // agent can impersonate a human-user message.
 func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify bool) (*GroupMessage, error) {
-	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, false)
+	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, false, false)
 }
 
 // PostMessageStrict is PostMessage with mandatory CAS: an empty
@@ -1136,12 +1173,30 @@ func (m *GroupDMManager) PostMessage(ctx context.Context, groupID, agentID, cont
 // under the same lock as the CAS compare so a racing first post cannot
 // slip through the "room is empty" allowance.
 func (m *GroupDMManager) PostMessageStrict(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify bool) (*GroupMessage, error) {
-	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, true)
+	return m.postMessage(ctx, groupID, agentID, content, expectedLatestID, notify, true, false)
 }
 
-func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify, requireCAS bool) (*GroupMessage, error) {
+// PostExternalMessage posts on behalf of an external AI agent ("xa_...").
+// CAS is mandatory and the hop is derived from the message the caller
+// replied to (hop(expectedLatest)+1); a post that would reach the room's
+// max hop is refused with ErrExternalHopLimit, because an external agent
+// reacts to events on its own and suppressing kojo-side notifications
+// alone would not stop an external<->agent loop.
+func (m *GroupDMManager) PostExternalMessage(ctx context.Context, groupID, externalID, content, expectedLatestID string) (*GroupMessage, error) {
+	if !IsExternalID(externalID) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, externalID)
+	}
+	return m.postMessage(ctx, groupID, externalID, content, expectedLatestID, true, true, true)
+}
+
+func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, content, expectedLatestID string, notify, requireCAS, external bool) (*GroupMessage, error) {
 	if agentID == UserSenderID {
 		return nil, fmt.Errorf("agent id %q is reserved for the human user", agentID)
+	}
+	// External ids may only post through PostExternalMessage (the
+	// external listener), never through the kojo agent / Owner API.
+	if IsExternalID(agentID) != external {
+		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	}
 
 	// The CAS check, append, and cache update must happen under the same
@@ -1188,7 +1243,14 @@ func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, cont
 	// renames don't rewrite history (consistent with the rest of the
 	// transcript), but neither does a blank name leak in via the cache.
 	var senderName string
-	if a, ok := m.agentMgr.Get(agentID); !ok {
+	if external {
+		x, ok := m.externalInfo(agentID)
+		if !ok || !x.Enabled {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
+		}
+		senderName = x.Name
+	} else if a, ok := m.agentMgr.Get(agentID); !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, agentID)
 	} else if a.Archived {
@@ -1257,7 +1319,9 @@ func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, cont
 	// everything else starts a fresh chain at 0. Persisted on the message
 	// so relay depth survives restarts.
 	hop := 0
-	if th, ok := m.currentTriggerHop(agentID); ok {
+	if external {
+		// Computed below from the CAS cursor.
+	} else if th, ok := m.currentTriggerHop(agentID); ok {
 		hop = th + 1
 	}
 
@@ -1293,6 +1357,24 @@ func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, cont
 		}
 		expectedSeq = seq
 		enforceSeq = true
+		if external {
+			prev, _, perr := loadGroupMessagesAfterSeq(groupID, seq-1, 1)
+			if perr != nil {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("load replied-to message: %w", perr)
+			}
+			if len(prev) > 0 {
+				if prev[0].AgentID == UserSenderID {
+					hop = 1
+				} else {
+					hop = prev[0].Hop + 1
+				}
+			}
+			if hop >= maxHops {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("%w: hop %d reaches the room limit %d; wait for the operator", ErrExternalHopLimit, hop, maxHops)
+			}
+		}
 	} else if requireCAS {
 		// Mandatory-CAS caller on an (in-cache) empty room: enforce
 		// "room must be empty" at the DB level too, so two concurrent
@@ -1339,12 +1421,18 @@ func (m *GroupDMManager) postMessage(ctx context.Context, groupID, agentID, cont
 	// entirely — the message stays in the transcript for humans, but no
 	// agent is notified, so the chain terminates. Mentions do NOT pierce
 	// this limit (they only pierce cooldown).
+	// External recipients get every message as an event (they decide
+	// for themselves); only their muted setting is honoured.
+	m.publishExternalMessage(groupID, msg, recipients)
 	if notify {
 		if msg.Hop >= maxHops {
 			m.logger.Info("groupdm agent fan-out suppressed (hop limit)",
 				"group", groupID, "message", msg.ID, "hop", msg.Hop, "maxHops", maxHops)
 		} else {
 			for _, r := range recipients {
+				if IsExternalID(r.AgentID) {
+					continue
+				}
 				go m.notifyAgent(r.AgentID, groupID, groupName, msg, false,
 					containsMention(msg.Mentions, r.AgentID))
 			}
@@ -1412,6 +1500,12 @@ func (m *GroupDMManager) currentTriggerHop(agentID string) (int, bool) {
 func (m *GroupDMManager) parseMentions(content string, memberIDs []string) []string {
 	names := make(map[string]string, len(memberIDs))
 	for _, id := range memberIDs {
+		if IsExternalID(id) {
+			if x, ok := m.externalInfo(id); ok {
+				names[id] = x.Name
+			}
+			continue
+		}
 		if a, ok := m.agentMgr.Get(id); ok {
 			names[id] = a.Name
 		}
@@ -1519,10 +1613,16 @@ func (m *GroupDMManager) postUserMessage(ctx context.Context, groupID, content s
 		if !isSteer {
 			go m.runThreadTurnReserved(threadAgentID, groupID, groupName, msg, threadTurn, threadArrival)
 		}
-	} else if notify {
-		for _, r := range recipients {
-			go m.notifyAgent(r.AgentID, groupID, groupName, msg, true,
-				containsMention(msg.Mentions, r.AgentID))
+	} else {
+		m.publishExternalMessage(groupID, msg, recipients)
+		if notify {
+			for _, r := range recipients {
+				if IsExternalID(r.AgentID) {
+					continue
+				}
+				go m.notifyAgent(r.AgentID, groupID, groupName, msg, true,
+					containsMention(msg.Mentions, r.AgentID))
+			}
 		}
 	}
 
@@ -2904,6 +3004,10 @@ func renameRecipientsLocked(g *GroupDM, callerAgentID string) []GroupMember {
 // notifyRename sends a lightweight notification about a group rename.
 // Unlike message notifications, this does not enforce cooldown or expect a reply.
 func (m *GroupDMManager) notifyRename(agentID, groupID, groupName, oldName, newName, callerName string) {
+	if IsExternalID(agentID) {
+		m.publishExternal(agentID, ExternalEvent{Type: ExternalEventGroupUpdated, GroupID: groupID})
+		return
+	}
 	notification := fmt.Sprintf(
 		"[Group DM: %s] Group renamed from %q to %q by %s.",
 		groupName, oldName, newName, callerName,
@@ -3010,6 +3114,10 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 	// message can never satisfy `msg.AgentID == agentID` against a real
 	// member. A debug log here helps detect real-world fan-out bugs that
 	// this guard would otherwise mask.
+	if IsExternalID(agentID) {
+		// Externals are fed by publishExternalMessage, never a chat turn.
+		return
+	}
 	if msg.AgentID == agentID {
 		m.logger.Debug("groupdm self-notification suppressed",
 			"group", groupID, "agent", agentID, "messageID", msg.ID, "senderIsUser", senderIsUser)
@@ -3047,12 +3155,13 @@ func (m *GroupDMManager) notifyAgent(agentID, groupID, groupName string, msg *Gr
 	ns.groupID = groupID
 	ns.groupName = groupName
 	ns.pendingMsgs = append(ns.pendingMsgs, pendingMsg{
-		sender:       msg.AgentName,
-		content:      msg.Content,
-		timestamp:    msg.Timestamp,
-		senderIsUser: senderIsUser,
-		attachments:  msg.Attachments,
-		hop:          msg.Hop,
+		sender:           msg.AgentName,
+		content:          msg.Content,
+		timestamp:        msg.Timestamp,
+		senderIsUser:     senderIsUser,
+		senderIsExternal: IsExternalID(msg.AgentID),
+		attachments:      msg.Attachments,
+		hop:              msg.Hop,
 	})
 	// Bound the pending buffer: if a recipient stays busy while posts pile
 	// up we drop the oldest entries rather than growing without limit. The
@@ -3312,6 +3421,8 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 	b.WriteString("\n")
 	b.WriteString(styleHint)
 	b.WriteString("\n")
+	extHeader, extFooter := m.externalNotice(groupID, pending)
+	b.WriteString(extHeader)
 	if omitted > 0 {
 		fmt.Fprintf(&b, "(%d earlier message(s) omitted — fetch the full transcript if needed.)\n", omitted)
 	}
@@ -3334,6 +3445,8 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 		senderLabel := sanitizeHeaderField(p.sender)
 		if p.senderIsUser {
 			senderLabel = senderLabel + " (human operator)"
+		} else if p.senderIsExternal {
+			senderLabel = senderLabel + " (external agent, not the operator)"
 		}
 		c := p.content
 		clipped := false
@@ -3357,6 +3470,7 @@ func (m *GroupDMManager) renderNotification(agentID, groupID, groupName, latestM
 		}
 	}
 	b.WriteString("--- END UNTRUSTED GROUP MESSAGES ---\n")
+	b.WriteString(extFooter)
 	// Reply curl. expectedLatestMessageId is the CAS guard: the server
 	// rejects the post with 409 Conflict if any other member posted after
 	// the latest message ID above, returning the diff so the agent can
@@ -3709,7 +3823,7 @@ func (m *GroupDMManager) threadAgentInfo(id string) (*Agent, bool) {
 	return m.lookupMember(id, true)
 }
 
-func (m *GroupDMManager) resolveMembers(ids []string, allowRemote bool) ([]GroupMember, error) {
+func (m *GroupDMManager) resolveMembers(ids []string, allowRemote, allowExternal bool) ([]GroupMember, error) {
 	seen := make(map[string]bool, len(ids))
 	var members []GroupMember
 	for _, id := range ids {
@@ -3720,6 +3834,14 @@ func (m *GroupDMManager) resolveMembers(ids []string, allowRemote bool) ([]Group
 			continue
 		}
 		seen[id] = true
+		if IsExternalID(id) {
+			mem, err := m.resolveExternalMember(id, allowExternal)
+			if err != nil {
+				return nil, err
+			}
+			members = append(members, mem)
+			continue
+		}
 		a, ok := m.lookupMember(id, allowRemote)
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
@@ -3749,6 +3871,14 @@ func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
 	copy(cp.Members, g.Members)
 	// Resolve current agent names (stored names may be stale after rename).
 	for i, mem := range cp.Members {
+		if IsExternalID(mem.AgentID) {
+			cp.Members[i].Kind = MemberKindExternal
+			if x, ok := m.externalInfo(mem.AgentID); ok {
+				cp.Members[i].AgentName = x.Name
+				cp.Members[i].Description = x.Description
+			}
+			continue
+		}
 		if a, ok := m.agentMgr.Get(mem.AgentID); ok {
 			cp.Members[i].AgentName = a.Name
 		}
@@ -3759,6 +3889,12 @@ func (m *GroupDMManager) copyGroup(g *GroupDM) *GroupDM {
 // AddMember adds an agent to an existing group DM. callerAgentID must be a current member.
 // Notifies existing members about the new addition.
 func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*GroupDM, error) {
+	return m.AddMemberAs(id, newAgentID, callerAgentID, false)
+}
+
+// AddMemberAs is AddMember with the caller's authority. Only an Owner /
+// ownerDeputy (ownerAuthority) may add an external agent.
+func (m *GroupDMManager) AddMemberAs(id, newAgentID, callerAgentID string, ownerAuthority bool) (*GroupDM, error) {
 	if newAgentID == UserSenderID {
 		return nil, fmt.Errorf("agent id %q is reserved for the human user", newAgentID)
 	}
@@ -3766,14 +3902,24 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 		return nil, err
 	}
 	// Resolve the new member first (outside lock)
-	a, ok := m.agentMgr.Get(newAgentID)
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
+	newIsExternal := IsExternalID(newAgentID)
+	var newMember GroupMember
+	if newIsExternal {
+		mem, err := m.resolveExternalMember(newAgentID, ownerAuthority)
+		if err != nil {
+			return nil, err
+		}
+		newMember = mem
+	} else {
+		a, ok := m.agentMgr.Get(newAgentID)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
+		}
+		if a.Archived {
+			return nil, fmt.Errorf("%w: %s", ErrAgentArchived, newAgentID)
+		}
+		newMember = GroupMember{AgentID: a.ID, AgentName: a.Name}
 	}
-	if a.Archived {
-		return nil, fmt.Errorf("%w: %s", ErrAgentArchived, newAgentID)
-	}
-	newMember := GroupMember{AgentID: a.ID, AgentName: a.Name}
 
 	m.mu.Lock()
 	g, err := m.liveGroupLocked(id)
@@ -3787,6 +3933,10 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	if g.Kind == GroupDMKindDM {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("cannot add members to a dm room %s; create a group instead", id)
+	}
+	if newIsExternal && g.Kind != GroupDMKindGroup && g.Kind != "" {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("%w: external agents can only join group rooms", ErrExternalNotAllowed)
 	}
 
 	// Verify caller is a member
@@ -3813,7 +3963,12 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 	// append an agent right after Archive's RemoveAgent removed it from
 	// everywhere else, or append a deleted agent that will never receive
 	// notifications.
-	if a2, ok := m.agentMgr.Get(newAgentID); !ok {
+	if newIsExternal {
+		if _, err := m.resolveExternalMember(newAgentID, ownerAuthority); err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+	} else if a2, ok := m.agentMgr.Get(newAgentID); !ok {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, newAgentID)
 	} else if a2.Archived {
@@ -3873,7 +4028,11 @@ func (m *GroupDMManager) AddMember(id, newAgentID, callerAgentID string) (*Group
 		go m.notifyMemberChange(r.AgentID, id, groupName, callerName, newMember.AgentName, "added")
 	}
 	// Notify the new member that they were added
-	go m.notifyMemberChange(newAgentID, id, groupName, callerName, newMember.AgentName, "added_you")
+	if newIsExternal {
+		m.publishExternal(newAgentID, ExternalEvent{Type: ExternalEventMemberAdded, GroupID: id})
+	} else {
+		go m.notifyMemberChange(newAgentID, id, groupName, callerName, newMember.AgentName, "added_you")
+	}
 
 	return cp, nil
 }
@@ -3896,14 +4055,23 @@ func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 	originalUpdatedAt := g.UpdatedAt
 	var leaverName string
 	var filtered []GroupMember
+	found := false
 	for _, mem := range g.Members {
 		if mem.AgentID == agentID {
+			found = true
 			leaverName = mem.AgentName
 		} else {
 			filtered = append(filtered, mem)
 		}
 	}
-	if leaverName == "" {
+	if found && leaverName == "" && IsExternalID(agentID) {
+		if x, ok := m.externalInfo(agentID); ok {
+			leaverName = x.Name
+		} else {
+			leaverName = agentID
+		}
+	}
+	if !found || leaverName == "" {
 		m.mu.Unlock()
 		return fmt.Errorf("%w: agent %s in group %s", ErrGroupNotMember, agentID, id)
 	}
@@ -3969,8 +4137,15 @@ func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 
 	m.logger.Info("agent left group DM", "group", id, "agent", agentID, "deleted", deleteGroup)
 
+	if IsExternalID(agentID) {
+		m.publishExternal(agentID, ExternalEvent{Type: ExternalEventMemberRemoved, GroupID: id})
+	}
 	// Notify remaining members (including the last one when group is dissolved)
 	for _, r := range remaining {
+		if deleteGroup && IsExternalID(r.AgentID) {
+			m.publishExternal(r.AgentID, ExternalEvent{Type: ExternalEventGroupDeleted, GroupID: id})
+			continue
+		}
 		go m.notifyMemberChange(r.AgentID, id, groupName, leaverName, leaverName, "left")
 	}
 
@@ -3979,6 +4154,10 @@ func (m *GroupDMManager) LeaveGroup(id, agentID string) error {
 
 // notifyMemberChange sends a notification about member addition or departure.
 func (m *GroupDMManager) notifyMemberChange(agentID, groupID, groupName, actorName, targetName, action string) {
+	if IsExternalID(agentID) {
+		m.publishExternal(agentID, ExternalEvent{Type: ExternalEventGroupUpdated, GroupID: groupID})
+		return
+	}
 	var notification string
 	switch action {
 	case "added":
@@ -4000,6 +4179,43 @@ func (m *GroupDMManager) notifyMemberChange(agentID, groupID, groupName, actorNa
 // persistOne; persist failures revert the in-memory mutation so the
 // next save sweep doesn't propagate a phantom drop.
 func (m *GroupDMManager) RemoveAgent(agentID string) {
+	// Snapshot the external co-members of every affected room so they
+	// learn about the shrink / dissolve afterwards.
+	type affected struct {
+		id        string
+		externals []string
+	}
+	var before []affected
+	m.mu.Lock()
+	for _, g := range m.groups {
+		in := false
+		var xs []string
+		for _, mem := range g.Members {
+			if mem.AgentID == agentID {
+				in = true
+			} else if IsExternalID(mem.AgentID) {
+				xs = append(xs, mem.AgentID)
+			}
+		}
+		if in && len(xs) > 0 {
+			before = append(before, affected{g.ID, xs})
+		}
+	}
+	m.mu.Unlock()
+	m.removeAgentCore(agentID)
+	for _, a := range before {
+		_, alive := m.Get(a.id)
+		for _, x := range a.externals {
+			if !alive {
+				m.publishExternal(x, ExternalEvent{Type: ExternalEventGroupDeleted, GroupID: a.id})
+			} else if m.CheckMembership(a.id, x) == nil {
+				m.publishExternal(x, ExternalEvent{Type: ExternalEventGroupUpdated, GroupID: a.id})
+			}
+		}
+	}
+}
+
+func (m *GroupDMManager) removeAgentCore(agentID string) {
 	// First pass: collect IDs of every group that contains agentID.
 	// Crucially DO NOT classify (toShrink vs toDelete) here, and DO
 	// NOT set m.deleting — that happens in the second pass under
@@ -4347,6 +4563,7 @@ func groupDMToRecord(g *GroupDM) *store.GroupDMRecord {
 		}
 		members = append(members, store.GroupDMMember{
 			AgentID:      mem.AgentID,
+			Kind:         mem.Kind,
 			NotifyMode:   string(mem.NotifyMode),
 			DigestWindow: mem.DigestWindow,
 		})
@@ -4371,6 +4588,7 @@ func groupRecordToGroupDM(rec *store.GroupDMRecord) *GroupDM {
 	for _, mem := range rec.Members {
 		members = append(members, GroupMember{
 			AgentID:      mem.AgentID,
+			Kind:         mem.Kind,
 			NotifyMode:   NotifyMode(mem.NotifyMode),
 			DigestWindow: mem.DigestWindow,
 		})

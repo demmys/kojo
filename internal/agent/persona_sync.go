@@ -44,6 +44,9 @@ func SyncAgentPersonaFromDisk(ctx context.Context, st *store.Store, agentID stri
 
 	release := lockPersonaSync(agentID)
 	defer release()
+	if AgentSealed(agentID) {
+		return nil
+	}
 
 	content, fileExists, readErr := readPersonaForSync(agentID)
 	if readErr != nil {

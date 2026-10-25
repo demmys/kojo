@@ -30,7 +30,11 @@ const openCodeAuxTimeout = 2 * time.Minute
 
 // openOpenCodeDB opens the agent's OpenCode session DB read-only, or
 // returns (nil, nil) when it does not exist yet.
-func openOpenCodeDB(home string) (*sql.DB, error) {
+func openOpenCodeDB(home string) (*sql.DB, error) { return openOpenCodeDBMode(home, true) }
+
+// openOpenCodeDBMode is openOpenCodeDB with the access mode chosen by the
+// caller; a writable handle uses BEGIN IMMEDIATE and enforces foreign keys.
+func openOpenCodeDBMode(home string, readOnly bool) (*sql.DB, error) {
 	// Never follow a planted link out of the home (e.g. data ->
 	// ~/.local/share): that would read the operator's own OpenCode DB.
 	if err := geminiRefuseSymlinks(home, filepath.Join(home, "data"), openCodeDataDir(home)); err != nil {
@@ -53,7 +57,7 @@ func openOpenCodeDB(home string) (*sql.DB, error) {
 			return nil, fmt.Errorf("opencode db sidecar %s is not a regular file", path+side)
 		}
 	}
-	return sql.Open("sqlite", codexSQLiteDSN(path, true))
+	return sql.Open("sqlite", codexSQLiteDSN(path, readOnly))
 }
 
 // openCodeSessionExists reports whether sessionID is in the agent's

@@ -181,6 +181,9 @@ func readPersonaFile(agentID string) (string, bool) {
 // (CLI process spawned by another goroutine) never observes a
 // partially-truncated body.
 func writePersonaFile(agentID string, content string) error {
+	if AgentSealed(agentID) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, agentID)
+	}
 	p := filepath.Join(agentDir(agentID), "persona.md")
 	if content == "" {
 		err := os.Remove(p)
@@ -422,6 +425,9 @@ func WriteWorkspaceFile(ctx context.Context, st *store.Store, agentID string, ki
 	// REST PUT.
 	release := LockAgentMemorySync(agentID)
 	defer release()
+	if AgentSealed(agentID) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSealed, agentID)
+	}
 
 	if trimmed == "" {
 		if err := st.SoftDeleteAgentWorkspaceFile(ctx, agentID, kind, ifMatchETag); err != nil {
@@ -959,6 +965,12 @@ func writeStatusSectionReadOnly(sb *strings.Builder, content string) {
 // between turns belongs here, NOT in the system prompt — keeping it out of
 // the system prompt is what lets Claude's prompt cache stay warm.
 //
+// The recent-activity diary is NOT part of it: a resumed session already
+// holds that history, so re-sending it every turn only burns tokens. It
+// travels as ChatOptions.SessionStartContext (see BuildSessionStartContext)
+// and is injected by the backend only when a fresh session starts, plus
+// once after a native compaction (MarkDiaryReinject).
+//
 // The block is wrapped in a `<context>...</context>` tag so the agent can
 // recognise it as data, not instructions. Inner content is escaped so a
 // stray `</context>` in a task title / diary entry / search snippet
@@ -991,12 +1003,6 @@ func (m *Manager) BuildVolatileContext(ctx context.Context, agentID string, quer
 			sb.WriteString(escapeContextClose(taskSummary))
 		}
 	}
-	if !m.injectionDisabled(agentID, InjectionDiaryNotes) {
-		if diarySummary := RecentDiarySummary(agentID); diarySummary != "" {
-			sb.WriteString("\n")
-			sb.WriteString(escapeContextClose(diarySummary))
-		}
-	}
 	if queryContext != "" && !m.injectionDisabled(agentID, InjectionMemorySearch) {
 		sb.WriteString("\n")
 		sb.WriteString(escapeContextClose(queryContext))
@@ -1027,6 +1033,66 @@ func (m *Manager) BuildVolatileContext(ctx context.Context, agentID string, quer
 	}
 
 	return sb.String()
+}
+
+// BuildSessionStartContext returns the recent-activity diary block that a
+// backend injects into the <context> block only when the turn starts a
+// fresh session (or one-shot) — see injectSessionContexts. Empty when the
+// injection is disabled or no summary exists yet.
+func (m *Manager) BuildSessionStartContext(agentID string) string {
+	if m.injectionDisabled(agentID, InjectionDiaryNotes) {
+		return ""
+	}
+	diary := RecentDiarySummary(agentID)
+	if diary == "" {
+		return ""
+	}
+	return escapeContextClose(diary)
+}
+
+// MarkDiaryReinject flags the agent's next main-chat turn to carry the
+// recent-activity diary even on a resumed session. Called after a native
+// compaction of the main session rewrote memory/recent.md: the compacted
+// session lost the detail the summary preserves, so it is handed back
+// exactly once. The flag is a generation number so a compaction that lands
+// while a turn is being prepared survives that turn's clear.
+func (m *Manager) MarkDiaryReinject(agentID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.diaryReinject == nil {
+		m.diaryReinject = make(map[string]uint64)
+	}
+	m.diaryReinjectSeq++
+	m.diaryReinject[agentID] = m.diaryReinjectSeq
+}
+
+// IsMainClaudeSession reports whether a Claude hook payload (session_id,
+// else the transcript file name) belongs to the agent's main session, whose
+// id is the deterministic agentIDToUUID. Unknown payloads count as main.
+func IsMainClaudeSession(agentID, sessionID, transcriptPath string) bool {
+	id := sessionID
+	if id == "" && transcriptPath != "" {
+		id = strings.TrimSuffix(filepath.Base(transcriptPath), ".jsonl")
+	}
+	return id == "" || id == agentIDToUUID(agentID)
+}
+
+// diaryReinjectPending returns the pending MarkDiaryReinject generation (0
+// when none) without consuming it; clearDiaryReinject drops exactly that
+// generation once the turn was accepted, so a turn that fails to start
+// leaves it for the next one.
+func (m *Manager) diaryReinjectPending(agentID string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.diaryReinject[agentID]
+}
+
+func (m *Manager) clearDiaryReinject(agentID string, gen uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if gen != 0 && m.diaryReinject[agentID] == gen {
+		delete(m.diaryReinject, agentID)
+	}
 }
 
 // injectionDisabled reports whether the given context-injection section

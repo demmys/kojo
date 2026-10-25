@@ -95,6 +95,18 @@ func FormatOneShotHistoryContexts(history []chathistory.HistoryMessage, selfUser
 		formatResumeSessionContext(history, selfUserID)
 }
 
+// injectSessionContexts is the per-backend entry point for the context that
+// belongs only to a session's first turn: the recent-activity diary
+// (SessionStartContext) followed by the response surface's transcript
+// (injectSessionHistoryContext). resumed reports whether the backend is
+// continuing a native session.
+func injectSessionContexts(userMessage string, opts ChatOptions, resumed bool) string {
+	if !resumed && opts.SessionStartContext != "" {
+		userMessage = injectRecentMessagesContext(userMessage, opts.SessionStartContext)
+	}
+	return injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumed)
+}
+
 // injectSessionHistoryContext enforces the shared continuity rule for every
 // response surface and backend: a fresh session gets the canonical transcript,
 // while a resumed external session gets a small, explicitly historical recap.

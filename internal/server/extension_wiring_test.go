@@ -28,7 +28,7 @@ func TestExtensionServiceWanted(t *testing.T) {
 	local, archived := create("local"), create("archived")
 	remote, remoteArchived := create("remote"), create("remote-archived")
 	for _, id := range []string{archived, remoteArchived} {
-		if err := mgr.Archive(id); err != nil {
+		if err := mgr.Archive(id, "test-passcode"); err != nil {
 			t.Fatal(err)
 		}
 	}

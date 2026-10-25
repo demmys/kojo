@@ -153,6 +153,8 @@ func (s *Server) handlePutWorkspaceFile(w http.ResponseWriter, r *http.Request, 
 	rec, err := agent.WriteWorkspaceFile(r.Context(), s.agents.Store(), id, kind, req.Content, ifMatch)
 	if err != nil {
 		switch {
+		case errors.Is(err, agent.ErrAgentSealed):
+			writeError(w, http.StatusConflict, "sealed", err.Error())
 		case errors.Is(err, store.ErrETagMismatch):
 			writeError(w, http.StatusPreconditionFailed, "precondition_failed", "If-Match: etag mismatch")
 		case errors.Is(err, store.ErrNotFound):

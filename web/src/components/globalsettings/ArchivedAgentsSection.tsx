@@ -5,6 +5,7 @@ import { errMsg } from "../../lib/utils";
 import { SectionCard } from "../ui/SectionCard";
 import { Button } from "../ui/Button";
 import { useT } from "../../lib/i18n";
+import { ArchivePasscodeDialog } from "../agent/ArchivePasscodeDialog";
 
 interface Props {
   setError: (msg: string) => void;
@@ -39,14 +40,35 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
   const setAgentBusy = (id: string, op: "unarchive" | "delete" | undefined) =>
     setBusy((prev) => ({ ...prev, [id]: op }));
 
-  const handleUnarchive = async (a: AgentInfo) => {
+  // Sealed agents need their archive passcode; the dialog stays open
+  // (with the error) on a wrong passcode.
+  const [unsealTarget, setUnsealTarget] = useState<AgentInfo | null>(null);
+  const [unsealError, setUnsealError] = useState("");
+
+  const handleUnarchive = async (a: AgentInfo, passcode?: string) => {
+    if (a.archiveSealed && passcode === undefined) {
+      setUnsealError("");
+      setUnsealTarget(a);
+      return;
+    }
     setAgentBusy(a.id, "unarchive");
     try {
-      await agentApi.unarchive(a.id);
+      await agentApi.unarchive(a.id, passcode);
       setAgents((prev) => (prev ?? []).filter((x) => x.id !== a.id));
+      setUnsealTarget(null);
       flashSuccess();
     } catch (e) {
-      setError(errMsg(e));
+      const msg = errMsg(e);
+      if (passcode !== undefined) {
+        setUnsealError(msg.includes("invalid_passcode") ? t("archive.invalidPasscode") : msg);
+      } else if (msg.includes("passcode_required")) {
+        // archiveSealed can be missing (e.g. a remote-held agent);
+        // the server is authoritative, so fall back to the dialog.
+        setUnsealError("");
+        setUnsealTarget(a);
+      } else {
+        setError(msg);
+      }
     } finally {
       setAgentBusy(a.id, undefined);
     }
@@ -105,6 +127,7 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
                 <div className="truncate font-mono text-[10px] text-ink-faint">
                   {a.tool}
                   {a.archivedAt ? ` · ${t("gs.archivedOn", { date: a.archivedAt.slice(0, 10) })}` : ""}
+                  {a.archiveSealed ? ` · 🔒 ${t("archive.sealedBadge")}` : ""}
                 </div>
               </div>
               <div className="flex shrink-0 gap-2">
@@ -123,6 +146,19 @@ export function ArchivedAgentsSection({ setError, flashSuccess }: Props) {
           );
         })}
       </div>
+      {unsealTarget && (
+        <ArchivePasscodeDialog
+          mode="unarchive"
+          title={t("archive.unarchiveTitle")}
+          description={t("archive.unarchiveDesc", { name: unsealTarget.name })}
+          submitLabel={t("gs.restore")}
+          busyLabel="..."
+          busy={busy[unsealTarget.id] === "unarchive"}
+          error={unsealError}
+          onSubmit={(pc) => handleUnarchive(unsealTarget, pc)}
+          onCancel={() => setUnsealTarget(null)}
+        />
+      )}
     </SectionCard>
   );
 }

@@ -72,6 +72,9 @@ func (m *Manager) Fork(srcID string, opts ForkOptions) (*Agent, error) {
 	}
 	srcCopy := copyAgent(src)
 	m.mu.Unlock()
+	if AgentSealed(srcID) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSealed, srcID)
+	}
 
 	// Build the forked agent metadata: keep persona/model/tool/etc., reset
 	// identity and anything that binds to external systems.

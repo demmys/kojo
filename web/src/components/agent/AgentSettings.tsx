@@ -41,6 +41,7 @@ import { Textarea } from "../ui/Textarea";
 import { Select } from "../ui/Select";
 import { Toggle } from "../ui/Toggle";
 import { Banner } from "../ui/Banner";
+import { ArchivePasscodeDialog } from "./ArchivePasscodeDialog";
 import { Button } from "../ui/Button";
 
 // Section ids (also i18n keys under "settings.sec.<id>"). Stable lists so
@@ -218,6 +219,8 @@ export function AgentSettings() {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [archiving, setArchiving] = useState(false);
+  const [showArchiveDialog, setShowArchiveDialog] = useState(false);
+  const [archiveError, setArchiveError] = useState("");
   const [resetting, setResetting] = useState(false);
   const [resettingSession, setResettingSession] = useState(false);
   // Attachment blob cache. `attachCache` is the size probe shown next to the
@@ -1190,14 +1193,14 @@ export function AgentSettings() {
     }
   };
 
-  const handleArchive = async () => {
-    if (!confirm(t("settings.archiveConfirm"))) return;
+  const handleArchive = async (passcode: string) => {
     setArchiving(true);
+    setArchiveError("");
     try {
-      await agentApi.archive(id!);
+      await agentApi.archive(id!, passcode);
       navigate("/", { replace: true });
     } catch (err) {
-      setError(errMsg(err));
+      setArchiveError(errMsg(err));
       setArchiving(false);
     }
   };
@@ -2263,7 +2266,10 @@ export function AgentSettings() {
             </div>
             <div>
               <Button
-                onClick={handleArchive}
+                onClick={() => {
+                  setArchiveError("");
+                  setShowArchiveDialog(true);
+                }}
                 disabled={archiving}
                 className="w-full"
               >
@@ -2333,6 +2339,19 @@ export function AgentSettings() {
         </main>
       </div>
 
+      {showArchiveDialog && (
+        <ArchivePasscodeDialog
+          mode="archive"
+          title={t("archive.archiveTitle")}
+          description={t("settings.archiveConfirm")}
+          submitLabel={t("settings.archiveAgent")}
+          busyLabel={t("settings.archiving")}
+          busy={archiving}
+          error={archiveError}
+          onSubmit={handleArchive}
+          onCancel={() => setShowArchiveDialog(false)}
+        />
+      )}
       {showForkDialog && (
         <div
           role="dialog"

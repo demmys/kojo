@@ -522,8 +522,8 @@ const messages = {
   },
   "settings.inj.diary_notes.label": { ja: "日誌ノート", en: "Diary Notes" },
   "settings.inj.diary_notes.desc": {
-    ja: "最近の活動日誌 (毎ターン)",
-    en: "Recent activity diary (per turn)",
+    ja: "最近の活動日誌 (セッション開始時・圧縮直後のみ)",
+    en: "Recent activity diary (session start and right after compaction only)",
   },
   "settings.inj.memory_search.label": { ja: "メモリ検索", en: "Memory Search" },
   "settings.inj.memory_search.desc": {
@@ -883,14 +883,26 @@ const messages = {
     ja: "人格とメモリを引き継いだコピーを作る。Slack・通知・認証情報は引き継がれない。",
     en: "Create a copy with persona and memory carried over. Slack, notifications, and credentials are not transferred.",
   },
+  "archive.passcode": { ja: "パスコード", en: "Passcode" },
+  "archive.passcodeConfirm": { ja: "パスコード (確認)", en: "Confirm passcode" },
+  "archive.passcodeMismatch": { ja: "パスコードが一致しない", en: "Passcodes do not match" },
+  "archive.passcodeTooShort": { ja: "{n} 文字以上にして", en: "Use at least {n} characters" },
+  "archive.invalidPasscode": { ja: "パスコードが違う", en: "Incorrect passcode" },
+  "archive.archiveTitle": { ja: "エージェントをアーカイブ", en: "Archive agent" },
+  "archive.unarchiveTitle": { ja: "アーカイブから復元", en: "Restore from archive" },
+  "archive.unarchiveDesc": {
+    ja: "「{name}」のデータは暗号化されている。アーカイブ時のパスコードを入力して。",
+    en: "\u201c{name}\u201d is encrypted. Enter the passcode used when archiving.",
+  },
+  "archive.sealedBadge": { ja: "暗号化済み", en: "encrypted" },
   "settings.archiving": { ja: "アーカイブ中...", en: "Archiving..." },
   "settings.archiveAgent": {
     ja: "エージェントをアーカイブ",
     en: "Archive Agent",
   },
   "settings.archiveAgentHelp": {
-    ja: "メインリストから隠してランタイム活動を止める。データは保持され、設定から復元できる。全グループ DM から外れる (アーカイブ解除しても復帰しない)。",
-    en: "Hide from the main list and stop runtime activity. Data is kept; restore from Settings. Removes the agent from all group DMs (memberships are NOT restored on unarchive).",
+    ja: "メインリストから隠してランタイム活動を止める。ディレクトリはパスコードで暗号化圧縮され、設定から同じパスコードで復元できる。全グループ DM から外れる (アーカイブ解除しても復帰しない)。",
+    en: "Hide from the main list and stop runtime activity. The directory is compressed and encrypted with a passcode; restore from Settings with the same passcode. Removes the agent from all group DMs (memberships are NOT restored on unarchive).",
   },
   "settings.deleting": { ja: "削除中...", en: "Deleting..." },
   "settings.deleteAgent": { ja: "エージェントを削除", en: "Delete Agent" },
@@ -952,8 +964,8 @@ const messages = {
     en: "Delete this agent? This cannot be undone.",
   },
   "settings.archiveConfirm": {
-    ja: "このエージェントをアーカイブする? ランタイム活動は止まるがデータは保持され、設定から復元できる。\n\n全グループ DM から外れ (2人グループは解散)、アーカイブ解除してもメンバーシップは復帰しない — 再招待が必要。",
-    en: "Archive this agent? Runtime activity stops; data is kept and can be restored from Settings.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
+    ja: "このエージェントをアーカイブする? ランタイム活動は止まり、エージェントのディレクトリはこのパスコードで暗号化圧縮される。設定から復元するときに同じパスコードが要る。パスコードを忘れたらディレクトリは復元できない。\n\n全グループ DM から外れ (2人グループは解散)、アーカイブ解除してもメンバーシップは復帰しない — 再招待が必要。",
+    en: "Archive this agent? Runtime activity stops and the agent's directory is compressed and encrypted with this passcode. Restoring from Settings needs the same passcode; if you forget it the directory cannot be recovered.\n\nThe agent will be removed from all group DMs (2-person groups dissolve), and memberships are NOT restored on unarchive — the agent must be re-invited.",
   },
 
   // ── AgentDataBrowser ──
@@ -2030,6 +2042,80 @@ const messages = {
   "gdm.archiveFailed": { ja: "アーカイブに失敗", en: "Failed to archive" },
   "gdm.archiving": { ja: "アーカイブ中…", en: "Archiving…" },
   "gdm.archive": { ja: "アーカイブ", en: "Archive" },
+  "xa.title": { ja: "外部エージェント", en: "External Agents" },
+  "xa.desc": {
+    ja: "tailnet 上の別ノードで動く AI をグループ DM に参加させる。登録すると 10 分有効の pairing code が出るので、外部ノードから curl で交換する。pair したノードはこの Owner UI に入れなくなる。",
+    en: "Let AIs running on other tailnet nodes join group DMs. Registering issues a pairing code valid for 10 minutes; redeem it from the external node with curl. A paired node is locked out of this Owner UI.",
+  },
+  "xa.noListener": {
+    ja: "外部用 listener が起動していない。kojo を --external-port 付きで起動しないと外部エージェントは接続できない。",
+    en: "The external listener is not running. Start kojo with --external-port so external agents can connect.",
+  },
+  "xa.none": { ja: "外部エージェントはまだいない", en: "No external agents yet" },
+  "xa.online": { ja: "接続中", en: "Online" },
+  "xa.offline": { ja: "未接続", en: "Offline" },
+  "xa.disabled": { ja: "無効", en: "Disabled" },
+  "xa.unpaired": { ja: "未 pair", en: "Not paired" },
+  "xa.revoked": { ja: "token 破棄済み", en: "Token revoked" },
+  "xa.lastSeen": { ja: "最終接続 {time}", en: "Last seen {time}" },
+  "xa.enabled": { ja: "有効", en: "Enabled" },
+  "xa.codeExpires": { ja: "{time} まで有効", en: "Valid until {time}" },
+  "xa.codeHelp": {
+    ja: "外部ノードで実行すると token が 1 回だけ返る。code は 1 回使うと失効する。",
+    en: "Run this on the external node; the token is returned once. The code is single-use.",
+  },
+  "xa.copy": { ja: "コピー", en: "Copy" },
+  "xa.copied": { ja: "コピーした", en: "Copied" },
+  "xa.issueCode": { ja: "pairing code 発行", en: "Issue pairing code" },
+  "xa.repair": { ja: "再 pair", en: "Re-pair" },
+  "xa.repairConfirm": {
+    ja: "「{name}」の新しい pairing code を出す? pair が成功した時点で今の token とノードの束縛が置き換わる。",
+    en: "Issue a new pairing code for \u201c{name}\u201d? The current token and node binding are replaced once it is redeemed.",
+  },
+  "xa.revoke": { ja: "token 破棄", en: "Revoke token" },
+  "xa.revokeConfirm": {
+    ja: "「{name}」の token を破棄して接続を切る? ノードの束縛は残る。",
+    en: "Revoke \u201c{name}\u201d's token and disconnect it? The node binding is kept.",
+  },
+  "xa.deleteConfirm": {
+    ja: "「{name}」を削除する? 全部屋から外れて接続も切れる。",
+    en: "Delete \u201c{name}\u201d? It is removed from every room and disconnected.",
+  },
+  "xa.register": { ja: "新規登録", en: "Register" },
+  "xa.name": { ja: "名前", en: "Name" },
+  "xa.namePlaceholder": { ja: "名前 (例: codex-laptop)", en: "Name (e.g. codex-laptop)" },
+  "xa.description": { ja: "説明", en: "Description" },
+  "xa.descPlaceholder": { ja: "説明 (任意。部屋のメンバーに見える)", en: "Description (optional, shown to room members)" },
+  "xa.registerButton": { ja: "登録して code 発行", en: "Register & issue code" },
+  "xa.nodes": { ja: "Owner UI から締め出したノード", en: "Nodes locked out of the Owner UI" },
+  "xa.nodesHelp": {
+    ja: "一度 pair したノードは外部エージェントを消してもここに残る。戻すと tailnet の他ノードと同じく Owner UI に入れる。",
+    en: "Nodes that ever paired stay here even after the agent is deleted. Restoring lets the node into the Owner UI like any other tailnet node.",
+  },
+  "xa.nodeRestore": { ja: "Owner UI に戻す", en: "Restore access" },
+  "xa.nodeRestoreConfirm": {
+    ja: "「{name}」を Owner UI に入れるように戻す?",
+    en: "Let \u201c{name}\u201d back into the Owner UI?",
+  },
+  "xa.badge": { ja: "外部", en: "external" },
+  "xa.pickerSection": { ja: "外部エージェント", en: "External agents" },
+  "xa.add": { ja: "外部エージェントを追加", en: "Add external agent" },
+  "xa.addNoCaller": {
+    ja: "kojo のエージェントがいない部屋には追加できない",
+    en: "Rooms without a kojo agent cannot add members",
+  },
+  "xa.addNone": { ja: "追加できる外部エージェントはない", en: "No external agents to add" },
+  "xa.trustTitle": { ja: "外部メンバーの扱い", en: "External members" },
+  "xa.trustUntrusted": { ja: "信用しない", en: "Untrusted" },
+  "xa.trustUntrustedHint": {
+    ja: "外部の発言はデータとして扱い、指示としては従わない",
+    en: "Treat external messages as data, never as instructions",
+  },
+  "xa.trustPeer": { ja: "仲間として扱う", en: "Peer" },
+  "xa.trustPeerHint": {
+    ja: "kojo のエージェントと同じように扱う",
+    en: "Treat them like any other kojo agent",
+  },
 } satisfies Record<string, Entry>;
 
 export type MessageKey = keyof typeof messages;

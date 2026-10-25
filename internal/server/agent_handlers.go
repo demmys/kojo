@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,6 +96,9 @@ type agentResponse struct {
 	// holder is the write authority, so the UI must not submit a
 	// full-form save built from this snapshot.
 	HolderSnapshotStale bool `json:"holderSnapshotStale,omitempty"`
+	// ArchiveSealed is true when an archived agent's directory is held
+	// in a passcode-encrypted archive; unarchive then needs the passcode.
+	ArchiveSealed bool `json:"archiveSealed,omitempty"`
 }
 
 // agentRuntimeSnapshot bundles the runtime-derived fields that feed
@@ -229,6 +233,9 @@ func (s *Server) buildAgentResponse(a *agent.Agent, snap agentRuntimeSnapshot) a
 		resp.NextCronAt = snap.nextCron.Format(time.RFC3339)
 	}
 	resp.CronPausedGlobal = snap.cronPaused
+	if a.Archived {
+		resp.ArchiveSealed = agent.AgentSealed(a.ID)
+	}
 	if s.agents != nil {
 		resp.IsSwitching = s.agents.IsSwitching(a.ID)
 	}
@@ -445,12 +452,16 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		// deadline and concurrency keep the list endpoint responsive when
 		// peers are slow.
 		s.enrichRemoteAgents(r.Context(), all, nil)
-		out := make([]*agent.Agent, 0, len(all))
+		out := make([]any, 0, len(all))
 		for _, a := range all {
 			switch {
 			case onlyArchived && !a.Archived:
 				continue
 			case !onlyArchived && !includeArchived && a.Archived:
+				continue
+			}
+			if a.Archived && agent.AgentSealed(a.ID) {
+				out = append(out, archivedListEntry{Agent: a, ArchiveSealed: true})
 				continue
 			}
 			out = append(out, a)
@@ -493,6 +504,13 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]any{"agents": out})
+}
+
+// archivedListEntry decorates a sealed archived agent in the list
+// response so the Archived section can ask for the passcode on restore.
+type archivedListEntry struct {
+	*agent.Agent
+	ArchiveSealed bool `json:"archiveSealed"`
 }
 
 func (s *Server) handleAgentDirectory(w http.ResponseWriter, r *http.Request) {
@@ -744,6 +762,9 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := s.agents.Update(id, cfg)
 	if err != nil {
+		if writeArchivePasscodeError(w, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -823,7 +844,9 @@ func (s *Server) handleResetAgentData(w http.ResponseWriter, r *http.Request) {
 		clearErr = s.extensions.ClearAgentChatHistory(id)
 	})
 	if err != nil {
-		if errors.Is(err, agent.ErrAgentNotFound) {
+		if writeArchivePasscodeError(w, err) {
+			// mapped
+		} else if errors.Is(err, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 		} else if errors.Is(err, agent.ErrAgentBusy) {
 			writeError(w, http.StatusConflict, "conflict", err.Error())
@@ -983,6 +1006,9 @@ func (s *Server) handleForkAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := s.agents.Fork(id, agent.ForkOptions{Name: body.Name, IncludeTranscript: body.IncludeTranscript})
 	if err != nil {
+		if writeArchivePasscodeError(w, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -1017,6 +1043,13 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// ?archive=true keeps all on-disk data but stops runtime activity.
 	// Restored later via POST /api/v1/agents/{id}/unarchive.
 	archive := r.URL.Query().Get("archive") == "true"
+	var passcode string
+	if archive {
+		var ok bool
+		if passcode, ok = readArchivePasscode(w, r); !ok {
+			return
+		}
+	}
 
 	// Manager.Archive / Manager.Delete take Manager.LockPatch
 	// internally, so we MUST NOT acquire it here — sync.Mutex is
@@ -1035,12 +1068,22 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	// are reconciled below: the reconcile reads that state.
 	var opErr error
 	if archive {
-		opErr = s.agents.Archive(id)
+		opErr = s.agents.Archive(id, passcode)
 	} else {
 		opErr = s.agents.Delete(id)
 	}
 	if opErr != nil {
-		if errors.Is(opErr, agent.ErrAgentNotFound) {
+		if archive {
+			// Archive can fail after the archived flag is committed
+			// (drain timeout / seal error): runtime must still stop.
+			if a, ok := s.agents.Get(id); ok && a.Archived {
+				s.reconcileLocalAgentLifecycle(r.Context(), id)
+				s.reconcileExtensionServices()
+			}
+		}
+		if writeArchivePasscodeError(w, opErr) {
+			// mapped
+		} else if errors.Is(opErr, agent.ErrAgentNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", opErr.Error())
 		} else if errors.Is(opErr, agent.ErrAgentBusy) {
 			writeError(w, http.StatusConflict, "conflict", opErr.Error())
@@ -1107,7 +1150,14 @@ func (s *Server) handleUnarchiveAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.agents.Unarchive(id); err != nil {
+	passcode, ok := readArchivePasscode(w, r)
+	if !ok {
+		return
+	}
+	if err := s.agents.Unarchive(id, passcode); err != nil {
+		if writeArchivePasscodeError(w, err) {
+			return
+		}
 		switch {
 		case errors.Is(err, agent.ErrAgentNotFound):
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
@@ -2785,6 +2835,12 @@ func (s *Server) handlePreCompact(w http.ResponseWriter, r *http.Request) {
 	if err := agent.PreCompactSummarize(id, a.Tool, payload.TranscriptPath, s.logger); err != nil {
 		s.logger.Warn("pre-compact summarize failed", "agent", id, "err", err)
 		// Return 200 anyway — don't block compaction on summary failure
+	} else if agent.IsMainClaudeSession(id, payload.SessionID, payload.TranscriptPath) {
+		// The diary is otherwise injected only on a fresh session; the
+		// compacted main session gets the fresh summary once more. Keyed
+		// (thread / Slack) sessions are not tracked: their next fresh
+		// start carries it anyway.
+		s.agents.MarkDiaryReinject(id)
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -2909,4 +2965,52 @@ func (s *Server) handleResetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResponse(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// archivePasscodeMaxBody caps the {"passcode":...} body accepted by
+// archive / unarchive.
+const archivePasscodeMaxBody = 4 << 10
+
+// readArchivePasscode reads the optional JSON body {"passcode":"..."}
+// of DELETE ?archive=true and POST /unarchive. An empty body yields "".
+func readArchivePasscode(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if r.Body == nil {
+		return "", true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, archivePasscodeMaxBody+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "read body: "+err.Error())
+		return "", false
+	}
+	if len(body) > archivePasscodeMaxBody {
+		writeError(w, http.StatusRequestEntityTooLarge, "too_large", "body too large")
+		return "", false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return "", true
+	}
+	var req struct {
+		Passcode string `json:"passcode"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return "", false
+	}
+	return req.Passcode, true
+}
+
+// writeArchivePasscodeError maps the sealed-archive errors; returns
+// false when err is not one of them.
+func writeArchivePasscodeError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, agent.ErrArchivePasscodeRequired):
+		writeError(w, http.StatusBadRequest, "passcode_required", err.Error())
+	case errors.Is(err, agent.ErrArchivePasscodeInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_passcode", err.Error())
+	case errors.Is(err, agent.ErrAgentSealed):
+		writeError(w, http.StatusConflict, "sealed", err.Error())
+	default:
+		return false
+	}
+	return true
 }

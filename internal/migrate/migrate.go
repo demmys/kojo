@@ -116,13 +116,77 @@ type LockFile struct {
 	MigratorVersion  string `json:"migrator_version"`
 }
 
-// CompleteFile records a successful migration.
+// CompleteFile records a successful migration, or (FreshInstall=true) a
+// v1 dir that was initialized from scratch without importing v0. Both
+// mark the v1 dir as canonical so subsequent boots take the normal
+// startup path.
 type CompleteFile struct {
 	V0Path           string `json:"v0_path"`
 	V0SHA256Manifest string `json:"v0_sha256_manifest"`
 	V1SchemaVersion  int    `json:"v1_schema_version"`
 	CompletedAt      int64  `json:"completed_at"`
 	MigratorVersion  string `json:"migrator_version"`
+	// FreshInstall is true when the v1 dir was created by a first-time
+	// install or `--fresh` rather than by importing v0. V0Path and
+	// V0SHA256Manifest are empty in that case, so `--clean v0` refuses
+	// and the runtime never consults v0 data.
+	FreshInstall bool `json:"fresh_install,omitempty"`
+}
+
+// MarkFreshInstall initializes kojo.db under v1Dir (applying the schema)
+// and publishes a FreshInstall CompleteFile so the next boot recognizes
+// the dir as a completed v1 install. Refuses to overwrite an existing
+// CompleteFile or to run while a migration lock is present.
+func MarkFreshInstall(ctx context.Context, v1Dir, migratorVersion string, now time.Time) error {
+	if v1Dir == "" {
+		return errors.New("migrate: v1Dir is required")
+	}
+	if migratorVersion == "" {
+		return errors.New("migrate: migratorVersion is required")
+	}
+	// Hold the runtime lock while touching kojo.db so a running kojo or
+	// `--restore` on the same dir cannot interleave. Released on return;
+	// the caller's runtime boot re-acquires it.
+	v1Lock, err := configdir.Acquire(v1Dir)
+	if err != nil {
+		return fmt.Errorf("migrate: acquire v1 lock (another kojo is running on %s): %w", v1Dir, err)
+	}
+	defer v1Lock.Release()
+	completePath := filepath.Join(v1Dir, CompleteFileName)
+	if _, err := os.Stat(completePath); err == nil {
+		return ErrAlreadyComplete
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("migrate: stat complete: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(v1Dir, LockFileName)); err == nil {
+		return fmt.Errorf("migrate: %s present; an unfinished --migrate owns this dir", LockFileName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("migrate: stat lock: %w", err)
+	}
+	st, err := store.Open(ctx, store.Options{ConfigDir: v1Dir})
+	if err != nil {
+		return fmt.Errorf("migrate: open v1 store: %w", err)
+	}
+	schemaVersion, err := st.SchemaVersion(ctx)
+	if cerr := st.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("migrate: read schema version: %w", err)
+	}
+	body, err := json.MarshalIndent(CompleteFile{
+		V1SchemaVersion: schemaVersion,
+		CompletedAt:     now.UnixMilli(),
+		MigratorVersion: migratorVersion,
+		FreshInstall:    true,
+	}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("migrate: marshal complete: %w", err)
+	}
+	if err := atomicWrite(completePath, body); err != nil {
+		return fmt.Errorf("migrate: publish complete: %w", err)
+	}
+	return nil
 }
 
 // Result summarizes a successful or failed Run for the caller (the cmd
@@ -369,6 +433,52 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		Warnings:        warnings,
 		CompletedAt:     opts.Now(),
 	}, nil
+}
+
+// RebaseFreshInstallSchema lowers a fresh-install marker's
+// V1SchemaVersion to kojo.db's current schema version. `--restore` calls
+// it after a verified snapshot apply: the marker records whatever schema
+// the first boot (or self-heal adoption) applied, so an older snapshot of
+// the same install would otherwise trip the startup "possible truncated
+// restore" guard. Migration markers and missing markers are left alone.
+func RebaseFreshInstallSchema(ctx context.Context, v1Dir string) error {
+	completePath := filepath.Join(v1Dir, CompleteFileName)
+	body, err := os.ReadFile(completePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("migrate: read complete: %w", err)
+	}
+	var cf CompleteFile
+	if err := json.Unmarshal(body, &cf); err != nil {
+		return fmt.Errorf("migrate: parse complete: %w", err)
+	}
+	if !cf.FreshInstall {
+		return nil
+	}
+	st, err := store.Open(ctx, store.Options{ConfigDir: v1Dir, ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("migrate: open v1 store: %w", err)
+	}
+	dbVer, err := st.SchemaVersion(ctx)
+	if cerr := st.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("migrate: read schema version: %w", err)
+	}
+	if dbVer <= 0 || dbVer >= cf.V1SchemaVersion {
+		return nil
+	}
+	cf.V1SchemaVersion = dbVer
+	out, err := json.MarshalIndent(cf, "", "  ")
+	if err != nil {
+		return fmt.Errorf("migrate: marshal complete: %w", err)
+	}
+	if err := atomicWrite(completePath, out); err != nil {
+		return fmt.Errorf("migrate: publish complete: %w", err)
+	}
+	return nil
 }
 
 // canResumeV1 returns true when the v1 dir contains nothing that would

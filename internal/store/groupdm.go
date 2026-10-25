@@ -61,6 +61,7 @@ const UserSenderID = "user"
 // before Phase 4 normalizes membership into a separate table.
 type GroupDMMember struct {
 	AgentID      string `json:"agent_id"`
+	Kind         string `json:"kind,omitempty"`        // ""=kojo agent | "external"
 	NotifyMode   string `json:"notify_mode,omitempty"`   // ""|"realtime"|"digest"
 	DigestWindow int    `json:"digest_window,omitempty"` // seconds, only meaningful with digest mode
 }
@@ -603,9 +604,7 @@ func verifyMembersAlive(ctx context.Context, tx *sql.Tx, members []string) error
 			return errors.New("store: empty member id")
 		}
 		var alive int
-		err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM agents WHERE id = ? AND deleted_at IS NULL`, id,
-		).Scan(&alive)
+		err := tx.QueryRowContext(ctx, memberAliveSQL(id, false), id).Scan(&alive)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("store: member %q: %w", id, ErrNotFound)
 		}
@@ -614,6 +613,22 @@ func verifyMembersAlive(ctx context.Context, tx *sql.Tx, members []string) error
 		}
 	}
 	return nil
+}
+
+// ExternalAgentIDPrefix marks group members that are external AI agents
+// (rows in external_agents, not agents).
+const ExternalAgentIDPrefix = "xa_"
+
+// memberAliveSQL picks the liveness probe for a member/author id. An
+// external author must also be enabled.
+func memberAliveSQL(id string, asAuthor bool) string {
+	if strings.HasPrefix(id, ExternalAgentIDPrefix) {
+		if asAuthor {
+			return `SELECT 1 FROM external_agents WHERE id = ? AND deleted_at IS NULL AND enabled = 1`
+		}
+		return `SELECT 1 FROM external_agents WHERE id = ? AND deleted_at IS NULL`
+	}
+	return `SELECT 1 FROM agents WHERE id = ? AND deleted_at IS NULL`
 }
 
 // memberIDs projects out just the agent_ids for FK alive-checks.
@@ -888,9 +903,7 @@ func (s *Store) AppendGroupDMMessage(ctx context.Context, rec *GroupDMMessageRec
 		// transcript against its own (now-frozen) agents.json.
 	default:
 		var aOk int
-		err := tx.QueryRowContext(ctx,
-			`SELECT 1 FROM agents WHERE id = ? AND deleted_at IS NULL`, rec.AgentID,
-		).Scan(&aOk)
+		err := tx.QueryRowContext(ctx, memberAliveSQL(rec.AgentID, true), rec.AgentID).Scan(&aOk)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("store.AppendGroupDMMessage: author %q: %w", rec.AgentID, ErrNotFound)
 		}

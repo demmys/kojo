@@ -357,8 +357,9 @@ type Agent struct {
 	Effort  string `json:"effort,omitempty"`  // claude/grok/codex effort level
 	Tool    string `json:"tool"`              // backend id, see tool_names.go
 	WorkDir string `json:"workDir,omitempty"` // file storage directory (empty = agentDir)
-	// CronExpr is a 5-field standard cron expression (M H DOM Mon DOW).
-	// Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
+	// CronExpr is one or more newline-separated 5-field standard cron
+	// expressions (M H DOM Mon DOW); multiple lines fire on the union of
+	// their ticks. Empty = scheduling disabled. Validated via ValidateCronExpr; rejected
 	// expressions never reach this field.
 	CronExpr       string `json:"cronExpr"`
 	TimeoutMinutes int    `json:"timeoutMinutes"` // max duration per cron run in minutes (0 = default 10, -1 = no timeout)
@@ -767,7 +768,8 @@ type AgentConfig struct {
 	CustomAPIKey string `json:"customApiKey"`
 	ThinkingMode string `json:"thinkingMode"`
 	WorkDir      string `json:"workDir"`
-	// CronExpr is the 5-field cron expression for periodic check-ins.
+	// CronExpr is the 5-field cron expression (or newline-separated list of
+	// them) for periodic check-ins.
 	// nil    = use default ("*/30 * * * *" with per-agent offset).
 	// ""     = scheduling explicitly disabled.
 	// other  = validated via ValidateCronExpr.

@@ -32,8 +32,10 @@ var customOpenCodePresets = []CustomOpenCodePreset{
 	{ID: "mistral", Name: "Mistral", BaseURL: "https://api.mistral.ai/v1"},
 	{ID: "cerebras", Name: "Cerebras", BaseURL: "https://api.cerebras.ai/v1"},
 	{ID: "xai", Name: "xAI", BaseURL: "https://api.x.ai/v1"},
+	{ID: "zai", Name: "Z.ai", BaseURL: "https://api.z.ai/api/paas/v4"},
 	{ID: "ollama", Name: "Ollama (local)", BaseURL: "http://127.0.0.1:11434/v1", KeyOptional: true},
 	{ID: "lmstudio", Name: "LM Studio (local)", BaseURL: "http://127.0.0.1:1234/v1", KeyOptional: true},
+	{ID: "llamacpp", Name: "llama-server (local)", BaseURL: "http://127.0.0.1:8080/v1", KeyOptional: true},
 }
 
 // CustomOpenCodePresets returns a copy of the provider whitelist.

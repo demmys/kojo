@@ -235,3 +235,24 @@ func TestManagerCustomOpenCodeValidation(t *testing.T) {
 		t.Fatalf("tool switch with a preset: %v", err)
 	}
 }
+
+func TestCustomOpenCodePresetLocalPort(t *testing.T) {
+	ok := []string{"http://127.0.0.1:8081/v1", "http://127.0.0.1:65535/v1", " http://127.0.0.1:9000/v1 "}
+	for _, u := range ok {
+		p, found := CustomOpenCodePresetByBaseURL(u)
+		if !found || !p.PortConfigurable || p.BaseURL != strings.TrimSpace(u) {
+			t.Errorf("%q: got %+v %v", u, p, found)
+		}
+	}
+	bad := []string{
+		"http://127.0.0.1/v1", "http://127.0.0.1:0/v1", "http://127.0.0.1:70000/v1", "http://127.0.0.1:080/v1",
+		"http://localhost:9000/v1", "https://127.0.0.1:9000/v1", "http://127.0.0.1:9000/v2",
+		"http://127.0.0.1:9000/v1?x=1", "http://127.0.0.1:9000/v1?", "http://127.0.0.1:9000/v1#", "http://u@127.0.0.1:9000/v1", "http://127.0.0.1:9000/v1/",
+		"http://evil.example:9000/v1", "https://api.groq.com:8443/openai/v1",
+	}
+	for _, u := range bad {
+		if _, found := CustomOpenCodePresetByBaseURL(u); found {
+			t.Errorf("%q accepted", u)
+		}
+	}
+}

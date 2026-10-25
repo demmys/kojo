@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -21,6 +23,9 @@ type CustomOpenCodePreset struct {
 	BaseURL string `json:"baseURL"`
 	// KeyOptional marks local servers that run without authentication.
 	KeyOptional bool `json:"keyOptional,omitempty"`
+	// PortConfigurable marks local presets whose port may differ from the
+	// default: any http://<same host>:<port><same path> is accepted.
+	PortConfigurable bool `json:"portConfigurable,omitempty"`
 }
 
 var customOpenCodePresets = []CustomOpenCodePreset{
@@ -33,9 +38,9 @@ var customOpenCodePresets = []CustomOpenCodePreset{
 	{ID: "cerebras", Name: "Cerebras", BaseURL: "https://api.cerebras.ai/v1"},
 	{ID: "xai", Name: "xAI", BaseURL: "https://api.x.ai/v1"},
 	{ID: "zai", Name: "Z.ai", BaseURL: "https://api.z.ai/api/paas/v4"},
-	{ID: "ollama", Name: "Ollama (local)", BaseURL: "http://127.0.0.1:11434/v1", KeyOptional: true},
-	{ID: "lmstudio", Name: "LM Studio (local)", BaseURL: "http://127.0.0.1:1234/v1", KeyOptional: true},
-	{ID: "llamacpp", Name: "llama-server (local)", BaseURL: "http://127.0.0.1:8080/v1", KeyOptional: true},
+	{ID: "ollama", Name: "Ollama (local)", BaseURL: "http://127.0.0.1:11434/v1", KeyOptional: true, PortConfigurable: true},
+	{ID: "lmstudio", Name: "LM Studio (local)", BaseURL: "http://127.0.0.1:1234/v1", KeyOptional: true, PortConfigurable: true},
+	{ID: "llamacpp", Name: "llama-server (local)", BaseURL: "http://127.0.0.1:8080/v1", KeyOptional: true, PortConfigurable: true},
 }
 
 // CustomOpenCodePresets returns a copy of the provider whitelist.
@@ -49,6 +54,30 @@ func CustomOpenCodePresetByBaseURL(baseURL string) (CustomOpenCodePreset, bool) 
 	baseURL = strings.TrimSpace(baseURL)
 	for _, p := range customOpenCodePresets {
 		if p.BaseURL == baseURL {
+			return p, true
+		}
+	}
+	// A port-configurable local preset also matches the same scheme, host
+	// and path on another port. The first such preset wins (they share
+	// host and path); only the provider id label depends on which.
+	u, err := url.Parse(baseURL)
+	if err != nil || u.User != nil || u.String() != baseURL || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return CustomOpenCodePreset{}, false
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != u.Port() {
+		return CustomOpenCodePreset{}, false
+	}
+	for _, p := range customOpenCodePresets {
+		if !p.PortConfigurable {
+			continue
+		}
+		pu, err := url.Parse(p.BaseURL)
+		if err != nil {
+			continue
+		}
+		if u.Scheme == pu.Scheme && u.Hostname() == pu.Hostname() && u.Path == pu.Path && u.RawPath == "" {
+			p.BaseURL = baseURL
 			return p, true
 		}
 	}

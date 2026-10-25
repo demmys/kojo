@@ -684,6 +684,11 @@ const messages = {
     ja: "OpenAI互換プロバイダを許可リストから選択（任意URLは指定不可）",
     en: "Pick an OpenAI-compatible provider from the allowed list (arbitrary URLs are not accepted)",
   },
+  "settings.customOpenCodePort": { ja: "ポート", en: "Port" },
+  "settings.customOpenCodePortHelp": {
+    ja: "ローカルサーバーのポート (1-65535)。ホストは 127.0.0.1 固定",
+    en: "Port of the local server (1-65535). The host is fixed to 127.0.0.1",
+  },
   "settings.customOpenCodeKeyOptional": {
     ja: "ローカルサーバーのため APIキーは省略可",
     en: "Local server: the API key is optional",

@@ -39,6 +39,7 @@ export interface CustomOpenCodePreset {
   name: string;
   baseURL: string;
   keyOptional?: boolean;
+  portConfigurable?: boolean;
 }
 
 export interface DirEntry {

@@ -28,11 +28,13 @@ import { useAvatarImageProviders } from "./useAvatarImageProviders";
 import {
   buildAgentSavePayload,
   defaultCodexApps,
-  GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
   GEMINI_MAX_OUTPUT_TOKENS_LIMIT,
+  defaultMaxOutputTokensFor,
   isCodexCLITool,
-  needsCustomURLFor,
+  supportsMaxOutputTokens,
+  usesCustomBaseURL,
 } from "./agentSettingsPayload";
+import { CustomOpenCodeProviderField } from "./fields/CustomOpenCodeProviderField";
 import { PageHeader } from "../ui/PageHeader";
 import { SectionCard } from "../ui/SectionCard";
 import { Field } from "../ui/Field";
@@ -664,7 +666,7 @@ export function AgentSettings() {
       // PATCH has persisted its Base URL. The credential endpoint binds the
       // key to that saved URL, but this sequencing remains one user-visible
       // Save operation rather than leaking the storage split into the UI.
-      const pendingCustomAPIKey = needsCustomURL ? customAPIKey.trim() : "";
+      const pendingCustomAPIKey = usesCustomBaseURL(tool) ? customAPIKey.trim() : "";
       // cronMessage and userContext live in separate workspace files
       // (checkin.md, user.md) — they're persisted via dedicated
       // endpoints, NOT the agents PATCH. Dirty detection compares the
@@ -686,7 +688,7 @@ export function AgentSettings() {
       const statusDirty = statusContent !== loadedStatus && !statusIsDefault;
       const anchorDirty = anchorContent !== loadedAnchor;
       const customURLChanged =
-        needsCustomURLFor(tool) &&
+        usesCustomBaseURL(tool) &&
         customBaseURL.trim() !== (agent?.customBaseURL ?? "").trim();
 
       // A key replacement against an unchanged endpoint is a credential-only
@@ -1309,9 +1311,9 @@ export function AgentSettings() {
       (supportsEffort(tool) && effort !== ((agent.effort || "") as EffortLevel | "")) ||
       autoEffort !== (agent.autoEffort ?? true) ||
       (isCodexCLITool(tool) && codexAppsOverride !== (agent.codexApps ?? null)) ||
-      (tool === "gemini" && maxOutputTokens !== (agent.maxOutputTokens ?? 0)) ||
+      (supportsMaxOutputTokens(tool) && maxOutputTokens !== (agent.maxOutputTokens ?? 0)) ||
       tool.trim() !== agent.tool ||
-      (needsCustomURLFor(tool) &&
+      (usesCustomBaseURL(tool) &&
         customBaseURL.trim() !== (agent.customBaseURL ?? "http://localhost:8080")) ||
       (tool === "custom-bare" && thinkingMode !== (agent.thinkingMode ?? "")) ||
       responseLanguage.trim() !== (agent.responseLanguage ?? "") ||
@@ -1337,7 +1339,7 @@ export function AgentSettings() {
       (statusContent !== loadedStatus && !statusIsDefault) ||
       anchorContent !== loadedAnchor);
   const dirty =
-    nonSecretDirty || (!!agent && needsCustomURLFor(tool) && !!customAPIKey.trim());
+    nonSecretDirty || (!!agent && usesCustomBaseURL(tool) && !!customAPIKey.trim());
 
   // Rehydrate every form field from the persisted agent row / loaded
   // workspace-file snapshots, dropping unsaved edits.
@@ -1666,18 +1668,26 @@ export function AgentSettings() {
               setEffort={setEffort}
             />
 
-            {needsCustomURL && (
+            {usesCustomBaseURL(tool) && (
               <div className="space-y-4">
-                <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
-                  <Input
-                    mono
-                    value={customBaseURL}
-                    onChange={(e) => setCustomBaseURL(e.target.value)}
+                {tool === "custom-opencode" ? (
+                  <CustomOpenCodeProviderField
+                    baseURL={customBaseURL}
+                    setBaseURL={setCustomBaseURL}
                     disabled={customAPIKeySaving || saving}
-                    placeholder="http://localhost:8080"
                   />
-                </Field>
-                <Field label={t("settings.customApiKey")} help={t("settings.customApiKeyHelp")}>
+                ) : (
+                  <Field label={t("settings.customBaseUrl")} help={t("settings.customBaseUrlHelp")}>
+                    <Input
+                      mono
+                      value={customBaseURL}
+                      onChange={(e) => setCustomBaseURL(e.target.value)}
+                      disabled={customAPIKeySaving || saving}
+                      placeholder="http://localhost:8080"
+                    />
+                  </Field>
+                )}
+                <Field label={t("settings.customApiKey")} help={t(tool === "custom-opencode" ? "settings.customOpenCodeApiKeyHelp" : "settings.customApiKeyHelp")}>
                   <div className="space-y-2">
                     <Input
                       mono
@@ -1689,7 +1699,7 @@ export function AgentSettings() {
                         if (e.target.value) setCustomNoAuth(false);
                       }}
                       disabled={customAPIKeySaving || saving || customNoAuthEnabled}
-                      placeholder={customAPIKeyConfigured ? t("settings.customApiKeyConfigured") : "sk-unsloth-…"}
+                      placeholder={customAPIKeyConfigured ? t("settings.customApiKeyConfigured") : tool === "custom-opencode" ? "sk-…" : "sk-unsloth-…"}
                     />
                     <div className="flex items-center gap-2">
                       {customAPIKeyConfigured && (
@@ -1763,7 +1773,7 @@ export function AgentSettings() {
               />
             )}
 
-            {tool === "gemini" && (
+            {supportsMaxOutputTokens(tool) && (
               <Field label={t("settings.maxOutputTokens")} help={t("settings.maxOutputTokensDesc")}>
                 <div className="w-36">
                   <Input
@@ -1772,7 +1782,7 @@ export function AgentSettings() {
                     max={GEMINI_MAX_OUTPUT_TOKENS_LIMIT}
                     step={1}
                     value={maxOutputTokens > 0 ? String(maxOutputTokens) : ""}
-                    placeholder={String(GEMINI_DEFAULT_MAX_OUTPUT_TOKENS)}
+                    placeholder={String(defaultMaxOutputTokensFor(tool))}
                     aria-label={t("settings.maxOutputTokens")}
                     onChange={(e) => {
                       // Empty / invalid = server default (0).

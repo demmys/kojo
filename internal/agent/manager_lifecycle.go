@@ -2383,7 +2383,7 @@ func (m *Manager) ResetSession(agentID string) error {
 				"agent", agentID,
 				"filesRemoved", files, "threadsRemoved", threads)
 		}
-	case ToolGemini:
+	case ToolGemini, ToolCustomOpenCode:
 		files, cerr := clearGeminiSessionCounted(agentID)
 		if cerr != nil {
 			m.logger.Warn("CLI session reset: gemini clear partial failure",

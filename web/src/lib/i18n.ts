@@ -657,6 +657,10 @@ const messages = {
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
   },
   "settings.maxOutputTokens": { ja: "最大出力トークン", en: "Max output tokens" },
+  "field.toolCustomOpenCodeHelp": {
+    ja: "OpenCode を許可リストの OpenAI互換プロバイダで実行。モデルIDとAPIキーはエージェントごとに設定",
+    en: "Run OpenCode against an allowed OpenAI-compatible provider. Model id and API key are set per agent",
+  },
   "field.toolGeminiHelp": {
     ja: "gemini は Gemini モデルを OpenCode (opencode CLI) 経由で動かす。opencode のインストールと Global Settings の Gemini API キーが必要。",
     en: "gemini runs Gemini models through OpenCode (the opencode CLI). Requires opencode to be installed and a Gemini API key in Global Settings.",
@@ -671,6 +675,19 @@ const messages = {
     en: "Load the connectors linked to your ChatGPT account (GitHub, Slack, Gmail, Drive, ...) as Codex tools. With a custom endpoint every tool definition is inlined into each request and eats the context window, so the default is on for codex and off for custom-codex.",
   },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
+  "settings.customOpenCodeApiKeyHelp": {
+    ja: "選択したプロバイダのAPIキー。エージェントごとに暗号化保存され、OpenCode にのみ渡される",
+    en: "API key for the selected provider. Stored encrypted per agent and passed only to OpenCode",
+  },
+  "settings.customOpenCodeProvider": { ja: "プロバイダ", en: "Provider" },
+  "settings.customOpenCodeProviderHelp": {
+    ja: "OpenAI互換プロバイダを許可リストから選択（任意URLは指定不可）",
+    en: "Pick an OpenAI-compatible provider from the allowed list (arbitrary URLs are not accepted)",
+  },
+  "settings.customOpenCodeKeyOptional": {
+    ja: "ローカルサーバーのため APIキーは省略可",
+    en: "Local server: the API key is optional",
+  },
   "settings.customBaseUrlHelp": {
     ja: "Anthropic/OpenAI互換API。localhostまたはTailscaleホストを指定",
     en: "Anthropic/OpenAI-compatible API on localhost or a Tailscale host",

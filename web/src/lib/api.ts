@@ -30,6 +30,15 @@ export interface ServerInfo {
   tools?: Record<string, { available: boolean; path: string }>;
   shellTool: string; // "tmux" on Unix, "shell" on Windows
   agentBackends?: Record<string, boolean>;
+  // Whitelisted OpenAI-compatible providers for the custom-opencode tool.
+  customOpenCodePresets?: CustomOpenCodePreset[];
+}
+
+export interface CustomOpenCodePreset {
+  id: string;
+  name: string;
+  baseURL: string;
+  keyOptional?: boolean;
 }
 
 export interface DirEntry {

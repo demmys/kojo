@@ -274,7 +274,10 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 			return geminiEffortModels[model] != ""
 		}
 		return false
-	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
+	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:
+		// custom-opencode sends no reasoning effort (no variants are
+		// defined); the stored value is accepted on the same ladder so a
+		// tool switch from another custom-* backend does not 400.
 		if !ValidEffort(effort) {
 			return false
 		}
@@ -1035,6 +1038,11 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	}
 	if ToolRequiresCustomBaseURL(cfg.Tool) && cfg.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
+	}
+	if NormalizeToolName(cfg.Tool) == ToolCustomOpenCode {
+		if err := ValidateCustomOpenCodeConfig(cfg.CustomBaseURL, cfg.Model); err != nil {
+			return nil, err
+		}
 	}
 	if !ValidThinkingMode(cfg.ThinkingMode) {
 		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)

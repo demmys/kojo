@@ -52,6 +52,12 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "",
     models: [],
   },
+  // custom-opencode: OpenCode against a whitelisted OpenAI-compatible
+  // provider; the model id is free text.
+  "custom-opencode": {
+    default: "",
+    models: [],
+  },
 };
 
 /** Return the default model for a given tool. */

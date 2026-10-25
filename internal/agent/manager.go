@@ -518,13 +518,14 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 	m := &Manager{
 		agents: make(map[string]*Agent),
 		backends: map[string]ChatBackend{
-			ToolClaude:       NewClaudeBackend(logger),
-			ToolCodex:        NewCodexBackend(logger),
-			ToolGrok:         NewGrokBackend(logger),
-			ToolGemini:       NewGeminiBackend(logger, creds),
-			ToolCustomClaude: NewCustomClaudeBackend(logger, creds),
-			ToolCustomCodex:  NewCustomCodexBackend(logger, creds),
-			ToolCustomBare:   NewCustomBareBackend(logger, creds),
+			ToolClaude:         NewClaudeBackend(logger),
+			ToolCodex:          NewCodexBackend(logger),
+			ToolGrok:           NewGrokBackend(logger),
+			ToolGemini:         NewGeminiBackend(logger, creds),
+			ToolCustomClaude:   NewCustomClaudeBackend(logger, creds),
+			ToolCustomCodex:    NewCustomCodexBackend(logger, creds),
+			ToolCustomBare:     NewCustomBareBackend(logger, creds),
+			ToolCustomOpenCode: NewCustomOpenCodeBackend(logger, creds),
 		},
 		store:              st,
 		creds:              creds,
@@ -1625,6 +1626,12 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	if ToolRequiresCustomBaseURL(prospTool) && prospBaseURL == "" {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", prospTool)
+	}
+	if NormalizeToolName(prospTool) == ToolCustomOpenCode {
+		if err := ValidateCustomOpenCodeConfig(prospBaseURL, prospModel); err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
 	}
 	m.mu.Unlock()
 
@@ -2927,7 +2934,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			resetErr = deleteCodexThreadRefStrict(agentID, sessionKey)
 		case ToolGrok:
 			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
-		case ToolGemini:
+		case ToolGemini, ToolCustomOpenCode:
 			resetErr = deleteGeminiThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
@@ -3979,7 +3986,7 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 		return codexCanResumeSession(agentID, sessionKey)
 	case ToolGrok:
 		return grokCanResumeSession(agentID, sessionKey)
-	case ToolGemini:
+	case ToolGemini, ToolCustomOpenCode:
 		return geminiCanResumeSession(agentID, sessionKey)
 	}
 

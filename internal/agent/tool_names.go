@@ -20,7 +20,21 @@ const (
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"
+	// ToolCustomOpenCode drives OpenCode (like ToolGemini) against one of
+	// the whitelisted OpenAI-compatible providers in opencode_presets.go;
+	// Agent.CustomBaseURL holds the chosen preset's base URL.
+	ToolCustomOpenCode = "custom-opencode"
 )
+
+// isOpenCodeTool reports whether the backend runs OpenCode and therefore
+// owns the agent's .opencode-home (sessions, refs, skills).
+func isOpenCodeTool(tool string) bool {
+	switch NormalizeToolName(tool) {
+	case ToolGemini, ToolCustomOpenCode:
+		return true
+	}
+	return false
+}
 
 // legacyToolNames maps the pre-rename identifiers onto their current
 // equivalents. "custom" and "llama.cpp" were renamed because neither name
@@ -51,7 +65,7 @@ func NormalizeToolName(tool string) string {
 // runtime fallback.
 func ToolRequiresCustomBaseURL(tool string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
+	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:
 		return true
 	default:
 		return false

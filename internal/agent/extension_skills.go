@@ -68,7 +68,7 @@ func extensionSkillRoot(tool string) string {
 		return ".claude"
 	case ToolCodex, ToolCustomCodex:
 		return ".codex"
-	case ToolGemini:
+	case ToolGemini, ToolCustomOpenCode:
 		return ".opencode"
 	}
 	return ""
@@ -98,7 +98,7 @@ func SyncExtensionSkillsForTool(agentID, tool string, logger *slog.Logger) {
 	// concurrent tool switch cannot interleave with this sweep.
 	unlock := lockDeviceSwitchSkill(agentID)
 	defer unlock()
-	if NormalizeToolName(tool) == ToolGemini {
+	if isOpenCodeTool(tool) {
 		// Copies kojo installed for the pre-OpenCode gemini backend
 		// (marker-owned only; hand-written skills stay).
 		syncExtensionSkills(filepath.Join(agentDir(agentID), legacyGeminiSkillRoot, "skills"), nil, logger)

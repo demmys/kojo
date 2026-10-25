@@ -33,6 +33,12 @@ func (m *Manager) ResetData(id string) error {
 		return err
 	}
 	defer cleanup()
+	// Re-check under the guard: an Archive that sealed between the
+	// check above and acquiring the guard must not have plaintext
+	// files recreated beside its sealed archive.
+	if AgentSealed(id) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, id)
+	}
 
 	if err := m.waitBusyClear(id); err != nil {
 		return err
@@ -322,6 +328,11 @@ func (m *Manager) Archive(id, passcode string) error {
 	}
 	defer cleanup()
 
+	// Terminate persistent claude processes (main + keyed) before the
+	// tree is packed: an idle lingering session would otherwise survive
+	// the archive and could recreate plaintext files after the seal.
+	m.closeClaudeSessionSync(id)
+
 	if already {
 		if err := m.waitOneShotClear(id); err != nil {
 			return fmt.Errorf("%w: chats are still draining; retry to encrypt", ErrAgentBusy)
@@ -398,7 +409,9 @@ func (m *Manager) sealArchived(id, passcode string) error {
 		if err := os.RemoveAll(agentDir(id)); err != nil {
 			return fmt.Errorf("archive: remove leftover plaintext dir: %w", err)
 		}
-		removeBashCaptureDir(id, m.logger)
+		if err := removeBashCaptureDir(id, m.logger); err != nil {
+			return fmt.Errorf("archive: remove bash captures: %w", err)
+		}
 		return nil
 	}
 	if err := sealAgentDir(id, passcode); err != nil {
@@ -408,7 +421,11 @@ func (m *Manager) sealArchived(id, passcode string) error {
 	// Bash captures live outside the agent dir, so sealing doesn't pack
 	// or remove them; drop them so no plaintext command output survives
 	// the seal. They are disposable (the hook prunes them after 24h).
-	removeBashCaptureDir(id, m.logger)
+	// A failure is surfaced so the caller retries; the retry takes the
+	// already-sealed branch above and finishes the removal.
+	if err := removeBashCaptureDir(id, m.logger); err != nil {
+		return fmt.Errorf("archive: sealed, but failed to remove bash captures: %w", err)
+	}
 	m.logger.Info("agent dir sealed", "id", id)
 	return nil
 }

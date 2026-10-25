@@ -960,8 +960,28 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			}
 		}
 	}
+	// Held until the turn's process exits so a concurrent turn on the same
+	// session never prunes under a live run.
+	releaseLive := func() {}
+	if resumeID != "" {
+		releaseLive = acquireOpenCodeLiveSession(home, resumeID, func() {
+			pruneOpenCodeSessionLogged(ctx, home, agent.ID, resumeID, b.logger)
+		})
+		// The wait is bounded by openCodePruneTimeout; a turn aborted
+		// meanwhile must not start OpenCode.
+		if err := ctx.Err(); err != nil {
+			releaseLive()
+			return nil, err
+		}
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			releaseLive()
+		}
+	}()
 	buildMessage := func(resuming bool) string {
-		msg := injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resuming)
+		msg := injectSessionContexts(userMessage, opts, resuming)
 		if !opts.OneShot && !resuming && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 			msg = injectRecentMessagesContext(msg, opts.RecentMessagesContext)
 		}
@@ -1030,8 +1050,10 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	}
 
 	ch := make(chan ChatEvent, 64)
+	handedOff = true
 	go func() {
 		defer close(ch)
+		defer releaseLive()
 		defer removeTurnConfig()
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }

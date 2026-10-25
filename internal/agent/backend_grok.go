@@ -326,7 +326,7 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		}
 	}
 
-	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext, resumeID != "")
+	userMessage = injectSessionContexts(userMessage, opts, resumeID != "")
 
 	// A fresh session has no history of its own, so bootstrap it with a
 	// bounded transcript excerpt (including the recent tool calls) the

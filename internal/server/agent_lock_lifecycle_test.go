@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestLocalAgentActivationHook_CreateForkUnarchive(t *testing.T) {
 	assertLocalAgentLock(t, srv, forked.ID, true)
 	assertArrivedMarker(t, srv, forked.ID, true)
 
-	archiveReq := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/"+created.ID+"?archive=true", nil)
+	archiveReq := httptest.NewRequest(http.MethodDelete, "/api/v1/agents/"+created.ID+"?archive=true", strings.NewReader(`{"passcode":"test-passcode"}`))
 	archiveReq.SetPathValue("id", created.ID)
 	archiveReq = authedRequest(archiveReq, auth.Principal{Role: auth.RoleOwner})
 	archiveRR := httptest.NewRecorder()
@@ -82,7 +83,7 @@ func TestLocalAgentActivationHook_CreateForkUnarchive(t *testing.T) {
 	}
 	assertLocalAgentLock(t, srv, created.ID, false)
 	assertArrivedMarker(t, srv, created.ID, false)
-	unarchiveReq := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/unarchive", nil)
+	unarchiveReq := httptest.NewRequest(http.MethodPost, "/api/v1/agents/"+created.ID+"/unarchive", strings.NewReader(`{"passcode":"test-passcode"}`))
 	unarchiveReq.SetPathValue("id", created.ID)
 	unarchiveReq = authedRequest(unarchiveReq, auth.Principal{Role: auth.RoleOwner})
 	unarchiveRR := httptest.NewRecorder()

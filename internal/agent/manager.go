@@ -111,11 +111,15 @@ type Manager struct {
 	goalLifecycle atomic.Pointer[context.Context]
 	mu            sync.Mutex
 	agents        map[string]*Agent
-	backends      map[string]ChatBackend
-	store         *agentStore
-	creds         *CredentialStore
-	cron          *cronScheduler
-	logger        *slog.Logger
+	// diaryReinject marks agents whose next main-chat turn carries the
+	// recent-activity diary even on a resumed session (MarkDiaryReinject).
+	diaryReinject    map[string]uint64
+	diaryReinjectSeq uint64
+	backends         map[string]ChatBackend
+	store            *agentStore
+	creds            *CredentialStore
+	cron             *cronScheduler
+	logger           *slog.Logger
 	// fileWatcher reflects agent-CLI disk writes (MEMORY.md, memory/,
 	// persona.md, workspace files) into the DB promptly. nil until
 	// StartFileWatcher runs; guarded by mu.
@@ -620,6 +624,10 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 						strings.TrimSpace(a.CronMessage), "",
 						store.AgentWorkspaceFileInsertOptions{AllowOverwrite: true}); uerr != nil {
 						logger.Warn("checkin migration: workspace upsert failed", "agent", a.ID, "err", uerr)
+					} else if AgentSealed(a.ID) {
+						// No disk mirror into the encrypted-away dir;
+						// Unarchive reconciles workspace files from DB.
+						migrated = true
 					} else {
 						checkinPath := filepath.Join(agentDir(a.ID), "checkin.md")
 						if werr := atomicfile.WriteBytes(checkinPath, []byte(strings.TrimSpace(a.CronMessage)), 0o644); werr != nil {
@@ -1661,6 +1669,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	// agentStore-internal paths take store.mu THEN personaSyncMu via
 	// upsertAgent; a path holding personaSyncMu and waiting for store.mu
 	// would invert that order and deadlock.
+	if cfg.Persona != nil && AgentSealed(id) {
+		return nil, fmt.Errorf("%w: %s", ErrAgentSealed, id)
+	}
 	if cfg.Persona != nil {
 		releasePersonaSync := lockPersonaSync(id)
 
@@ -1983,10 +1994,15 @@ func (m *Manager) HasCredentials() bool {
 // keys on the system prompt prefix, and any per-turn change there
 // invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy             Agent
-	backend               ChatBackend
-	sysPrompt             string
-	volatileContext       string
+	agentCopy           Agent
+	backend             ChatBackend
+	sysPrompt           string
+	volatileContext     string
+	sessionStartContext string
+	// diaryReinjected: volatileContext carries the post-compaction diary of
+	// this MarkDiaryReinject generation; the caller clears it once the
+	// backend accepted the turn.
+	diaryReinjected       uint64
 	freshSessionContext   string
 	recentMessagesContext string
 	history               []HistoryTurn
@@ -2000,6 +2016,10 @@ type chatPrep struct {
 // WebUI turns.
 type prepareChatOptions struct {
 	disableKojoAttachmentInstructions bool
+	// mainSession marks the agent's main WebUI session (chat, regenerate):
+	// the only surface that consumes a pending post-compaction diary
+	// re-injection.
+	mainSession bool
 }
 
 func applyPrepareChatOptions(a *Agent, opts prepareChatOptions) {
@@ -2188,6 +2208,21 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
+	// The diary rides the fresh-session path; after a native compaction the
+	// main session gets it once more inside this turn's <context>.
+	// The generation is read before the summary so a PreCompact landing in
+	// between leaves a newer generation (and summary) for the next turn.
+	var diaryReinjected uint64
+	if opts.mainSession {
+		diaryReinjected = m.diaryReinjectPending(agentID)
+	}
+	sessionStartContext := m.BuildSessionStartContext(agentID)
+	if sessionStartContext == "" {
+		diaryReinjected = 0
+	} else if diaryReinjected != 0 {
+		volatileContext = injectRecentMessagesContext(volatileContext, sessionStartContext)
+		sessionStartContext = ""
+	}
 	freshSessionContext := ""
 	recentMessagesContext := ""
 	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
@@ -2213,6 +2248,8 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		backend:               backend,
 		sysPrompt:             sysPrompt,
 		volatileContext:       volatileContext,
+		sessionStartContext:   sessionStartContext,
+		diaryReinjected:       diaryReinjected,
 		freshSessionContext:   freshSessionContext,
 		recentMessagesContext: recentMessagesContext,
 		history:               history,
@@ -2351,7 +2388,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// classifier runs concurrently with the (slow) prepare work.
 	effortCh := m.resolveTurnEffortAsync(ctx, agentID, userMessage, role == "system")
 
-	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false, prepareChatOptions{})
+	prep, err := m.prepareChat(ctx, agentID, userMessage, true, false, prepareChatOptions{mainSession: true})
 	if err != nil {
 		return nil, err
 	}
@@ -2460,6 +2497,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		MCPServers:            prep.mcpServers,
 		AutomatedTrigger:      role == "system" && goal == nil,
 		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
+		SessionStartContext:   prep.sessionStartContext,
 		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
@@ -2521,6 +2559,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	m.commitMainStopNote(agentID, stopNoteETag)
+	if prep.diaryReinjected != 0 {
+		m.clearDiaryReinject(agentID, prep.diaryReinjected)
+	}
 
 	// Return a subscriber channel for the immediate caller.
 	// The raw outCh is consumed exclusively by the broadcaster.
@@ -2913,6 +2954,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		PreserveGoalOnCancel: func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		OneShot:              oneShotMode,
 		MCPServers:           prep.mcpServers,
+		SessionStartContext:  prep.sessionStartContext,
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
 		LingerBackgroundTasks: opts.LingerBackgroundTasks && sessionKey != "" &&
@@ -4745,7 +4787,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 	// transcript so a setup failure leaves history intact. Memory context
 	// injection is skipped — the index still contains entries for messages
 	// about to be truncated, which would otherwise leak into the prompt.
-	prep, err := m.prepareChat(ctx, agentID, srcMsg.Content, true, true, prepareChatOptions{})
+	prep, err := m.prepareChat(ctx, agentID, srcMsg.Content, true, true, prepareChatOptions{mainSession: true})
 	if err != nil {
 		return err
 	}
@@ -4806,6 +4848,7 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 		defer cancel()
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
+			SessionStartContext: prep.sessionStartContext,
 			FreshSessionContext: prep.freshSessionContext,
 			// Session-less backends replay the transcript; here it has
 			// to stop short of the message being re-run, which travels
@@ -4871,6 +4914,9 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			return
 		}
 		m.commitMainStopNote(agentID, stopNoteETag)
+		if prep.diaryReinjected != 0 {
+			m.clearDiaryReinject(agentID, prep.diaryReinjected)
+		}
 		end := m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 		m.markMainTurnEnded(agentID)
 		m.recordMainTurnStop(agentID, chatCtx, end)

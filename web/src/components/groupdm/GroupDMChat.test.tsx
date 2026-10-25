@@ -242,6 +242,20 @@ describe("GroupDMChat thread room", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
   });
 
+  it("marks messages from external agents with a badge", async () => {
+    mocks.groupMessages.mockResolvedValue({
+      messages: [
+        { id: "m1", agentId: "ag_alice", agentName: "Alice", content: "from kojo", timestamp: "2026-06-15T00:00:01Z" },
+        { id: "m2", agentId: "xa_ext", agentName: "Codex", content: "from outside", timestamp: "2026-06-15T00:00:02Z" },
+      ],
+      hasMore: false,
+    });
+    renderGroup();
+
+    expect(await screen.findByText("from outside")).toBeInTheDocument();
+    expect(screen.getAllByText(/^(外部|external)$/)).toHaveLength(1);
+  });
+
   it("renders a token usage line under an agent reply", async () => {
     mocks.groupGet.mockResolvedValue(threadGroup);
     mocks.groupMessages.mockResolvedValue({

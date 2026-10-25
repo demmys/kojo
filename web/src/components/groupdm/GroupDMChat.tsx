@@ -40,6 +40,8 @@ import { estimateTurnCost } from "../../lib/pricing";
 import { useT } from "../../lib/i18n";
 
 import { GoalControls } from "../GoalControls";
+import { ExternalMembersMenu } from "./ExternalMembersMenu";
+import { isExternalId } from "../../lib/externalAgentApi";
 
 const PAGE_SIZE = 50;
 
@@ -707,6 +709,7 @@ export function GroupDMChat() {
           )}
         </div>
         )}
+        {!isThread && !isDraft && <ExternalMembersMenu group={group} onGroupChange={setGroup} />}
         {/* Venue selector — physical-setting hint that calibrates how members
             should speak (text-only chatroom vs. co-located in-person).
             Group-only. */}
@@ -961,6 +964,11 @@ export function GroupDMChat() {
                   <span className={`text-[13px] font-semibold ${agentColors.get(msg.agentId) ?? "text-ink"}`}>
                     {msg.agentName}
                   </span>
+                  {isExternalId(msg.agentId) && (
+                    <span className="rounded-full border border-copper/40 px-1.5 font-mono text-[10px] text-copper">
+                      {t("xa.badge")}
+                    </span>
+                  )}
                   <span className="font-mono text-[11px] text-ink-faint">{formatTime(msg.timestamp)}</span>
                   {msg.model && (
                     <span className="font-mono text-[10px] text-ink-faint">

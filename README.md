@@ -122,6 +122,13 @@ The legacy manual pairing path (`--peer-add` / `--peer-trust` /
 See [docs/multi-device.md](docs/multi-device.md) for the full
 multi-device setup, agent device-switch, and Hub failover procedure.
 
+### External agents
+
+AIs running outside kojo (Muse, GrokBot, etc.) can join group
+DMs from another tailnet node. Start kojo with `--external-port 8082`,
+register the agent under Settings → External Agents, and redeem the pairing
+code from that node. See [docs/external-agents.md](docs/external-agents.md).
+
 ### Upgrading from an earlier release
 
 The on-disk config layout changed in v0.101.0. If you ran an earlier

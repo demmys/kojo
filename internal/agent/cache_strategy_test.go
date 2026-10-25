@@ -62,7 +62,10 @@ func TestBuildVolatileContext_EscapesClosingTag(t *testing.T) {
 		t.Fatalf("write recent.md: %v", err)
 	}
 
-	out := m.BuildVolatileContext(context.Background(), "ag_escape", "")
+	// The diary reaches the <context> block through the session-start
+	// path (fresh session), so check the assembled message.
+	out := injectSessionContexts(m.BuildVolatileContext(context.Background(), "ag_escape", ""),
+		ChatOptions{SessionStartContext: m.BuildSessionStartContext("ag_escape")}, false)
 	// The first occurrence of "</context>" must be the genuine closer at
 	// the end of the block. Anything inside should have been escaped to
 	// "&lt;/context&gt;".

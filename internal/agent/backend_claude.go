@@ -653,8 +653,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	inv := b.buildClaudeInvocation(agent, systemPrompt, dir, opts.OneShot, opts.MCPServers, opts.AutomatedTrigger, opts.SessionKey)
 	args := inv.args
 	fresh := !opts.OneShot && inv.bootstrapRecentContext
-	userMessage = injectSessionHistoryContext(userMessage, opts.FreshSessionContext, opts.ResumeSessionContext,
-		!opts.OneShot && !fresh)
+	userMessage = injectSessionContexts(userMessage, opts, !opts.OneShot && !fresh)
 	if fresh && opts.FreshSessionContext == "" && opts.RecentMessagesContext != "" {
 		userMessage = injectRecentMessagesContext(userMessage, opts.RecentMessagesContext)
 	}
@@ -2753,10 +2752,12 @@ func bashCaptureDir(agentID string) string {
 // removeBashCaptureDir deletes an agent's captures (reset / delete). Before
 // captures moved out of the agent dir this happened implicitly via the
 // .claude/ or agent dir RemoveAll.
-func removeBashCaptureDir(agentID string, logger *slog.Logger) {
-	if err := os.RemoveAll(bashCaptureDir(agentID)); err != nil && logger != nil {
+func removeBashCaptureDir(agentID string, logger *slog.Logger) error {
+	err := os.RemoveAll(bashCaptureDir(agentID))
+	if err != nil && logger != nil {
 		logger.Warn("failed to remove bash capture dir", "agent", agentID, "err", err)
 	}
+	return err
 }
 
 // legacyBashCaptureTTL matches the hook's own prune window.

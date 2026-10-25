@@ -1051,7 +1051,11 @@ func PreCompactSummarize(agentID string, tool string, transcriptPath string, log
 		summary = out
 	}
 
-	// Append to today's diary (audit trail).
+	// Append to today's diary (audit trail). Never into a sealed
+	// (encrypted, removed) agent dir.
+	if AgentSealed(agentID) {
+		return fmt.Errorf("%w: %s", ErrAgentSealed, agentID)
+	}
 	dir := filepath.Join(agentDir(agentID), "memory")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create memory dir: %w", err)

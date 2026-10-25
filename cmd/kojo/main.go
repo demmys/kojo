@@ -66,6 +66,7 @@ func main() {
 	}
 
 	port := flag.Int("port", 8080, "port number (auto-increments if busy)")
+	externalPort := flag.Int("external-port", 0, "tailnet port for the external AI agent API (plain HTTP, tsnet Hub mode only; 0 = disabled)")
 	dev := flag.Bool("dev", false, "enable dev mode (proxy to Vite)")
 	local := flag.Bool("local", false, "listen on localhost only (no Tailscale)")
 	hostname := flag.String("hostname", "kojo", "tsnet machine name (becomes <name>.<tailnet>.ts.net). Ignored in --local / --dev mode")
@@ -285,7 +286,9 @@ func main() {
 	// also honor.
 	sessionV0LegacyDir := ""
 	if probe := probeDirs(); probe.v1Complete && probe.v0Exists {
-		sessionV0LegacyDir = probe.v0Path
+		if cf, err := readCompleteFile(probe.v1Path); err == nil && !cf.FreshInstall {
+			sessionV0LegacyDir = probe.v0Path
+		}
 	}
 
 	// Acquire an exclusive advisory lock on the config dir so a second kojo
@@ -1618,7 +1621,7 @@ func main() {
 			Logf:     func(format string, args ...any) { logger.Debug(fmt.Sprintf(format, args...)) },
 		}
 
-		ln, err := listenTsnetTLS(tsServer, fmt.Sprintf(":%d", *port))
+		ln, err := listenTsnetTLS(tsServer, fmt.Sprintf(":%d", *port), srv.TrackPublicListener)
 		if err != nil {
 			logger.Error("failed to listen on tailscale", "err", err)
 			os.Exit(1)
@@ -1678,6 +1681,9 @@ func main() {
 			//      a tsnet NodeKey there would never match an inbound
 			//      Hub call and every §3.7 inter-peer surface (notably
 			//      /agent-sync/state) would 403 forbidden.
+			if *externalPort > 0 {
+				startExternalListener(ctx, tsServer, lc, srv, *externalPort, logger, stop)
+			}
 			go captureSelfNodeKeyFromTailscale(ctx, lc, srv, nil, logger)
 			go captureOSSelfNodeKeyForRegistrar(ctx, peerRegistrar, logger)
 			// Background refresh: bounded retry until tsnet
@@ -2320,7 +2326,7 @@ func listenWithFallback(host string, startPort, maxAttempts int, logger *slog.Lo
 // http.Server.Serve upgrades a tls.Conn that negotiated "h2" on its own.
 // WebSockets stay on HTTP/1.1: extended CONNECT (RFC 8441) is off by
 // default in net/http, so browsers open a separate h1 connection for them.
-func listenTsnetTLS(s *tsnet.Server, addr string) (net.Listener, error) {
+func listenTsnetTLS(s *tsnet.Server, addr string, wrap func(net.Listener) net.Listener) (net.Listener, error) {
 	st, err := s.Up(context.Background())
 	if err != nil {
 		return nil, err
@@ -2339,6 +2345,9 @@ func listenTsnetTLS(s *tsnet.Server, addr string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+	if wrap != nil {
+		ln = wrap(ln)
+	}
 	return tls.NewListener(ln, tsnetListenerTLSConfig(lc.GetCertificate)), nil
 }
 
@@ -2354,4 +2363,51 @@ func tsnetListenerTLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate
 // HTTP/2 setup and an h2-negotiated connection gets served as HTTP/1.
 func tsnetServeTLSConfig() *tls.Config {
 	return &tls.Config{NextProtos: tsnetALPN}
+}
+
+// startExternalListener opens the dedicated tailnet listener for
+// external AI agents (plain HTTP over tsnet; WireGuard already encrypts
+// and WhoIs authenticates the node, the Bearer token the agent).
+func startExternalListener(ctx context.Context, tsServer *tsnet.Server, lc *localTailscale.Client, srv *server.Server, port int, logger *slog.Logger, stop context.CancelFunc) {
+	srv.SetExternalWhoIs(func(ctx context.Context, remoteAddr string) (store.ExternalNodeIdentity, error) {
+		w, err := lc.WhoIs(ctx, remoteAddr)
+		if err != nil {
+			return store.ExternalNodeIdentity{}, err
+		}
+		if w == nil || w.Node == nil {
+			return store.ExternalNodeIdentity{}, errors.New("unknown tailnet node")
+		}
+		id := store.ExternalNodeIdentity{
+			StableNodeID: string(w.Node.StableID),
+			NodeName:     strings.TrimSuffix(w.Node.Name, "."),
+		}
+		for _, pfx := range w.Node.Addresses {
+			id.TailnetIPs = append(id.TailnetIPs, pfx.Addr().String())
+		}
+		return id, nil
+	})
+	xln, err := tsServer.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		logger.Error("external agent listener failed", "port", port, "err", err)
+		return
+	}
+	go func() {
+		// tsnet may not know its DNSName yet; retry for a while.
+		for i := 0; i < 60; i++ {
+			if st, err := lc.Status(ctx); err == nil && st.Self != nil && st.Self.DNSName != "" {
+				srv.SetExternalBaseURL(fmt.Sprintf("http://%s:%d", strings.TrimSuffix(st.Self.DNSName, "."), port))
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
+	go func() {
+		if err := srv.ServeExternal(xln); err != nil && err != http.ErrServerClosed {
+			logger.Error("external listener error", "err", err)
+		}
+	}()
 }

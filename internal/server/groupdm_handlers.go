@@ -166,8 +166,9 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	g, err := s.groupdms.CreateWithNotify(req.Name, req.MemberIDs, req.Cooldown,
-		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue), req.NotifyMembers)
+	g, err := s.groupdms.CreateWithNotifyAs(req.Name, req.MemberIDs, req.Cooldown,
+		agent.GroupDMStyle(req.Style), agent.GroupDMVenue(req.Venue), req.NotifyMembers,
+		auth.FromContext(r.Context()).HasOwnerAuthority())
 	if err != nil {
 		// Don't leak whether a memberId names an unknown / archived agent
 		// to non-Owners — that would let an agent enumerate hidden or
@@ -187,6 +188,9 @@ func (s *Server) handleCreateGroupDM(w http.ResponseWriter, r *http.Request) {
 type groupDMWithStatus struct {
 	*agent.GroupDM
 	Members []groupMemberWithStatus `json:"members"`
+	// ExternalTrust is the room's trust level for external agents'
+	// messages ("untrusted" | "peer").
+	ExternalTrust string `json:"externalTrust,omitempty"`
 }
 
 type groupMemberWithStatus struct {
@@ -209,7 +213,13 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 	members := make([]groupMemberWithStatus, len(g.Members))
 	for i, m := range g.Members {
 		var status string
-		if isPhysical {
+		if agent.IsExternalID(m.AgentID) {
+			// External agents: "online" while an event stream is open.
+			status = "offline"
+			if s.external != nil && s.external.hub.online(m.AgentID) {
+				status = "online"
+			}
+		} else if isPhysical {
 			status = "unknown"
 		} else if avail, found := s.agents.IsAgentDMAvailable(m.AgentID); !found {
 			status = "unknown"
@@ -223,7 +233,7 @@ func (s *Server) handleGetGroupDM(w http.ResponseWriter, r *http.Request) {
 		members[i] = groupMemberWithStatus{GroupMember: m, Status: status}
 	}
 
-	resp := groupDMWithStatus{GroupDM: g, Members: members}
+	resp := groupDMWithStatus{GroupDM: g, Members: members, ExternalTrust: s.groupdms.ExternalTrust(g.ID)}
 	writeJSONResponse(w, http.StatusOK, resp)
 }
 
@@ -667,7 +677,7 @@ func (s *Server) handleAddGroupMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	g, err := s.groupdms.AddMember(id, req.AgentID, req.CallerAgentID)
+	g, err := s.groupdms.AddMemberAs(id, req.AgentID, req.CallerAgentID, auth.FromContext(r.Context()).HasOwnerAuthority())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return

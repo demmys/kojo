@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/configdir"
 	"github.com/loppo-llc/kojo/internal/store"
 )
 
@@ -643,5 +645,101 @@ func TestRunDoesNotWriteV0(t *testing.T) {
 	postManifest, _ := ManifestSHA256(v0)
 	if preManifest != postManifest {
 		t.Errorf("v0 dir was written during migration: pre=%s post=%s", preManifest, postManifest)
+	}
+}
+
+func TestMarkFreshInstall(t *testing.T) {
+	ctx := context.Background()
+	v1 := t.TempDir()
+	if err := MarkFreshInstall(ctx, v1, "test", time.UnixMilli(1000)); err != nil {
+		t.Fatalf("MarkFreshInstall: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(v1, CompleteFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cf CompleteFile
+	if err := json.Unmarshal(body, &cf); err != nil {
+		t.Fatal(err)
+	}
+	if !cf.FreshInstall || cf.V1SchemaVersion <= 0 || cf.CompletedAt != 1000 || cf.V0Path != "" || cf.V0SHA256Manifest != "" {
+		t.Fatalf("unexpected marker: %+v", cf)
+	}
+	if err := MarkFreshInstall(ctx, v1, "test", time.Now()); !errors.Is(err, ErrAlreadyComplete) {
+		t.Fatalf("second MarkFreshInstall err = %v, want ErrAlreadyComplete", err)
+	}
+}
+
+func TestMarkFreshInstallRefusesMigrationLock(t *testing.T) {
+	v1 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(v1, LockFileName), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkFreshInstall(context.Background(), v1, "test", time.Now()); err == nil {
+		t.Fatal("MarkFreshInstall succeeded with migration lock present")
+	}
+	if _, err := os.Stat(filepath.Join(v1, CompleteFileName)); !os.IsNotExist(err) {
+		t.Fatalf("complete file written despite lock: %v", err)
+	}
+}
+
+func TestMarkFreshInstallRefusesHeldRuntimeLock(t *testing.T) {
+	v1 := t.TempDir()
+	lock, err := configdir.Acquire(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+	if err := MarkFreshInstall(context.Background(), v1, "test", time.Now()); err == nil {
+		t.Fatal("MarkFreshInstall succeeded while another holder owns kojo.lock")
+	}
+}
+
+func TestRebaseFreshInstallSchema(t *testing.T) {
+	ctx := context.Background()
+	v1 := t.TempDir()
+	if err := MarkFreshInstall(ctx, v1, "test", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(v1, CompleteFileName)
+	read := func() CompleteFile {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cf CompleteFile
+		if err := json.Unmarshal(body, &cf); err != nil {
+			t.Fatal(err)
+		}
+		return cf
+	}
+	cf := read()
+	dbVer := cf.V1SchemaVersion
+	// Simulate a marker newer than the restored DB.
+	cf.V1SchemaVersion = dbVer + 5
+	body, _ := json.Marshal(cf)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RebaseFreshInstallSchema(ctx, v1); err != nil {
+		t.Fatalf("rebase: %v", err)
+	}
+	if got := read().V1SchemaVersion; got != dbVer {
+		t.Fatalf("V1SchemaVersion = %d, want %d", got, dbVer)
+	}
+
+	// Migration markers stay untouched.
+	cf = read()
+	cf.FreshInstall = false
+	cf.V1SchemaVersion = dbVer + 5
+	body, _ = json.Marshal(cf)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RebaseFreshInstallSchema(ctx, v1); err != nil {
+		t.Fatalf("rebase migrated: %v", err)
+	}
+	if got := read().V1SchemaVersion; got != dbVer+5 {
+		t.Fatalf("migrated marker rewritten: %d", got)
 	}
 }

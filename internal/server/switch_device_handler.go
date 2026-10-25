@@ -209,6 +209,12 @@ func (s *Server) handleAgentHandoffSwitch(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if agent.AgentSealed(agentID) {
+		writeError(w, http.StatusConflict, "sealed",
+			"agent data is sealed in an encrypted archive; unarchive it first")
+		return
+	}
+
 	// Serialize switch transactions, including deferred Goal execution. This
 	// lock is not retained while the requesting native turn finishes.
 	unlockSwitch := s.lockPendingFinalize(pendingSyncKey{AgentID: agentID, OpID: "switch-transaction"})

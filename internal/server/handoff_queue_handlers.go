@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
 	"github.com/loppo-llc/kojo/internal/peer"
 	"github.com/loppo-llc/kojo/internal/store"
 )
@@ -39,6 +40,12 @@ const handoffQueueMaxBody = 1 << 20
 // postAgentMessageRequest is the wire shape of POST /agents/{id}/messages.
 type postAgentMessageRequest struct {
 	Content string `json:"content"`
+}
+
+// extensionNotice labels text an extension posts into the main chat
+// so neither the agent nor the user mistakes it for the user's words.
+func extensionNotice(extensionID, content string) string {
+	return "[system message] 拡張機能 " + extensionID + " からの通知\n\n" + content
 }
 
 // handlePostAgentMessage is the local (holder-side) HTTP send path:
@@ -75,7 +82,21 @@ func (s *Server) handlePostAgentMessage(w http.ResponseWriter, r *http.Request) 
 	// Background context: the chat outlives this request, same as
 	// the WS path — the transcript records the response even if
 	// the caller goes away.
-	events, err := s.agents.Chat(context.Background(), id, req.Content, "user", nil)
+	content, role := req.Content, "user"
+	var source []agent.BusySource
+	if p := auth.FromContext(r.Context()); p.IsExtension() {
+		// A package speaks for an outside system, not for the user:
+		// land it in the main transcript as a labelled system turn.
+		content = extensionNotice(p.ExtensionID, content)
+		role = "system"
+		source = []agent.BusySource{agent.BusySourceNotification}
+	}
+	events, err := s.agents.Chat(context.Background(), id, content, role, nil, source...)
+	if errors.Is(err, agent.ErrAgentBusy) {
+		w.Header().Set("X-Kojo-No-Idempotency-Cache", "1")
+		writeError(w, http.StatusConflict, "busy", "agent is busy")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "chat_failed", err.Error())
 		return
@@ -114,6 +135,16 @@ func (s *Server) proxyOrQueueAgentMessage(w http.ResponseWriter, r *http.Request
 	if req.Content == "" {
 		writeError(w, http.StatusBadRequest, "bad_request", "content required")
 		return
+	}
+
+	if p := auth.FromContext(r.Context()); p.IsExtension() {
+		// The holder sees a peer principal, not the package, so label
+		// the text here. It lands as a user-role turn over there.
+		req.Content = extensionNotice(p.ExtensionID, req.Content)
+		if body, err = json.Marshal(req); err != nil {
+			writeError(w, http.StatusInternalServerError, "encode_failed", err.Error())
+			return
+		}
 	}
 
 	peerRec, err := st.GetPeer(r.Context(), holderDeviceID)

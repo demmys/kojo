@@ -1,0 +1,267 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/loppo-llc/kojo/internal/agent"
+	"github.com/loppo-llc/kojo/internal/auth"
+	"github.com/loppo-llc/kojo/internal/peer"
+	"github.com/loppo-llc/kojo/internal/store"
+)
+
+// newReclaimTestServer returns a server identified as self with one agent
+// whose lock row is held by holder.
+func newReclaimTestServer(t *testing.T, self, holder string) (*Server, string) {
+	t.Helper()
+	srv := newChunkedSyncTestServer(t)
+	srv.peerID = &peer.Identity{DeviceID: self, Name: self}
+	a, err := srv.agents.Create(agent.AgentConfig{Name: "reclaimed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.agents.Store().AcquireAgentLock(context.Background(), a.ID, holder,
+		store.NowMillis(), int64((5*time.Minute)/time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	return srv, a.ID
+}
+
+func postReclaimed(t *testing.T, srv *Server, p auth.Principal, reclaimer, agentID string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(peerAgentReclaimedRequest{ReclaimerDeviceID: reclaimer, AgentID: agentID})
+	rr := httptest.NewRecorder()
+	req := authedRequest(httptest.NewRequest(http.MethodPost, reclaimedPeerPath, bytes.NewReader(body)), p)
+	srv.handlePeerAgentReclaimed(rr, req)
+	return rr
+}
+
+func TestPeerAgentReclaimedReleasesLocalHolder(t *testing.T) {
+	srv, id := newReclaimTestServer(t, "old", "old")
+	var hooked atomic.Value
+	srv.SetOnAgentReleasedAsSource(func(_ context.Context, agentID string) { hooked.Store(agentID) })
+
+	rr := postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "hub"}, "hub", id)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reclaimed: %d %s", rr.Code, rr.Body.String())
+	}
+	var out peerAgentReclaimedResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil || !out.Released {
+		t.Fatalf("must release: %+v %v", out, err)
+	}
+	if got, _ := hooked.Load().(string); got != id {
+		t.Fatalf("release hook not fired: %q", got)
+	}
+	ctx := context.Background()
+	st := srv.agents.Store()
+	if _, err := st.GetAgentLock(ctx, id); err == nil {
+		t.Fatal("lock row must be gone")
+	}
+	if marked, err := st.HasAgentFullSyncMarker(ctx, id); err != nil || !marked {
+		t.Fatalf("full-sync marker: %v %v", marked, err)
+	}
+
+	// Next switch back here: the probe must ask for a full snapshot.
+	body, _ := json.Marshal(peerAgentSyncStateRequest{AgentID: id, SourceDeviceID: "hub"})
+	rr = httptest.NewRecorder()
+	req := authedRequest(httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync/state", bytes.NewReader(body)), auth.Principal{Role: auth.RolePeer, PeerID: "hub"})
+	srv.handlePeerAgentSyncState(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("state: %d %s", rr.Code, rr.Body.String())
+	}
+	var state store.AgentSyncState
+	if err := json.Unmarshal(rr.Body.Bytes(), &state); err != nil || state.Known {
+		t.Fatalf("must request full sync: %+v %v", state, err)
+	}
+
+	// A stale incremental payload (marker landed after the probe) is refused.
+	a, err := st.GetAgent(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = json.Marshal(&peerAgentSyncRequest{Agent: a, OpID: "inc", SourceDeviceID: "hub", SinceMessageSeq: 3})
+	rr = httptest.NewRecorder()
+	req = authedRequest(httptest.NewRequest(http.MethodPost, "/api/v1/peers/agent-sync", bytes.NewReader(body)), auth.Principal{Role: auth.RolePeer, PeerID: "hub"})
+	srv.handlePeerAgentSync(rr, req)
+	if rr.Code != http.StatusConflict || !bytes.Contains(rr.Body.Bytes(), []byte("full_sync_required")) {
+		t.Fatalf("incremental after reclaim: %d %s", rr.Code, rr.Body.String())
+	}
+	if marked, _ := st.HasAgentFullSyncMarker(ctx, id); !marked {
+		t.Fatal("refused incremental must keep the marker")
+	}
+}
+
+func TestPeerAgentReclaimedIgnoresNonHolder(t *testing.T) {
+	srv, id := newReclaimTestServer(t, "old", "elsewhere")
+	fired := false
+	srv.SetOnAgentReleasedAsSource(func(context.Context, string) { fired = true })
+	rr := postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "hub"}, "hub", id)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reclaimed: %d %s", rr.Code, rr.Body.String())
+	}
+	var out peerAgentReclaimedResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil || out.Released {
+		t.Fatalf("non-holder must not release: %+v %v", out, err)
+	}
+	if fired {
+		t.Fatal("release hook must not fire")
+	}
+	ctx := context.Background()
+	lock, err := srv.agents.Store().GetAgentLock(ctx, id)
+	if err != nil || lock.HolderPeer != "elsewhere" {
+		t.Fatalf("lock must be untouched: %+v %v", lock, err)
+	}
+	if marked, _ := srv.agents.Store().HasAgentFullSyncMarker(ctx, id); marked {
+		t.Fatal("non-holder must not get a full-sync marker")
+	}
+}
+
+func TestPeerAgentReclaimedRejectsForeignSigner(t *testing.T) {
+	srv, id := newReclaimTestServer(t, "old", "old")
+	rr := postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "mallory"}, "hub", id)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("foreign signer: %d %s", rr.Code, rr.Body.String())
+	}
+	rr = postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "old"}, "old", id)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("self reclaimer: %d %s", rr.Code, rr.Body.String())
+	}
+	lock, err := srv.agents.Store().GetAgentLock(context.Background(), id)
+	if err != nil || lock.HolderPeer != "old" {
+		t.Fatalf("lock must be untouched: %+v %v", lock, err)
+	}
+	// Owner (manual recovery on the old holder) may name any reclaimer.
+	rr = postReclaimed(t, srv, auth.Principal{Role: auth.RoleOwner}, "hub", id)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("owner: %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func readReclaimNotice(t *testing.T, srv *Server, id string) *reclaimNotice {
+	t.Helper()
+	rec, err := srv.agents.Store().GetKV(context.Background(), reclaimNoticeNamespace, id)
+	if err != nil {
+		return nil
+	}
+	var n reclaimNotice
+	if err := json.Unmarshal([]byte(rec.Value), &n); err != nil {
+		t.Fatal(err)
+	}
+	return &n
+}
+
+func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) {
+	var got atomic.Value
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reclaimedPeerPath {
+			http.NotFound(w, r)
+			return
+		}
+		var req peerAgentReclaimedRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got.Store(req)
+		writeJSONResponse(w, http.StatusOK, peerAgentReclaimedResponse{AgentID: req.AgentID, Released: true})
+	}))
+	t.Cleanup(old.Close)
+	srv, id := newReclaimTestServer(t, "hub", "hub")
+	ctx := context.Background()
+	st := srv.agents.Store()
+	for _, p := range []*store.PeerRecord{
+		{DeviceID: "old", Name: "Old", URL: old.URL, Status: store.PeerStatusOnline},
+		{DeviceID: "off", Name: "Off", URL: "http://127.0.0.1:1", Status: store.PeerStatusOffline},
+	} {
+		if _, err := st.UpsertPeer(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := srv.recordReclaimNotice(ctx, id, 7); err != nil {
+		t.Fatal(err)
+	}
+	res, err := srv.deliverReclaimNotice(ctx, id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.ReleasedOn) != 1 || res.ReleasedOn[0] != "old" || len(res.PendingPeers) != 1 || res.PendingPeers[0] != "off" {
+		t.Fatalf("result: %+v", res)
+	}
+	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimerDeviceID != "hub" || req.AgentID != id {
+		t.Fatalf("wire request: %+v", req)
+	}
+	n := readReclaimNotice(t, srv, id)
+	if n == nil || len(n.Peers) != 1 || n.Peers[0] != "off" {
+		t.Fatalf("notice must keep only the offline peer: %+v", n)
+	}
+
+	// Once the agent leaves this device the notice is stale and dropped.
+	lock, err := st.GetAgentLock(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ReleaseAgentLock(ctx, id, "hub", lock.FencingToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AcquireAgentLock(ctx, id, "new", store.NowMillis(), 60000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.deliverReclaimNotice(ctx, id, ""); err != nil {
+		t.Fatal(err)
+	}
+	if n := readReclaimNotice(t, srv, id); n != nil {
+		t.Fatalf("stale notice must be dropped: %+v", n)
+	}
+}
+
+func TestForceReclaimNotifiesOldHolder(t *testing.T) {
+	var calls atomic.Int32
+	holder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != reclaimedPeerPath {
+			http.NotFound(w, r)
+			return
+		}
+		calls.Add(1)
+		var req peerAgentReclaimedRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSONResponse(w, http.StatusOK, peerAgentReclaimedResponse{AgentID: req.AgentID, Released: true})
+	}))
+	t.Cleanup(holder.Close)
+	srv, _, id := prepareRemoteExternalChat(t, holder.URL)
+	reclaimForRouteTest(t, srv, id)
+	if calls.Load() != 1 {
+		t.Fatalf("old holder told %d times", calls.Load())
+	}
+	if n := readReclaimNotice(t, srv, id); n != nil {
+		t.Fatalf("delivered notice must be cleared: %+v", n)
+	}
+}
+
+func TestPeerAgentReclaimedConcurrentReclaimTieBreak(t *testing.T) {
+	// "a" < "z": a device that also reclaimed keeps the agent against a
+	// higher-ID reclaimer, and yields to a lower one.
+	srv, id := newReclaimTestServer(t, "a", "a")
+	if err := srv.putReclaimNotice(context.Background(), id, &reclaimNotice{Peers: []string{"z"}, CreatedAt: store.NowMillis()}); err != nil {
+		t.Fatal(err)
+	}
+	rr := postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "z"}, "z", id)
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("lower ID must win: %d %s", rr.Code, rr.Body.String())
+	}
+	lock, err := srv.agents.Store().GetAgentLock(context.Background(), id)
+	if err != nil || lock.HolderPeer != "a" {
+		t.Fatalf("winner lost the agent: %+v %v", lock, err)
+	}
+
+	srv2, id2 := newReclaimTestServer(t, "z", "z")
+	if err := srv2.putReclaimNotice(context.Background(), id2, &reclaimNotice{Peers: []string{"a"}, CreatedAt: store.NowMillis()}); err != nil {
+		t.Fatal(err)
+	}
+	rr = postReclaimed(t, srv2, auth.Principal{Role: auth.RolePeer, PeerID: "a"}, "a", id2)
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
+		t.Fatalf("higher ID must yield: %d %s", rr.Code, rr.Body.String())
+	}
+}

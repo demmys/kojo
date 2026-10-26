@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 )
@@ -203,4 +204,167 @@ DELETE FROM kv
 		return nil, fmt.Errorf("store.ForceReclaimAgentToLocal: commit: %w", err)
 	}
 	return rec, nil
+}
+
+// AgentFullSyncMarkerKey is the machine-local kv key (namespace
+// "handoff") that forces the next incoming device-switch for agentID to
+// ship a full snapshot instead of an incremental delta. It is written
+// when this peer is told that another device force-reclaimed an agent it
+// still believed it owned: rows written here after the reclaim diverge
+// from the reclaimer's history (same seq / same memory natural key with
+// different ids), so an incremental merge would either drop rows or
+// collide on idx_memory_entries_alive_natkey. Cleared by
+// SyncAgentFromPeer once a full (non-incremental) snapshot lands.
+func AgentFullSyncMarkerKey(agentID string) string { return "full_sync/" + agentID }
+
+// HasAgentFullSyncMarker reports whether AgentFullSyncMarkerKey is set.
+func (s *Store) HasAgentFullSyncMarker(ctx context.Context, agentID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM kv WHERE namespace = 'handoff' AND key = ?`,
+		AgentFullSyncMarkerKey(agentID)).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("store.HasAgentFullSyncMarker: %w", err)
+	}
+	return n > 0, nil
+}
+
+// ReleaseReclaimedAgentHere is the old-holder half of force-reclaim. The
+// reclaiming device rewrote only ITS OWN agent_locks row; this peer may
+// still record itself as holder (agent_locks.holder_peer == localPeerID)
+// or, after a graceful stop wiped the lock rows, still carry the durable
+// arrived/<id> marker that re-seeds AgentLockGuard on the next boot.
+// Either form keeps a second runtime alive (split-brain: duplicate cron /
+// checkins, diverging transcript) and makes every later switch back here
+// fail authorizeIncomingSource with ErrStaleHandoff.
+//
+// When this peer does claim the agent, in one transaction:
+//
+//   - agent_locks: DELETE our own row and bump agent_fencing_counters so
+//     any in-flight write from the local runtime fails fencing and every
+//     pending incoming_handoffs generation is invalidated. A row naming
+//     another peer is left alone.
+//   - incoming_handoffs: non-terminal rows → aborted (mirrors
+//     ForceReclaimAgentToLocal).
+//   - blob_refs: clear handoff_pending; home_peer is left alone (see
+//     PurgeAgentRuntimeStateForRetry).
+//   - kv handoff markers arrived/, arrived_proxy/, pending/ → DELETE so a
+//     restart does not resurrect the runtime.
+//
+// The caller must write AgentFullSyncMarkerKey BEFORE calling this (a
+// stray marker only costs one full sync) and tear down the in-memory
+// runtime AFTER (which also writes released/<id>).
+//
+// Returns released=false, without touching anything, when this peer does
+// not claim the agent (no own lock row and no arrival marker) — e.g. it already handed the agent on, so the reclaim notice
+// is obsolete here.
+func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPeerID string) (bool, error) {
+	if agentID == "" {
+		return false, errors.New("store.ReleaseReclaimedAgentHere: agent_id required")
+	}
+	if localPeerID == "" {
+		return false, errors.New("store.ReleaseReclaimedAgentHere: local_peer required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	claims, err := localPeerClaimsAgentTx(ctx, tx, agentID, localPeerID)
+	if err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: %w", err)
+	}
+	if !claims {
+		return false, nil
+	}
+
+	// Only our own lock row goes. A row naming another peer (claim came
+	// from a leftover arrival marker) is that peer's shadow and may still
+	// back an incoming-handoff authorization, so it and the fencing
+	// counter stay untouched.
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM agent_locks WHERE agent_id = ? AND holder_peer = ?`, agentID, localPeerID)
+	if err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: agent_locks: %w", err)
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: agent_locks: %w", err)
+	}
+	// The counter row is FK'd to agents; skip the bump for an agent this
+	// DB never registered (arrival marker without an agents row).
+	var hasAgent int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM agents WHERE id = ?`, agentID).Scan(&hasAgent); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: agent lookup: %w", err)
+	}
+	if deleted > 0 && hasAgent > 0 {
+		if _, err := nextFencingToken(ctx, tx, agentID); err != nil {
+			return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE incoming_handoffs SET phase='aborted' WHERE agent_id=? AND phase NOT IN ('done','aborted')`,
+		agentID,
+	); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: incoming_handoffs: %w", err)
+	}
+	blobPrefix := "kojo://global/agents/" + agentID + "/"
+	blobPrefixEnd, _ := nextPrefix(blobPrefix)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE blob_refs SET handoff_pending = 0 WHERE uri >= ? AND uri < ? AND handoff_pending = 1`,
+		blobPrefix, blobPrefixEnd,
+	); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: blob_refs: %w", err)
+	}
+	pendingPrefix := "pending/" + agentID + "/"
+	pendingPrefixEnd, _ := nextPrefix(pendingPrefix)
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM kv
+		  WHERE namespace = 'handoff'
+		    AND (key = ? OR key = ? OR (key >= ? AND key < ?))`,
+		"arrived/"+agentID, "arrived_proxy/"+agentID, pendingPrefix, pendingPrefixEnd,
+	); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: kv handoff: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: commit: %w", err)
+	}
+	return true, nil
+}
+
+// LocalPeerClaimsAgent is the read-only precheck for
+// ReleaseReclaimedAgentHere (same predicate, outside a transaction).
+func (s *Store) LocalPeerClaimsAgent(ctx context.Context, agentID, localPeerID string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	return localPeerClaimsAgentTx(ctx, tx, agentID, localPeerID)
+}
+
+func localPeerClaimsAgentTx(ctx context.Context, tx *sql.Tx, agentID, localPeerID string) (bool, error) {
+	var holder sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT holder_peer FROM agent_locks WHERE agent_id = ?`, agentID).Scan(&holder)
+	switch {
+	case err == nil:
+		if holder.String == localPeerID {
+			return true, nil
+		}
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return false, fmt.Errorf("agent_locks lookup: %w", err)
+	}
+	// No own row: an arrival marker still re-seeds AgentLockGuard on boot
+	// (and the guard takes over a foreign row once its lease lapses here).
+	var arrived int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM kv WHERE namespace = 'handoff' AND key = ?`,
+		"arrived/"+agentID).Scan(&arrived); err != nil {
+		return false, fmt.Errorf("arrival marker lookup: %w", err)
+	}
+	return arrived > 0, nil
 }

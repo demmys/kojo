@@ -32,6 +32,9 @@ const forceReclaimLeaseDuration = 5 * time.Minute
 //  2. Fire onAgentForceReclaimed (cmd/kojo wires it to
 //     AgentLockGuard.AddAgent + Manager.ActivateAgentRuntime) so
 //     the local chat surface reattaches without a daemon restart.
+//  3. Notify every other peer (reclaim_notice.go) so the previous
+//     holder releases its runtime instead of running a second copy;
+//     unreachable peers keep a pending notice that is retried.
 //
 // Trade-off: any in-flight write from the previous holder racing
 // the reclaim WILL fail CheckFencing on the new token. That's the
@@ -96,12 +99,34 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	s.logger.Info("force-reclaim: agent runtime reclaimed",
 		"agent", id, "fencing_token", rec.FencingToken,
 		"lease_expires_at", rec.LeaseExpiresAt)
-	writeJSONResponse(w, http.StatusOK, map[string]any{
+	// Tell the previous holder (and any other peer that still claims the
+	// agent) to let go. Best-effort: the local reclaim already committed,
+	// and peers we can't reach now keep a pending notice that the retry
+	// loop delivers once they come back. Still under the switch lock, so
+	// no switch can move the agent away mid-delivery.
+	var notice reclaimNoticeResult
+	resp := map[string]any{
 		"agentId":        id,
 		"holderPeer":     rec.HolderPeer,
 		"fencingToken":   rec.FencingToken,
 		"leaseExpiresAt": rec.LeaseExpiresAt,
-	})
+	}
+	if err := s.recordReclaimNotice(r.Context(), id, rec.FencingToken); err != nil {
+		// Nothing is queued for retry. The reclaim itself stands, so stay
+		// 200 but say so: re-running force-reclaim records the notice
+		// again (at the cost of another fencing bump). A local kv write
+		// failing here is rare enough not to warrant a notice-only route.
+		s.logger.Error("force-reclaim: could not persist notice for the previous holder",
+			"agent", id, "err", err)
+		resp["reclaimNoticeError"] = "notice not recorded; re-run force-reclaim to notify the previous holder: " + err.Error()
+	} else {
+		notice, err = s.deliverReclaimNotice(r.Context(), id, "")
+		if err != nil {
+			s.logger.Warn("force-reclaim: notice delivery failed; will retry", "agent", id, "err", err)
+		}
+	}
+	resp["reclaimNotice"] = notice
+	writeJSONResponse(w, http.StatusOK, resp)
 }
 
 // requireOwnerForAgents mirrors requireOwnerForPeers — the

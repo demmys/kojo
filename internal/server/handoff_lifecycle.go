@@ -18,6 +18,9 @@ func (s *Server) releaseHandoffSource(ctx context.Context, agentID, target strin
 		s.logger.Warn("handoff: obsolete source release ignored", "agent", agentID, "expected_holder", target, "expected_token", token, "err", err)
 		return
 	}
+	// The agent left this device, so a reclaim made here earlier no longer
+	// competes with anyone's (reclaim_notice.go concurrent-reclaim order).
+	s.clearLocalReclaimedAt(ctx, agentID)
 	if s.onAgentReleasedAsSource != nil {
 		s.onAgentReleasedAsSource(ctx, agentID)
 	}

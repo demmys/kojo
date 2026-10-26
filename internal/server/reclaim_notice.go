@@ -346,6 +346,41 @@ func (s *Server) localReclaimedAt(ctx context.Context, agentID string) (int64, e
 	return at, nil
 }
 
+// clearLocalReclaimedAt forgets this device's reclaim time for agentID.
+// Called whenever the agent leaves this device: the timestamp only orders
+// reclaims within one ownership epoch, and a stale one (possibly ahead of
+// another device's clock) would otherwise refuse a later, legitimate
+// reclaim. Best-effort.
+func (s *Server) clearLocalReclaimedAt(ctx context.Context, agentID string) {
+	if s.agents == nil || s.agents.Store() == nil {
+		return
+	}
+	err := s.agents.Store().DeleteKV(ctx, reclaimedAtNamespace, agentID, "")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.logger.Warn("force-reclaim: could not clear local reclaim time", "agent", agentID, "err", err)
+	}
+}
+
+// restoreLocalReclaimedAt puts back a reclaim time captured before a
+// failed force-reclaim attempt (0 = there was none).
+func (s *Server) restoreLocalReclaimedAt(ctx context.Context, agentID string, at int64) error {
+	if at <= 0 {
+		err := s.agents.Store().DeleteKV(ctx, reclaimedAtNamespace, agentID, "")
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		return nil
+	}
+	_, err := s.agents.Store().PutKV(ctx, &store.KVRecord{
+		Namespace: reclaimedAtNamespace,
+		Key:       agentID,
+		Value:     strconv.FormatInt(at, 10),
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{})
+	return err
+}
+
 // reclaimSupersedes reports whether reclaim (atA, idA) is ordered after
 // (atB, idB). Both peers compare the same two pairs, so exactly one side
 // of a concurrent reclaim yields regardless of delivery order.
@@ -462,6 +497,7 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if released {
+		s.clearLocalReclaimedAt(ctx, req.AgentID)
 		// Writes released/<id>, stops cron / notify / one-shots and drops
 		// the agent from AgentLockGuard.desired. If the guard re-acquired
 		// between our commit and this call, RemoveAgent releases that row.

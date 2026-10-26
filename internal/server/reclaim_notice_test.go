@@ -281,6 +281,9 @@ func TestPeerAgentReclaimedConcurrentReclaimOrder(t *testing.T) {
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
 		t.Fatalf("later reclaim must win: %d %s", rr.Code, rr.Body.String())
 	}
+	if at, err := srv.localReclaimedAt(context.Background(), id); err != nil || at != 0 {
+		t.Fatalf("losing the agent must forget the local reclaim time: %d %v", at, err)
+	}
 
 	// The mirror side of the tie yields.
 	srv2, id2 := newReclaimTestServer(t, "a", "a")

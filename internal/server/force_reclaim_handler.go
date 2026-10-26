@@ -76,12 +76,17 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	// Outbox first: persist the notice for the previous holder BEFORE the
 	// reclaim commits, so a crash or hang-up right after the commit can't
 	// leave the old runtime running with nothing queued to tell it. If
-	// the reclaim below fails, the notice is dropped again (and a leftover
-	// one is discarded by the delivery pass, which only sends while this
-	// device holds the agent). Detached from the request and bounded so
-	// the switch lock is not held indefinitely.
+	// the reclaim below fails, the notice is left in place: it addresses
+	// every peer (a superset of any notice it replaced) and the delivery
+	// pass discards it unless this device holds the agent. Detached from
+	// the request and bounded so the switch lock is not held indefinitely.
 	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
 	defer cancelNotice()
+	prevReclaimedAt, err := s.localReclaimedAt(noticeCtx, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "force-reclaim: reclaim time lookup: "+err.Error())
+		return
+	}
 	if err := s.recordReclaimNotice(noticeCtx, id); err != nil {
 		s.logger.Error("force-reclaim: could not record notice for the previous holder", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
@@ -101,8 +106,9 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
 	)
 	if err != nil {
-		if derr := s.deleteReclaimNotice(noticeCtx, id); derr != nil {
-			s.logger.Warn("force-reclaim: could not drop notice after failed reclaim", "agent", id, "err", derr)
+		// No new ownership epoch started: keep the previous reclaim time.
+		if rerr := s.restoreLocalReclaimedAt(noticeCtx, id, prevReclaimedAt); rerr != nil {
+			s.logger.Warn("force-reclaim: could not restore reclaim time after failed reclaim", "agent", id, "err", rerr)
 		}
 		s.logger.Error("force-reclaim: atomic state restore failed", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",

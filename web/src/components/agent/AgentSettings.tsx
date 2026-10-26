@@ -33,6 +33,7 @@ import {
   isCodexCLITool,
   supportsMaxOutputTokens,
   usesCustomBaseURL,
+  isLocalOpenCodeBaseURL,
 } from "./agentSettingsPayload";
 import { CustomOpenCodeProviderField } from "./fields/CustomOpenCodeProviderField";
 import { PageHeader } from "../ui/PageHeader";
@@ -585,7 +586,8 @@ export function AgentSettings() {
   }, [id, agent?.nextCronAt]);
 
   const isCustomClaude = tool === "custom-claude" || tool === "custom";
-  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp" ||
+    (tool === "custom-opencode" && isLocalOpenCodeBaseURL(customBaseURL));
   useEffect(() => {
     if (!isCustomClaude) setCustomNoAuth(false);
   }, [isCustomClaude]);

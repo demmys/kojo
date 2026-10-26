@@ -187,3 +187,33 @@ func TestHandleCustomModelsRejectsNonTailnetAddress(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+func TestHandleCustomModelsOpenCodeLocalPresetUsesBaseModelsPath(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("path=%q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]string{{"id": "GLM-5.3-GGUF"}},
+		})
+	}))
+	defer upstream.Close()
+
+	srv := newSTTTestServer(t)
+	baseURL := upstream.URL + "/v1" // httptest listens on 127.0.0.1:<port>
+	if _, ok := agent.CustomOpenCodePresetByBaseURL(baseURL); !ok {
+		t.Fatalf("%s is not a local custom-opencode preset", baseURL)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/custom-models?baseURL="+url.QueryEscape(baseURL), nil)
+	req = authedRequest(req, auth.Principal{Role: auth.RoleOwner})
+	rr := httptest.NewRecorder()
+	srv.handleCustomModels(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "GLM-5.3-GGUF") {
+		t.Fatalf("body=%s", rr.Body.String())
+	}
+}

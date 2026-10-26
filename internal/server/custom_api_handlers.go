@@ -187,7 +187,13 @@ func (s *Server) handleCustomModels(w http.ResponseWriter, r *http.Request) {
 	}
 	defer client.CloseIdleConnections()
 	parsed, _ := customapi.ParseBaseURL(baseURL) // already validated above
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/v1/models"
+	// custom-opencode local presets store the OpenAI base (…/v1) itself;
+	// every other custom backend stores the server root.
+	modelsSuffix := "/v1/models"
+	if preset, ok := agent.CustomOpenCodePresetByBaseURL(baseURL); ok && preset.PortConfigurable {
+		modelsSuffix = "/models"
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + modelsSuffix
 	parsed.RawPath = ""
 
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, parsed.String(), nil)

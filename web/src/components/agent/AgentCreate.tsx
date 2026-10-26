@@ -22,7 +22,7 @@ import { Textarea } from "../ui/Textarea";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
 import { useT } from "../../lib/i18n";
-import { usesCustomBaseURL } from "./agentSettingsPayload";
+import { isLocalOpenCodeBaseURL, usesCustomBaseURL } from "./agentSettingsPayload";
 import {
   TONE_AUTO,
   TONE_MODEL_DEFAULT,
@@ -102,7 +102,8 @@ export function AgentCreate() {
   }, []);
 
   const isCustomClaude = tool === "custom-claude" || tool === "custom";
-  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp" ||
+    (tool === "custom-opencode" && isLocalOpenCodeBaseURL(customBaseURL));
   useEffect(() => {
     if (!isCustomClaude) setCustomNoAuth(false);
   }, [isCustomClaude]);

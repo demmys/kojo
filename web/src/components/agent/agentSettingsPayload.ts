@@ -102,10 +102,36 @@ export function needsCustomURLFor(tool: string): boolean {
  * True when the tool stores a CustomBaseURL (and an endpoint-bound custom
  * API key): every needsCustomURLFor tool plus custom-opencode, whose base
  * URL is one of the server's whitelisted provider presets rather than
- * free text (and which has no model discovery).
+ * free text (model discovery only for its local presets; see
+ * discoversCustomModels).
  */
 export function usesCustomBaseURL(tool: string): boolean {
   return needsCustomURLFor(tool) || tool === "custom-opencode";
+}
+
+/**
+ * True when baseURL is a custom-opencode local preset (Ollama / LM Studio /
+ * llama-server on http://127.0.0.1:<port>/v1). Those run unauthenticated
+ * and the server lists their models from <baseURL>/models.
+ */
+export function isLocalOpenCodeBaseURL(baseURL: string): boolean {
+  try {
+    const u = new URL(baseURL.trim());
+    // URL drops an explicit :80, so an empty port is fine; the server
+    // re-validates the exact preset shape anyway.
+    return u.protocol === "http:" && u.hostname === "127.0.0.1" && u.pathname === "/v1" &&
+      !u.search && !u.hash && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the model field is populated from the endpoint's model list:
+ * every free-URL custom backend, plus custom-opencode on a local preset.
+ */
+export function discoversCustomModels(tool: string, baseURL: string): boolean {
+  return needsCustomURLFor(tool) || (tool === "custom-opencode" && isLocalOpenCodeBaseURL(baseURL));
 }
 
 /**

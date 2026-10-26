@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -177,5 +178,29 @@ func TestSyncAgentFromPeerClearsFullSyncMarkerOnlyOnFullSync(t *testing.T) {
 	}
 	if ok, err := s.HasAgentFullSyncMarker(ctx, "ag"); err != nil || ok {
 		t.Fatalf("full sync kept marker: %v %v", ok, err)
+	}
+}
+
+func TestForceReclaimStampedBindsReclaimTimeToToken(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id := agentLockTestSetup(t, s)
+	// The unstamped variant leaves no record.
+	if _, err := s.ForceReclaimAgentToLocal(ctx, id, "hub", NowMillis(), 300000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetKV(ctx, ReclaimedAtNamespace, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unstamped reclaim wrote a stamp: %v", err)
+	}
+	rec, err := s.ForceReclaimAgentToLocalStamped(ctx, id, "hub", NowMillis(), 300000, 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kv, err := s.GetKV(ctx, ReclaimedAtNamespace, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "1234:" + strconv.FormatInt(rec.FencingToken, 10); kv.Value != want {
+		t.Fatalf("stamp = %q, want %q", kv.Value, want)
 	}
 }

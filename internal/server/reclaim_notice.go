@@ -44,15 +44,10 @@ import (
 
 const (
 	reclaimNoticeNamespace = "handoff_reclaim_notice"
-	// reclaimedAtNamespace keeps, per agent, when this device last
-	// force-reclaimed it. Outlives the notice (which is deleted once
-	// delivered) because the concurrent-reclaim order must not depend on
-	// the outgoing delivery queue.
-	reclaimedAtNamespace  = "handoff_reclaimed_at"
-	reclaimedPeerPath     = "/api/v1/peers/agent-sync/reclaimed"
-	reclaimNoticeTTL      = 7 * 24 * time.Hour
-	reclaimNoticeInterval = 1 * time.Minute
-	reclaimNoticeTimeout  = 10 * time.Second
+	reclaimedPeerPath      = "/api/v1/peers/agent-sync/reclaimed"
+	reclaimNoticeTTL       = 7 * 24 * time.Hour
+	reclaimNoticeInterval  = 1 * time.Minute
+	reclaimNoticeTimeout   = 10 * time.Second
 )
 
 type reclaimNotice struct {
@@ -69,25 +64,17 @@ type reclaimNoticeResult struct {
 	PendingPeers []string `json:"pendingPeers"`
 }
 
-// recordReclaimNotice records this device's reclaim time and persists a
-// notice addressed to every registered peer except self. Called by the
-// force-reclaim handler BEFORE the local state restore commits (outbox).
-func (s *Server) recordReclaimNotice(ctx context.Context, agentID string) error {
+// recordReclaimNotice persists a notice, stamped with reclaimedAt, addressed
+// to every registered peer except self. Called by the force-reclaim handler
+// BEFORE the local state restore commits (outbox).
+func (s *Server) recordReclaimNotice(ctx context.Context, agentID string, reclaimedAt int64) error {
 	st := s.agents.Store()
 	peers, err := st.ListPeers(ctx, store.ListPeersOptions{})
 	if err != nil {
 		return fmt.Errorf("list peers: %w", err)
 	}
-	n := reclaimNotice{CreatedAt: store.NowMillis()}
-	if _, err := st.PutKV(ctx, &store.KVRecord{
-		Namespace: reclaimedAtNamespace,
-		Key:       agentID,
-		Value:     strconv.FormatInt(n.CreatedAt, 10),
-		Type:      store.KVTypeString,
-		Scope:     store.KVScopeMachine,
-	}, store.KVPutOptions{}); err != nil {
-		return fmt.Errorf("record reclaim time: %w", err)
-	}
+	n := reclaimNotice{CreatedAt: reclaimedAt}
+
 	for _, p := range peers {
 		if p == nil || p.DeviceID == "" || p.DeviceID == s.peerID.DeviceID {
 			continue
@@ -329,56 +316,41 @@ func (s *Server) kickReclaimNotices() {
 	}
 }
 
-// localReclaimedAt returns when this device last force-reclaimed agentID
-// (0 when never, or when the record is unreadable).
+// localReclaimedAt returns when this device force-reclaimed agentID in
+// the CURRENT ownership epoch: the stamp written with the reclaim
+// (store.ReclaimedAtNamespace, "<at>:<token>") counts only while this
+// device still holds the lock row with that fencing token. Once the agent
+// leaves, is re-acquired after a restart, or the stamp is unreadable, it
+// returns 0 — erring toward yielding to a competing reclaim.
 func (s *Server) localReclaimedAt(ctx context.Context, agentID string) (int64, error) {
-	rec, err := s.agents.Store().GetKV(ctx, reclaimedAtNamespace, agentID)
+	st := s.agents.Store()
+	rec, err := st.GetKV(ctx, store.ReclaimedAtNamespace, agentID)
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	at, err := strconv.ParseInt(rec.Value, 10, 64)
+	atStr, tokStr, ok := strings.Cut(rec.Value, ":")
+	if !ok {
+		return 0, nil
+	}
+	at, err1 := strconv.ParseInt(atStr, 10, 64)
+	token, err2 := strconv.ParseInt(tokStr, 10, 64)
+	if err1 != nil || err2 != nil || at <= 0 {
+		return 0, nil
+	}
+	v, err := st.GetAgentLockVersion(ctx, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return 0, nil
+	}
 	if err != nil {
+		return 0, err
+	}
+	if v.Holder != s.peerID.DeviceID || v.Token != token {
 		return 0, nil
 	}
 	return at, nil
-}
-
-// clearLocalReclaimedAt forgets this device's reclaim time for agentID.
-// Called whenever the agent leaves this device: the timestamp only orders
-// reclaims within one ownership epoch, and a stale one (possibly ahead of
-// another device's clock) would otherwise refuse a later, legitimate
-// reclaim. Best-effort.
-func (s *Server) clearLocalReclaimedAt(ctx context.Context, agentID string) {
-	if s.agents == nil || s.agents.Store() == nil {
-		return
-	}
-	err := s.agents.Store().DeleteKV(ctx, reclaimedAtNamespace, agentID, "")
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.logger.Warn("force-reclaim: could not clear local reclaim time", "agent", agentID, "err", err)
-	}
-}
-
-// restoreLocalReclaimedAt puts back a reclaim time captured before a
-// failed force-reclaim attempt (0 = there was none).
-func (s *Server) restoreLocalReclaimedAt(ctx context.Context, agentID string, at int64) error {
-	if at <= 0 {
-		err := s.agents.Store().DeleteKV(ctx, reclaimedAtNamespace, agentID, "")
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err
-		}
-		return nil
-	}
-	_, err := s.agents.Store().PutKV(ctx, &store.KVRecord{
-		Namespace: reclaimedAtNamespace,
-		Key:       agentID,
-		Value:     strconv.FormatInt(at, 10),
-		Type:      store.KVTypeString,
-		Scope:     store.KVScopeMachine,
-	}, store.KVPutOptions{})
-	return err
 }
 
 // reclaimSupersedes reports whether reclaim (atA, idA) is ordered after
@@ -497,7 +469,6 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if released {
-		s.clearLocalReclaimedAt(ctx, req.AgentID)
 		// Writes released/<id>, stops cron / notify / one-shots and drops
 		// the agent from AgentLockGuard.desired. If the guard re-acquired
 		// between our commit and this call, RemoveAgent releases that row.

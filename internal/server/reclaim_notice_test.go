@@ -181,7 +181,7 @@ func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if err := srv.recordReclaimNotice(ctx, id); err != nil {
+	if err := srv.recordReclaimNotice(ctx, id, store.NowMillis()); err != nil {
 		t.Fatal(err)
 	}
 	res, err := srv.deliverReclaimNotice(ctx, id, "")
@@ -250,11 +250,18 @@ func postReclaimedAt(t *testing.T, srv *Server, reclaimer, agentID string, at in
 	return rr
 }
 
-func setLocalReclaimedAtForTest(t *testing.T, srv *Server, id string, at int64) {
+// setLocalReclaimedAtForTest stamps a reclaim time bound to the current
+// lock epoch (tokenDelta != 0 forges a stamp from another epoch).
+func setLocalReclaimedAtForTest(t *testing.T, srv *Server, id string, at, tokenDelta int64) {
 	t.Helper()
+	v, err := srv.agents.Store().GetAgentLockVersion(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := srv.agents.Store().PutKV(context.Background(), &store.KVRecord{
-		Namespace: reclaimedAtNamespace, Key: id, Value: strconv.FormatInt(at, 10),
-		Type: store.KVTypeString, Scope: store.KVScopeMachine,
+		Namespace: store.ReclaimedAtNamespace, Key: id,
+		Value: strconv.FormatInt(at, 10) + ":" + strconv.FormatInt(v.Token+tokenDelta, 10),
+		Type:  store.KVTypeString, Scope: store.KVScopeMachine,
 	}, store.KVPutOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +271,13 @@ func TestPeerAgentReclaimedConcurrentReclaimOrder(t *testing.T) {
 	// A newer local reclaim keeps the agent, however late the older
 	// notice arrives (no dependence on our own delivery queue).
 	srv, id := newReclaimTestServer(t, "z", "z")
-	setLocalReclaimedAtForTest(t, srv, id, 2000)
+	// A stamp from another ownership epoch (e.g. before a restart or an
+	// earlier stay) does not count: the old holder yields.
+	setLocalReclaimedAtForTest(t, srv, id, 9000, -1)
+	if at, err := srv.localReclaimedAt(context.Background(), id); err != nil || at != 0 {
+		t.Fatalf("stale-epoch stamp must be ignored: %d %v", at, err)
+	}
+	setLocalReclaimedAtForTest(t, srv, id, 2000, 0)
 	if rr := postReclaimedAt(t, srv, "a", id, 1000); rr.Code != http.StatusConflict {
 		t.Fatalf("newer local reclaim must win: %d %s", rr.Code, rr.Body.String())
 	}
@@ -287,7 +300,7 @@ func TestPeerAgentReclaimedConcurrentReclaimOrder(t *testing.T) {
 
 	// The mirror side of the tie yields.
 	srv2, id2 := newReclaimTestServer(t, "a", "a")
-	setLocalReclaimedAtForTest(t, srv2, id2, 2000)
+	setLocalReclaimedAtForTest(t, srv2, id2, 2000, 0)
 	rr = postReclaimedAt(t, srv2, "z", id2, 2000)
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
 		t.Fatalf("lower ID must yield on a tie: %d %s", rr.Code, rr.Body.String())

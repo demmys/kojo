@@ -82,12 +82,11 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	// the request and bounded so the switch lock is not held indefinitely.
 	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
 	defer cancelNotice()
-	prevReclaimedAt, err := s.localReclaimedAt(noticeCtx, id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "force-reclaim: reclaim time lookup: "+err.Error())
-		return
-	}
-	if err := s.recordReclaimNotice(noticeCtx, id); err != nil {
+	// One timestamp orders this reclaim against a concurrent one elsewhere:
+	// it rides on the notice and is stamped (bound to the new fencing
+	// token) inside the reclaim tx below.
+	reclaimedAt := store.NowMillis()
+	if err := s.recordReclaimNotice(noticeCtx, id, reclaimedAt); err != nil {
 		s.logger.Error("force-reclaim: could not record notice for the previous holder", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"force-reclaim: record notice for the previous holder: "+err.Error())
@@ -101,15 +100,11 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 	// agent_locks was rewritten but blob_refs.home_peer kept
 	// pointing at the dead peer and the next device-switch
 	// surfaced wrong_source.
-	rec, err := s.agents.Store().ForceReclaimAgentToLocal(
+	rec, err := s.agents.Store().ForceReclaimAgentToLocalStamped(
 		r.Context(), id, s.peerID.DeviceID,
-		store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
+		reclaimedAt, forceReclaimLeaseDuration.Milliseconds(), reclaimedAt,
 	)
 	if err != nil {
-		// No new ownership epoch started: keep the previous reclaim time.
-		if rerr := s.restoreLocalReclaimedAt(noticeCtx, id, prevReclaimedAt); rerr != nil {
-			s.logger.Warn("force-reclaim: could not restore reclaim time after failed reclaim", "agent", id, "err", rerr)
-		}
 		s.logger.Error("force-reclaim: atomic state restore failed", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"force-reclaim: "+err.Error())

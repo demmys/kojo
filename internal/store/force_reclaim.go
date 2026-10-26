@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -116,6 +117,19 @@ func (s *Store) PurgeAgentRuntimeStateForRetry(ctx context.Context, agentID stri
 // `leaseDurationMs` follows AgentLockLeaseDuration to match what
 // AgentLockGuard's refresh loop expects.
 func (s *Store) ForceReclaimAgentToLocal(ctx context.Context, agentID, localPeerID string, now, leaseDurationMs int64) (*AgentLockRecord, error) {
+	return s.ForceReclaimAgentToLocalStamped(ctx, agentID, localPeerID, now, leaseDurationMs, 0)
+}
+
+// ReclaimedAtNamespace holds, per agent, "<reclaimedAt>:<fencingToken>"
+// for this device's latest force-reclaim. Binding it to the token scopes
+// it to one ownership epoch: once the lock row is released, re-acquired
+// or taken by another peer, the stamp no longer matches and is ignored.
+const ReclaimedAtNamespace = "handoff_reclaimed_at"
+
+// ForceReclaimAgentToLocalStamped is ForceReclaimAgentToLocal that also
+// records reclaimedAt (when > 0) under ReclaimedAtNamespace in the same
+// transaction, bound to the new fencing token.
+func (s *Store) ForceReclaimAgentToLocalStamped(ctx context.Context, agentID, localPeerID string, now, leaseDurationMs, reclaimedAt int64) (*AgentLockRecord, error) {
 	if agentID == "" {
 		return nil, errors.New("store.ForceReclaimAgentToLocal: agent_id required")
 	}
@@ -154,6 +168,12 @@ ON CONFLICT(agent_id) DO UPDATE SET
 		agentID, localPeerID, token, expires, now, localPeerID,
 	); err != nil {
 		return nil, fmt.Errorf("store.ForceReclaimAgentToLocal: agent_locks: %w", err)
+	}
+	if reclaimedAt > 0 {
+		if err := upsertMachineKVTx(ctx, tx, ReclaimedAtNamespace, agentID,
+			strconv.FormatInt(reclaimedAt, 10)+":"+strconv.FormatInt(token, 10), now); err != nil {
+			return nil, fmt.Errorf("store.ForceReclaimAgentToLocal: reclaim stamp: %w", err)
+		}
 	}
 
 	// --- blob_refs: every per-agent blob points at local again
@@ -340,10 +360,10 @@ func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPee
 	// (which then drops its pending notice) never leaves a state a
 	// restart could resurrect, nor an incremental sync over diverged rows.
 	now := NowMillis()
-	if err := upsertHandoffKVTx(ctx, tx, AgentFullSyncMarkerKey(agentID), reclaimerPeerID, now); err != nil {
+	if err := upsertMachineKVTx(ctx, tx, "handoff", AgentFullSyncMarkerKey(agentID), reclaimerPeerID, now); err != nil {
 		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: full-sync marker: %w", err)
 	}
-	if err := upsertHandoffKVTx(ctx, tx, "released/"+agentID,
+	if err := upsertMachineKVTx(ctx, tx, "handoff", "released/"+agentID,
 		time.UnixMilli(now).UTC().Format(time.RFC3339Nano), now); err != nil {
 		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: released marker: %w", err)
 	}
@@ -353,11 +373,11 @@ func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPee
 	return true, nil
 }
 
-// upsertHandoffKVTx is PutKV's unconditional upsert for a plain machine-
-// scoped string row in the "handoff" namespace, inside the caller's tx.
-func upsertHandoffKVTx(ctx context.Context, tx *sql.Tx, key, value string, now int64) error {
+// upsertMachineKVTx is PutKV's unconditional upsert for a plain machine-
+// scoped string row, inside the caller's tx.
+func upsertMachineKVTx(ctx context.Context, tx *sql.Tx, namespace, key, value string, now int64) error {
 	rec := KVRecord{
-		Namespace: "handoff",
+		Namespace: namespace,
 		Key:       key,
 		Value:     value,
 		Type:      KVTypeString,

@@ -181,7 +181,7 @@ func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if err := srv.recordReclaimNotice(ctx, id, 7); err != nil {
+	if err := srv.recordReclaimNotice(ctx, id); err != nil {
 		t.Fatal(err)
 	}
 	res, err := srv.deliverReclaimNotice(ctx, id, "")

@@ -73,6 +73,21 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusInternalServerError, "internal", "agent lookup: "+err.Error())
 		return
 	}
+	// Outbox first: persist the notice for the previous holder BEFORE the
+	// reclaim commits, so a crash or hang-up right after the commit can't
+	// leave the old runtime running with nothing queued to tell it. If
+	// the reclaim below fails, the notice is dropped again (and a leftover
+	// one is discarded by the delivery pass, which only sends while this
+	// device holds the agent). Detached from the request and bounded so
+	// the switch lock is not held indefinitely.
+	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
+	defer cancelNotice()
+	if err := s.recordReclaimNotice(noticeCtx, id); err != nil {
+		s.logger.Error("force-reclaim: could not record notice for the previous holder", "agent", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "internal",
+			"force-reclaim: record notice for the previous holder: "+err.Error())
+		return
+	}
 	// One-shot atomic restore of every device-switch artefact
 	// (agent_locks, blob_refs, kv handoff markers) back to "local
 	// owns the runtime". Without this all-in-one tx the operator
@@ -86,6 +101,9 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		store.NowMillis(), forceReclaimLeaseDuration.Milliseconds(),
 	)
 	if err != nil {
+		if derr := s.deleteReclaimNotice(noticeCtx, id); derr != nil {
+			s.logger.Warn("force-reclaim: could not drop notice after failed reclaim", "agent", id, "err", derr)
+		}
 		s.logger.Error("force-reclaim: atomic state restore failed", "agent", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal",
 			"force-reclaim: "+err.Error())
@@ -101,38 +119,21 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		"agent", id, "fencing_token", rec.FencingToken,
 		"lease_expires_at", rec.LeaseExpiresAt)
 	// Tell the previous holder (and any other peer that still claims the
-	// agent) to let go. Best-effort: the local reclaim already committed,
-	// and peers we can't reach now keep a pending notice that the retry
-	// loop delivers once they come back. Still under the switch lock, so
-	// no switch can move the agent away mid-delivery.
-	var notice reclaimNoticeResult
-	resp := map[string]any{
+	// agent) to let go. Best-effort: peers we can't reach now keep the
+	// pending notice, which the retry loop delivers once they come back.
+	// Still under the switch lock, so no switch can move the agent away
+	// mid-delivery.
+	notice, err := s.deliverReclaimNotice(noticeCtx, id, "")
+	if err != nil {
+		s.logger.Warn("force-reclaim: notice delivery failed; will retry", "agent", id, "err", err)
+	}
+	writeJSONResponse(w, http.StatusOK, map[string]any{
 		"agentId":        id,
 		"holderPeer":     rec.HolderPeer,
 		"fencingToken":   rec.FencingToken,
 		"leaseExpiresAt": rec.LeaseExpiresAt,
-	}
-	// Detached from the request: the reclaim already committed, so a client
-	// hanging up must not cancel the notice write and leave nothing queued
-	// for retry. Bounded so the switch lock is not held indefinitely.
-	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
-	defer cancelNotice()
-	if err := s.recordReclaimNotice(noticeCtx, id, rec.FencingToken); err != nil {
-		// Nothing is queued for retry. The reclaim itself stands, so stay
-		// 200 but say so: re-running force-reclaim records the notice
-		// again (at the cost of another fencing bump). A local kv write
-		// failing here is rare enough not to warrant a notice-only route.
-		s.logger.Error("force-reclaim: could not persist notice for the previous holder",
-			"agent", id, "err", err)
-		resp["reclaimNoticeError"] = "notice not recorded; re-run force-reclaim to notify the previous holder: " + err.Error()
-	} else {
-		notice, err = s.deliverReclaimNotice(noticeCtx, id, "")
-		if err != nil {
-			s.logger.Warn("force-reclaim: notice delivery failed; will retry", "agent", id, "err", err)
-		}
-	}
-	resp["reclaimNotice"] = notice
-	writeJSONResponse(w, http.StatusOK, resp)
+		"reclaimNotice":  notice,
+	})
 }
 
 // requireOwnerForAgents mirrors requireOwnerForPeers — the

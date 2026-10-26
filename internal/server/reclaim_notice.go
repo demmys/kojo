@@ -56,10 +56,6 @@ const (
 )
 
 type reclaimNotice struct {
-	// Token is the reclaimer's local fencing token right after the
-	// reclaim. Informational only (tokens are never compared across
-	// peers).
-	Token int64 `json:"token"`
 	// Peers still to be told. Removed once a peer answers 200.
 	Peers     []string `json:"peers"`
 	CreatedAt int64    `json:"createdAt"`
@@ -73,16 +69,16 @@ type reclaimNoticeResult struct {
 	PendingPeers []string `json:"pendingPeers"`
 }
 
-// recordReclaimNotice persists a notice addressed to every registered peer
-// except self. Called by the force-reclaim handler after the local state
-// restore committed.
-func (s *Server) recordReclaimNotice(ctx context.Context, agentID string, token int64) error {
+// recordReclaimNotice records this device's reclaim time and persists a
+// notice addressed to every registered peer except self. Called by the
+// force-reclaim handler BEFORE the local state restore commits (outbox).
+func (s *Server) recordReclaimNotice(ctx context.Context, agentID string) error {
 	st := s.agents.Store()
 	peers, err := st.ListPeers(ctx, store.ListPeersOptions{})
 	if err != nil {
 		return fmt.Errorf("list peers: %w", err)
 	}
-	n := reclaimNotice{Token: token, CreatedAt: store.NowMillis()}
+	n := reclaimNotice{CreatedAt: store.NowMillis()}
 	if _, err := st.PutKV(ctx, &store.KVRecord{
 		Namespace: reclaimedAtNamespace,
 		Key:       agentID,
@@ -460,19 +456,7 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	// Marker first: if anything below fails, the worst case is one extra
-	// full sync, never an incremental merge over diverged rows.
-	if _, err := st.PutKV(ctx, &store.KVRecord{
-		Namespace: "handoff",
-		Key:       store.AgentFullSyncMarkerKey(req.AgentID),
-		Value:     req.ReclaimerDeviceID,
-		Type:      store.KVTypeString,
-		Scope:     store.KVScopeMachine,
-	}, store.KVPutOptions{}); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "full-sync marker: "+err.Error())
-		return
-	}
-	released, err := st.ReleaseReclaimedAgentHere(ctx, req.AgentID, s.peerID.DeviceID)
+	released, err := st.ReleaseReclaimedAgentHere(ctx, req.AgentID, s.peerID.DeviceID, req.ReclaimerDeviceID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal", err.Error())
 		return

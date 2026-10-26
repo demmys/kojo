@@ -66,9 +66,8 @@ GuardのAdd、Remove、refreshもagent単位で直列化し、Remove前のsnapsh
 
 このため、強制復帰した端末は旧holderへ解放を通知する。
 
-1. 強制復帰がcommitした後、自分以外の登録peer全員を宛先とする通知を`kv`（namespace `handoff_reclaim_notice`、machine scope）に保存し、その場で配信する。
-   結果は応答の`reclaimNotice`（`releasedOn` / `notHolderOn` / `pendingPeers`）で確認できる。
-   通知の保存自体に失敗した場合は、応答に`reclaimNoticeError`が付く。強制復帰を再実行すれば通知を保存し直せる。ただし再実行でもfencing tokenが進み、未完了のhandoffは中止される。
+1. 強制復帰は、commitの前に、自分以外の登録peer全員を宛先とする通知を`kv`（namespace `handoff_reclaim_notice`、machine scope）に保存する。commit直後にクラッシュしても通知が残るようにするためで、保存できなければ強制復帰自体を500で中止する。
+   commit後にその場で配信し、結果は応答の`reclaimNotice`（`releasedOn` / `notHolderOn` / `pendingPeers`）で確認できる。
 2. 受信側（`POST /api/v1/peers/agent-sync/reclaimed`）は、自分がまだagentを保持している場合だけ解放する。
    - 署名peerは`reclaimer_device_id`と一致する必要がある。
    - lock行または到着markerが自分を指しているかを確認する。
@@ -76,11 +75,10 @@ GuardのAdd、Remove、refreshもagent単位で直列化し、Remove前のsnapsh
      - 自分を指すlock行を消し、fencing counterを進める。到着markerだけで保持と判定した場合、他peerを指すlock行（shadow）とcounterには触れない。
      - 未完了の`incoming_handoffs`をabortedにする。
      - 到着markerとpendingを消す。
-     - `released/<id>`を書き込む。
-     - cron、notify、one-shotを止め、AgentLockGuardから外す。
+     - `released/<id>`と`full_sync/<id>`を書き込む。
+     - ここまでを1 transactionで行い、その後cron、notify、one-shotを止め、AgentLockGuardから外す。200を返す時点で解放は永続化されているので、再起動してもruntimeは復活しない。
    - 保持していなければ何もせず`released=false`を返す。このため全peerへの一斉送信でも安全で、多段移動の中継peerが記録されていても届く。
-3. 解放した端末には`handoff/full_sync/<id>` markerが付く。
-   次にこの端末へ移動するとき、state probeは`Known=false`を返して全量snapshotを要求する。
+3. 解放した端末に付いた`handoff/full_sync/<id>` markerにより、次にこの端末へ移動するときはstate probeが`Known=false`を返し、全量snapshotを要求する。
    probeの後でmarkerが付いた場合も、差分の`agent-sync`は`409 full_sync_required`で拒否する。
    markerは全量syncのcommitと同じtransactionで消える。
 4. 届かなかったpeerへの通知はpendingのまま残り、次の契機で再送する。

@@ -47,7 +47,7 @@ func TestReleaseReclaimedAgentHereReleasesSelfHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac")
+	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac", "hub")
 	if err != nil || !released {
 		t.Fatalf("released=%v err=%v; want true", released, err)
 	}
@@ -61,6 +61,15 @@ func TestReleaseReclaimedAgentHereReleasesSelfHolder(t *testing.T) {
 	}
 	if !hasHandoffKVForTest(t, s, "arrived/ag_other") {
 		t.Error("another agent's marker was deleted")
+	}
+	// Durable with the release: startup eviction + full-sync next time.
+	for _, k := range []string{"released/" + id, AgentFullSyncMarkerKey(id)} {
+		if !hasHandoffKVForTest(t, s, k) {
+			t.Errorf("kv %s not written", k)
+		}
+	}
+	if rec, err := s.GetKV(ctx, "handoff", AgentFullSyncMarkerKey(id)); err != nil || rec.Value != "hub" || rec.ETag == "" {
+		t.Fatalf("full-sync marker: %+v %v", rec, err)
 	}
 	after, err := s.GetAgentLockVersion(ctx, id)
 	if err != nil {
@@ -86,7 +95,7 @@ func TestReleaseReclaimedAgentHereReleasesArrivalMarkerOnly(t *testing.T) {
 	ctx := context.Background()
 	id := agentLockTestSetup(t, s)
 	putHandoffKVForTest(t, s, "arrived/"+id)
-	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac")
+	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac", "hub")
 	if err != nil || !released {
 		t.Fatalf("released=%v err=%v; want true", released, err)
 	}
@@ -101,7 +110,7 @@ func TestReleaseReclaimedAgentHereIgnoresNonHolder(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
 	id := agentLockTestSetup(t, s)
-	if released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac"); err != nil || released {
+	if released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac", "hub"); err != nil || released {
 		t.Fatalf("no row/no marker: released=%v err=%v", released, err)
 	}
 	if _, err := s.AcquireAgentLock(ctx, id, "hub", NowMillis(), 300000); err != nil {
@@ -109,7 +118,7 @@ func TestReleaseReclaimedAgentHereIgnoresNonHolder(t *testing.T) {
 	}
 	putHandoffKVForTest(t, s, "pending/"+id+"/op1")
 	before, _ := s.GetAgentLockVersion(ctx, id)
-	if released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac"); err != nil || released {
+	if released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac", "hub"); err != nil || released {
 		t.Fatalf("other holder: released=%v err=%v", released, err)
 	}
 	after, _ := s.GetAgentLockVersion(ctx, id)
@@ -130,7 +139,7 @@ func TestReleaseReclaimedAgentHereKeepsForeignRowWithStaleArrival(t *testing.T) 
 	}
 	putHandoffKVForTest(t, s, "arrived/"+id)
 	before, _ := s.GetAgentLockVersion(ctx, id)
-	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac")
+	released, err := s.ReleaseReclaimedAgentHere(ctx, id, "mac", "hub")
 	if err != nil || !released {
 		t.Fatalf("arrival marker must count as a claim: released=%v err=%v", released, err)
 	}

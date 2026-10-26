@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // PurgeAgentRuntimeStateForRetry drops every per-agent
@@ -244,21 +245,28 @@ func (s *Store) HasAgentFullSyncMarker(ctx context.Context, agentID string) (boo
 //     any in-flight write from the local runtime fails fencing and every
 //     pending incoming_handoffs generation is invalidated. A row naming
 //     another peer is left alone.
+//
 //   - incoming_handoffs: non-terminal rows → aborted (mirrors
 //     ForceReclaimAgentToLocal).
+//
 //   - blob_refs: clear handoff_pending; home_peer is left alone (see
 //     PurgeAgentRuntimeStateForRetry).
+//
 //   - kv handoff markers arrived/, arrived_proxy/, pending/ → DELETE so a
 //     restart does not resurrect the runtime.
 //
-// The caller must write AgentFullSyncMarkerKey BEFORE calling this (a
-// stray marker only costs one full sync) and tear down the in-memory
-// runtime AFTER (which also writes released/<id>).
+//   - kv handoff full_sync/<id> (value reclaimerPeerID) and released/<id>
+//     → UPSERT, so the next switch back is a full snapshot and startup
+//     eviction drops the agent even if the runtime teardown below never
+//     ran.
+//
+// The caller tears down the in-memory runtime AFTER (cron / notify /
+// one-shots, AgentLockGuard).
 //
 // Returns released=false, without touching anything, when this peer does
 // not claim the agent (no own lock row and no arrival marker) — e.g. it already handed the agent on, so the reclaim notice
 // is obsolete here.
-func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPeerID string) (bool, error) {
+func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPeerID, reclaimerPeerID string) (bool, error) {
 	if agentID == "" {
 		return false, errors.New("store.ReleaseReclaimedAgentHere: agent_id required")
 	}
@@ -328,10 +336,69 @@ func (s *Store) ReleaseReclaimedAgentHere(ctx context.Context, agentID, localPee
 	); err != nil {
 		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: kv handoff: %w", err)
 	}
+	// Durable in the same tx as the release, so a 200 to the reclaimer
+	// (which then drops its pending notice) never leaves a state a
+	// restart could resurrect, nor an incremental sync over diverged rows.
+	now := NowMillis()
+	if err := upsertHandoffKVTx(ctx, tx, AgentFullSyncMarkerKey(agentID), reclaimerPeerID, now); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: full-sync marker: %w", err)
+	}
+	if err := upsertHandoffKVTx(ctx, tx, "released/"+agentID,
+		time.UnixMilli(now).UTC().Format(time.RFC3339Nano), now); err != nil {
+		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: released marker: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("store.ReleaseReclaimedAgentHere: commit: %w", err)
 	}
 	return true, nil
+}
+
+// upsertHandoffKVTx is PutKV's unconditional upsert for a plain machine-
+// scoped string row in the "handoff" namespace, inside the caller's tx.
+func upsertHandoffKVTx(ctx context.Context, tx *sql.Tx, key, value string, now int64) error {
+	rec := KVRecord{
+		Namespace: "handoff",
+		Key:       key,
+		Value:     value,
+		Type:      KVTypeString,
+		Scope:     KVScopeMachine,
+		Version:   1,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	var curVersion int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT version, created_at FROM kv WHERE namespace = ? AND key = ?`,
+		rec.Namespace, rec.Key).Scan(&curVersion, &rec.CreatedAt)
+	switch {
+	case err == nil:
+		rec.Version = curVersion + 1
+	case errors.Is(err, sql.ErrNoRows):
+		rec.CreatedAt = now
+	default:
+		return err
+	}
+	rec.ETag, err = computeKVETag(&rec)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO kv (
+  namespace, key, value, value_encrypted, type, secret, scope,
+  version, etag, created_at, updated_at
+) VALUES (?, ?, ?, NULL, ?, 0, ?, ?, ?, ?, ?)
+ON CONFLICT(namespace, key) DO UPDATE SET
+  value = excluded.value,
+  value_encrypted = NULL,
+  type = excluded.type,
+  secret = 0,
+  scope = excluded.scope,
+  version = excluded.version,
+  etag = excluded.etag,
+  updated_at = excluded.updated_at`,
+		rec.Namespace, rec.Key, rec.Value, string(rec.Type), string(rec.Scope),
+		rec.Version, rec.ETag, rec.CreatedAt, rec.UpdatedAt)
+	return err
 }
 
 // LocalPeerClaimsAgent is the read-only precheck for

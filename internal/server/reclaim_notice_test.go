@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func newReclaimTestServer(t *testing.T, self, holder string) (*Server, string) {
 
 func postReclaimed(t *testing.T, srv *Server, p auth.Principal, reclaimer, agentID string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, _ := json.Marshal(peerAgentReclaimedRequest{ReclaimerDeviceID: reclaimer, AgentID: agentID})
+	body, _ := json.Marshal(peerAgentReclaimedRequest{ReclaimerDeviceID: reclaimer, AgentID: agentID, ReclaimedAt: store.NowMillis()})
 	rr := httptest.NewRecorder()
 	req := authedRequest(httptest.NewRequest(http.MethodPost, reclaimedPeerPath, bytes.NewReader(body)), p)
 	srv.handlePeerAgentReclaimed(rr, req)
@@ -190,7 +191,7 @@ func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) 
 	if len(res.ReleasedOn) != 1 || res.ReleasedOn[0] != "old" || len(res.PendingPeers) != 1 || res.PendingPeers[0] != "off" {
 		t.Fatalf("result: %+v", res)
 	}
-	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimerDeviceID != "hub" || req.AgentID != id {
+	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimerDeviceID != "hub" || req.AgentID != id || req.ReclaimedAt <= 0 {
 		t.Fatalf("wire request: %+v", req)
 	}
 	n := readReclaimNotice(t, srv, id)
@@ -240,37 +241,56 @@ func TestForceReclaimNotifiesOldHolder(t *testing.T) {
 	}
 }
 
-func TestPeerAgentReclaimedConcurrentReclaimTieBreak(t *testing.T) {
-	// "a" < "z": a device that also reclaimed keeps the agent against a
-	// higher-ID reclaimer, and yields to a lower one.
-	srv, id := newReclaimTestServer(t, "a", "a")
-	if err := srv.putReclaimNotice(context.Background(), id, &reclaimNotice{Peers: []string{"z"}, CreatedAt: store.NowMillis()}); err != nil {
+func postReclaimedAt(t *testing.T, srv *Server, reclaimer, agentID string, at int64) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(peerAgentReclaimedRequest{ReclaimerDeviceID: reclaimer, AgentID: agentID, ReclaimedAt: at})
+	rr := httptest.NewRecorder()
+	req := authedRequest(httptest.NewRequest(http.MethodPost, reclaimedPeerPath, bytes.NewReader(body)), auth.Principal{Role: auth.RolePeer, PeerID: reclaimer})
+	srv.handlePeerAgentReclaimed(rr, req)
+	return rr
+}
+
+func setLocalReclaimedAtForTest(t *testing.T, srv *Server, id string, at int64) {
+	t.Helper()
+	if _, err := srv.agents.Store().PutKV(context.Background(), &store.KVRecord{
+		Namespace: reclaimedAtNamespace, Key: id, Value: strconv.FormatInt(at, 10),
+		Type: store.KVTypeString, Scope: store.KVScopeMachine,
+	}, store.KVPutOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	rr := postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "z"}, "z", id)
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("lower ID must win: %d %s", rr.Code, rr.Body.String())
+}
+
+func TestPeerAgentReclaimedConcurrentReclaimOrder(t *testing.T) {
+	// A newer local reclaim keeps the agent, however late the older
+	// notice arrives (no dependence on our own delivery queue).
+	srv, id := newReclaimTestServer(t, "z", "z")
+	setLocalReclaimedAtForTest(t, srv, id, 2000)
+	if rr := postReclaimedAt(t, srv, "a", id, 1000); rr.Code != http.StatusConflict {
+		t.Fatalf("newer local reclaim must win: %d %s", rr.Code, rr.Body.String())
+	}
+	// Equal timestamps: the higher device ID is ordered later.
+	if rr := postReclaimedAt(t, srv, "a", id, 2000); rr.Code != http.StatusConflict {
+		t.Fatalf("tie must go to higher ID: %d %s", rr.Code, rr.Body.String())
 	}
 	lock, err := srv.agents.Store().GetAgentLock(context.Background(), id)
-	if err != nil || lock.HolderPeer != "a" {
+	if err != nil || lock.HolderPeer != "z" {
 		t.Fatalf("winner lost the agent: %+v %v", lock, err)
 	}
-
-	// Our notice already reached "z": its reclaim came later and wins.
-	if err := srv.putReclaimNotice(context.Background(), id, &reclaimNotice{Peers: []string{"offline"}, CreatedAt: store.NowMillis()}); err != nil {
-		t.Fatal(err)
-	}
-	rr = postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "z"}, "z", id)
+	// A later reclaim elsewhere wins.
+	rr := postReclaimedAt(t, srv, "a", id, 3000)
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
 		t.Fatalf("later reclaim must win: %d %s", rr.Code, rr.Body.String())
 	}
 
-	srv2, id2 := newReclaimTestServer(t, "z", "z")
-	if err := srv2.putReclaimNotice(context.Background(), id2, &reclaimNotice{Peers: []string{"a"}, CreatedAt: store.NowMillis()}); err != nil {
-		t.Fatal(err)
-	}
-	rr = postReclaimed(t, srv2, auth.Principal{Role: auth.RolePeer, PeerID: "a"}, "a", id2)
+	// The mirror side of the tie yields.
+	srv2, id2 := newReclaimTestServer(t, "a", "a")
+	setLocalReclaimedAtForTest(t, srv2, id2, 2000)
+	rr = postReclaimedAt(t, srv2, "z", id2, 2000)
 	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
-		t.Fatalf("higher ID must yield: %d %s", rr.Code, rr.Body.String())
+		t.Fatalf("lower ID must yield on a tie: %d %s", rr.Code, rr.Body.String())
+	}
+	// Peers must send reclaimed_at.
+	if rr := postReclaimedAt(t, srv, "a", id, 0); rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing reclaimed_at: %d %s", rr.Code, rr.Body.String())
 	}
 }

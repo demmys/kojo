@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,10 +44,15 @@ import (
 
 const (
 	reclaimNoticeNamespace = "handoff_reclaim_notice"
-	reclaimedPeerPath      = "/api/v1/peers/agent-sync/reclaimed"
-	reclaimNoticeTTL       = 7 * 24 * time.Hour
-	reclaimNoticeInterval  = 1 * time.Minute
-	reclaimNoticeTimeout   = 10 * time.Second
+	// reclaimedAtNamespace keeps, per agent, when this device last
+	// force-reclaimed it. Outlives the notice (which is deleted once
+	// delivered) because the concurrent-reclaim order must not depend on
+	// the outgoing delivery queue.
+	reclaimedAtNamespace  = "handoff_reclaimed_at"
+	reclaimedPeerPath     = "/api/v1/peers/agent-sync/reclaimed"
+	reclaimNoticeTTL      = 7 * 24 * time.Hour
+	reclaimNoticeInterval = 1 * time.Minute
+	reclaimNoticeTimeout  = 10 * time.Second
 )
 
 type reclaimNotice struct {
@@ -77,6 +83,15 @@ func (s *Server) recordReclaimNotice(ctx context.Context, agentID string, token 
 		return fmt.Errorf("list peers: %w", err)
 	}
 	n := reclaimNotice{Token: token, CreatedAt: store.NowMillis()}
+	if _, err := st.PutKV(ctx, &store.KVRecord{
+		Namespace: reclaimedAtNamespace,
+		Key:       agentID,
+		Value:     strconv.FormatInt(n.CreatedAt, 10),
+		Type:      store.KVTypeString,
+		Scope:     store.KVScopeMachine,
+	}, store.KVPutOptions{}); err != nil {
+		return fmt.Errorf("record reclaim time: %w", err)
+	}
 	for _, p := range peers {
 		if p == nil || p.DeviceID == "" || p.DeviceID == s.peerID.DeviceID {
 			continue
@@ -166,7 +181,7 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			released, done := s.sendReclaimNotice(ctx, agentID, id)
+			released, done := s.sendReclaimNotice(ctx, agentID, id, n.CreatedAt)
 			outcomes[i] = outcome{peer: id, released: released, done: done}
 		}(i, id)
 	}
@@ -199,7 +214,7 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 // sendReclaimNotice POSTs one notice. done=true means the notice needs no
 // further delivery to this peer (answered, or the peer is gone from the
 // registry).
-func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string) (released, done bool) {
+func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string, reclaimedAt int64) (released, done bool) {
 	rec, err := s.agents.Store().GetPeer(ctx, deviceID)
 	if errors.Is(err, store.ErrNotFound) {
 		return false, true
@@ -214,6 +229,7 @@ func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string
 	body, _ := json.Marshal(peerAgentReclaimedRequest{
 		ReclaimerDeviceID: s.peerID.DeviceID,
 		AgentID:           agentID,
+		ReclaimedAt:       reclaimedAt,
 	})
 	reqCtx, cancel := context.WithTimeout(ctx, reclaimNoticeTimeout)
 	defer cancel()
@@ -317,26 +333,39 @@ func (s *Server) kickReclaimNotices() {
 	}
 }
 
-// reclaimNoticePendingFor reports whether this device's own reclaim notice
-// for agentID has not yet been delivered to deviceID.
-func (s *Server) reclaimNoticePendingFor(ctx context.Context, agentID, deviceID string) (bool, error) {
-	rec, err := s.agents.Store().GetKV(ctx, reclaimNoticeNamespace, agentID)
+// localReclaimedAt returns when this device last force-reclaimed agentID
+// (0 when never, or when the record is unreadable).
+func (s *Server) localReclaimedAt(ctx context.Context, agentID string) (int64, error) {
+	rec, err := s.agents.Store().GetKV(ctx, reclaimedAtNamespace, agentID)
 	if errors.Is(err, store.ErrNotFound) {
-		return false, nil
+		return 0, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	var n reclaimNotice
-	if err := json.Unmarshal([]byte(rec.Value), &n); err != nil {
-		return false, nil // unreadable notices are dropped by the delivery pass
+	at, err := strconv.ParseInt(rec.Value, 10, 64)
+	if err != nil {
+		return 0, nil
 	}
-	return slices.Contains(n.Peers, deviceID), nil
+	return at, nil
+}
+
+// reclaimSupersedes reports whether reclaim (atA, idA) is ordered after
+// (atB, idB). Both peers compare the same two pairs, so exactly one side
+// of a concurrent reclaim yields regardless of delivery order.
+func reclaimSupersedes(atA int64, idA string, atB int64, idB string) bool {
+	if atA != atB {
+		return atA > atB
+	}
+	return idA > idB
 }
 
 type peerAgentReclaimedRequest struct {
 	ReclaimerDeviceID string `json:"reclaimer_device_id"`
 	AgentID           string `json:"agent_id"`
+	// ReclaimedAt is the reclaimer's wall-clock millis at reclaim time.
+	// Required from peers; orders concurrent reclaims.
+	ReclaimedAt int64 `json:"reclaimed_at,omitempty"`
 }
 
 type peerAgentReclaimedResponse struct {
@@ -379,7 +408,12 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "bad_request", "agent_id required")
 		return
 	}
-	if p.IsPeer() || p.PeerID != "" {
+	isPeer := p.IsPeer() || p.PeerID != ""
+	if isPeer {
+		if req.ReclaimedAt <= 0 {
+			writeError(w, http.StatusBadRequest, "bad_request", "reclaimed_at required for peer principal")
+			return
+		}
 		if req.ReclaimerDeviceID == "" || !verifySignerIsSource(p, req.ReclaimerDeviceID) {
 			writeError(w, http.StatusForbidden, "forbidden",
 				"signer peer device_id does not match reclaimer_device_id")
@@ -408,23 +442,21 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 		writeJSONResponse(w, http.StatusOK, peerAgentReclaimedResponse{AgentID: req.AgentID})
 		return
 	}
-	// Concurrent reclaims: both devices reclaimed before either heard from
-	// the other, so each holds the agent and still has the other in its
-	// pending notice. Releasing on both sides would leave nobody holding
-	// it, so the lower device ID keeps it and refuses; the reclaimer keeps
-	// its notice pending and drops it once our own notice has made it let
-	// go. If our notice already reached the reclaimer (it is no longer in
-	// Peers), its reclaim happened after ours and wins. An owner (manual
-	// recovery) is never refused.
-	if (p.IsPeer() || p.PeerID != "") && s.peerID.DeviceID < req.ReclaimerDeviceID {
-		concurrent, err := s.reclaimNoticePendingFor(ctx, req.AgentID, req.ReclaimerDeviceID)
+	// Concurrent reclaims: both devices may hold the agent and notify each
+	// other. Releasing on both sides would leave nobody holding it, so the
+	// reclaims are totally ordered by (reclaimed_at, device ID) and only an
+	// older local reclaim yields. The order is static, so a delayed or
+	// retried notice cannot flip the outcome. An owner (manual recovery) is
+	// never refused.
+	if isPeer {
+		ownAt, err := s.localReclaimedAt(ctx, req.AgentID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
-		if concurrent {
+		if ownAt > 0 && reclaimSupersedes(ownAt, s.peerID.DeviceID, req.ReclaimedAt, req.ReclaimerDeviceID) {
 			writeError(w, http.StatusConflict, "concurrent_reclaim",
-				"this device also force-reclaimed the agent and wins the tie-break")
+				"this device force-reclaimed the agent after the notifying device")
 			return
 		}
 	}

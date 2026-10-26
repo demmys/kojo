@@ -317,6 +317,23 @@ func (s *Server) kickReclaimNotices() {
 	}
 }
 
+// reclaimNoticePendingFor reports whether this device's own reclaim notice
+// for agentID has not yet been delivered to deviceID.
+func (s *Server) reclaimNoticePendingFor(ctx context.Context, agentID, deviceID string) (bool, error) {
+	rec, err := s.agents.Store().GetKV(ctx, reclaimNoticeNamespace, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var n reclaimNotice
+	if err := json.Unmarshal([]byte(rec.Value), &n); err != nil {
+		return false, nil // unreadable notices are dropped by the delivery pass
+	}
+	return slices.Contains(n.Peers, deviceID), nil
+}
+
 type peerAgentReclaimedRequest struct {
 	ReclaimerDeviceID string `json:"reclaimer_device_id"`
 	AgentID           string `json:"agent_id"`
@@ -391,19 +408,23 @@ func (s *Server) handlePeerAgentReclaimed(w http.ResponseWriter, r *http.Request
 		writeJSONResponse(w, http.StatusOK, peerAgentReclaimedResponse{AgentID: req.AgentID})
 		return
 	}
-	// Concurrent reclaims: both devices hold the agent and each has a
-	// pending notice for the other. Releasing on both sides would leave
-	// nobody holding it, so the lower device ID keeps it and refuses; the
-	// reclaimer keeps its notice pending and drops it once our own notice
-	// has made it let go. An owner (manual recovery) is never refused.
-	if p.IsPeer() || p.PeerID != "" {
-		if _, err := st.GetKV(ctx, reclaimNoticeNamespace, req.AgentID); err == nil &&
-			s.peerID.DeviceID < req.ReclaimerDeviceID {
+	// Concurrent reclaims: both devices reclaimed before either heard from
+	// the other, so each holds the agent and still has the other in its
+	// pending notice. Releasing on both sides would leave nobody holding
+	// it, so the lower device ID keeps it and refuses; the reclaimer keeps
+	// its notice pending and drops it once our own notice has made it let
+	// go. If our notice already reached the reclaimer (it is no longer in
+	// Peers), its reclaim happened after ours and wins. An owner (manual
+	// recovery) is never refused.
+	if (p.IsPeer() || p.PeerID != "") && s.peerID.DeviceID < req.ReclaimerDeviceID {
+		concurrent, err := s.reclaimNoticePendingFor(ctx, req.AgentID, req.ReclaimerDeviceID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal", err.Error())
+			return
+		}
+		if concurrent {
 			writeError(w, http.StatusConflict, "concurrent_reclaim",
 				"this device also force-reclaimed the agent and wins the tie-break")
-			return
-		} else if err != nil && !errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
 	}

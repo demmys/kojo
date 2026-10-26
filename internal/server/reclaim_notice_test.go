@@ -256,6 +256,15 @@ func TestPeerAgentReclaimedConcurrentReclaimTieBreak(t *testing.T) {
 		t.Fatalf("winner lost the agent: %+v %v", lock, err)
 	}
 
+	// Our notice already reached "z": its reclaim came later and wins.
+	if err := srv.putReclaimNotice(context.Background(), id, &reclaimNotice{Peers: []string{"offline"}, CreatedAt: store.NowMillis()}); err != nil {
+		t.Fatal(err)
+	}
+	rr = postReclaimed(t, srv, auth.Principal{Role: auth.RolePeer, PeerID: "z"}, "z", id)
+	if rr.Code != http.StatusOK || !bytes.Contains(rr.Body.Bytes(), []byte(`"released":true`)) {
+		t.Fatalf("later reclaim must win: %d %s", rr.Code, rr.Body.String())
+	}
+
 	srv2, id2 := newReclaimTestServer(t, "z", "z")
 	if err := srv2.putReclaimNotice(context.Background(), id2, &reclaimNotice{Peers: []string{"a"}, CreatedAt: store.NowMillis()}); err != nil {
 		t.Fatal(err)

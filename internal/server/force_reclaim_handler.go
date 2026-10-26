@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -111,7 +112,12 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 		"fencingToken":   rec.FencingToken,
 		"leaseExpiresAt": rec.LeaseExpiresAt,
 	}
-	if err := s.recordReclaimNotice(r.Context(), id, rec.FencingToken); err != nil {
+	// Detached from the request: the reclaim already committed, so a client
+	// hanging up must not cancel the notice write and leave nothing queued
+	// for retry. Bounded so the switch lock is not held indefinitely.
+	noticeCtx, cancelNotice := context.WithTimeout(context.WithoutCancel(r.Context()), 2*reclaimNoticeTimeout)
+	defer cancelNotice()
+	if err := s.recordReclaimNotice(noticeCtx, id, rec.FencingToken); err != nil {
 		// Nothing is queued for retry. The reclaim itself stands, so stay
 		// 200 but say so: re-running force-reclaim records the notice
 		// again (at the cost of another fencing bump). A local kv write
@@ -120,7 +126,7 @@ func (s *Server) handleAgentHandoffForceReclaim(w http.ResponseWriter, r *http.R
 			"agent", id, "err", err)
 		resp["reclaimNoticeError"] = "notice not recorded; re-run force-reclaim to notify the previous holder: " + err.Error()
 	} else {
-		notice, err = s.deliverReclaimNotice(r.Context(), id, "")
+		notice, err = s.deliverReclaimNotice(noticeCtx, id, "")
 		if err != nil {
 			s.logger.Warn("force-reclaim: notice delivery failed; will retry", "agent", id, "err", err)
 		}

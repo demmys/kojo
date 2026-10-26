@@ -38,6 +38,13 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "gemini-4-argon",
     models: ["gemini-4-argon", "gemini-3.8-flash"],
   },
+  // Antigravity CLI (`agy`, experimental). Base ids from `agy models`
+  // without the effort suffix; the backend appends -<effort>. Keep in sync
+  // with internal/agent/backend_antigravity.go antigravityEffortModels.
+  antigravity: {
+    default: "gemini-4-argon",
+    models: ["gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b"],
+  },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
   "custom-claude": {
@@ -127,7 +134,19 @@ export function supportsAutoEffort(tool: string): boolean {
 }
 
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini";
+  return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini" || tool === "antigravity";
+}
+
+// agy model ids carry the effort as a suffix; gpt-oss-120b only exists as
+// -medium. Model ids such as claude-opus-5-5 also exist on the claude
+// backend with a different ladder, hence the tool-aware lookup.
+const antigravitySingleEffortModels: Record<string, EffortLevel> = { "gpt-oss-120b": "medium" };
+
+function antigravityEffortLevels(model: string): readonly EffortLevel[] {
+  const only = antigravitySingleEffortModels[model];
+  if (only) return [only];
+  if (!model || toolModels.antigravity.models.includes(model)) return ["low", "medium", "high"] as const;
+  return [];
 }
 
 // codex CLI 0.159.2: gpt-6.1-sol, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
@@ -150,7 +169,8 @@ export function sessionEffortLevelsForModel(model: string): string[] {
 }
 
 /** Return available effort levels for a given model. */
-export function effortLevelsForModel(model: string): readonly EffortLevel[] {
+export function effortLevelsForModel(model: string, tool?: string): readonly EffortLevel[] {
+  if (tool === "antigravity") return antigravityEffortLevels(model);
   // With the CLI-default model, the concrete model (and therefore support
   // for xhigh/max) is not known. Offer only the common safe ladder; in
   // particular Codex drops max when no model id is available for gating.
@@ -165,7 +185,8 @@ export function effortLevelsForModel(model: string): readonly EffortLevel[] {
 }
 
 /** Return the default effort level label for a given model. */
-export function defaultEffortForModel(model: string): string {
+export function defaultEffortForModel(model: string, tool?: string): string {
+  if (tool === "antigravity") return "medium";
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";

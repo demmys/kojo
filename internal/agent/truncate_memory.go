@@ -311,6 +311,13 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		m.logger.Info("truncate: gemini sessions cleared", "agent", agentID, "files", geminiFilesRm)
 	}
 
+	// 2e. Antigravity conversations: dropped wholesale for the same reason.
+	if agyFilesRm, agyConvsRm, aerr := clearAntigravitySessionCounted(agentID); aerr != nil {
+		m.logger.Warn("truncate: antigravity session partial failure", "agent", agentID, "err", aerr)
+	} else if agyConvsRm > 0 {
+		m.logger.Info("truncate: antigravity conversations cleared", "agent", agentID, "files", agyFilesRm, "conversations", agyConvsRm)
+	}
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race

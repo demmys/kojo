@@ -274,6 +274,8 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 			return geminiEffortModels[model] != ""
 		}
 		return false
+	case ToolAntigravity:
+		return antigravityValidModelEffort(model, effort)
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
 		if !ValidEffort(effort) {
 			return false

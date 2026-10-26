@@ -20,6 +20,8 @@ const (
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"
+	// ToolAntigravity drives Google's Antigravity CLI (`agy`). Experimental.
+	ToolAntigravity = "antigravity"
 )
 
 // legacyToolNames maps the pre-rename identifiers onto their current

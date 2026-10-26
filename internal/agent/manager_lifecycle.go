@@ -100,6 +100,7 @@ func (m *Manager) ResetData(id string) error {
 	clearClaudeSession(id, m.logger)
 	clearGrokSession(id)
 	clearCodexSession(id)
+	clearAntigravitySession(id)
 	// OpenCode home (sessions, kojo session refs and the config,
 	// regenerated on the next turn) and the pre-OpenCode
 	// .gemini-cli-home. Under the gemini transfer lock, hence here
@@ -2418,6 +2419,15 @@ func (m *Manager) ResetSession(agentID string) error {
 		} else {
 			m.logger.Debug("CLI session reset: gemini cleared",
 				"agent", agentID, "filesRemoved", files)
+		}
+	case ToolAntigravity:
+		files, convs, cerr := clearAntigravitySessionCounted(agentID)
+		if cerr != nil {
+			m.logger.Warn("CLI session reset: antigravity clear partial failure",
+				"agent", agentID, "err", cerr, "filesRemoved", files, "conversationsRemoved", convs)
+		} else {
+			m.logger.Debug("CLI session reset: antigravity cleared",
+				"agent", agentID, "filesRemoved", files, "conversationsRemoved", convs)
 		}
 	}
 

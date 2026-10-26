@@ -1729,6 +1729,7 @@ export function AgentSettings() {
               effort={effort}
               setEffort={setEffort}
               models={needsCustomURL ? customModels : modelsForTool(tool)}
+              tool={tool}
               disabled={needsCustomURL && customModelsStatus !== "success" && customModelsStatus !== "error"}
             />
 

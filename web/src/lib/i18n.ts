@@ -661,6 +661,10 @@ const messages = {
     ja: "gemini は Gemini モデルを OpenCode (opencode CLI) 経由で動かす。opencode のインストールと Global Settings の Gemini API キーが必要。",
     en: "gemini runs Gemini models through OpenCode (the opencode CLI). Requires opencode to be installed and a Gemini API key in Global Settings.",
   },
+  "field.toolAntigravityHelp": {
+    ja: "antigravity は Antigravity CLI (agy) で動かす実験的バックエンド。agy のインストールとログインが必要。拡張パッケージの MCP (Slack / Discord 等) は未対応。",
+    en: "antigravity is an experimental backend driven by the Antigravity CLI (agy). Requires agy to be installed and signed in. Extension-package MCP servers (Slack, Discord, ...) are not supported yet.",
+  },
   "settings.maxOutputTokensDesc": {
     ja: "1 ターンの応答で生成できるトークン数の上限 (思考トークンを含む)。空欄で既定値 65536。",
     en: "Upper bound on tokens generated per response (thinking included). Leave empty for the default (65536).",

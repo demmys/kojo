@@ -34,10 +34,10 @@ export function EffortPicker({
       >
         <option value="">
           {model
-            ? t("field.effortDefault", { level: defaultEffortForModel(model) })
+            ? t("field.effortDefault", { level: defaultEffortForModel(model, tool) })
             : t("field.effortCliDefault")}
         </option>
-        {effortLevelsForModel(model).map((e) => (
+        {effortLevelsForModel(model, tool).map((e) => (
           <option key={e} value={e}>
             {e}
           </option>

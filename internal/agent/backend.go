@@ -209,7 +209,9 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGemini:
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGemini, ToolAntigravity:
+		// antigravity keeps per-key conversation refs under
+		// agentDir/.antigravity/threads.
 		// gemini keeps the same per-key ref layout as grok under
 		// agentDir/.opencode-home/kojo/threads.
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to

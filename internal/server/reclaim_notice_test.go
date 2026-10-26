@@ -181,17 +181,34 @@ func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	if err := srv.recordReclaimNotice(ctx, id, store.NowMillis()); err != nil {
+	// A notice whose reclaim never committed (no stamp) is dropped unsent.
+	if err := srv.recordReclaimNotice(ctx, id, 5000); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := srv.deliverReclaimNotice(ctx, id, ""); err != nil || len(res.ReleasedOn) != 0 {
+		t.Fatalf("uncommitted notice delivered: %+v %v", res, err)
+	}
+	if n := readReclaimNotice(t, srv, id); n != nil {
+		t.Fatalf("uncommitted notice must be dropped: %+v", n)
+	}
+	// A failed later attempt announces the committed reclaim's time, even
+	// from another lock epoch (e.g. after a restart re-acquired the lock).
+	at := store.NowMillis()
+	setLocalReclaimedAtForTest(t, srv, id, at, -1)
+	if err := srv.recordReclaimNotice(ctx, id, at+1000); err != nil {
 		t.Fatal(err)
 	}
 	res, err := srv.deliverReclaimNotice(ctx, id, "")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimedAt != at {
+		t.Fatalf("must announce the committed reclaim time %d: %+v", at, req)
+	}
 	if len(res.ReleasedOn) != 1 || res.ReleasedOn[0] != "old" || len(res.PendingPeers) != 1 || res.PendingPeers[0] != "off" {
 		t.Fatalf("result: %+v", res)
 	}
-	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimerDeviceID != "hub" || req.AgentID != id || req.ReclaimedAt <= 0 {
+	if req, _ := got.Load().(peerAgentReclaimedRequest); req.ReclaimerDeviceID != "hub" || req.AgentID != id {
 		t.Fatalf("wire request: %+v", req)
 	}
 	n := readReclaimNotice(t, srv, id)
@@ -215,6 +232,40 @@ func TestDeliverReclaimNoticeReleasesOnlineAndKeepsOfflinePending(t *testing.T) 
 	}
 	if n := readReclaimNotice(t, srv, id); n != nil {
 		t.Fatalf("stale notice must be dropped: %+v", n)
+	}
+}
+
+func TestDeliverReclaimNoticeStopsOnConcurrentReclaim(t *testing.T) {
+	var calls atomic.Int32
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeError(w, http.StatusConflict, "concurrent_reclaim", "later reclaim here")
+	}))
+	t.Cleanup(peerSrv.Close)
+	srv, id := newReclaimTestServer(t, "hub", "hub")
+	ctx := context.Background()
+	if _, err := srv.agents.Store().UpsertPeer(ctx, &store.PeerRecord{
+		DeviceID: "z", Name: "Z", URL: peerSrv.URL, Status: store.PeerStatusOnline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	at := store.NowMillis()
+	setLocalReclaimedAtForTest(t, srv, id, at, 0)
+	if err := srv.recordReclaimNotice(ctx, id, at); err != nil {
+		t.Fatal(err)
+	}
+	res, err := srv.deliverReclaimNotice(ctx, id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.SupersededOn) != 1 || res.SupersededOn[0] != "z" || len(res.PendingPeers) != 0 {
+		t.Fatalf("result: %+v", res)
+	}
+	if n := readReclaimNotice(t, srv, id); n != nil {
+		t.Fatalf("superseded notice must not be retried: %+v", n)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d", calls.Load())
 	}
 }
 

@@ -62,7 +62,20 @@ type reclaimNoticeResult struct {
 	ReleasedOn   []string `json:"releasedOn"`
 	NotHolderOn  []string `json:"notHolderOn"`
 	PendingPeers []string `json:"pendingPeers"`
+	// SupersededOn lists peers that refused because they force-reclaimed
+	// the agent after this device (409 concurrent_reclaim); they keep it.
+	SupersededOn []string `json:"supersededOn,omitempty"`
 }
+
+// reclaimNoticeOutcome is one peer's answer to a notice.
+type reclaimNoticeOutcome int
+
+const (
+	reclaimNoticePending    reclaimNoticeOutcome = iota // retry later
+	reclaimNoticeReleased                               // old holder let go
+	reclaimNoticeNotHolder                              // peer did not run it (or is gone)
+	reclaimNoticeSuperseded                             // peer's own later reclaim wins
+)
 
 // recordReclaimNotice persists a notice, stamped with reclaimedAt, addressed
 // to every registered peer except self. Called by the force-reclaim handler
@@ -141,6 +154,25 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 			"agent", agentID, "holder", version.Holder)
 		return res, s.deleteReclaimNotice(ctx, agentID)
 	}
+	// The notice is written before the reclaim tx (outbox), so it may
+	// belong to a reclaim that never committed. Only the stamp written by
+	// a committed reclaim is announced: no stamp means there is nothing
+	// to announce, and an older stamp (the latest attempt failed) is the
+	// reclaim this device actually performed.
+	committedAt, err := s.committedReclaimAt(ctx, agentID)
+	if err != nil {
+		return res, err
+	}
+	if committedAt <= 0 {
+		s.logger.Info("force-reclaim notice: no committed reclaim; dropping notice", "agent", agentID)
+		return res, s.deleteReclaimNotice(ctx, agentID)
+	}
+	if committedAt != n.CreatedAt {
+		n.CreatedAt = committedAt
+		if err := s.putReclaimNotice(ctx, agentID, &n); err != nil {
+			return res, err
+		}
+	}
 	if store.NowMillis()-n.CreatedAt > reclaimNoticeTTL.Milliseconds() {
 		s.logger.Warn("force-reclaim notice: expired with peers never reached",
 			"agent", agentID, "pending", n.Peers)
@@ -148,9 +180,8 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 	}
 
 	type outcome struct {
-		peer     string
-		released bool
-		done     bool
+		peer   string
+		result reclaimNoticeOutcome
 	}
 	var targets []string
 	for _, id := range n.Peers {
@@ -164,23 +195,24 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			released, done := s.sendReclaimNotice(ctx, agentID, id, n.CreatedAt)
-			outcomes[i] = outcome{peer: id, released: released, done: done}
+			outcomes[i] = outcome{peer: id, result: s.sendReclaimNotice(ctx, agentID, id, n.CreatedAt)}
 		}(i, id)
 	}
 	wg.Wait()
 
 	delivered := map[string]bool{}
 	for _, o := range outcomes {
-		if !o.done {
+		switch o.result {
+		case reclaimNoticeReleased:
+			res.ReleasedOn = append(res.ReleasedOn, o.peer)
+		case reclaimNoticeNotHolder:
+			res.NotHolderOn = append(res.NotHolderOn, o.peer)
+		case reclaimNoticeSuperseded:
+			res.SupersededOn = append(res.SupersededOn, o.peer)
+		default:
 			continue
 		}
 		delivered[o.peer] = true
-		if o.released {
-			res.ReleasedOn = append(res.ReleasedOn, o.peer)
-		} else {
-			res.NotHolderOn = append(res.NotHolderOn, o.peer)
-		}
 	}
 	remaining := slices.DeleteFunc(slices.Clone(n.Peers), func(id string) bool { return delivered[id] })
 	res.PendingPeers = remaining
@@ -194,20 +226,19 @@ func (s *Server) deliverReclaimNotice(ctx context.Context, agentID, onlyPeer str
 	return res, nil
 }
 
-// sendReclaimNotice POSTs one notice. done=true means the notice needs no
-// further delivery to this peer (answered, or the peer is gone from the
-// registry).
-func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string, reclaimedAt int64) (released, done bool) {
+// sendReclaimNotice POSTs one notice. Every outcome except
+// reclaimNoticePending ends delivery to this peer.
+func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string, reclaimedAt int64) reclaimNoticeOutcome {
 	rec, err := s.agents.Store().GetPeer(ctx, deviceID)
 	if errors.Is(err, store.ErrNotFound) {
-		return false, true
+		return reclaimNoticeNotHolder
 	}
 	if err != nil || rec == nil || rec.Status != store.PeerStatusOnline || rec.URL == "" {
-		return false, false
+		return reclaimNoticePending
 	}
 	addr, err := peer.NormalizeAddress(rec.URL)
 	if err != nil {
-		return false, false
+		return reclaimNoticePending
 	}
 	body, _ := json.Marshal(peerAgentReclaimedRequest{
 		ReclaimerDeviceID: s.peerID.DeviceID,
@@ -218,34 +249,54 @@ func (s *Server) sendReclaimNotice(ctx context.Context, agentID, deviceID string
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, addr+reclaimedPeerPath, bytes.NewReader(body))
 	if err != nil {
-		return false, false
+		return reclaimNoticePending
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := peer.NoKeepAliveHTTPClient(reclaimNoticeTimeout).Do(req)
 	if err != nil {
 		s.logger.Info("force-reclaim notice: peer unreachable; will retry",
 			"agent", agentID, "peer", deviceID, "err", err)
-		return false, false
+		return reclaimNoticePending
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode == http.StatusConflict && peerErrorCode(raw) == "concurrent_reclaim" {
+		// Retrying cannot change the (reclaimed_at, device ID) order.
+		s.logger.Warn("force-reclaim notice: peer reclaimed the agent after this device and keeps it",
+			"agent", agentID, "peer", deviceID)
+		return reclaimNoticeSuperseded
+	}
 	if resp.StatusCode != http.StatusOK {
 		// 403/404 from a peer that predates this endpoint stays pending
 		// until it is upgraded (or the notice expires).
 		s.logger.Info("force-reclaim notice: peer refused; will retry",
 			"agent", agentID, "peer", deviceID, "status", resp.StatusCode,
 			"body", strings.TrimSpace(string(raw)))
-		return false, false
+		return reclaimNoticePending
 	}
 	var out peerAgentReclaimedResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return false, false
+		return reclaimNoticePending
 	}
-	if out.Released {
-		s.logger.Warn("force-reclaim notice: old holder released its runtime",
-			"agent", agentID, "peer", deviceID)
+	if !out.Released {
+		return reclaimNoticeNotHolder
 	}
-	return out.Released, true
+	s.logger.Warn("force-reclaim notice: old holder released its runtime",
+		"agent", agentID, "peer", deviceID)
+	return reclaimNoticeReleased
+}
+
+// peerErrorCode extracts error.code from a writeError response body.
+func peerErrorCode(raw []byte) string {
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &e) != nil {
+		return ""
+	}
+	return e.Error.Code
 }
 
 // deliverAllReclaimNotices is one retry pass over every pending notice.
@@ -323,24 +374,11 @@ func (s *Server) kickReclaimNotices() {
 // leaves, is re-acquired after a restart, or the stamp is unreadable, it
 // returns 0 — erring toward yielding to a competing reclaim.
 func (s *Server) localReclaimedAt(ctx context.Context, agentID string) (int64, error) {
-	st := s.agents.Store()
-	rec, err := st.GetKV(ctx, store.ReclaimedAtNamespace, agentID)
-	if errors.Is(err, store.ErrNotFound) {
-		return 0, nil
-	}
-	if err != nil {
+	at, token, err := s.reclaimStamp(ctx, agentID)
+	if err != nil || at <= 0 {
 		return 0, err
 	}
-	atStr, tokStr, ok := strings.Cut(rec.Value, ":")
-	if !ok {
-		return 0, nil
-	}
-	at, err1 := strconv.ParseInt(atStr, 10, 64)
-	token, err2 := strconv.ParseInt(tokStr, 10, 64)
-	if err1 != nil || err2 != nil || at <= 0 {
-		return 0, nil
-	}
-	v, err := st.GetAgentLockVersion(ctx, agentID)
+	v, err := s.agents.Store().GetAgentLockVersion(ctx, agentID)
 	if errors.Is(err, store.ErrNotFound) {
 		return 0, nil
 	}
@@ -351,6 +389,38 @@ func (s *Server) localReclaimedAt(ctx context.Context, agentID string) (int64, e
 		return 0, nil
 	}
 	return at, nil
+}
+
+// committedReclaimAt returns the time of this device's latest COMMITTED
+// force-reclaim of agentID regardless of epoch (0 when none). Unlike
+// localReclaimedAt it survives a restart's lock re-acquire, so a pending
+// notice keeps being retried; it is used only for delivery, where the
+// caller has already checked that this device holds the agent.
+func (s *Server) committedReclaimAt(ctx context.Context, agentID string) (int64, error) {
+	at, _, err := s.reclaimStamp(ctx, agentID)
+	return at, err
+}
+
+// reclaimStamp parses store.ReclaimedAtNamespace's "<at>:<token>" (zeros
+// when absent or unreadable).
+func (s *Server) reclaimStamp(ctx context.Context, agentID string) (at, token int64, err error) {
+	rec, err := s.agents.Store().GetKV(ctx, store.ReclaimedAtNamespace, agentID)
+	if errors.Is(err, store.ErrNotFound) {
+		return 0, 0, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	atStr, tokStr, ok := strings.Cut(rec.Value, ":")
+	if !ok {
+		return 0, 0, nil
+	}
+	at, err1 := strconv.ParseInt(atStr, 10, 64)
+	token, err2 := strconv.ParseInt(tokStr, 10, 64)
+	if err1 != nil || err2 != nil || at <= 0 {
+		return 0, 0, nil
+	}
+	return at, token, nil
 }
 
 // reclaimSupersedes reports whether reclaim (atA, idA) is ordered after

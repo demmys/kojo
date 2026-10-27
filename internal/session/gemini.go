@@ -7,7 +7,7 @@ import (
 
 // toolGemini is the PTY tool that runs Gemini models in the OpenCode TUI
 // (`opencode`) with a Gemini API key. The kojo tool id is "gemini-api"
-// ("gemini" before toolGeminiCLI existed); the binary is OpenCode.
+// ("gemini" before toolGeminiAgy existed); the binary is OpenCode.
 //
 // Unlike the other user tools it is never exec'd directly: OpenCode would
 // read the operator's ~/.config/opencode, ~/.local/share/opencode (incl.
@@ -18,17 +18,17 @@ import (
 // Create/Restart refuse to start gemini without one.
 const toolGemini = "gemini-api"
 
-// toolGeminiCLI is the PTY tool that runs the Antigravity CLI (`agy`, the
+// toolGeminiAgy is the PTY tool that runs the Antigravity CLI (`agy`, the
 // successor of Google's gemini-cli) as the operator, like claude or grok:
 // it uses the operator's own agy sign-in and settings.
-const toolGeminiCLI = "gemini-cli"
+const toolGeminiAgy = "gemini-agy"
 
 // toolBinary maps a tool id to the executable it runs.
 func toolBinary(tool string) string {
 	switch tool {
 	case toolGemini:
 		return "opencode"
-	case toolGeminiCLI:
+	case toolGeminiAgy:
 		return "agy"
 	}
 	return tool
@@ -220,7 +220,7 @@ func geminiHasApprovalMode(args []string) bool {
 	return false
 }
 
-// buildAgyRestartArgs restarts an agy (gemini-cli) session. kojo does not
+// buildAgyRestartArgs restarts an gemini-agy session. kojo does not
 // capture agy conversation ids from the TUI, so toolSessionID is normally
 // empty; an explicit --conversation <id> the user passed is kept so the
 // restart reopens that conversation rather than whichever agy touched last

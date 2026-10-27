@@ -274,7 +274,7 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 			return geminiEffortModels[model] != ""
 		}
 		return false
-	case ToolGeminiCLI:
+	case ToolGeminiAgy:
 		// agy (1.4.8) takes --effort low/medium/high only for the bare
 		// model ids in agyEffortModels.
 		switch effort {

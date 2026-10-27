@@ -158,7 +158,7 @@ func backendNeedsRecentMessagesFallback(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolGrok, ToolGeminiAPI, ToolCustomOpenCode, ToolGeminiCLI:
+	case ToolClaude, ToolCustomClaude, ToolGrok, ToolGeminiAPI, ToolCustomOpenCode, ToolGeminiAgy:
 		return true
 	default:
 		return false

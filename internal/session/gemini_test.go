@@ -151,8 +151,8 @@ func TestNormalizeLegacyGeminiTool(t *testing.T) {
 	if got := NormalizeToolName("gemini"); got != toolGemini {
 		t.Fatalf("NormalizeToolName(gemini) = %q, want %q", got, toolGemini)
 	}
-	if got := toolBinary(toolGeminiCLI); got != "agy" {
-		t.Fatalf("toolBinary(gemini-cli) = %q", got)
+	if got := toolBinary(toolGeminiAgy); got != "agy" {
+		t.Fatalf("toolBinary(gemini-agy) = %q", got)
 	}
 	if got := newRestoredSession(SessionInfo{ID: "s_1", Tool: "gemini"}); got.Tool != toolGemini {
 		t.Fatalf("restored legacy session tool = %q", got.Tool)
@@ -174,12 +174,12 @@ func TestBuildAgyRestartArgs(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := buildRestartArgs(toolGeminiCLI, c.in, c.tsid); !reflect.DeepEqual(got, c.want) {
+			if got := buildRestartArgs(toolGeminiAgy, c.in, c.tsid); !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("got %q, want %q", got, c.want)
 			}
 		})
 	}
-	if got := appendYoloFlag(toolGeminiCLI, []string{"-m", "x"}, true); !reflect.DeepEqual(got, []string{"-m", "x", "--dangerously-skip-permissions"}) {
+	if got := appendYoloFlag(toolGeminiAgy, []string{"-m", "x"}, true); !reflect.DeepEqual(got, []string{"-m", "x", "--dangerously-skip-permissions"}) {
 		t.Fatalf("yolo: got %q", got)
 	}
 }

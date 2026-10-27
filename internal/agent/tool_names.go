@@ -17,11 +17,11 @@ const (
 	ToolCodex  = "codex"
 	ToolGrok   = "grok"
 	// ToolGeminiAPI runs Gemini models through OpenCode with a Gemini API
-	// key. It was called "gemini" until ToolGeminiCLI was added.
+	// key. It was called "gemini" until ToolGeminiAgy was added.
 	ToolGeminiAPI = "gemini-api"
-	// ToolGeminiCLI drives the Antigravity CLI (`agy`, the successor of
+	// ToolGeminiAgy drives the Antigravity CLI (`agy`, the successor of
 	// Google's gemini-cli), signed in with the operator's Google account.
-	ToolGeminiCLI    = "gemini-cli"
+	ToolGeminiAgy    = "gemini-agy"
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"
@@ -50,7 +50,7 @@ func isOpenCodeTool(tool string) bool {
 // path (normalizeAgent), so agents created before the rename keep working
 // without a data migration step.
 //
-// "gemini" became "gemini-api" when the Antigravity-backed "gemini-cli"
+// "gemini" became "gemini-api" when the Antigravity-backed "gemini-agy"
 // was added, so the bare name could not be mistaken for either.
 var legacyToolNames = map[string]string{
 	"custom":    ToolCustomClaude,

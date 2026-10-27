@@ -658,8 +658,8 @@ const messages = {
   },
   "settings.maxOutputTokens": { ja: "最大出力トークン", en: "Max output tokens" },
   "field.toolGeminiCliHelp": {
-    ja: "gemini-cli は Antigravity CLI (agy、gemini-cli の後継) を動かす。agy のインストールと、このホストのターミナルで一度 `agy` を起動して Google アカウントでサインインしておくことが必要。",
-    en: "gemini-cli runs the Antigravity CLI (agy, the successor of gemini-cli). Requires agy to be installed and signed in with a Google account (run `agy` once in a terminal on this host).",
+    ja: "gemini-agy は Antigravity CLI (agy、gemini-cli の後継) を動かす。agy のインストールと、このホストのターミナルで一度 `agy` を起動して Google アカウントでサインインしておくことが必要。",
+    en: "gemini-agy runs the Antigravity CLI (agy, the successor of gemini-cli). Requires agy to be installed and signed in with a Google account (run `agy` once in a terminal on this host).",
   },
   "field.toolCustomOpenCodeHelp": {
     ja: "OpenCode を許可リストの OpenAI互換プロバイダで実行。モデルIDとAPIキーはエージェントごとに設定",
@@ -1899,7 +1899,7 @@ const messages = {
     ja: "--auto 付きで起動する",
     en: "Launches with --auto",
   },
-  "ns.geminiCliHelp": {
+  "ns.geminiAgyHelp": {
     ja: "Antigravity CLI (agy) の TUI を起動する。Google アカウントでのサインインはこの TUI でもできる。",
     en: "Launches the Antigravity CLI (agy) TUI. You can also sign in with your Google account from this TUI.",
   },

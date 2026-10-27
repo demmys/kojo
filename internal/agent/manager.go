@@ -521,7 +521,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 			ToolClaude:         NewClaudeBackend(logger),
 			ToolCodex:          NewCodexBackend(logger),
 			ToolGrok:           NewGrokBackend(logger),
-			ToolGeminiCLI:      NewAgyBackend(logger),
+			ToolGeminiAgy:      NewAgyBackend(logger),
 			ToolGeminiAPI:      NewGeminiBackend(logger, creds),
 			ToolCustomClaude:   NewCustomClaudeBackend(logger, creds),
 			ToolCustomCodex:    NewCustomCodexBackend(logger, creds),
@@ -2937,7 +2937,7 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			resetErr = deleteGrokThreadRefStrict(agentID, sessionKey)
 		case ToolGeminiAPI, ToolCustomOpenCode:
 			resetErr = deleteGeminiThreadRefStrict(agentID, sessionKey)
-		case ToolGeminiCLI:
+		case ToolGeminiAgy:
 			resetErr = deleteAgyThreadRefStrict(agentID, sessionKey)
 		}
 		if resetErr != nil {
@@ -3991,7 +3991,7 @@ func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 		return grokCanResumeSession(agentID, sessionKey)
 	case ToolGeminiAPI, ToolCustomOpenCode:
 		return geminiCanResumeSession(agentID, sessionKey)
-	case ToolGeminiCLI:
+	case ToolGeminiAgy:
 		return agyCanResumeSession(agentID, sessionKey)
 	}
 

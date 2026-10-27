@@ -242,7 +242,7 @@ export function NewSession() {
             )}
 
             {/* Tool selection */}
-            <Field label={t("field.tool")} help={tool === "gemini-api" ? t("ns.geminiHelp") : tool === "gemini-cli" ? t("ns.geminiCliHelp") : undefined}>
+            <Field label={t("field.tool")} help={tool === "gemini-api" ? t("ns.geminiHelp") : tool === "gemini-agy" ? t("ns.geminiAgyHelp") : undefined}>
               <div className="space-y-2">
                 {info &&
                   Object.entries(info.tools ?? {}).map(([name, toolInfo]) => (
@@ -373,7 +373,7 @@ export function NewSession() {
                       : tool === "gemini-api"
                         ? t("ns.yoloGemini")
 
-                        : tool === "gemini-cli"
+                        : tool === "gemini-agy"
                           ? t("ns.yoloClaude")
                         : t("ns.yoloOther")}
                 </div>

@@ -38,14 +38,14 @@ export const toolModels: Record<string, ToolModelConfig> = {
     default: "gemini-4-argon",
     models: ["gemini-4-argon", "gemini-3.8-flash"],
   },
-  // gemini-cli runs the Antigravity CLI (agy) signed in with the operator's
+  // gemini-agy runs the Antigravity CLI (agy) signed in with the operator's
   // Google account. Ids are agy model slugs (`agy models`, agy 1.4.8);
   // "" leaves the choice to agy's default (gemini-4-argon on a paid
   // account). agy lists each family per effort level (gemini-4-argon-high,
   // ...); kojo offers the bare id plus the effort selector instead. The list
   // is the paid tier's; a free account only gets gemini-3.8-flash and
   // gpt-oss-120b-medium.
-  "gemini-cli": {
+  "gemini-agy": {
     default: "",
     models: ["gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
   },
@@ -141,11 +141,11 @@ const defaultXhighModels = new Set(["claude-opus-4-7"]);
 /** Tools whose per-turn effort the server's auto-effort classifier can
  * drive (internal/agent/auto_effort.go toolSupportsAutoEffort). */
 export function supportsAutoEffort(tool: string): boolean {
-  return tool === "claude" || tool === "grok" || tool === "gemini-api" || tool === "gemini-cli";
+  return tool === "claude" || tool === "grok" || tool === "gemini-api" || tool === "gemini-agy";
 }
 
 export function supportsEffort(tool: string): boolean {
-  return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini-api" || tool === "gemini-cli";
+  return tool === "claude" || tool === "grok" || tool === "codex" || tool === "gemini-api" || tool === "gemini-agy";
 }
 
 // codex CLI 0.159.2: gpt-6.1-sol, gpt-6-sol, gpt-6-astra, gpt-5.6-sol and gpt-5.6-terra
@@ -173,7 +173,7 @@ export function effortLevelsForModel(model: string, tool?: string): readonly Eff
   // rejects it for gpt-oss-120b-medium (effort is in the id).
   // whose ladder is low/medium/high. Keep in sync with agent.go
   // agyEffortModels.
-  if (tool === "gemini-cli") {
+  if (tool === "gemini-agy") {
     return agyEffortModels.has(model) ? (["low", "medium", "high"] as const) : [];
   }
   // With the CLI-default model, the concrete model (and therefore support
@@ -191,7 +191,7 @@ export function effortLevelsForModel(model: string, tool?: string): readonly Eff
 
 /** Return the default effort level label for a given model. */
 export function defaultEffortForModel(model: string, tool?: string): string {
-  if (tool === "gemini-cli") return "high";
+  if (tool === "gemini-agy") return "high";
   if (codexLowDefaultModels.has(model)) return "low";
   if (codexXhighDefaultModels.has(model)) return "xhigh";
   if (codexEffortModels.has(model)) return "medium";

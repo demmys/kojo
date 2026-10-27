@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// AgyBackend implements ChatBackend for the "gemini-cli" tool: the
+// AgyBackend implements ChatBackend for the "gemini-agy" tool: the
 // Antigravity CLI (`agy`), Google's successor to gemini-cli. It runs agy
 // headlessly with --input-format/--output-format stream-json: the user
 // message goes in as one NDJSON "user" event on stdin (no ARG_MAX limit,
@@ -41,7 +41,7 @@ func NewAgyBackend(logger *slog.Logger) *AgyBackend {
 	return &AgyBackend{logger: logger}
 }
 
-func (b *AgyBackend) Name() string { return ToolGeminiCLI }
+func (b *AgyBackend) Name() string { return ToolGeminiAgy }
 
 func (b *AgyBackend) Available() bool { return agyPath() != "" }
 
@@ -215,7 +215,7 @@ func buildAgyArgs(resumeID string, agent *Agent, withAgent bool) []string {
 	}
 	// A stored effort the model has no ladder for would fail the run
 	// ("--effort is not supported for model ...").
-	if agent.Effort != "" && ValidToolModelEffort(ToolGeminiCLI, agent.Model, agent.Effort) {
+	if agent.Effort != "" && ValidToolModelEffort(ToolGeminiAgy, agent.Model, agent.Effort) {
 		args = append(args, "--effort", agent.Effort)
 	}
 	return args

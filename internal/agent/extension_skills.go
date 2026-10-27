@@ -70,7 +70,7 @@ func extensionSkillRoot(tool string) string {
 		return ".codex"
 	case ToolGeminiAPI, ToolCustomOpenCode:
 		return ".opencode"
-	case ToolGeminiCLI:
+	case ToolGeminiAgy:
 		// agy reads workspace skills from <cwd>/.agents/skills.
 		return ".agents"
 	}

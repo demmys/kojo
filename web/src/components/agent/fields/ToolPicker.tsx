@@ -7,7 +7,7 @@ import { Field } from "../../ui/Field";
 import { useT } from "../../../lib/i18n";
 import { needsCustomURLFor } from "../agentSettingsPayload";
 
-const TOOLS = ["claude", "codex", "grok", "gemini-api", "gemini-cli", "custom-claude", "custom-codex", "custom-bare", "custom-opencode"];
+const TOOLS = ["claude", "codex", "grok", "gemini-api", "gemini-agy", "custom-claude", "custom-codex", "custom-bare", "custom-opencode"];
 
 /**
  * The "Tool" (backend) selector. Switching tools resets the model to the
@@ -38,7 +38,7 @@ export function ToolPicker({
     <Field label={t("field.tool")} help={
         tool === "gemini-api"
           ? t("field.toolGeminiHelp")
-          : tool === "gemini-cli"
+          : tool === "gemini-agy"
             ? t("field.toolGeminiCliHelp")
             : tool === "custom-opencode"
             ? t("field.toolCustomOpenCodeHelp")

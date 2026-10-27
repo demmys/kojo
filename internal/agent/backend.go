@@ -209,8 +209,8 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGeminiAPI, ToolCustomOpenCode, ToolGeminiCLI:
-		// gemini-cli (agy) stores its conversation id per key under
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGeminiAPI, ToolCustomOpenCode, ToolGeminiAgy:
+		// gemini-agy stores its conversation id per key under
 		// agentDir/.agy/threads.
 		// gemini keeps the same per-key ref layout as grok under
 		// agentDir/.opencode-home/kojo/threads.

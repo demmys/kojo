@@ -93,16 +93,16 @@ func renderAgyMCPConfig(servers map[string]mcpServerEntry) (string, error) {
 // gets only the tools its frontmatter lists (none without the key), and
 // names agy does not know fail the whole run, so this is the default
 // agent's tool set minus the names agy 1.4.8 refuses there (browser_*,
-// command_status, ...). MCP servers from mcp_config.json are reachable
-// regardless (call_mcp_tool is added by agy).
+// command_status, ...) and minus schedule / search_marketplace, which
+// kojo does not want agents to use. MCP servers from mcp_config.json are
+// reachable regardless (call_mcp_tool is added by agy).
 var agyAgentTools = []string{
 	"ask_custom_permission", "ask_permission", "ask_question", "define_subagent",
 	"find_by_name", "finish", "generate_image", "grep_search", "invoke_subagent",
 	"list_dir", "list_plugin_accounts", "manage_subagents", "manage_task",
 	"multi_replace_file_content", "notebook_edit", "read_url_content",
-	"replace_file_content", "run_command", "run_workflow", "schedule",
-	"search_marketplace", "search_web", "send_message", "view_file", "wait",
-	"write_to_file",
+	"replace_file_content", "run_command", "run_workflow", "search_web",
+	"send_message", "view_file", "wait", "write_to_file",
 }
 
 // renderAgyAgentDef renders the custom agent that carries kojo's system

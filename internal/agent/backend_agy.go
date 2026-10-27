@@ -312,7 +312,9 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 				_ = cmd.Process.Signal(syscall.SIGTERM)
 			})
 		}
-		result := parseAgyStream(stdout, b.logger, send, onResult)
+		thoughts := newAgyThoughtReader(b.logger)
+		result := parseAgyStream(stdout, b.logger, send, onResult, thoughts.Lookup)
+		thoughts.Close()
 		waitErr := cmd.Wait()
 		killedAfterResult := false
 		if exitTimer != nil {
@@ -472,7 +474,11 @@ type agyStreamEvent struct {
 // Unknown events and step types are skipped. onResult is called once, when
 // the result event arrives. A send that returns false (context cancelled)
 // stops parsing and marks the result cancelled.
-func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func()) *agyStreamResult {
+//
+// thought, when non-nil, fetches the thought summary of an agent_response
+// step that stream-json withholds; ok=false means "not stored yet", so it
+// is retried on that step's later events (until DONE).
+func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool, onResult func(), thought func(convID string, idx int) (string, bool)) *agyStreamResult {
 	res := &agyStreamResult{}
 	scanner := newSkippingLineScanner(r)
 	loggedSkips := 0
@@ -480,6 +486,15 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 	var toolUses []ToolUse
 	toolStarted := map[int]bool{}
 	toolDone := map[int]bool{}
+	thoughtDone := map[int]bool{}
+	var thoughtPending []int // agent_response steps whose thought was not readable by DONE
+	emitThought := func(t string) bool {
+		if thinkBuf.Len() > 0 {
+			t = "\n\n" + t
+		}
+		thinkBuf.WriteString(t)
+		return send(ChatEvent{Type: "thinking", Delta: t})
+	}
 	finish := func(cancelled bool) *agyStreamResult {
 		res.text = textBuf.String()
 		res.thinking = thinkBuf.String()
@@ -526,6 +541,22 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 			}
 			switch su.StepType {
 			case "agent_response":
+				if thought != nil && !thoughtDone[su.StepIndex] && su.ThinkingDelta == "" {
+					convID := su.ConversationID
+					if convID == "" {
+						convID = res.conversationID
+					}
+					t, ok := thought(convID, su.StepIndex)
+					if (ok && t != "") || su.State == "DONE" {
+						thoughtDone[su.StepIndex] = true
+						if !ok && su.State == "DONE" {
+							thoughtPending = append(thoughtPending, su.StepIndex)
+						}
+					}
+					if t != "" && !emitThought(t) {
+						return finish(true)
+					}
+				}
 				if su.TextDelta != "" {
 					textBuf.WriteString(su.TextDelta)
 					if !send(ChatEvent{Type: "text", Delta: su.TextDelta}) {
@@ -573,6 +604,17 @@ func parseAgyStream(r io.Reader, logger *slog.Logger, send func(ChatEvent) bool,
 				continue
 			}
 			res.gotResult = true
+			if r.ConversationID != "" {
+				res.conversationID = r.ConversationID
+			}
+			// Last chance for thoughts that were not readable when their
+			// step finished (store write lagging the stream).
+			for _, idx := range thoughtPending {
+				if t, _ := thought(res.conversationID, idx); t != "" && !emitThought(t) {
+					return finish(true)
+				}
+			}
+			thoughtPending = nil
 			res.status = r.Status
 			res.errorMessage = r.Error
 			res.response = r.Response

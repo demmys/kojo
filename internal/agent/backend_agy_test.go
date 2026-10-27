@@ -119,7 +119,7 @@ func TestParseAgyStream(t *testing.T) {
 	res := parseAgyStream(strings.NewReader(agyTestStream), silentLogger(), func(e ChatEvent) bool {
 		events = append(events, e)
 		return true
-	}, func() { results++ })
+	}, func() { results++ }, nil)
 
 	if res.cancelled || !res.gotResult || res.status != "SUCCESS" || results != 1 {
 		t.Fatalf("result = %+v, onResult calls = %d", res, results)
@@ -154,12 +154,12 @@ func TestParseAgyStream(t *testing.T) {
 
 func TestParseAgyStream_ResponseFallbackAndCancel(t *testing.T) {
 	in := `{"event":"result","result":{"status":"SUCCESS","response":"only here"}}` + "\n"
-	res := parseAgyStream(strings.NewReader(in), silentLogger(), func(ChatEvent) bool { return true }, nil)
+	res := parseAgyStream(strings.NewReader(in), silentLogger(), func(ChatEvent) bool { return true }, nil, nil)
 	if res.text != "only here" {
 		t.Errorf("text = %q, want the result response", res.text)
 	}
 
-	res = parseAgyStream(strings.NewReader(agyTestStream), silentLogger(), func(ChatEvent) bool { return false }, nil)
+	res = parseAgyStream(strings.NewReader(agyTestStream), silentLogger(), func(ChatEvent) bool { return false }, nil, nil)
 	if !res.cancelled {
 		t.Errorf("a refused send must mark the run cancelled")
 	}

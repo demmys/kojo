@@ -252,3 +252,14 @@ describe("toolModels — custom backends", () => {
     expect(modelsForTool("llama.cpp")).toEqual([]);
   });
 });
+
+describe("gemini-cli (agy)", () => {
+  it("offers low/medium/high only for bare family ids", () => {
+    for (const m of ["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
+      expect(effortLevelsForModel(m, "gemini-cli")).toEqual(["low", "medium", "high"]);
+    }
+    expect(effortLevelsForModel("gpt-oss-120b-medium", "gemini-cli")).toEqual([]);
+    // the claude backend's ladder is unaffected by the shared id
+    expect(effortLevelsForModel("claude-opus-5-5")).toContain("max");
+  });
+});

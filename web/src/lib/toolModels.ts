@@ -40,12 +40,14 @@ export const toolModels: Record<string, ToolModelConfig> = {
   },
   // gemini-cli runs the Antigravity CLI (agy) signed in with the operator's
   // Google account. Ids are agy model slugs (`agy models`, agy 1.4.8);
-  // "" leaves the choice to agy's default (gemini-3.8-flash). agy also lists
-  // gemini-3.8-flash-{low,medium,high}; kojo offers the bare id plus the
-  // effort selector instead.
+  // "" leaves the choice to agy's default (gemini-4-argon on a paid
+  // account). agy lists each family per effort level (gemini-4-argon-high,
+  // ...); kojo offers the bare id plus the effort selector instead. The list
+  // is the paid tier's; a free account only gets gemini-3.8-flash and
+  // gpt-oss-120b-medium.
   "gemini-cli": {
     default: "",
-    models: ["gemini-3.8-flash", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"],
+    models: ["gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium"],
   },
   // The custom-* backends have no fixed model list: the operator supplies
   // the endpoint and useCustomModels fetches whatever it advertises.
@@ -121,7 +123,7 @@ const grokEffortModels = new Set(toolModels.grok.models);
 // "flash" is the legacy gemini-cli alias for gemini-3.8-flash; the backend
 // resolves it before picking the variant. Keep in sync with
 // internal/agent/backend_opencode.go geminiEffortModels.
-const agyEffortModels = new Set(["", "gemini-3.8-flash"]);
+const agyEffortModels = new Set(["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]);
 const geminiEffortModels = new Set([...toolModels["gemini-api"].models, "flash"]);
 const grokXhighModels = new Set(["grok-4.7", "grok-4.7-build-fast", "grok-4.6"]);
 
@@ -167,7 +169,8 @@ export function sessionEffortLevelsForModel(model: string, tool?: string): strin
 
 /** Return available effort levels for a given model. */
 export function effortLevelsForModel(model: string, tool?: string): readonly EffortLevel[] {
-  // agy rejects --effort for every model but gemini-3.8-flash (its default),
+  // agy takes --effort low/medium/high only for the bare family ids; it
+  // rejects it for gpt-oss-120b-medium (effort is in the id).
   // whose ladder is low/medium/high. Keep in sync with agent.go
   // agyEffortModels.
   if (tool === "gemini-cli") {

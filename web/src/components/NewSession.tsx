@@ -305,7 +305,7 @@ export function NewSession() {
                 valid ladder is unknowable, so both stay CLI default). May
                 include "ultra" for codex models that advertise it; ultra is
                 intentionally NOT offered in agent settings. */}
-            {model && supportsEffort(tool) && (
+            {model && supportsEffort(tool) && sessionEffortLevelsForModel(model, tool).length > 0 && (
               <Field label={t("field.effort")}>
                 <Select value={effort} onChange={(e) => setEffort(e.target.value)} mono>
                   <option value="">{t("ns.defaultOption")}</option>

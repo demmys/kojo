@@ -275,8 +275,8 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 		}
 		return false
 	case ToolGeminiCLI:
-		// agy (1.4.8) rejects --effort for every model but gemini-3.8-flash
-		// (also its default, model ""), whose ladder is low/medium/high.
+		// agy (1.4.8) takes --effort low/medium/high only for the bare
+		// model ids in agyEffortModels.
 		switch effort {
 		case "":
 			return true

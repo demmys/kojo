@@ -60,9 +60,19 @@ func agyPath() string {
 	return ""
 }
 
-// agyEffortModels lists the models agy takes --effort for ("" is agy's
-// default model, gemini-3.8-flash). Keep in sync with web toolModels.ts.
-var agyEffortModels = map[string]bool{"": true, "gemini-3.8-flash": true}
+// agyEffortModels lists the models agy takes --effort (low/medium/high)
+// for: the bare ids of the families `agy models` lists per effort level
+// (agy 1.4.8, paid tier). "" is agy's default model (gemini-4-argon on the
+// paid tier, gemini-3.8-flash on the free one; both take the ladder).
+// Suffixed ids (gemini-4-argon-high, gpt-oss-120b-medium) conflict with
+// --effort. Keep in sync with web toolModels.ts.
+var agyEffortModels = map[string]bool{
+	"":                  true,
+	"gemini-4-argon":    true,
+	"gemini-3.8-flash":  true,
+	"claude-opus-5-5":   true,
+	"claude-sonnet-5-5": true,
+}
 
 // agyConversationIDPattern matches agy conversation ids (UUIDs). Every
 // value read from the agent-writable ref files is checked before it

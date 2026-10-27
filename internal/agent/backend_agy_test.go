@@ -361,7 +361,7 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 // agy rejects --effort for models without a ladder, so a stored effort
 // must not reach argv for them.
 func TestBuildAgyArgs_DropsUnsupportedEffort(t *testing.T) {
-	for _, m := range []string{"claude-sonnet-4-6", "gemini-3.8-flash-high"} {
+	for _, m := range []string{"gpt-oss-120b-medium", "gemini-4-argon-high"} {
 		if args := buildAgyArgs("", &Agent{Model: m, Effort: "high"}, false); slices.Contains(args, "--effort") {
 			t.Errorf("%s: args carry --effort: %q", m, args)
 		}

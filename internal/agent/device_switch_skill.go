@@ -716,7 +716,7 @@ func SyncDeviceSwitchSkillForTool(agentID, tool string, enabled bool, logger *sl
 		SyncGrokDeviceSwitchSkill(agentID, enabled, logger)
 	case ToolCodex, ToolCustomCodex:
 		SyncCodexDeviceSwitchSkill(agentID, enabled, logger)
-	case ToolGemini, ToolCustomOpenCode:
+	case ToolGeminiAPI, ToolCustomOpenCode:
 		SyncGeminiDeviceSwitchSkill(agentID, enabled, logger)
 	}
 }

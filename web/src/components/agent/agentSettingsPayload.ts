@@ -54,7 +54,7 @@ export const CUSTOM_OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
 /** True for the tools whose output cap the maxOutputTokens setting drives. */
 export function supportsMaxOutputTokens(tool: string): boolean {
-  return tool === "gemini" || tool === "custom-opencode";
+  return tool === "gemini-api" || tool === "custom-opencode";
 }
 
 /** Server default maxOutputTokens for the tool. */

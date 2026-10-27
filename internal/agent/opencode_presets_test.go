@@ -141,7 +141,7 @@ func TestCustomOpenCodeEnvAndArgs(t *testing.T) {
 	if got := effectiveOpenCodeMaxOutputTokens(ToolCustomOpenCode, 4000); got != 4000 {
 		t.Errorf("explicit max = %d", got)
 	}
-	if got := effectiveOpenCodeMaxOutputTokens(ToolGemini, 0); got != GeminiDefaultMaxOutputTokens {
+	if got := effectiveOpenCodeMaxOutputTokens(ToolGeminiAPI, 0); got != GeminiDefaultMaxOutputTokens {
 		t.Errorf("gemini default = %d", got)
 	}
 	args := buildOpenCodeRunArgs("kojo-groq/llama", "", "")
@@ -167,7 +167,7 @@ func TestCustomOpenCodeToolPlumbing(t *testing.T) {
 		!backendSupportsDeviceSwitch(ToolCustomOpenCode) || !ToolRequiresCustomBaseURL(ToolCustomOpenCode) {
 		t.Error("custom-opencode tool helpers")
 	}
-	if NewGeminiBackend(nil, nil).Name() != ToolGemini {
+	if NewGeminiBackend(nil, nil).Name() != ToolGeminiAPI {
 		t.Error("gemini name")
 	}
 }

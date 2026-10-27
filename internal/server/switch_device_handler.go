@@ -2121,7 +2121,7 @@ func (s *Server) buildAgentSyncRequest(ctx context.Context, agentID string, targ
 	// export` (a consistent snapshot from its SQLite DB, even mid-turn).
 	// Read failure degrades to the canonical-history fallback rather
 	// than blocking the switch.
-	if tool == agent.ToolGemini || tool == agent.ToolCustomOpenCode {
+	if tool == agent.ToolGeminiAPI || tool == agent.ToolCustomOpenCode {
 		gemTransfer, gemSkipped, gmerr := agent.ReadGeminiSessionFiles(agentID)
 		if gmerr != nil {
 			s.logger.Warn("agent-sync: gemini session unavailable; using history fallback",

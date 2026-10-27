@@ -7,7 +7,7 @@ import { Field } from "../../ui/Field";
 import { useT } from "../../../lib/i18n";
 import { needsCustomURLFor } from "../agentSettingsPayload";
 
-const TOOLS = ["claude", "codex", "grok", "gemini", "custom-claude", "custom-codex", "custom-bare", "custom-opencode"];
+const TOOLS = ["claude", "codex", "grok", "gemini-api", "gemini-cli", "custom-claude", "custom-codex", "custom-bare", "custom-opencode"];
 
 /**
  * The "Tool" (backend) selector. Switching tools resets the model to the
@@ -36,9 +36,11 @@ export function ToolPicker({
   const t = useT();
   return (
     <Field label={t("field.tool")} help={
-        tool === "gemini"
+        tool === "gemini-api"
           ? t("field.toolGeminiHelp")
-          : tool === "custom-opencode"
+          : tool === "gemini-cli"
+            ? t("field.toolGeminiCliHelp")
+            : tool === "custom-opencode"
             ? t("field.toolCustomOpenCodeHelp")
             : undefined
       }>
@@ -57,7 +59,7 @@ export function ToolPicker({
                   } else {
                     const m = defaultModelForTool(name);
                     setModel(m);
-                    if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
+                    if (effort && !effortLevelsForModel(m, name).includes(effort)) setEffort("");
                   }
                 }
               }}

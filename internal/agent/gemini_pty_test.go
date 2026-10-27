@@ -272,7 +272,7 @@ func TestGeminiPTYLaunch_AgentAndPlain(t *testing.T) {
 
 	const id = "ag_ocpty"
 	m.mu.Lock()
-	m.agents[id] = &Agent{ID: id, Tool: ToolGemini, Model: "gemini-3.8-flash", Effort: "low", MaxOutputTokens: 4096}
+	m.agents[id] = &Agent{ID: id, Tool: ToolGeminiAPI, Model: "gemini-3.8-flash", Effort: "low", MaxOutputTokens: 4096}
 	m.agents["ag_other"] = &Agent{ID: "ag_other", Tool: ToolClaude, Model: "opus", Effort: "max", MaxOutputTokens: 777}
 	m.mu.Unlock()
 	for _, a := range []string{id, "ag_other"} {
@@ -504,7 +504,7 @@ func TestGeminiPTYLaunch_PendingImportBlocksResume(t *testing.T) {
 	const id = "ag_ocpty_pending"
 	const sid = "ses_eb8ffdbd0ffe067Bl9pwxaAw03"
 	m.mu.Lock()
-	m.agents[id] = &Agent{ID: id, Tool: ToolGemini, Model: "gemini-3.8-flash"}
+	m.agents[id] = &Agent{ID: id, Tool: ToolGeminiAPI, Model: "gemini-3.8-flash"}
 	m.mu.Unlock()
 	dir := agentDir(id)
 	pending := filepath.Join(geminiPendingImportDir(dir), sid+".json")
@@ -536,7 +536,7 @@ func TestGeminiPTYLaunch_RefusesFork(t *testing.T) {
 	const id = "ag_ocpty_fork"
 	const sid = "ses_eb8ffdbd0ffe067Bl9pwxaAw04"
 	m.mu.Lock()
-	m.agents[id] = &Agent{ID: id, Tool: ToolGemini, Model: "gemini-3.8-flash"}
+	m.agents[id] = &Agent{ID: id, Tool: ToolGeminiAPI, Model: "gemini-3.8-flash"}
 	m.mu.Unlock()
 	// A pending device-switch export keeps the -s (the empty DB would
 	// otherwise drop it, and --fork with it); the fork check comes first.

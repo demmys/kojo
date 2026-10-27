@@ -221,7 +221,7 @@ func mapTierToEffort(a *Agent, tier string) string {
 // their static value.
 func toolSupportsAutoEffort(tool string) bool {
 	switch tool {
-	case ToolClaude, ToolGrok, ToolGemini:
+	case ToolClaude, ToolGrok, ToolGeminiAPI, ToolGeminiCLI:
 		return true
 	}
 	return false

@@ -143,11 +143,11 @@ var geminiStripEnvPrefixes = []string{
 type GeminiBackend struct {
 	logger *slog.Logger
 	creds  *CredentialStore
-	tool   string // ToolGemini or ToolCustomOpenCode
+	tool   string // ToolGeminiAPI or ToolCustomOpenCode
 }
 
 func NewGeminiBackend(logger *slog.Logger, creds *CredentialStore) *GeminiBackend {
-	return &GeminiBackend{logger: logger, creds: creds, tool: ToolGemini}
+	return &GeminiBackend{logger: logger, creds: creds, tool: ToolGeminiAPI}
 }
 
 // NewCustomOpenCodeBackend returns the OpenCode backend for the
@@ -158,7 +158,7 @@ func NewCustomOpenCodeBackend(logger *slog.Logger, creds *CredentialStore) *Gemi
 
 func (b *GeminiBackend) Name() string {
 	if b.tool == "" {
-		return ToolGemini
+		return ToolGeminiAPI
 	}
 	return b.tool
 }

@@ -91,8 +91,8 @@ describe("buildAgentSavePayload", () => {
   });
 
   it("forwards maxOutputTokens only for gemini", () => {
-    expect(buildAgentSavePayload(baseState({ tool: "gemini", maxOutputTokens: 8192 })).maxOutputTokens).toBe(8192);
-    expect(buildAgentSavePayload(baseState({ tool: "gemini" })).maxOutputTokens).toBe(0);
+    expect(buildAgentSavePayload(baseState({ tool: "gemini-api", maxOutputTokens: 8192 })).maxOutputTokens).toBe(8192);
+    expect(buildAgentSavePayload(baseState({ tool: "gemini-api" })).maxOutputTokens).toBe(0);
     expect(buildAgentSavePayload(baseState({ tool: "claude", maxOutputTokens: 8192 })).maxOutputTokens).toBeUndefined();
   });
 

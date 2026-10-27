@@ -1737,6 +1737,7 @@ export function AgentSettings() {
 
             <ModelPicker
               model={model}
+              tool={tool}
               setModel={setModel}
               effort={effort}
               setEffort={setEffort}

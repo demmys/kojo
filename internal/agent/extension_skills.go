@@ -68,8 +68,11 @@ func extensionSkillRoot(tool string) string {
 		return ".claude"
 	case ToolCodex, ToolCustomCodex:
 		return ".codex"
-	case ToolGemini, ToolCustomOpenCode:
+	case ToolGeminiAPI, ToolCustomOpenCode:
 		return ".opencode"
+	case ToolGeminiCLI:
+		// agy reads workspace skills from <cwd>/.agents/skills.
+		return ".agents"
 	}
 	return ""
 }

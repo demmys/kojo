@@ -201,8 +201,8 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   });
 
   it("gemini lists argon (default) and flash with low/medium/high, default medium", () => {
-    expect(modelsForTool("gemini")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
-    expect(defaultModelForTool("gemini")).toBe("gemini-4-argon");
+    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
+    expect(defaultModelForTool("gemini-api")).toBe("gemini-4-argon");
     for (const m of ["gemini-4-argon", "gemini-3.8-flash"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");

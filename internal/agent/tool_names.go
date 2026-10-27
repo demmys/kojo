@@ -13,14 +13,19 @@ package agent
 //     directly, with no CLI in between. No tools, no session, no skills —
 //     every turn is a stateless [system, user] request.
 const (
-	ToolClaude       = "claude"
-	ToolCodex        = "codex"
-	ToolGrok         = "grok"
-	ToolGemini       = "gemini"
+	ToolClaude = "claude"
+	ToolCodex  = "codex"
+	ToolGrok   = "grok"
+	// ToolGeminiAPI runs Gemini models through OpenCode with a Gemini API
+	// key. It was called "gemini" until ToolGeminiCLI was added.
+	ToolGeminiAPI = "gemini-api"
+	// ToolGeminiCLI drives the Antigravity CLI (`agy`, the successor of
+	// Google's gemini-cli), signed in with the operator's Google account.
+	ToolGeminiCLI    = "gemini-cli"
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"
-	// ToolCustomOpenCode drives OpenCode (like ToolGemini) against one of
+	// ToolCustomOpenCode drives OpenCode (like ToolGeminiAPI) against one of
 	// the whitelisted OpenAI-compatible providers in opencode_presets.go;
 	// Agent.CustomBaseURL holds the chosen preset's base URL.
 	ToolCustomOpenCode = "custom-opencode"
@@ -30,7 +35,7 @@ const (
 // owns the agent's .opencode-home (sessions, refs, skills).
 func isOpenCodeTool(tool string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolGemini, ToolCustomOpenCode:
+	case ToolGeminiAPI, ToolCustomOpenCode:
 		return true
 	}
 	return false
@@ -44,9 +49,13 @@ func isOpenCodeTool(tool string) bool {
 // Old values are still accepted on the API and migrated on the store's read
 // path (normalizeAgent), so agents created before the rename keep working
 // without a data migration step.
+//
+// "gemini" became "gemini-api" when the Antigravity-backed "gemini-cli"
+// was added, so the bare name could not be mistaken for either.
 var legacyToolNames = map[string]string{
 	"custom":    ToolCustomClaude,
 	"llama.cpp": ToolCustomBare,
+	"gemini":    ToolGeminiAPI,
 }
 
 // NormalizeToolName rewrites a legacy tool identifier to its current name.

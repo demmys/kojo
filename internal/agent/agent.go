@@ -258,7 +258,7 @@ func ValidModelEffort(model, effort string) bool {
 // assumptions about that built-in model's effort ladder.
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolGemini:
+	case ToolGeminiAPI:
 		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
 		// only set it (as an OpenCode variant) for the models in
 		// geminiEffortModels (an empty model means GeminiDefaultModel).
@@ -272,6 +272,16 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 				model = GeminiDefaultModel
 			}
 			return geminiEffortModels[model] != ""
+		}
+		return false
+	case ToolGeminiCLI:
+		// agy (1.4.8) rejects --effort for every model but gemini-3.8-flash
+		// (also its default, model ""), whose ladder is low/medium/high.
+		switch effort {
+		case "":
+			return true
+		case "low", "medium", "high":
+			return agyEffortModels[model]
 		}
 		return false
 	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:

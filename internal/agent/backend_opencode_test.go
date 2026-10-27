@@ -218,7 +218,7 @@ func TestValidToolModelEffort_Gemini(t *testing.T) {
 		{"flash", "", true},
 	}
 	for _, c := range cases {
-		if got := ValidToolModelEffort(ToolGemini, c.model, c.effort); got != c.ok {
+		if got := ValidToolModelEffort(ToolGeminiAPI, c.model, c.effort); got != c.ok {
 			t.Errorf("ValidToolModelEffort(gemini, %q, %q) = %v, want %v", c.model, c.effort, got, c.ok)
 		}
 	}

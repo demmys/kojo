@@ -75,6 +75,12 @@ func (m *Manager) ResetData(id string) error {
 	}
 	// The reset conversation has no "previous turn" left to explain.
 	m.dropMainStopNote(id)
+	// Fail before erasing the transcript if native context cannot be
+	// cleared. Returning success with a resumable old Agy conversation
+	// would let forgotten content reappear on the next turn.
+	if _, err := clearAgySessionCounted(id); err != nil {
+		return fmt.Errorf("reset: clear agy sessions: %w", err)
+	}
 
 	dir := agentDir(id)
 
@@ -2424,6 +2430,7 @@ func (m *Manager) ResetSession(agentID string) error {
 		if cerr != nil {
 			m.logger.Warn("CLI session reset: gemini-cli clear partial failure",
 				"agent", agentID, "err", cerr, "filesRemoved", files)
+			return fmt.Errorf("reset session: clear agy sessions: %w", cerr)
 		} else {
 			m.logger.Debug("CLI session reset: gemini-cli cleared",
 				"agent", agentID, "filesRemoved", files)

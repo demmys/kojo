@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/loppo-llc/kojo/internal/backenddiag"
 	"github.com/loppo-llc/kojo/internal/configdir"
 )
 
@@ -786,7 +787,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		if result.cancelled {
 			cmd.Wait()
 			content := mergeStreamTexts(result)
-			emitCancelDone(ctx, ch, content, result.thinking, result.toolUses, result.usage)
+			emitCancelDone(ctx, ch, content, result.thinking, result.toolUses, result.usage, result.backendDiagnostic)
 			return
 		}
 
@@ -798,12 +799,12 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			if processError == "" {
 				processError = err.Error()
 			}
-			if result.fullText == "" && result.lastAssistantText == "" && len(result.toolUses) == 0 {
+			if result.fullText == "" && result.lastAssistantText == "" && len(result.toolUses) == 0 && result.backendDiagnostic == nil {
 				send(ChatEvent{Type: "error", ErrorMessage: processError})
 				return
 			}
 		}
-		if processError == "" && result.resultError != "" && ctx.Err() == nil {
+		if (processError == "" || result.backendDiagnostic != nil) && result.resultError != "" && ctx.Err() == nil {
 			processError = result.resultError
 		}
 
@@ -830,7 +831,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		if recoverSessionID == "" {
 			recoverSessionID = expectedSessionID
 		}
-		if finalText == "" && recoverSessionID != "" {
+		if finalText == "" && recoverSessionID != "" && result.backendDiagnostic == nil {
 			if sessionText := recoverFromSession(agent.ID, recoverSessionID, b.logger); sessionText != "" {
 				b.logger.Info("recovered text from session log",
 					"agent", agent.ID,
@@ -861,7 +862,7 @@ func (b *ClaudeBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			)
 		}
 
-		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError})
+		send(ChatEvent{Type: "done", Message: msg, Usage: result.usage, ErrorMessage: processError, BackendDiagnostic: result.backendDiagnostic})
 	}()
 
 	return ch, nil
@@ -1028,14 +1029,17 @@ type streamParseResult struct {
 	// lastAssistantIsLatestText is true when the most recent textual event
 	// was a complete assistant event and text deltas already preceded it.
 	// A subsequent text delta clears it, preserving newer retry output.
-	lastAssistantIsLatestText bool
-	streamSessionID           string
-	resultError               string // non-empty when result subtype starts with "error"
-	toolUses                  []ToolUse
-	usage                     *Usage
-	cancelled                 bool   // true if send returned false (context cancelled)
-	origin                    string // "result" event origin.kind, e.g. "task-notification"
-	usageCumulative           bool   // usage came from result.modelUsage (cumulative per process)
+	lastAssistantIsLatestText   bool
+	streamSessionID             string
+	resultError                 string // provider/CLI failure, never assistant prose
+	backendDiagnostic           *backenddiag.Diagnostic
+	refusalCategory             string
+	apiErrorFollowedByAssistant bool
+	toolUses                    []ToolUse
+	usage                       *Usage
+	cancelled                   bool   // true if send returned false (context cancelled)
+	origin                      string // "result" event origin.kind, e.g. "task-notification"
+	usageCumulative             bool   // usage came from result.modelUsage (cumulative per process)
 }
 
 // applyUsage merges non-zero token metrics into res.usage, allocating it
@@ -1283,6 +1287,12 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		}
 
 	case "system":
+		if parentID == "" && event.APIRefusalCategory != "" {
+			res.refusalCategory = event.APIRefusalCategory
+			if res.backendDiagnostic != nil {
+				res.backendDiagnostic.Category = event.APIRefusalCategory
+			}
+		}
 		status := "thinking"
 		if event.Subtype == "compact_boundary" {
 			status = "compacting"
@@ -1293,6 +1303,34 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 		}
 
 	case "assistant":
+		if event.IsAPIErrorMessage || event.IsTranscriptAPIErrorMessage {
+			var detail strings.Builder
+			for _, block := range event.Message.Content {
+				if block.Type == "text" {
+					detail.WriteString(block.Text)
+				}
+			}
+			category := ""
+			if parentID == "" {
+				category = res.refusalCategory
+			}
+			d := backenddiag.Claude(detail.String(), category)
+			_ = json.Unmarshal(event.APIErrorCode, &d.Code)
+			a.logger.Warn("claude API failure", "code", d.Code, "category", d.Category,
+				"request_id", d.RequestID, "message_id", d.MessageID,
+				"detail", d.Detail, "parent_tool_use_id", parentID)
+			if parentID == "" {
+				u := event.Message.Usage
+				applyUsage(res, u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens)
+				res.backendDiagnostic = d
+				res.apiErrorFollowedByAssistant = false
+				res.resultError = d.Detail
+				if res.resultError == "" {
+					res.resultError = "claude API request failed"
+				}
+			}
+			break // never append a provider failure to main or subagent prose
+		}
 		if parentID != "" {
 			// Subagent turn: complete (non-streamed-delta) assistant
 			// message belonging to a Task-spawned subagent. Route its
@@ -1323,6 +1361,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 				}
 			}
 			break
+		}
+		if res.backendDiagnostic != nil && len(event.Message.Content) > 0 {
+			res.apiErrorFollowedByAssistant = true
 		}
 		var atext strings.Builder
 		for _, block := range event.Message.Content {
@@ -1496,8 +1537,27 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 
 	case "result":
 		isResult = true
-		if strings.HasPrefix(event.Subtype, "error") {
+		// A generated refusal is still an answer. Only CLI failure markers
+		// (not stop_reason or words in normal prose) classify API diagnostics.
+		apiResult := event.IsError != nil && *event.IsError && strings.HasPrefix(event.Result, "API Error: ")
+		failed := (event.IsError != nil && *event.IsError) || strings.HasPrefix(event.Subtype, "error")
+		if !failed && event.Subtype == "success" && res.backendDiagnostic != nil &&
+			((event.IsError != nil && !*event.IsError) || res.apiErrorFollowedByAssistant ||
+				(event.Result != "" && event.Result != res.backendDiagnostic.Detail)) {
+			// A CLI retry may recover within the turn. Do not mark its real
+			// successful answer as failed because an earlier attempt failed.
+			res.resultError, res.backendDiagnostic = "", nil
+		}
+		if failed && res.resultError == "" {
 			res.resultError = "claude turn failed: " + event.Subtype
+			if apiResult {
+				res.backendDiagnostic = backenddiag.Claude(event.Result, res.refusalCategory)
+				_ = json.Unmarshal(event.APIErrorCode, &res.backendDiagnostic.Code)
+				res.resultError = event.Result
+				d := res.backendDiagnostic
+				a.logger.Warn("claude API failure", "code", d.Code, "category", d.Category,
+					"request_id", d.RequestID, "message_id", d.MessageID, "detail", d.Detail)
+			}
 		}
 		if event.SessionID != "" {
 			res.streamSessionID = event.SessionID
@@ -1529,7 +1589,9 @@ func (a *turnAccumulator) feed(event claudeStreamEvent, rawParentID string) (isR
 			// keep the stream-accumulated tokens and attach the cost.
 			res.usage.CostUSD = event.TotalCostUSD
 		}
-		if event.Result != "" {
+		isDiagnosticResult := res.backendDiagnostic != nil &&
+			(event.Result == res.backendDiagnostic.Detail || apiResult)
+		if event.Result != "" && !isDiagnosticResult {
 			if fullText.Len() == 0 {
 				fullText.WriteString(event.Result)
 				res.lastAssistantIsLatestText = false
@@ -1614,6 +1676,13 @@ func (sub *subagentState) appendText(text string) {
 // Claude stream-json event types
 type claudeStreamEvent struct {
 	Type string `json:"type"`
+	// Stream JSON uses snake_case; on-disk transcripts use camelCase.
+	IsAPIErrorMessage           bool            `json:"is_api_error_message,omitempty"`
+	IsTranscriptAPIErrorMessage bool            `json:"isApiErrorMessage,omitempty"`
+	APIErrorCode                json.RawMessage `json:"error,omitempty"`
+	APIRefusalCategory          string          `json:"apiRefusalCategory,omitempty"`
+	IsError                     *bool           `json:"is_error,omitempty"`
+	StopReason                  string          `json:"stop_reason,omitempty"`
 
 	// ParentToolUseID tags events that belong to a subagent spawned by a
 	// Task tool call, rather than the main assistant turn. Appears as a
@@ -2344,8 +2413,10 @@ func recoverFromSession(agentID string, sessionID string, logger *slog.Logger) s
 
 	for scanner.Scan() {
 		var raw struct {
-			Type    string          `json:"type"`
-			Message json.RawMessage `json:"message"`
+			Type                    string          `json:"type"`
+			Message                 json.RawMessage `json:"message"`
+			IsAPIErrorMessage       bool            `json:"isApiErrorMessage"`
+			IsStreamAPIErrorMessage bool            `json:"is_api_error_message"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &raw) != nil {
 			continue
@@ -2353,6 +2424,9 @@ func recoverFromSession(agentID string, sessionID string, logger *slog.Logger) s
 
 		switch raw.Type {
 		case "assistant":
+			if raw.IsAPIErrorMessage || raw.IsStreamAPIErrorMessage {
+				continue
+			}
 			var msg struct {
 				Content []claudeContentBlock `json:"content"`
 			}

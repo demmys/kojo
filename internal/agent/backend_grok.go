@@ -243,6 +243,9 @@ func deleteGrokThreadRefStrict(agentID, sessionKey string) error {
 	return err
 }
 
+// grokBackgroundWaitTimeout is effectively unlimited (100 years).
+const grokBackgroundWaitTimeout = "3153600000"
+
 func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt string, trust bool) []string {
 	args := []string{
 		"--prompt-file", promptPath,
@@ -257,6 +260,10 @@ func buildGrokArgs(promptPath, dir, resumeID string, agent *Agent, systemPrompt 
 		// Skip plan mode + subagent spawning to keep behaviour predictable.
 		"--no-plan",
 		"--no-subagents",
+		// grok stops background work (and exits 1) 10 minutes after the
+		// last turn by default. Kojo's own turn timeout already bounds the
+		// run, so let background tasks finish.
+		"--background-wait-timeout", grokBackgroundWaitTimeout,
 	}
 	if trust {
 		// Folder trust gates the MCP servers of <dir>/.grok/config.toml.
@@ -404,7 +411,11 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 
 		send := func(e ChatEvent) bool { return ctxSend(ctx, ch, e) }
 
-		result := parseGrokStream(stdout, b.logger, send)
+		act := newActivityReader(stdout)
+		watchDone := make(chan struct{})
+		idleKilled := watchGrokIdle(cmd, act, watchDone, b.logger, agent.ID)
+		result := parseGrokStream(act, b.logger, send)
+		close(watchDone)
 
 		if result.cancelled {
 			cmd.Wait()
@@ -442,6 +453,13 @@ func (b *GrokBackend) Chat(ctx context.Context, agent *Agent, userMessage string
 		// user sees an empty assistant message and never learns the
 		// turn failed.
 		waitErr := cmd.Wait()
+		if idleKilled.Load() && waitErr != nil && result.text != "" {
+			// The watchdog ended a grok that had finished its work but
+			// would not exit. grok prints its "end" event only after the
+			// background wait it is stuck in, so the streamed reply is
+			// the turn's outcome.
+			waitErr = nil
+		}
 		processError := classifyGrokProcessError(waitErr, stderrBuf.String(), result.streamError)
 		if waitErr != nil {
 			b.logger.Warn("grok process exited with error",

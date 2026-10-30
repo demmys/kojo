@@ -82,11 +82,17 @@ func (m *Manager) Abort(agentID string, cause error) {
 	m.abortExceptOneShot(agentID, 0, cause, cause)
 }
 
-// AbortByUser is the WebUI main-chat stop button: the main chat is stopped by
-// the user; the external turns cancelled with it are told kojo stopped them
-// (nobody asked to stop those).
+// AbortByUser is the WebUI main-chat stop button. It stops the main chat
+// only: thread / external turns (Slack, Discord, group DM, ext-chat) run
+// concurrently and have their own stop paths, so the main stop button must
+// not take them down with it.
 func (m *Manager) AbortByUser(agentID string) {
-	m.abortExceptOneShot(agentID, 0, UserStop(), KojoStop(stopReasonMainChatAbort))
+	m.busyMu.Lock()
+	entry, ok := m.busy[agentID]
+	m.busyMu.Unlock()
+	if ok {
+		entry.stop(UserStop())
+	}
 }
 
 // AbortExceptOneShot cancels the main chat and every external turn except the

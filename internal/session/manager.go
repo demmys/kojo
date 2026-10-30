@@ -67,11 +67,13 @@ var userTools = map[string]bool{
 	"codex":          true,
 	"grok":           true,
 	toolGemini:       true,
+	toolGeminiAgy:    true,
 	toolCustomClaude: true,
 }
 
 // legacySessionTools maps pre-rename PTY tool identifiers to current ones.
-var legacySessionTools = map[string]string{"custom": toolCustomClaude}
+// "gemini" became "gemini-api" when toolGeminiAgy was added.
+var legacySessionTools = map[string]string{"custom": toolCustomClaude, "gemini": toolGemini}
 
 // NormalizeToolName rewrites a legacy PTY tool identifier to its current
 // name. Unknown values pass through so isAllowedTool still rejects them.
@@ -754,6 +756,8 @@ func yoloNativeFlag(tool string) string {
 		return "--dangerously-bypass-approvals-and-sandbox"
 	case toolGemini:
 		return "--auto"
+	case toolGeminiAgy:
+		return "--dangerously-skip-permissions"
 	default:
 		return ""
 	}
@@ -904,6 +908,9 @@ func buildRestartArgs(tool string, origArgs []string, toolSessionID string) []st
 
 	case toolGemini:
 		return buildGeminiRestartArgs(origArgs, toolSessionID)
+
+	case toolGeminiAgy:
+		return buildAgyRestartArgs(origArgs, toolSessionID)
 
 	default:
 		// Internal tools (tmux/shell) use platform-specific restart args

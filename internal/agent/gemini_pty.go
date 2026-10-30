@@ -128,7 +128,7 @@ func (m *Manager) geminiPTYTargetFor(workDir string) geminiPTYTarget {
 		return plain
 	}
 	t := geminiPTYTarget{home: openCodeHome(agentDir(id)), agentID: id, model: GeminiDefaultModel}
-	if NormalizeToolName(tool) == ToolGemini {
+	if NormalizeToolName(tool) == ToolGeminiAPI {
 		t.model = resolveGeminiModel(model)
 		t.effort = effort
 		t.maxOutputTokens = maxOut

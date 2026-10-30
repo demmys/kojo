@@ -6,7 +6,8 @@ import (
 )
 
 // toolGemini is the PTY tool that runs Gemini models in the OpenCode TUI
-// (`opencode`). The kojo tool id stays "gemini"; the binary is OpenCode.
+// (`opencode`) with a Gemini API key. The kojo tool id is "gemini-api"
+// ("gemini" before toolGeminiAgy existed); the binary is OpenCode.
 //
 // Unlike the other user tools it is never exec'd directly: OpenCode would
 // read the operator's ~/.config/opencode, ~/.local/share/opencode (incl.
@@ -15,12 +16,20 @@ import (
 // launch (kojo-managed OpenCode home, regenerated config, API key from
 // kojo's credential store handed over via the environment) and
 // Create/Restart refuse to start gemini without one.
-const toolGemini = "gemini"
+const toolGemini = "gemini-api"
+
+// toolGeminiAgy is the PTY tool that runs the Antigravity CLI (`agy`, the
+// successor of Google's gemini-cli) as the operator, like claude or grok:
+// it uses the operator's own agy sign-in and settings.
+const toolGeminiAgy = "gemini-agy"
 
 // toolBinary maps a tool id to the executable it runs.
 func toolBinary(tool string) string {
-	if tool == toolGemini {
+	switch tool {
+	case toolGemini:
 		return "opencode"
+	case toolGeminiAgy:
+		return "agy"
 	}
 	return tool
 }
@@ -209,4 +218,40 @@ func geminiHasApprovalMode(args []string) bool {
 		}
 	}
 	return false
+}
+
+// buildAgyRestartArgs restarts an gemini-agy session. kojo does not
+// capture agy conversation ids from the TUI, so toolSessionID is normally
+// empty; an explicit --conversation <id> the user passed is kept so the
+// restart reopens that conversation rather than whichever agy touched last
+// in the work dir (--continue).
+func buildAgyRestartArgs(origArgs []string, toolSessionID string) []string {
+	args := make([]string, 0, len(origArgs)+2)
+	var pinned string
+	for i := 0; i < len(origArgs); i++ {
+		a := origArgs[i]
+		if a == "--continue" || a == "-c" || a == "--continue=true" || a == "-c=true" {
+			continue
+		}
+		if a == "--conversation" {
+			if i+1 < len(origArgs) {
+				pinned = origArgs[i+1]
+				i++
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--conversation="); ok {
+			pinned = v
+			continue
+		}
+		args = append(args, a)
+	}
+	switch {
+	case toolSessionID != "":
+		return append(args, "--conversation", toolSessionID)
+	case pinned != "":
+		return append(args, "--conversation", pinned)
+	default:
+		return append(args, "--continue")
+	}
 }

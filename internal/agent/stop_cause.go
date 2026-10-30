@@ -68,9 +68,6 @@ const (
 	stopReasonFork     = "エージェントのフォーク"
 	stopReasonTruncate = "メモリの切り詰め"
 	stopReasonSwitch   = "デバイス移行"
-	// stopReasonMainChatAbort: external turns cancelled along with a WebUI
-	// main-chat stop.
-	stopReasonMainChatAbort = "WebUI のメインチャットで停止操作が行われたため連動して停止"
 )
 
 // Exported reasons for stops made outside this package.

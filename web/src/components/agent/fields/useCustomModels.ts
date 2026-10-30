@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../../lib/api";
-import { needsCustomURLFor } from "../agentSettingsPayload";
+import { discoversCustomModels } from "../agentSettingsPayload";
 
 export type CustomModelsStatus = "idle" | "loading" | "success" | "error";
 export type CustomModelsErrorCode = "no_models" | "";
@@ -30,7 +30,7 @@ export function useCustomModels(
     enabled?: boolean;
   },
 ) {
-  const needsCustomURL = needsCustomURLFor(tool);
+  const needsCustomURL = discoversCustomModels(tool, baseURL);
   const [customModels, setCustomModels] = useState<string[]>([]);
   const [status, setStatus] = useState<CustomModelsStatus>("idle");
   const [error, setError] = useState("");

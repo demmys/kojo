@@ -246,8 +246,8 @@ func mainTurn(t *testing.T, m *Manager, b *stopNoteBackend, id string, block boo
 }
 
 // The WebUI stop button: the main turn is a user stop (no note, and it clears
-// an undelivered older one), the external turns it takes down with it are
-// kojo stops. Notes are delivered once.
+// an undelivered older one) and concurrent thread turns keep running. A kojo
+// stop of the thread turn leaves a keyed note that is delivered once.
 func TestAbortByUserNotesAndOneTimeDelivery(t *testing.T) {
 	m, b, id := newStopNoteManager(t, t.TempDir())
 	t.Cleanup(func() { _ = m.Close() })
@@ -265,19 +265,26 @@ func TestAbortByUserNotesAndOneTimeDelivery(t *testing.T) {
 
 	m.AbortByUser(id)
 	drainEvents(mainEvents)
-	drainEvents(osEvents)
-	waitIdle(t, m, id)
-
 	if c, ok := stopCauseOf(mainCtx); !ok || !c.ByUser {
 		t.Fatalf("main turn cause = %+v, %v", c, ok)
 	}
-	if c, ok := stopCauseOf(osCtx); !ok || c.ByUser || c.Reason != stopReasonMainChatAbort {
+	if err := osCtx.Err(); err != nil {
+		t.Fatalf("main-chat stop cancelled the thread turn: %v", err)
+	}
+	if got := m.peekKeyedNote(id, key); got != "" {
+		t.Fatalf("main-chat stop left a keyed note: %q", got)
+	}
+
+	m.cancelOneShots(id, KojoStop(stopReasonTruncate))
+	drainEvents(osEvents)
+	waitIdle(t, m, id)
+	if c, ok := stopCauseOf(osCtx); !ok || c.ByUser || c.Reason != stopReasonTruncate {
 		t.Fatalf("one-shot cause = %+v, %v", c, ok)
 	}
 	if got := m.PendingMainStopNote(id); got != "" {
 		t.Fatalf("user stop left a main note: %q", got)
 	}
-	if got := m.peekKeyedNote(id, key); got != stopNoteText(&StopCause{Reason: stopReasonMainChatAbort}) {
+	if got := m.peekKeyedNote(id, key); got != stopNoteText(&StopCause{Reason: stopReasonTruncate}) {
 		t.Fatalf("keyed note = %q", got)
 	}
 
@@ -297,7 +304,7 @@ func TestAbortByUserNotesAndOneTimeDelivery(t *testing.T) {
 	msg = <-b.msgs
 	<-b.ctxs
 	drainEvents(osEvents)
-	if !strings.Contains(msg, stopNoteText(&StopCause{Reason: stopReasonMainChatAbort})) {
+	if !strings.Contains(msg, stopNoteText(&StopCause{Reason: stopReasonTruncate})) {
 		t.Fatalf("keyed turn lacks the note: %q", msg)
 	}
 	if got := m.peekKeyedNote(id, key); got != "" {

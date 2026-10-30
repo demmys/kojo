@@ -442,14 +442,14 @@ func TestResolveTurnEffortGemini(t *testing.T) {
 	}
 	for _, c := range cases {
 		withFakeClassifier(t, fakeClassifierReturning(c.classifier))
-		a := &Agent{Tool: ToolGemini, Model: c.model, Effort: c.static}
+		a := &Agent{Tool: ToolGeminiAPI, Model: c.model, Effort: c.static}
 		eff, _ := resolveTurnEffort(context.Background(), a, "some question", false, "", "", testLogger())
 		if eff != c.want {
 			t.Fatalf("model %q static %q tier %q: got %q, want %q", c.model, c.static, c.classifier, eff, c.want)
 		}
 	}
 	// System turns pin gemini to low too.
-	a := &Agent{Tool: ToolGemini, Model: "gemini-4-argon", Effort: "high"}
+	a := &Agent{Tool: ToolGeminiAPI, Model: "gemini-4-argon", Effort: "high"}
 	if eff, src := resolveTurnEffort(context.Background(), a, "cron", true, "", "", testLogger()); eff != "low" || src != "rule" {
 		t.Fatalf("system turn: got (%q,%q)", eff, src)
 	}

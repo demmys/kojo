@@ -87,7 +87,7 @@ func TestDeviceSwitchHasSkillLoader(t *testing.T) {
 	for _, tool := range []string{"claude", "custom-claude", "grok", "codex", "custom-codex", "gemini", "custom-bare", ""} {
 		hasSkillLoader := backendLoadsClaudeSkills(tool) ||
 			NormalizeToolName(tool) == ToolCodex || NormalizeToolName(tool) == ToolCustomCodex ||
-			NormalizeToolName(tool) == ToolGemini
+			NormalizeToolName(tool) == ToolGeminiAPI
 		if backendSupportsDeviceSwitch(tool) && !hasSkillLoader {
 			t.Errorf("backendSupportsDeviceSwitch(%q) is true but no skill loader is wired", tool)
 		}

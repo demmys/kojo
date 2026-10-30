@@ -6,6 +6,7 @@ import { api, type ServerInfo } from "../../lib/api";
 import { modelsForTool, supportsEffort, type EffortLevel } from "../../lib/toolModels";
 import { errMsg } from "../../lib/utils";
 import { useCustomModels } from "./fields/useCustomModels";
+import { CustomOpenCodeProviderField } from "./fields/CustomOpenCodeProviderField";
 import { PersonaField } from "./fields/PersonaField";
 import { ToolPicker } from "./fields/ToolPicker";
 import { ModelPicker } from "./fields/ModelPicker";
@@ -21,6 +22,7 @@ import { Textarea } from "../ui/Textarea";
 import { Button } from "../ui/Button";
 import { Banner } from "../ui/Banner";
 import { useT } from "../../lib/i18n";
+import { isLocalOpenCodeBaseURL, usesCustomBaseURL } from "./agentSettingsPayload";
 import {
   TONE_AUTO,
   TONE_MODEL_DEFAULT,
@@ -100,7 +102,8 @@ export function AgentCreate() {
   }, []);
 
   const isCustomClaude = tool === "custom-claude" || tool === "custom";
-  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp";
+  const isKeyOptionalCustom = tool === "custom-bare" || tool === "custom-codex" || tool === "llama.cpp" ||
+    (tool === "custom-opencode" && isLocalOpenCodeBaseURL(customBaseURL));
   useEffect(() => {
     if (!isCustomClaude) setCustomNoAuth(false);
   }, [isCustomClaude]);
@@ -124,6 +127,8 @@ export function AgentCreate() {
       enabled: customModelDiscoveryReady,
     },
   );
+
+  const usesCustomURL = usesCustomBaseURL(tool);
 
   const templates = [...builtinTemplates(), ...customTemplates];
 
@@ -361,8 +366,8 @@ export function AgentCreate() {
         model,
         effort: supportsEffort(tool) && effort ? effort : undefined,
         tool,
-        customBaseURL: needsCustomURL ? customBaseURL : undefined,
-        customApiKey: needsCustomURL && customAPIKey.trim() ? customAPIKey.trim() : undefined,
+        customBaseURL: usesCustomURL ? customBaseURL : undefined,
+        customApiKey: usesCustomURL && customAPIKey.trim() ? customAPIKey.trim() : undefined,
         thinkingMode: tool === "custom-bare" && thinkingMode ? thinkingMode : undefined,
         workDir: workDir.trim() || undefined,
         cronExpr: cronExprDirty ? cronExpr : undefined,
@@ -680,17 +685,21 @@ export function AgentCreate() {
               }
             />
 
-            {needsCustomURL && (
+            {usesCustomURL && (
               <div className="space-y-4">
-                <Field label={t("create.apiBaseUrl")} help={t("settings.customBaseUrlHelp")}>
-                  <Input
-                    mono
-                    value={customBaseURL}
-                    onChange={(e) => setCustomBaseURL(e.target.value)}
-                    placeholder="http://localhost:8080"
-                  />
-                </Field>
-                <Field label={t("settings.customApiKey")} help={t("settings.customApiKeyHelp")}>
+                {tool === "custom-opencode" ? (
+                  <CustomOpenCodeProviderField baseURL={customBaseURL} setBaseURL={setCustomBaseURL} />
+                ) : (
+                  <Field label={t("create.apiBaseUrl")} help={t("settings.customBaseUrlHelp")}>
+                    <Input
+                      mono
+                      value={customBaseURL}
+                      onChange={(e) => setCustomBaseURL(e.target.value)}
+                      placeholder="http://localhost:8080"
+                    />
+                  </Field>
+                )}
+                <Field label={t("settings.customApiKey")} help={t(tool === "custom-opencode" ? "settings.customOpenCodeApiKeyHelp" : "settings.customApiKeyHelp")}>
                   <Input
                     mono
                     type="password"
@@ -701,7 +710,7 @@ export function AgentCreate() {
                       if (e.target.value) setCustomNoAuth(false);
                     }}
                     disabled={customNoAuthEnabled}
-                    placeholder="sk-unsloth-…"
+                    placeholder={tool === "custom-opencode" ? "sk-…" : "sk-unsloth-…"}
                   />
                 </Field>
                 {isCustomClaude && (
@@ -720,6 +729,7 @@ export function AgentCreate() {
 
             <ModelPicker
               model={model}
+              tool={tool}
               setModel={setModel}
               effort={effort}
               setEffort={setEffort}

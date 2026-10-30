@@ -657,9 +657,17 @@ const messages = {
     en: "Pick per-turn effort automatically based on task difficulty; the Effort setting becomes the ceiling/fallback.",
   },
   "settings.maxOutputTokens": { ja: "最大出力トークン", en: "Max output tokens" },
+  "field.toolGeminiCliHelp": {
+    ja: "gemini-agy は Antigravity CLI (agy、gemini-cli の後継) を動かす。agy のインストールと、このホストのターミナルで一度 `agy` を起動して Google アカウントでサインインしておくことが必要。",
+    en: "gemini-agy runs the Antigravity CLI (agy, the successor of gemini-cli). Requires agy to be installed and signed in with a Google account (run `agy` once in a terminal on this host).",
+  },
+  "field.toolCustomOpenCodeHelp": {
+    ja: "OpenCode を許可リストの OpenAI互換プロバイダで実行。モデルIDとAPIキーはエージェントごとに設定",
+    en: "Run OpenCode against an allowed OpenAI-compatible provider. Model id and API key are set per agent",
+  },
   "field.toolGeminiHelp": {
-    ja: "gemini は Gemini モデルを OpenCode (opencode CLI) 経由で動かす。opencode のインストールと Global Settings の Gemini API キーが必要。",
-    en: "gemini runs Gemini models through OpenCode (the opencode CLI). Requires opencode to be installed and a Gemini API key in Global Settings.",
+    ja: "gemini-api は Gemini モデルを OpenCode (opencode CLI) 経由で動かす。opencode のインストールと Global Settings の Gemini API キーが必要。",
+    en: "gemini-api runs Gemini models through OpenCode (the opencode CLI). Requires opencode to be installed and a Gemini API key in Global Settings.",
   },
   "settings.maxOutputTokensDesc": {
     ja: "1 ターンの応答で生成できるトークン数の上限 (思考トークンを含む)。空欄で既定値 65536。",
@@ -671,6 +679,24 @@ const messages = {
     en: "Load the connectors linked to your ChatGPT account (GitHub, Slack, Gmail, Drive, ...) as Codex tools. With a custom endpoint every tool definition is inlined into each request and eats the context window, so the default is on for codex and off for custom-codex.",
   },
   "settings.customBaseUrl": { ja: "カスタム Base URL", en: "Custom Base URL" },
+  "settings.customOpenCodeApiKeyHelp": {
+    ja: "選択したプロバイダのAPIキー。エージェントごとに暗号化保存され、OpenCode にのみ渡される",
+    en: "API key for the selected provider. Stored encrypted per agent and passed only to OpenCode",
+  },
+  "settings.customOpenCodeProvider": { ja: "プロバイダ", en: "Provider" },
+  "settings.customOpenCodeProviderHelp": {
+    ja: "OpenAI互換プロバイダを許可リストから選択（任意URLは指定不可）",
+    en: "Pick an OpenAI-compatible provider from the allowed list (arbitrary URLs are not accepted)",
+  },
+  "settings.customOpenCodePort": { ja: "ポート", en: "Port" },
+  "settings.customOpenCodePortHelp": {
+    ja: "ローカルサーバーのポート (1-65535)。ホストは 127.0.0.1 固定",
+    en: "Port of the local server (1-65535). The host is fixed to 127.0.0.1",
+  },
+  "settings.customOpenCodeKeyOptional": {
+    ja: "ローカルサーバーのため APIキーは省略可",
+    en: "Local server: the API key is optional",
+  },
   "settings.customBaseUrlHelp": {
     ja: "Anthropic/OpenAI互換API。localhostまたはTailscaleホストを指定",
     en: "Anthropic/OpenAI-compatible API on localhost or a Tailscale host",
@@ -1872,6 +1898,10 @@ const messages = {
   "ns.yoloGemini": {
     ja: "--auto 付きで起動する",
     en: "Launches with --auto",
+  },
+  "ns.geminiAgyHelp": {
+    ja: "Antigravity CLI (agy) の TUI を起動する。Google アカウントでのサインインはこの TUI でもできる。",
+    en: "Launches the Antigravity CLI (agy) TUI. You can also sign in with your Google account from this TUI.",
   },
   "ns.geminiHelp": {
     ja: "Gemini モデルを OpenCode (opencode CLI) の TUI で動かす。Global Settings の Gemini API キーを使い、~/.config/opencode などの個人設定・ログインは読まない。",

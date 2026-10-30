@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/loppo-llc/kojo/internal/agent"
 	"io"
 	"net/http"
 	"os"
@@ -48,6 +49,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	if s.agents != nil {
 		resp["agentBackends"] = s.agents.BackendAvailability()
 	}
+	resp["customOpenCodePresets"] = agent.CustomOpenCodePresets()
 	writeJSONResponse(w, http.StatusOK, resp)
 }
 

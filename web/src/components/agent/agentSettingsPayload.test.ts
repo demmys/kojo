@@ -4,6 +4,7 @@ import {
   defaultCodexApps,
   isCodexCLITool,
   needsCustomURLFor,
+  discoversCustomModels,
   type AgentSettingsFormState,
 } from "./agentSettingsPayload";
 
@@ -90,8 +91,8 @@ describe("buildAgentSavePayload", () => {
   });
 
   it("forwards maxOutputTokens only for gemini", () => {
-    expect(buildAgentSavePayload(baseState({ tool: "gemini", maxOutputTokens: 8192 })).maxOutputTokens).toBe(8192);
-    expect(buildAgentSavePayload(baseState({ tool: "gemini" })).maxOutputTokens).toBe(0);
+    expect(buildAgentSavePayload(baseState({ tool: "gemini-api", maxOutputTokens: 8192 })).maxOutputTokens).toBe(8192);
+    expect(buildAgentSavePayload(baseState({ tool: "gemini-api" })).maxOutputTokens).toBe(0);
     expect(buildAgentSavePayload(baseState({ tool: "claude", maxOutputTokens: 8192 })).maxOutputTokens).toBeUndefined();
   });
 
@@ -208,5 +209,17 @@ describe("buildAgentSavePayload", () => {
       buildAgentSavePayload(baseState({ disabledInjections: ["memory_search", "diary_notes"] }))
         .disabledInjections,
     ).toEqual(["memory_search", "diary_notes"]);
+  });
+});
+
+describe("discoversCustomModels", () => {
+  it("covers free-URL custom backends and local custom-opencode presets only", () => {
+    expect(discoversCustomModels("custom-codex", "http://localhost:8080")).toBe(true);
+    expect(discoversCustomModels("custom-opencode", "http://127.0.0.1:8099/v1")).toBe(true);
+    expect(discoversCustomModels("custom-opencode", "https://openrouter.ai/api/v1")).toBe(false);
+    expect(discoversCustomModels("custom-opencode", "")).toBe(false);
+    expect(discoversCustomModels("custom-opencode", "http://127.0.0.1:8080")).toBe(false);
+    expect(discoversCustomModels("custom-opencode", "http://127.0.0.1:8080/v1?x")).toBe(false);
+    expect(discoversCustomModels("claude", "http://127.0.0.1:8080/v1")).toBe(false);
   });
 });

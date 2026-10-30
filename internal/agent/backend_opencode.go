@@ -134,16 +134,36 @@ var geminiStripEnvPrefixes = []string{
 // Sessions: the stream carries the OpenCode session id on every event;
 // kojo stores it per ChatOptions.SessionKey and replays it with
 // `-s <id>` on the next turn.
+//
+// The same backend also serves ToolCustomOpenCode (tool field): the turn
+// config then defines a "kojo-<preset>" provider on
+// @ai-sdk/openai-compatible (bundled in the opencode binary, so nothing is
+// installed) pointed at the agent's whitelisted preset, with the agent's
+// custom API key in KOJO_OC_CUSTOM_API_KEY.
 type GeminiBackend struct {
 	logger *slog.Logger
 	creds  *CredentialStore
+	tool   string // ToolGeminiAPI or ToolCustomOpenCode
 }
 
 func NewGeminiBackend(logger *slog.Logger, creds *CredentialStore) *GeminiBackend {
-	return &GeminiBackend{logger: logger, creds: creds}
+	return &GeminiBackend{logger: logger, creds: creds, tool: ToolGeminiAPI}
 }
 
-func (b *GeminiBackend) Name() string { return ToolGemini }
+// NewCustomOpenCodeBackend returns the OpenCode backend for the
+// custom-opencode tool.
+func NewCustomOpenCodeBackend(logger *slog.Logger, creds *CredentialStore) *GeminiBackend {
+	return &GeminiBackend{logger: logger, creds: creds, tool: ToolCustomOpenCode}
+}
+
+func (b *GeminiBackend) Name() string {
+	if b.tool == "" {
+		return ToolGeminiAPI
+	}
+	return b.tool
+}
+
+func (b *GeminiBackend) isCustom() bool { return b.tool == ToolCustomOpenCode }
 
 func (b *GeminiBackend) Available() bool {
 	_, err := exec.LookPath("opencode")
@@ -459,7 +479,7 @@ func openCodePermissions() map[string]any {
 const openCodeEnvPlugin = `// Managed by kojo; rewritten on every turn.
 const UNSET = "` + openCodeUnset + `"
 const XDG = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]
-const DROP = ["OPENCODE_TEST_HOME", "OPENCODE_TEST_MANAGED_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "OPENCODE_DISABLE_CHANNEL_DB", "GOOGLE_GENERATIVE_AI_API_KEY"]
+const DROP = ["OPENCODE_TEST_HOME", "OPENCODE_TEST_MANAGED_CONFIG_DIR", "OPENCODE_CONFIG", "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX", "OPENCODE_DISABLE_CHANNEL_DB", "GOOGLE_GENERATIVE_AI_API_KEY", "` + customOpenCodeAPIKeyEnv + `"]
 const STREAM = process.env["` + openCodeStreamEnv + `"] === "1"
 const kinds = new Map()
 const children = new Set()
@@ -699,7 +719,10 @@ func marshalOpenCodeConfig(cfg map[string]any) ([]byte, error) {
 
 // openCodeTurnConfig is the per-turn config passed via OPENCODE_CONFIG.
 type openCodeTurnConfig struct {
-	model           string // concrete model id
+	model string // concrete model id
+	// custom, when set, replaces the google provider with the
+	// custom-opencode preset (see customOpenCodeTurn).
+	custom          *customOpenCodeTurn
 	variant         string // "" = none
 	systemPrompt    string
 	maxOutputTokens int // stored agent setting (0 = default)
@@ -729,6 +752,9 @@ type openCodeTurnConfig struct {
 //     formatters with its own environment, which holds the API key;
 //   - shell, when set, is the group-logging wrapper of the real shell.
 func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
+	if t.custom != nil {
+		return buildCustomOpenCodeTurnConfig(t)
+	}
 	ref := "google/" + t.model
 	maxOut := EffectiveGeminiMaxOutputTokens(t.maxOutputTokens)
 	build := map[string]any{"model": ref}
@@ -767,6 +793,13 @@ func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
 			},
 		},
 	}
+	addOpenCodeTurnCommon(cfg, t)
+	return cfg
+}
+
+// addOpenCodeTurnCommon adds the provider-independent parts of a turn
+// config: shell wrapper, skills path and MCP servers.
+func addOpenCodeTurnCommon(cfg map[string]any, t openCodeTurnConfig) {
 	if t.shell != "" {
 		cfg["shell"] = t.shell
 	}
@@ -798,7 +831,6 @@ func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
 		}
 		cfg["mcp"] = mcp
 	}
-	return cfg
 }
 
 // openCodeMCPEnv builds a local MCP server's environment. OpenCode spawns
@@ -812,6 +844,7 @@ func buildOpenCodeTurnConfig(t openCodeTurnConfig) map[string]any {
 func openCodeMCPEnv(env map[string]string) map[string]string {
 	out := map[string]string{
 		"GOOGLE_GENERATIVE_AI_API_KEY": "",
+		customOpenCodeAPIKeyEnv:        "",
 		"OPENCODE_CONFIG":              "",
 		openCodeStreamEnv:              "",
 	}
@@ -871,6 +904,12 @@ func openCodeIsolationBaseEnv(home string, maxOutputTokens int) []string {
 // geminiCommandEnv builds a chat turn's env: inherited env minus every
 // OpenCode/Google knob, plus isolation, the turn config and the key.
 func geminiCommandEnv(agentID, dir, apiKey, turnConfig string, maxOutputTokens int) []string {
+	return openCodeCommandEnv(agentID, dir, "GOOGLE_GENERATIVE_AI_API_KEY", apiKey, turnConfig, maxOutputTokens)
+}
+
+// openCodeCommandEnv is geminiCommandEnv with the key's variable name as a
+// parameter (custom-opencode passes customOpenCodeAPIKeyEnv).
+func openCodeCommandEnv(agentID, dir, keyEnv, apiKey, turnConfig string, maxOutputTokens int) []string {
 	env := filterEnv(geminiStripEnvPrefixes, agentID, dir)
 	env = append(env, "PWD="+dir)
 	env = append(env, openCodeIsolationEnv(openCodeHome(dir), maxOutputTokens)...)
@@ -878,7 +917,7 @@ func geminiCommandEnv(agentID, dir, apiKey, turnConfig string, maxOutputTokens i
 		env = append(env, "OPENCODE_CONFIG="+turnConfig)
 	}
 	if apiKey != "" {
-		env = append(env, "GOOGLE_GENERATIVE_AI_API_KEY="+apiKey)
+		env = append(env, keyEnv+"="+apiKey)
 	}
 	// Turns on the plugin's live delta lines (chat only: in the PTY they
 	// would be written over the TUI).
@@ -894,8 +933,13 @@ func geminiCommandEnv(agentID, dir, apiKey, turnConfig string, maxOutputTokens i
 //   - --variant is not inherited from earlier turns, so it is sent on
 //     every turn.
 func buildGeminiArgs(model, variant, resumeID string) []string {
+	return buildOpenCodeRunArgs("google/"+model, variant, resumeID)
+}
+
+// buildOpenCodeRunArgs is buildGeminiArgs for a full "provider/model" ref.
+func buildOpenCodeRunArgs(ref, variant, resumeID string) []string {
 	args := []string{"run", "--format", "json", "--thinking", "--auto",
-		"--title", openCodeChatTitle, "-m", "google/" + model}
+		"--title", openCodeChatTitle, "-m", ref}
 	if variant != "" {
 		args = append(args, "--variant", variant)
 	}
@@ -915,11 +959,20 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 	if err != nil {
 		return nil, fmt.Errorf("opencode not found in PATH")
 	}
-	apiKey, err := loadGeminiAPIKey(b.creds)
-	if err != nil || strings.TrimSpace(apiKey) == "" {
-		return nil, errors.New("gemini: no Gemini API key configured (set it in Settings > API keys, or GEMINI_API_KEY)")
+	var custom *customOpenCodeTurn
+	var apiKey string
+	if b.isCustom() {
+		custom, apiKey, err = b.prepareCustomOpenCode(agent)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		apiKey, err = loadGeminiAPIKey(b.creds)
+		if err != nil || strings.TrimSpace(apiKey) == "" {
+			return nil, errors.New("gemini: no Gemini API key configured (set it in Settings > API keys, or GEMINI_API_KEY)")
+		}
+		apiKey = strings.TrimSpace(apiKey)
 	}
-	apiKey = strings.TrimSpace(apiKey)
 
 	dir := agentDir(agent.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -988,8 +1041,17 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		return msg
 	}
 
-	model := geminiModel(agent)
-	variant := geminiVariant(model, agent.Effort)
+	model, variant, ref := "", "", ""
+	keyEnv, maxOut := "GOOGLE_GENERATIVE_AI_API_KEY", agent.MaxOutputTokens
+	if custom != nil {
+		model, ref = custom.model, custom.ref()
+		keyEnv = customOpenCodeAPIKeyEnv
+		maxOut = effectiveOpenCodeMaxOutputTokens(ToolCustomOpenCode, agent.MaxOutputTokens)
+	} else {
+		model = geminiModel(agent)
+		variant = geminiVariant(model, agent.Effort)
+		ref = "google/" + model
+	}
 	// The turn's shell commands log their process groups so an aborted
 	// turn can reap the background jobs they leave (see opencode_shell.go).
 	shellDir, shell := "", ""
@@ -1011,15 +1073,16 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			_ = os.RemoveAll(shellDir)
 		}
 	}
-	cfgBody, err := marshalOpenCodeConfig(buildOpenCodeTurnConfig(openCodeTurnConfig{
+	cfgBody, err := renderOpenCodeTurnConfig(openCodeTurnConfig{
 		model:           model,
+		custom:          custom,
 		variant:         variant,
 		systemPrompt:    systemPrompt,
-		maxOutputTokens: agent.MaxOutputTokens,
+		maxOutputTokens: maxOut,
 		mcpServers:      opts.MCPServers,
 		skillsDir:       geminiSkillsDir(dir),
 		shell:           shell,
-	}))
+	})
 	if err != nil {
 		removeShellDir()
 		return nil, fmt.Errorf("build opencode config: %w", err)
@@ -1039,9 +1102,9 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 		removeShellDir()
 	}
 
-	env := appendKojoTurnEnv(geminiCommandEnv(agent.ID, dir, apiKey, turnConfig, agent.MaxOutputTokens), opts)
+	env := appendKojoTurnEnv(openCodeCommandEnv(agent.ID, dir, keyEnv, apiKey, turnConfig, maxOut), opts)
 	start := func(resume string) (*openCodeProc, error) {
-		return startOpenCode(ctx, ocPath, buildGeminiArgs(model, variant, resume), env, dir, buildMessage(resume != ""))
+		return startOpenCode(ctx, ocPath, buildOpenCodeRunArgs(ref, variant, resume), env, dir, buildMessage(resume != ""))
 	}
 	proc, err := start(resumeID)
 	if err != nil {
@@ -1109,7 +1172,7 @@ func (b *GeminiBackend) Chat(ctx context.Context, agent *Agent, userMessage stri
 			return
 		}
 
-		if result.usage != nil {
+		if result.usage != nil && custom == nil {
 			result.usage.CostUSD = geminiUsageCostUSD(model, result.usage, geminiNow())
 		}
 		processError := classifyGeminiProcessError(waitErr, proc.stderr.String(), result)

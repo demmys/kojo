@@ -209,7 +209,9 @@ func backendSupportsSessionKey(b ChatBackend) bool {
 		return false
 	}
 	switch b.Name() {
-	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGemini:
+	case ToolClaude, ToolCustomClaude, ToolCodex, ToolCustomCodex, ToolGrok, ToolGeminiAPI, ToolCustomOpenCode, ToolGeminiAgy:
+		// gemini-agy stores its conversation id per key under
+		// agentDir/.agy/threads.
 		// gemini keeps the same per-key ref layout as grok under
 		// agentDir/.opencode-home/kojo/threads.
 		// custom-claude delegates to ClaudeBackend.Chat and custom-codex to
@@ -292,7 +294,7 @@ func backendLoadsClaudeSkills(tool string) bool {
 // offers a switch it cannot fulfil.
 func backendSupportsDeviceSwitch(tool string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolClaude, ToolCustomClaude, ToolGrok, ToolCodex, ToolCustomCodex, ToolGemini:
+	case ToolClaude, ToolCustomClaude, ToolGrok, ToolCodex, ToolCustomCodex, ToolGeminiAPI, ToolCustomOpenCode:
 		return true
 	default:
 		return false

@@ -678,3 +678,21 @@ func stopHandoffDrainForTest(t *testing.T, srv *Server) {
 		}
 	}
 }
+
+func TestQueuedSendLabelsExtensionMessages(t *testing.T) {
+	srv := newQueueTestServer(t)
+	seedQueuePeer(t, srv, "peer-away", "http://unreachable.example:1", store.PeerStatusOffline)
+
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/agents/ag_qx/messages",
+		strings.NewReader(`{"content":"order paid"}`))
+	r = authedRequest(r, auth.Principal{Role: auth.RoleExtension, ExtensionID: "square"})
+	w := httptest.NewRecorder()
+	srv.proxyOrQueueAgentMessage(w, r, "ag_qx", "peer-away")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	msgs, _ := srv.agents.Store().ListHandoffQueuedMessages(context.Background(), "ag_qx")
+	if len(msgs) != 1 || msgs[0].Content != extensionNotice("square", "order paid") {
+		t.Fatalf("queue rows = %+v", msgs)
+	}
+}

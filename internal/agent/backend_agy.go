@@ -193,8 +193,10 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	// a cancelled `sleep 60` would outlive the turn. Kill the whole
 	// descendant tree instead, identified at start so a reused pid is
 	// never signalled.
-	// The ctx watcher can fire before Identify runs below; a zero ident
-	// then falls back to a plain KillTree of the just-started pid.
+	// The ctx watcher can fire before Identify runs below, so Cancel
+	// waits for the identity first. Without a known identity the tree
+	// snapshot could run after Wait reaped agy and hit a reused pid, so
+	// it falls back to os.Process.Kill, which cannot signal a stranger.
 	// The kill runs off the Cancel callback (exec holds Wait on it) and
 	// closes agyKilled when done; the cancel path waits for that, as
 	// OpenCode's awaitKill does, so no descendant outlives the turn.
@@ -204,17 +206,23 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 		agyIdent   proctree.Ident
 		agyKilled  chan struct{}
 	)
+	identReady := make(chan struct{})
 	cmd.Cancel = func() error {
+		<-identReady
 		killOnce.Do(func() {
 			agyIdentMu.Lock()
 			id := agyIdent
 			killed := make(chan struct{})
 			agyKilled = killed
 			agyIdentMu.Unlock()
-			pid := cmd.Process.Pid
+			proc := cmd.Process
 			go func() {
 				defer close(killed)
-				proctree.KillTreeIdent(pid, id, 5*time.Second)
+				if id == (proctree.Ident{}) {
+					_ = proc.Kill()
+					return
+				}
+				proctree.KillTreeIdent(proc.Pid, id, 5*time.Second)
 			}()
 		})
 		return nil
@@ -245,6 +253,7 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 	agyIdentMu.Lock()
 	agyIdent = ident
 	agyIdentMu.Unlock()
+	close(identReady)
 
 	ch := make(chan ChatEvent, 64)
 	go func() {

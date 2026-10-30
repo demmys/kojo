@@ -295,6 +295,12 @@ func (b *AgyBackend) Chat(ctx context.Context, agent *Agent, userMessage string,
 			waitErr = nil
 		}
 		processError := classifyAgyError(result, waitErr, stderrBuf.String())
+		// A turn that still produced text does not surface denials as an
+		// error, but keep them in the log so a partial answer is traceable.
+		if len(result.deniedActions) > 0 {
+			b.logger.Warn("agy: tool permission denied",
+				"agent", agent.ID, "actions", result.deniedActions, "status", result.status)
+		}
 		if processError != "" {
 			b.logger.Warn("agy turn failed", "agent", agent.ID, "err", processError,
 				"waitErr", waitErr, "stderr", stderrBuf.String())
@@ -334,6 +340,9 @@ func classifyAgyError(res *agyStreamResult, waitErr error, stderr string) string
 		msg := res.errorMessage
 		if msg == "" {
 			msg = "agy run ended with status " + res.status
+		}
+		if len(res.deniedActions) > 0 {
+			msg += " (denied tool permission: " + strings.Join(res.deniedActions, ", ") + ")"
 		}
 		return agyHintAuth(msg, stderr)
 	}

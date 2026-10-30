@@ -303,3 +303,11 @@ func TestParseAgyStreamParity(t *testing.T) {
 		t.Fatalf("denial lost: %q", got)
 	}
 }
+
+func TestClassifyAgyErrorKeepsDeniedActionsOnFailedStatus(t *testing.T) {
+	res := &agyStreamResult{gotResult: true, status: "ERROR", errorMessage: "boom", deniedActions: []string{"run_command"}}
+	got := classifyAgyError(res, nil, "")
+	if !strings.Contains(got, "boom") || !strings.Contains(got, "run_command") {
+		t.Fatalf("denied actions lost: %q", got)
+	}
+}

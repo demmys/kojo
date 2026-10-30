@@ -36,7 +36,7 @@ cancelとresult後の終了待ち上限で、開始時のPID identityに結び�
 ## 表示と診断
 
 別response stepの間に段落を入れ、最終本文のIDE専用`file://`リンクをラベルへ整形する。
-toolの`ERROR`も完了表示し、stdoutのfatal行・eventなしのエラー・`denied_actions`を診断に残す。
+toolの`ERROR`も完了表示し、stdoutのfatal行・eventなしのエラー・`denied_actions`を診断に残す（本文がある場合はログのみ、失敗statusではエラー文に併記）。
 
 ## 対象外
 

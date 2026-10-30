@@ -49,6 +49,21 @@ export interface AgentSettingsFormState {
   maxOutputTokens: number;
 }
 
+/** Server default for custom-opencode maxOutputTokens (Go CustomOpenCodeDefaultMaxOutputTokens). */
+export const CUSTOM_OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+
+/** True for the tools whose output cap the maxOutputTokens setting drives. */
+export function supportsMaxOutputTokens(tool: string): boolean {
+  return tool === "gemini-api" || tool === "custom-opencode";
+}
+
+/** Server default maxOutputTokens for the tool. */
+export function defaultMaxOutputTokensFor(tool: string): number {
+  return tool === "custom-opencode"
+    ? CUSTOM_OPENCODE_DEFAULT_MAX_OUTPUT_TOKENS
+    : GEMINI_DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
 /** Server default for gemini maxOutputTokens (Go GeminiDefaultMaxOutputTokens). */
 export const GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65536;
 /** Server upper bound (Go GeminiMaxOutputTokensLimit). */
@@ -84,6 +99,42 @@ export function needsCustomURLFor(tool: string): boolean {
 }
 
 /**
+ * True when the tool stores a CustomBaseURL (and an endpoint-bound custom
+ * API key): every needsCustomURLFor tool plus custom-opencode, whose base
+ * URL is one of the server's whitelisted provider presets rather than
+ * free text (model discovery only for its local presets; see
+ * discoversCustomModels).
+ */
+export function usesCustomBaseURL(tool: string): boolean {
+  return needsCustomURLFor(tool) || tool === "custom-opencode";
+}
+
+/**
+ * True when baseURL is a custom-opencode local preset (Ollama / LM Studio /
+ * llama-server on http://127.0.0.1:<port>/v1). Those run unauthenticated
+ * and the server lists their models from <baseURL>/models.
+ */
+export function isLocalOpenCodeBaseURL(baseURL: string): boolean {
+  try {
+    const u = new URL(baseURL.trim());
+    // URL drops an explicit :80, so an empty port is fine; the server
+    // re-validates the exact preset shape anyway.
+    return u.protocol === "http:" && u.hostname === "127.0.0.1" && u.pathname === "/v1" &&
+      !u.search && !u.hash && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the model field is populated from the endpoint's model list:
+ * every free-URL custom backend, plus custom-opencode on a local preset.
+ */
+export function discoversCustomModels(tool: string, baseURL: string): boolean {
+  return needsCustomURLFor(tool) || (tool === "custom-opencode" && isLocalOpenCodeBaseURL(baseURL));
+}
+
+/**
  * Build the PATCH /agents/{id} body from form state. Pure — no I/O,
  * no React state, no clocks. Mirrors the conditional shape the
  * server expects:
@@ -102,7 +153,7 @@ export function needsCustomURLFor(tool: string): boolean {
  *   - allowProtectedPaths: only emitted for claude / custom-claude — those
  *     are the only backends whose Bash/Edit gating respects the
  *     server-side allowlist.
- *   - maxOutputTokens: only emitted for gemini (0 = default).
+ *   - maxOutputTokens: only emitted for gemini / custom-opencode (0 = default).
  *   - tts: nested object; empty strings collapse to undefined so the
  *     server treats them as "use default".
  */
@@ -125,7 +176,7 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     model: trimmed.model,
     effort: supportsEffort(state.tool) ? state.effort : undefined,
     tool: trimmed.tool,
-    customBaseURL: needsCustomURLFor(state.tool) ? state.customBaseURL.trim() : undefined,
+    customBaseURL: usesCustomBaseURL(state.tool) ? state.customBaseURL.trim() : undefined,
     thinkingMode: state.tool === "custom-bare" ? state.thinkingMode : undefined,
     responseLanguage: state.responseLanguage.trim(),
     workDir: trimmed.workDir,
@@ -152,6 +203,6 @@ export function buildAgentSavePayload(state: AgentSettingsFormState): AgentUpdat
     disabledInjections: state.disabledInjections,
     autoEffort: state.autoEffort,
     codexApps: isCodexCLITool(state.tool) ? state.codexApps : undefined,
-    maxOutputTokens: state.tool === "gemini" ? state.maxOutputTokens : undefined,
+    maxOutputTokens: supportsMaxOutputTokens(state.tool) ? state.maxOutputTokens : undefined,
   };
 }

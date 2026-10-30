@@ -16,6 +16,7 @@ export function ModelPicker({
   effort,
   setEffort,
   models,
+  tool,
   disabled = false,
 }: {
   model: string;
@@ -23,12 +24,13 @@ export function ModelPicker({
   effort: EffortLevel | "";
   setEffort: (e: EffortLevel | "") => void;
   models: string[];
+  tool?: string;
   disabled?: boolean;
 }) {
   const t = useT();
   const onChange = (m: string) => {
     setModel(m);
-    if (effort && !effortLevelsForModel(m).includes(effort)) setEffort("");
+    if (effort && !effortLevelsForModel(m, tool).includes(effort)) setEffort("");
   };
   return (
     <Field label={t("settings.model")}>

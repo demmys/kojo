@@ -1,7 +1,47 @@
-import { Children, isValidElement, cloneElement, createContext, useContext, useMemo, useState, useCallback } from "react";
-import ReactMarkdown from "react-markdown";
+import { Children, isValidElement, cloneElement, createContext, useContext, useEffect, useMemo, useState, useCallback } from "react";
+import ReactMarkdown, { type Options as ReactMarkdownOptions } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
+import remarkMath from "remark-math";
+import { remarkStrictInlineMath } from "./mathDelimiters";
+
+type PluginList = NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
+
+// remark-math parses `$$...$$`; single-dollar math goes through the strict
+// detector so prose like "$5 and $10" stays text.
+const REMARK_PLUGINS: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = [
+  remarkGfm,
+  [remarkMath, { singleDollarTextMath: false }],
+  // Must run before remarkBreaks, which splits text into position-less nodes.
+  remarkStrictInlineMath,
+  remarkBreaks,
+];
+
+// KaTeX (JS + CSS + fonts) is loaded lazily, only once a rendered message
+// actually contains a math node. Until then math shows as plain code.
+let katexPlugins: PluginList | null = null;
+let katexLoad: Promise<PluginList> | null = null;
+function loadKatexPlugins(): Promise<PluginList> {
+  katexLoad ??= Promise.all([import("rehype-katex"), import("katex/dist/katex.min.css")]).then(
+    ([rehypeKatex]) => (katexPlugins = [rehypeKatex.default]),
+    (err) => {
+      katexLoad = null; // allow a retry on the next render
+      throw err;
+    },
+  );
+  return katexLoad;
+}
+
+interface HastNode {
+  properties?: { className?: unknown };
+  children?: HastNode[];
+}
+
+function hasMathNode(node: HastNode): boolean {
+  const cls = node.properties?.className;
+  if (Array.isArray(cls) && (cls.includes("math-inline") || cls.includes("math-display"))) return true;
+  return node.children?.some(hasMathNode) ?? false;
+}
 
 const InsideLinkCtx = createContext(false);
 const InsidePreCtx = createContext(false);
@@ -31,7 +71,8 @@ function mapTextChildren(
       // Only recurse into intrinsic HTML elements (string type), not custom components
       if (typeof child.type !== "string") return child;
       if (SKIP_TAGS.has(child.type)) return child;
-      const props = child.props as { children?: React.ReactNode };
+      const props = child.props as { children?: React.ReactNode; className?: string };
+      if (props.className?.includes("katex")) return child;
       if (props.children != null) {
         return cloneElement(child, {}, mapTextChildren(props.children, processText));
       }
@@ -145,9 +186,32 @@ export function MarkdownRenderer({ content, processText }: MarkdownRendererProps
     [processText],
   );
 
+  const [katex, setKatex] = useState<PluginList | null>(katexPlugins);
+  const [needsKatex, setNeedsKatex] = useState(false);
+  useEffect(() => {
+    if (!needsKatex || katex) return;
+    let alive = true;
+    loadKatexPlugins().then(
+      (p) => alive && setKatex(p),
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [needsKatex, katex]);
+  const rehypePlugins = useMemo<PluginList>(
+    () =>
+      katex ?? [
+        () => (tree: HastNode) => {
+          if (hasMathNode(tree)) queueMicrotask(() => setNeedsKatex(true));
+        },
+      ],
+    [katex],
+  );
+
   return (
     <div className="md-content">
-      <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={components}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components}>
         {content}
       </ReactMarkdown>
     </div>

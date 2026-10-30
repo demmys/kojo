@@ -118,7 +118,7 @@ func newRestoredSession(info SessionInfo) *Session {
 	}
 	s := &Session{
 		ID:              info.ID,
-		Tool:            info.Tool,
+		Tool:            NormalizeToolName(info.Tool),
 		WorkDir:         info.WorkDir,
 		Args:            info.Args,
 		CreatedAt:       t,

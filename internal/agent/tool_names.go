@@ -13,14 +13,33 @@ package agent
 //     directly, with no CLI in between. No tools, no session, no skills —
 //     every turn is a stateless [system, user] request.
 const (
-	ToolClaude       = "claude"
-	ToolCodex        = "codex"
-	ToolGrok         = "grok"
-	ToolGemini       = "gemini"
+	ToolClaude = "claude"
+	ToolCodex  = "codex"
+	ToolGrok   = "grok"
+	// ToolGeminiAPI runs Gemini models through OpenCode with a Gemini API
+	// key. It was called "gemini" until ToolGeminiAgy was added.
+	ToolGeminiAPI = "gemini-api"
+	// ToolGeminiAgy drives the Antigravity CLI (`agy`, the successor of
+	// Google's gemini-cli), signed in with the operator's Google account.
+	ToolGeminiAgy    = "gemini-agy"
 	ToolCustomClaude = "custom-claude"
 	ToolCustomCodex  = "custom-codex"
 	ToolCustomBare   = "custom-bare"
+	// ToolCustomOpenCode drives OpenCode (like ToolGeminiAPI) against one of
+	// the whitelisted OpenAI-compatible providers in opencode_presets.go;
+	// Agent.CustomBaseURL holds the chosen preset's base URL.
+	ToolCustomOpenCode = "custom-opencode"
 )
+
+// isOpenCodeTool reports whether the backend runs OpenCode and therefore
+// owns the agent's .opencode-home (sessions, refs, skills).
+func isOpenCodeTool(tool string) bool {
+	switch NormalizeToolName(tool) {
+	case ToolGeminiAPI, ToolCustomOpenCode:
+		return true
+	}
+	return false
+}
 
 // legacyToolNames maps the pre-rename identifiers onto their current
 // equivalents. "custom" and "llama.cpp" were renamed because neither name
@@ -30,9 +49,13 @@ const (
 // Old values are still accepted on the API and migrated on the store's read
 // path (normalizeAgent), so agents created before the rename keep working
 // without a data migration step.
+//
+// "gemini" became "gemini-api" when the Antigravity-backed "gemini-agy"
+// was added, so the bare name could not be mistaken for either.
 var legacyToolNames = map[string]string{
 	"custom":    ToolCustomClaude,
 	"llama.cpp": ToolCustomBare,
+	"gemini":    ToolGeminiAPI,
 }
 
 // NormalizeToolName rewrites a legacy tool identifier to its current name.
@@ -51,7 +74,7 @@ func NormalizeToolName(tool string) string {
 // runtime fallback.
 func ToolRequiresCustomBaseURL(tool string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
+	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:
 		return true
 	default:
 		return false

@@ -205,8 +205,8 @@ describe("toolModels — Opus 5 / effort defaults", () => {
   });
 
   it("gemini lists argon (default) and flash with low/medium/high, default medium", () => {
-    expect(modelsForTool("gemini")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
-    expect(defaultModelForTool("gemini")).toBe("gemini-4-argon");
+    expect(modelsForTool("gemini-api")).toEqual(["gemini-4-argon", "gemini-3.8-flash"]);
+    expect(defaultModelForTool("gemini-api")).toBe("gemini-4-argon");
     for (const m of ["gemini-4-argon", "gemini-3.8-flash"]) {
       expect(effortLevelsForModel(m)).toEqual(["low", "medium", "high"]);
       expect(defaultEffortForModel(m)).toBe("medium");
@@ -255,5 +255,16 @@ describe("toolModels — custom backends", () => {
   it("the pre-rename ids are gone from the table", () => {
     expect(modelsForTool("custom")).toEqual([]);
     expect(modelsForTool("llama.cpp")).toEqual([]);
+  });
+});
+
+describe("gemini-agy", () => {
+  it("offers low/medium/high only for bare family ids", () => {
+    for (const m of ["", "gemini-4-argon", "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5"]) {
+      expect(effortLevelsForModel(m, "gemini-agy")).toEqual(["low", "medium", "high"]);
+    }
+    expect(effortLevelsForModel("gpt-oss-120b-medium", "gemini-agy")).toEqual([]);
+    // the claude backend's ladder is unaffected by the shared id
+    expect(effortLevelsForModel("claude-opus-5-5")).toContain("max");
   });
 });

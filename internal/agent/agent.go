@@ -258,7 +258,7 @@ func ValidModelEffort(model, effort string) bool {
 // assumptions about that built-in model's effort ladder.
 func ValidToolModelEffort(tool, model, effort string) bool {
 	switch NormalizeToolName(tool) {
-	case ToolGemini:
+	case ToolGeminiAPI:
 		// Gemini's thinkingLevel ladder is low/medium/high, and kojo can
 		// only set it (as an OpenCode variant) for the models in
 		// geminiEffortModels (an empty model means GeminiDefaultModel).
@@ -274,7 +274,20 @@ func ValidToolModelEffort(tool, model, effort string) bool {
 			return geminiEffortModels[model] != ""
 		}
 		return false
-	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare:
+	case ToolGeminiAgy:
+		// agy (1.4.8) takes --effort low/medium/high only for the bare
+		// model ids in agyEffortModels.
+		switch effort {
+		case "":
+			return true
+		case "low", "medium", "high":
+			return agyEffortModels[model]
+		}
+		return false
+	case ToolCustomClaude, ToolCustomCodex, ToolCustomBare, ToolCustomOpenCode:
+		// custom-opencode sends no reasoning effort (no variants are
+		// defined); the stored value is accepted on the same ladder so a
+		// tool switch from another custom-* backend does not 400.
 		if !ValidEffort(effort) {
 			return false
 		}
@@ -1037,6 +1050,11 @@ func newAgent(cfg AgentConfig) (*Agent, error) {
 	}
 	if ToolRequiresCustomBaseURL(cfg.Tool) && cfg.CustomBaseURL == "" {
 		return nil, fmt.Errorf("customBaseURL is required for %s tool", cfg.Tool)
+	}
+	if NormalizeToolName(cfg.Tool) == ToolCustomOpenCode {
+		if err := ValidateCustomOpenCodeConfig(cfg.CustomBaseURL, cfg.Model); err != nil {
+			return nil, err
+		}
 	}
 	if !ValidThinkingMode(cfg.ThinkingMode) {
 		return nil, fmt.Errorf("unsupported thinkingMode: %q", cfg.ThinkingMode)

@@ -242,7 +242,7 @@ export function NewSession() {
             )}
 
             {/* Tool selection */}
-            <Field label={t("field.tool")} help={tool === "gemini" ? t("ns.geminiHelp") : undefined}>
+            <Field label={t("field.tool")} help={tool === "gemini-api" ? t("ns.geminiHelp") : tool === "gemini-agy" ? t("ns.geminiAgyHelp") : undefined}>
               <div className="space-y-2">
                 {info &&
                   Object.entries(info.tools ?? {}).map(([name, toolInfo]) => (
@@ -268,7 +268,7 @@ export function NewSession() {
                         className="accent-[color:var(--color-copper)]"
                       />
                       <span className="font-mono text-[14px] text-ink">{name}</span>
-                      {name === "gemini" && (
+                      {name === "gemini-api" && (
                         <span className="text-[11px] text-ink-faint">{t("tool.viaOpenCode")}</span>
                       )}
                       {!toolInfo.available && (
@@ -287,7 +287,7 @@ export function NewSession() {
                   onChange={(e) => {
                     const m = e.target.value;
                     setModel(m);
-                    if (effort && !sessionEffortLevelsForModel(m).includes(effort)) setEffort("");
+                    if (effort && !sessionEffortLevelsForModel(m, tool).includes(effort)) setEffort("");
                   }}
                   mono
                 >
@@ -305,11 +305,11 @@ export function NewSession() {
                 valid ladder is unknowable, so both stay CLI default). May
                 include "ultra" for codex models that advertise it; ultra is
                 intentionally NOT offered in agent settings. */}
-            {model && supportsEffort(tool) && (
+            {model && supportsEffort(tool) && sessionEffortLevelsForModel(model, tool).length > 0 && (
               <Field label={t("field.effort")}>
                 <Select value={effort} onChange={(e) => setEffort(e.target.value)} mono>
                   <option value="">{t("ns.defaultOption")}</option>
-                  {sessionEffortLevelsForModel(model).map((lv) => (
+                  {sessionEffortLevelsForModel(model, tool).map((lv) => (
                     <option key={lv} value={lv}>
                       {lv}
                     </option>
@@ -370,8 +370,11 @@ export function NewSession() {
                     ? t("ns.yoloClaude")
                     : tool === "codex"
                       ? t("ns.yoloCodex")
-                      : tool === "gemini"
+                      : tool === "gemini-api"
                         ? t("ns.yoloGemini")
+
+                        : tool === "gemini-agy"
+                          ? t("ns.yoloClaude")
                         : t("ns.yoloOther")}
                 </div>
               </div>

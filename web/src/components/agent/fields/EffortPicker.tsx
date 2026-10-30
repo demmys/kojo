@@ -26,6 +26,8 @@ export function EffortPicker({
 }) {
   const t = useT();
   if (!supportsEffort(tool)) return null;
+  const levels = effortLevelsForModel(model, tool);
+  if (levels.length === 0) return null;
   return (
     <Field label={t("field.effort")}>
       <Select
@@ -34,10 +36,10 @@ export function EffortPicker({
       >
         <option value="">
           {model
-            ? t("field.effortDefault", { level: defaultEffortForModel(model) })
+            ? t("field.effortDefault", { level: defaultEffortForModel(model, tool) })
             : t("field.effortCliDefault")}
         </option>
-        {effortLevelsForModel(model).map((e) => (
+        {levels.map((e) => (
           <option key={e} value={e}>
             {e}
           </option>

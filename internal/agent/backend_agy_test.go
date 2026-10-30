@@ -323,8 +323,11 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 	if got := readAgyConversationID(dir, ""); got != agyIDA {
 		t.Errorf("conversation ref = %q, want %q", got, agyIDA)
 	}
-	if b, _ := os.ReadFile(agyAgentDefPath(dir)); !strings.Contains(string(b), "SYSTEM PROMPT") {
-		t.Errorf("agent def = %q", b)
+	if b, _ := os.ReadFile(filepath.Join(agyRulesDir(dir), "kojo-system-01.md")); !strings.Contains(string(b), "SYSTEM PROMPT") {
+		t.Errorf("prompt rules = %q", b)
+	}
+	if b, _ := os.ReadFile(agyAgentDefPath(dir)); strings.Contains(string(b), "SYSTEM PROMPT") || !strings.Contains(string(b), "tools:") {
+		t.Errorf("custom agent must carry only static instructions and tool policy: %q", b)
 	}
 	argv, _ := os.ReadFile(argvLog)
 	if strings.Contains(string(argv), "--conversation") || !strings.Contains(string(argv), "--agent\nkojo\n") {
@@ -353,8 +356,11 @@ func TestAgyChat_FakeBinary(t *testing.T) {
 	if err := deleteAgyThreadRefStrict(agent.ID, "ag_agytest:slack:C1:1"); err != nil || agyCanResumeSession(agent.ID, "ag_agytest:slack:C1:1") {
 		t.Errorf("delete keyed ref: err=%v", err)
 	}
-	if n, err := clearAgySessionCounted(agent.ID); err != nil || n != 1 {
-		t.Errorf("clear = %d, %v; want 1 ref removed", n, err)
+	if _, err := clearAgySessionCounted(agent.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAgyConversationID(dir, ""); got != "" {
+		t.Errorf("ref survived reset: %s", got)
 	}
 }
 

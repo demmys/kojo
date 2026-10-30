@@ -311,6 +311,14 @@ func (m *Manager) truncateMemory(agentID string, since time.Time, fromMsgID stri
 		m.logger.Info("truncate: gemini sessions cleared", "agent", agentID, "files", geminiFilesRm)
 	}
 
+	// Agy conversations cannot be cut at a transcript boundary. Drop them
+	// so the next turn bootstraps from the already-truncated kojo history.
+	if files, err := clearAgySessionCounted(agentID); err != nil {
+		return nil, fmt.Errorf("truncate: clear agy sessions (transcript already truncated): %w", err)
+	} else if files > 0 {
+		m.logger.Info("truncate: agy sessions cleared", "agent", agentID, "files", files)
+	}
+
 	// 3. Daily diary (per-day .md files plus their pre-compaction summary
 	//    sections AND the corresponding memory_entries rows). Held under
 	//    memorySyncMu so a concurrent syncMemoryEntriesToDB can't race

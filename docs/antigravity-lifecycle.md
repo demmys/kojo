@@ -6,7 +6,7 @@ upstreamの`gemini-agy`を基準に、旧試験版`exp/antigravity-backend`に�
 ## Prompt
 
 agyのcustom agent本文は会話作成時に固定されるため、毎ターン変わるkojoの指示は`.agents/rules/kojo-system-*.md`（`always_on`）へ出す。
-UTF-8と改行境界を考慮して各ファイルを23KB以下に分割する。古いkojo管理chunkだけを削除し、ユーザー定義ruleは残す。
+UTF-8と改行境界を考慮して各ファイルを23KB以下に分割する。古いkojo管理chunk（`kojo-system-NN.md`）だけを削除し、同じprefixのユーザー定義ruleを含め他は残す。
 custom agentはupstreamのtool whitelistを維持し、本文はrulesを参照する固定文にする。
 MCP設定とrulesは一つのworkspace holdで保持し、別promptのターンに上書きされないようにする。
 

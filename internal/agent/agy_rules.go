@@ -79,3 +79,22 @@ func renderAgyRules(prompt string) map[string]string {
 	}
 	return out
 }
+
+// isAgyManagedRuleName reports whether name is a numbered chunk written
+// by renderAgyRules (kojo-system-NN.md). Other files sharing the prefix
+// are user rules and must survive pruning.
+func isAgyManagedRuleName(name string) bool {
+	if !strings.HasPrefix(name, agyRulesFilePrefix) || !strings.HasSuffix(name, ".md") {
+		return false
+	}
+	num := strings.TrimSuffix(strings.TrimPrefix(name, agyRulesFilePrefix), ".md")
+	if len(num) < 2 {
+		return false
+	}
+	for _, r := range num {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}

@@ -200,7 +200,7 @@ func prepareAgyManagedPaths(dir string, files map[string]string) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, agyRulesFilePrefix) || !strings.HasSuffix(name, ".md") {
+		if !isAgyManagedRuleName(name) {
 			continue
 		}
 		path := filepath.Join(agyRulesDir(dir), name)

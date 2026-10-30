@@ -231,6 +231,11 @@ func TestAgyPromptRulesRefreshAndPruneOnlyManagedFiles(t *testing.T) {
 	if err := os.WriteFile(userRule, []byte("user rule"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Shares the managed prefix but is not a numbered chunk.
+	prefixedUserRule := filepath.Join(agyRulesDir(dir), "kojo-system-local.md")
+	if err := os.WriteFile(prefixedUserRule, []byte("user rule"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	hold := func(prompt string) func() {
 		t.Helper()
 		files := map[string]string{agyAgentDefPath(dir): renderAgyAgentDef(prompt)}
@@ -261,8 +266,10 @@ func TestAgyPromptRulesRefreshAndPruneOnlyManagedFiles(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(agyRulesDir(dir), "kojo-system-01.md")); !os.IsNotExist(err) {
 		t.Fatal("empty prompt retained rules")
 	}
-	if b, err := os.ReadFile(userRule); err != nil || string(b) != "user rule" {
-		t.Fatal("removed unrelated rules")
+	for _, p := range []string{userRule, prefixedUserRule} {
+		if b, err := os.ReadFile(p); err != nil || string(b) != "user rule" {
+			t.Fatalf("removed unrelated rule %s", p)
+		}
 	}
 }
 

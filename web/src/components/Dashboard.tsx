@@ -339,15 +339,30 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
     // Unread counts piggyback on the existing 5s room-list poll (no extra
     // timer). Per-room GET /unread?after=<localStorage lastRead>; failures
     // for one room keep its previous badge.
+    //
+    // The list and the unread fan-out have separate in-flight guards: the
+    // list also carries each thread's busy dot, so one stuck /unread request
+    // must not freeze it.
     let cancelled = false;
-    let inflight = false;
+    let listInflight = false;
+    let unreadInflight = false;
     const loadGroups = async () => {
-      if (inflight) return;
-      inflight = true;
+      if (listInflight) return;
+      listInflight = true;
+      let groups: GroupDMInfo[];
       try {
-        const groups = await groupdmApi.list();
+        groups = await groupdmApi.list();
         if (cancelled) return;
         setGroupDMs(groups);
+      } catch (err) {
+        if (!cancelled) console.error(err);
+        return;
+      } finally {
+        listInflight = false;
+      }
+      if (unreadInflight) return;
+      unreadInflight = true;
+      try {
         const settled = await Promise.allSettled(
           groups.map((g) =>
             groupdmApi.unread(g.id, getLastRead(g.id)).then((u) => [g.id, u] as const),
@@ -363,10 +378,8 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
           }
           return next;
         });
-      } catch (err) {
-        if (!cancelled) console.error(err);
       } finally {
-        inflight = false;
+        unreadInflight = false;
       }
     };
     void loadGroups();
@@ -467,6 +480,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline gap-2">
               <span className="min-w-0 truncate text-[15px] font-semibold text-ink">{g.name}</span>
+              {g.busy && (
+                <span
+                  className="h-2 w-2 shrink-0 animate-lamp-pulse rounded-full bg-copper"
+                  title={t("dash.processing")}
+                  aria-label={t("dash.processing")}
+                />
+              )}
               {unreadBadge(g.id)}
               {open && <RelTime value={g.updatedAt} className="ml-auto" />}
             </div>
@@ -775,13 +795,13 @@ export function Dashboard({ variant = "page" }: DashboardProps) {
                             )}
                             {open && <RelTime value={ts} className="ml-auto" />}
                           </div>
+                          {agent.attention && agent.attentionReason && (
+                            <div className="mt-0.5 line-clamp-3 break-words text-[13px] text-copper" title={agent.attentionReason}>
+                              {agent.attentionReason}
+                            </div>
+                          )}
                           {open && (
                             <>
-                              {agent.attention && agent.attentionReason && (
-                                <div className="mt-0.5 truncate text-[13px] text-copper" title={agent.attentionReason}>
-                                  {agent.attentionReason}
-                                </div>
-                              )}
                               <div className={`mt-0.5 truncate text-[13px] ${errored ? "text-lamp-err/90" : "text-ink-dim"}`}>{preview}</div>
                               <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden">
                                 <Chip className="shrink-0">{agent.tool}</Chip>

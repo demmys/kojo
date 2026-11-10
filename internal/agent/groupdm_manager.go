@@ -216,6 +216,9 @@ type GroupDMManager struct {
 	// they belong to the active turn and must survive in an arrival snapshot.
 	threadQueueMu sync.Mutex
 	threadQueued  map[string]map[string]struct{}
+	// threadFresh marks rooms whose next turn must start a fresh native
+	// session (RewindThread). Persisted in kv; see groupdm_thread_rewind.go.
+	threadFresh threadFreshState
 	// threadSteerMus serializes persist→inject→rollback with arrival snapshot
 	// admission for one thread without blocking unrelated rooms.
 	threadSteerMus keyedMutex
@@ -391,6 +394,22 @@ func (m *GroupDMManager) sealThreadSteer(groupID string) error {
 	}
 	st.SteerSealed = true
 	return nil
+}
+
+// ThreadBusy reports whether groupID has a thread turn running or queued
+// behind one — the room list's busy indicator. threadLive alone would blink
+// off between back-to-back FIFO turns and while a queued human turn waits
+// for its ticket, so pending human-turn tickets (threadQueued) count too.
+func (m *GroupDMManager) ThreadBusy(groupID string) bool {
+	m.threadLiveMu.Lock()
+	_, live := m.threadLive[groupID]
+	m.threadLiveMu.Unlock()
+	if live {
+		return true
+	}
+	m.threadQueueMu.Lock()
+	defer m.threadQueueMu.Unlock()
+	return len(m.threadQueued[groupID]) > 0
 }
 
 func (m *GroupDMManager) ThreadLive(groupID string) (active bool, snapshot ThreadLiveSnapshot) {
@@ -1085,6 +1104,7 @@ func (m *GroupDMManager) Delete(id string, notify bool) error {
 			m.agentMgr.dropKeyedNotesAfterExitNotices(threadAgentID, "groupdm:"+id)
 		}
 		removeClaudeSession(threadAgentID, "groupdm:"+id)
+		m.clearThreadFreshSession(id)
 	}
 
 	m.logger.Info("group DM deleted", "id", id, "notify", notify)
@@ -1808,6 +1828,12 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		m.logger.Debug("thread turn skipped (room archived)", "group", groupID, "agent", agentID)
 		return
 	}
+	// A rewind removed turns the native session still holds: discard it and
+	// let the (rewound) transcript bootstrap a fresh one.
+	rewound := m.threadFreshSessionPending(groupID)
+	if rewound {
+		forceFresh = true
+	}
 
 	// Match the main WebUI chat: an interactive turn has no fixed deadline.
 	// It remains cancellable via StopThreadTurn or room archival.
@@ -1906,6 +1932,9 @@ func (m *GroupDMManager) runThreadTurnPayloadLocked(agentID, groupID, groupName,
 		oneShotOpts.ResponseAttachmentMessageID = replyMessageID
 	}
 	events, err := oneShot(ctx, agentID, payload, oneShotOpts)
+	if err == nil && rewound {
+		m.clearThreadFreshSession(groupID)
+	}
 	if err != nil {
 		if attachmentWatcher != nil {
 			m.agentMgr.deleteIngestedAttachments(attachmentWatcher.StopAndDrain())

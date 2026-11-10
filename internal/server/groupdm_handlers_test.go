@@ -609,6 +609,70 @@ func TestHandleGetGroupDMLive_ActiveSnapshotThenClears(t *testing.T) {
 	t.Fatalf("live snapshot still active after turn completed")
 }
 
+// TestHandleListGroupDMs_ThreadBusy verifies the room list flags a thread
+// room as busy while its turn is in flight (the dashboard's processing dot)
+// and drops the flag once the turn completes; idle rooms omit it.
+func TestHandleListGroupDMs_ThreadBusy(t *testing.T) {
+	srv, gdm, group, _ := newGroupDMHandlerTestServer(t)
+	aliceID := group.Members[0].AgentID
+
+	stub := &liveThreadStub{release: make(chan struct{})}
+	gdm.SetOneShotForTesting(stub.fn)
+
+	thread, err := gdm.CreateThread(aliceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := func() map[string]map[string]any {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/groupdms", nil)
+		rr := httptest.NewRecorder()
+		srv.handleListGroupDMs(rr, authedRequest(req, auth.Principal{Role: auth.RoleOwner}))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var resp struct {
+			Groups []map[string]any `json:"groups"`
+		}
+		readJSONResponse(t, rr, &resp)
+		out := map[string]map[string]any{}
+		for _, g := range resp.Groups {
+			id, _ := g["id"].(string)
+			out[id] = g
+		}
+		return out
+	}
+
+	before := list()
+	if _, has := before[thread.ID]["busy"]; has {
+		t.Fatalf("idle thread should omit busy, got %+v", before[thread.ID])
+	}
+	if before[thread.ID]["name"] == nil || before[thread.ID]["members"] == nil {
+		t.Fatalf("list item lost GroupDM fields: %+v", before[thread.ID])
+	}
+
+	if _, err := gdm.PostUserMessage(context.Background(), thread.ID, "ping", nil, true); err != nil {
+		t.Fatal(err)
+	}
+	waitBusy := func(want bool) {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			got, _ := list()[thread.ID]["busy"].(bool)
+			if got == want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("thread busy never became %v", want)
+	}
+	waitBusy(true)
+	if busy, _ := list()[group.ID]["busy"].(bool); busy {
+		t.Errorf("unrelated group room reported busy")
+	}
+	close(stub.release)
+	waitBusy(false)
+}
+
 // TestHandleCreateThread_RemoteHeldAgent verifies the Hub can open a thread
 // with an agent whose runtime was device-switched to another peer: the agent
 // is gone from the local Manager map but agent_locks names a holder, and the
@@ -649,5 +713,95 @@ func TestHandleCreateThread_RemoteHeldAgent(t *testing.T) {
 	readJSONResponse(t, rr, &th)
 	if th.Kind != agent.GroupDMKindThread || len(th.Members) != 1 || th.Members[0].AgentID != remote.ID || th.Members[0].AgentName != remote.Name {
 		t.Fatalf("thread = %+v", th)
+	}
+}
+
+func rewindGroupMessageRequest(groupID, msgID string, p auth.Principal) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/groupdms/"+groupID+"/messages/"+msgID+"/rewind", nil)
+	req.SetPathValue("id", groupID)
+	req.SetPathValue("msgId", msgID)
+	return authedRequest(req, p)
+}
+
+func TestHandleRewindGroupDMMessage(t *testing.T) {
+	srv, gdm, group, outsider := newGroupDMHandlerTestServer(t)
+	owner := auth.Principal{Role: auth.RoleOwner}
+	gdm.SetOneShotForTesting(func(ctx context.Context, agentID, userMessage string, opts agent.OneShotOpts) (<-chan agent.ChatEvent, error) {
+		ch := make(chan agent.ChatEvent, 1)
+		ch <- agent.ChatEvent{Type: "done", Message: &agent.Message{Content: "ok"}}
+		close(ch)
+		return ch, nil
+	})
+	thread, err := gdm.CreateThread(group.Members[0].AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	waitIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for gdm.ThreadBusy(thread.ID) {
+			if time.Now().After(deadline) {
+				t.Fatal("thread never went idle")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	// Each post gets an "ok" reply, so the room reads one/ok/two/ok/three/ok.
+	var ids []string
+	for _, text := range []string{"one", "two", "three"} {
+		m, err := gdm.PostUserMessage(ctx, thread.ID, text, nil, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, m.ID)
+		waitIdle()
+	}
+
+	rr := httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[1], auth.Principal{Role: auth.RoleAgent, AgentID: outsider.ID}))
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("non-member status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[1], owner))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp agent.ThreadRewindResult
+	readJSONResponse(t, rr, &resp)
+	if resp.MessagesRemoved != 4 {
+		t.Fatalf("messagesRemoved = %d, want 4", resp.MessagesRemoved)
+	}
+	msgs, _, latest, err := gdm.Messages(thread.ID, 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].ID != ids[0] || msgs[1].Content != "ok" || latest != msgs[1].ID {
+		t.Fatalf("after rewind: %d msgs, latest %q", len(msgs), latest)
+	}
+
+	// The removed message is gone now.
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(thread.ID, ids[2], owner))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("removed-message status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	gm, err := gdm.PostUserMessage(ctx, group.ID, "hi", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest(group.ID, gm.ID, owner))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("group-room status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.handleRewindGroupDMMessage(rr, rewindGroupMessageRequest("gd_missing", ids[0], owner))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("missing-group status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 }

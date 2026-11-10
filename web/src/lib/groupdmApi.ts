@@ -69,6 +69,8 @@ export interface GroupDMInfo {
   externalTrust?: ExternalTrust;
   createdAt: string;
   updatedAt: string;
+  /** Thread room with a turn in flight (list endpoint only). */
+  busy?: boolean;
 }
 
 export type ExternalTrust = "untrusted" | "peer";
@@ -248,6 +250,12 @@ export const groupdmApi = {
       `/api/v1/groupdms/${id}/messages?${params}`,
     ).then((r) => ({ messages: r.messages ?? [], hasMore: r.hasMore ?? false }));
   },
+
+  /** Thread rooms only: drop msgId and everything after it. The agent's
+   * next turn starts on a fresh session seeded with the shorter transcript.
+   * 409 while a thread turn is running. */
+  rewindToMessage: (id: string, msgId: string) =>
+    post<{ messagesRemoved: number }>(`/api/v1/groupdms/${id}/messages/${msgId}/rewind`, {}),
 
   postMessage: (groupId: string, agentId: string, content: string) =>
     post<GroupMessage>(`/api/v1/groupdms/${groupId}/messages`, { agentId, content }),

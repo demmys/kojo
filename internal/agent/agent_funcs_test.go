@@ -158,7 +158,7 @@ func TestValidEffort(t *testing.T) {
 
 func TestValidModelEffort(t *testing.T) {
 	// xhigh is valid for opus models, the Fable family, and Sonnet 5.5 / 5
-	for _, m := range []string{"opus", "sonnet", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
+	for _, m := range []string{"opus", "sonnet", "fable", "claude-sonnet-5-5", "claude-sonnet-5", "claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"} {
 		if !ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be valid for %q", m)
 		}
@@ -188,13 +188,22 @@ func TestValidModelEffort(t *testing.T) {
 		t.Errorf("expected xhigh to be invalid for grok-4.5")
 	}
 	// The Fable family supports max effort (Mythos-class, like opus)
-	for _, m := range []string{"claude-fable-5-1", "claude-fable-5"} {
+	for _, m := range []string{"fable", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5"} {
 		if !ValidModelEffort(m, "max") {
 			t.Errorf("expected max to be valid for %q", m)
 		}
 	}
+	// Haiku 5.5 (and the "haiku" alias, which resolves to it) takes the
+	// full ladder.
+	for _, m := range []string{"haiku", "claude-haiku-5-5"} {
+		for _, e := range []string{"xhigh", "max"} {
+			if !ValidModelEffort(m, e) {
+				t.Errorf("expected %s to be valid for %q", e, m)
+			}
+		}
+	}
 	// xhigh is invalid for non-opus/non-codex models
-	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-6", "haiku", ""} {
+	for _, m := range []string{"claude-sonnet-4-6", "claude-opus-4-6", ""} {
 		if ValidModelEffort(m, "xhigh") {
 			t.Errorf("expected xhigh to be invalid for %q", m)
 		}

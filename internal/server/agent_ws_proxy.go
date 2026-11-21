@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -116,7 +118,14 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 	// reject surfaces as a clean HTTP error before the inbound conn is
 	// upgraded), authenticates by Tailnet identity (no Authorization
 	// header), and disables keep-alives per hop. See its doc comment.
-	s.forwardWebSocketToPeer(w, r, peerWSForward{
+	s.forwardWebSocketToPeer(w, r, s.agentWSForward(agentID, targetDeviceID, addr))
+}
+
+// agentWSForward is proxyAgentWebSocket's forwarding policy, split out
+// so tests can drive forwardWebSocketToPeer with it without a peer
+// registry.
+func (s *Server) agentWSForward(agentID, targetDeviceID, addr string) peerWSForward {
+	return peerWSForward{
 		addr:           addr,
 		path:           "/api/v1/agents/" + agentID + "/ws",
 		buildErrPrefix: "build upgrade request: ",
@@ -133,7 +142,39 @@ func (s *Server) proxyAgentWebSocket(w http.ResponseWriter, r *http.Request, age
 			s.logger.Debug("agent ws proxy: closed",
 				"agent", agentID, "target", targetDeviceID)
 		},
-	})
+		// Version handshake belongs to the origin, not the holder.
+		// The UI bundle was served by THIS peer, so the stale-frontend
+		// check (web lib/versionCheck.ts) must compare it against this
+		// peer's version. Forwarding the holder's own "connected" frame
+		// made every agent held by a peer on a different build show a
+		// permanent "new version, reload" banner that reloading could
+		// never clear. Announce our version first, and swallow the
+		// holder's. Holders too old to send the frame are covered too.
+		onAccepted: func(ctx context.Context, client *websocket.Conn) {
+			_ = writeJSON(ctx, client, agentConnectedMsg(s.version))
+		},
+		dropTargetFrame: isAgentConnectedFrame,
+	}
+}
+
+// isAgentConnectedFrame reports whether a holder → UI frame is the
+// agentConnectedMsg handshake. It runs on every streamed frame, so the
+// cheap substring test gates the JSON decode: ordinary frames
+// (deltas, heartbeats, status events) never get parsed. No size cap —
+// the handshake's version string is the holder's to choose, and a
+// leaked oversize handshake would bring the sticky banner back; the
+// conn's read limit already bounds the decode.
+func isAgentConnectedFrame(typ websocket.MessageType, data []byte) bool {
+	if typ != websocket.MessageText {
+		return false
+	}
+	if !bytes.Contains(data, []byte(`"connected"`)) {
+		return false
+	}
+	var head struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(data, &head) == nil && head.Type == "connected"
 }
 
 // fencingAllowsAgentWrite returns true when the local peer is
@@ -167,13 +208,17 @@ func (s *Server) fencingAllowsAgentWrite(ctx context.Context, agentID string) bo
 
 // copyWS forwards frames src → dst until either side returns an
 // error. Preserves the original frame type (binary vs text) so
-// JSON frames the local handler emits round-trip identically.
-func copyWS(ctx context.Context, src, dst *websocket.Conn) {
+// JSON frames the local handler emits round-trip identically. A
+// non-nil drop swallows the frames it returns true for.
+func copyWS(ctx context.Context, src, dst *websocket.Conn, drop func(websocket.MessageType, []byte) bool) {
 	for {
 		typ, data, err := src.Read(ctx)
 		if err != nil {
 			_ = dst.Close(websocket.StatusNormalClosure, "peer closed")
 			return
+		}
+		if drop != nil && drop(typ, data) {
+			continue
 		}
 		if err := dst.Write(ctx, typ, data); err != nil {
 			_ = src.Close(websocket.StatusNormalClosure, "peer closed")

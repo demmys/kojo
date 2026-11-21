@@ -153,6 +153,17 @@ type peerWSForward struct {
 
 	// onClosed runs after both directions finish (per-site debug log).
 	onClosed func()
+
+	// onAccepted, if set, runs once on the freshly accepted inbound (UI)
+	// conn before any target frame is piped, so a frame it writes is
+	// guaranteed to be the first one the client sees. A write error is
+	// the site's to ignore: the pumps notice a dead client on their own.
+	onAccepted func(ctx context.Context, client *websocket.Conn)
+
+	// dropTargetFrame, if set, is consulted for every target → client
+	// frame; returning true swallows the frame instead of forwarding it.
+	// Keep it cheap: it runs on the hot streaming path.
+	dropTargetFrame func(typ websocket.MessageType, data []byte) bool
 }
 
 // forwardWebSocketToPeer dials the target peer's WS endpoint over
@@ -217,10 +228,13 @@ func (s *Server) forwardWebSocketToPeer(w http.ResponseWriter, r *http.Request, 
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	if o.onAccepted != nil {
+		o.onAccepted(ctx, clientConn)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, clientConn, targetConn) }()
-	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn) }()
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, clientConn, targetConn, nil) }()
+	go func() { defer wg.Done(); defer cancel(); copyWS(ctx, targetConn, clientConn, o.dropTargetFrame) }()
 	wg.Wait()
 
 	if o.onClosed != nil {

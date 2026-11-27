@@ -1361,10 +1361,6 @@ func main() {
 	// when an agent was reclaimed (reclaim_notice.go).
 	srv.StartReclaimNoticeLoop(ctx)
 
-	// Periodic GitHub Releases check. Skipped for dev/unparseable
-	// stamps (never auto-notify against a dirty describe), operator
-	// opt-out, or env kill-switch. The checker itself is still on
-	// server.Config so the HTTP endpoints can CheckNow/Apply on demand.
 	// Periodic extension update check (and auto-update for packages
 	// that opted in). Separate kill-switch from the binary check: the
 	// remotes it talks to are the ones the operator installed from.
@@ -1374,6 +1370,10 @@ func main() {
 		srv.StartExtensionUpdateLoop(ctx)
 	}
 
+	// Periodic GitHub Releases check. Skipped for dev/unparseable
+	// stamps (never auto-notify against a dirty describe), operator
+	// opt-out, or env kill-switch. The checker itself is still on
+	// server.Config so the HTTP endpoints can CheckNow/Apply on demand.
 	if *noUpdateCheck || os.Getenv("KOJO_NO_UPDATE_CHECK") == "1" {
 		logger.Info("selfupdate: periodic check disabled by flag or KOJO_NO_UPDATE_CHECK")
 	} else if _, err := selfupdate.ParseVersion(version); err != nil {
@@ -1642,7 +1642,7 @@ func main() {
 
 		// get tailscale addresses for display. Display only — the agent
 		// API base is wired further below to the local auth listener so
-		// system prompts / PreCompact curl examples point Bearer-required.
+		// system prompt curl examples point Bearer-required.
 		fmt.Fprintf(os.Stderr, "\n  kojo v%s running at:\n\n", version)
 		lc, lcErr := tsServer.LocalClient()
 		if lcErr != nil {
@@ -1736,7 +1736,7 @@ func main() {
 		authAddr := authLn.Addr().String()
 		agentAPIBase := "http://" + authAddr
 		agent.SetKojoAPIBase(agentAPIBase)
-		// Group DM / PreCompact / system-prompt curl examples must hit
+		// Group DM / system-prompt curl examples must hit
 		// the auth listener so the agent's Bearer is honored. The
 		// Tailscale listener is for the user UI only.
 		groupDMMgr.SetAPIBase(agentAPIBase)
@@ -1769,7 +1769,9 @@ func main() {
 	// every listener branch so agent.SetKojoAPIBase is already wired
 	// into the system prompt the woken turn will be built with. The
 	// timestamp fences the consumer to pre-boot markers only.
-	go agentMgr.ConsumeRestartWake(version, time.Now())
+	bootTime := time.Now()
+	go agentMgr.ConsumeRestartWake(version, bootTime)
+	go agentMgr.ConsumeModelSwitchWakes(bootTime)
 	go srv.RunNativeGoalRecovery(ctx)
 
 	<-ctx.Done()

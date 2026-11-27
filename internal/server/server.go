@@ -561,6 +561,9 @@ func New(cfg Config) *Server {
 		chunkedAgentSyncs:    make(map[string]*chunkedSyncEntry),
 		chunkedSyncSweepDone: make(chan struct{}),
 	}
+	if s.agents != nil {
+		s.agents.SetModelSwitchContinuer(s.continueThreadAfterModelSwitch)
+	}
 	go s.runChunkedSyncSweeper()
 	// Queue-and-forward: drain anything left queued across a
 	// restart. A holder that was already online when the hub came
@@ -896,6 +899,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/background-stop", s.handleExtensionChatBackgroundStop)
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/background-cancel", s.handleExtensionChatBackgroundCancel)
 	mux.HandleFunc("POST /api/v1/agents/{id}/ext-chat/handoff-ack", s.handleExtensionChatHandoffAck)
+	mux.HandleFunc("GET /api/v1/agents/{id}/model-switch", s.handleGetAgentModelSwitch)
+	mux.HandleFunc("POST /api/v1/agents/{id}/model-switch", s.handleAgentModelSwitch)
 	mux.HandleFunc("GET /api/v1/agents/{id}/ext-chat/events", s.handleExtensionChatEvents)
 	// UI languages contributed by extensions. Separate from
 	// /api/v1/extensions because they are a property of the browser
@@ -1234,9 +1239,12 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tts/audio/{file}", s.handleTTSAudio)
 	mux.HandleFunc("HEAD /api/v1/tts/audio/{file}", s.handleTTSAudio)
 
-	// Speech-to-text: mint a short-lived ephemeral token for the browser
-	// to open the xAI streaming STT WebSocket directly (owner-only).
+	// Speech-to-text: global provider selection (off / xAI / Gemini) and a
+	// short-lived ephemeral token so the browser can open the provider's
+	// streaming STT WebSocket directly (owner-only).
 	mux.HandleFunc("POST /api/v1/stt/token", s.handleSTTToken)
+	mux.HandleFunc("GET /api/v1/stt/config", s.handleGetSTTConfig)
+	mux.HandleFunc("PUT /api/v1/stt/config", s.handleSetSTTConfig)
 
 	// Tasks
 	mux.HandleFunc("GET /api/v1/agents/{id}/tasks", s.handleListTasks)
@@ -1249,9 +1257,6 @@ func (s *Server) registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/background-sessions", s.handleListBackgroundSessions)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}", s.handleStopBackgroundSession)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}/background-sessions/{key}/tasks/{taskId}", s.handleStopBackgroundTask)
-
-	// Pre-compaction summary (called by Claude Code's PreCompact hook)
-	mux.HandleFunc("POST /api/v1/agents/{id}/pre-compact", s.handlePreCompact)
 
 	// Session reset (CLI session only, keeps conversation history)
 	mux.HandleFunc("POST /api/v1/agents/{id}/reset-session", s.handleResetSession)

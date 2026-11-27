@@ -111,15 +111,11 @@ type Manager struct {
 	goalLifecycle atomic.Pointer[context.Context]
 	mu            sync.Mutex
 	agents        map[string]*Agent
-	// diaryReinject marks agents whose next main-chat turn carries the
-	// recent-activity diary even on a resumed session (MarkDiaryReinject).
-	diaryReinject    map[string]uint64
-	diaryReinjectSeq uint64
-	backends         map[string]ChatBackend
-	store            *agentStore
-	creds            *CredentialStore
-	cron             *cronScheduler
-	logger           *slog.Logger
+	backends      map[string]ChatBackend
+	store         *agentStore
+	creds         *CredentialStore
+	cron          *cronScheduler
+	logger        *slog.Logger
 	// fileWatcher reflects agent-CLI disk writes (MEMORY.md, memory/,
 	// persona.md, workspace files) into the DB promptly. nil until
 	// StartFileWatcher runs; guarded by mu.
@@ -188,13 +184,6 @@ type Manager struct {
 	// between the idle observation and the process re-exec.
 	// Guarded by busyMu.
 	quiescing bool
-
-	// summarizing counts in-flight post-turn summarize goroutines
-	// (turnSummarizeAsync). They run AFTER the busy entry clears, so
-	// without this counter a restart's drain would observe idle while
-	// a summarizer is mid-write on recent.md / the cursor file.
-	// Guarded by busyMu.
-	summarizing int
 
 	// notifying counts in-flight unsolicited background-turn goroutines
 	// (handleBackgroundTurn) per agent. An unsolicited turn registers busy
@@ -266,7 +255,15 @@ type Manager struct {
 	// Unlike busy (which allows only one chat per agent), multiple one-shot
 	// chats may run concurrently for the same agent.
 	// Keyed by a unique int64 ID since context.CancelFunc is not comparable.
-	oneShotSeq         int64
+	oneShotSeq int64
+
+	// modelSwitchMu guards modelSwitches, the agent-driven model switch
+	// waiting for its calling turn to end or its first turn to report back.
+	// Lock order: modelSwitchMu before mu/busyMu (SwitchModel calls Update).
+	modelSwitchMu       sync.Mutex
+	modelSwitches       map[string]*pendingModelSwitch
+	modelSwitchContinue func(ctx context.Context, agentID, sessionKey, capability, prompt string) error
+
 	oneShotCancels     map[string]map[int64]context.CancelCauseFunc // agentID → id → cancel
 	oneShotSessions    map[string]map[int64]string                  // agentID → id → SessionKey (restart-wake thread routing)
 	oneShotOrigins     map[string]map[int64]string                  // agentID → id → Hub peer that owns the response surface
@@ -584,7 +581,7 @@ func NewManager(logger *slog.Logger) (*Manager, error) {
 		// v0→v1 external-CLI migration linked the new encoded Claude
 		// project path to the old one. If --clean v0 later removed that
 		// target, repair the surviving dangling link at daemon startup so
-		// autosummary and the first post-restart chat can persist sessions.
+		// the first post-restart chat can persist sessions.
 		// Best-effort: one broken filesystem entry must not prevent every
 		// other agent from loading.
 		if repaired, repairErr := repairDanglingClaudeProjectDir(agentDir(a.ID)); repairErr != nil {
@@ -1734,6 +1731,10 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrAgentNotFound, id)
 	}
+	if cfg.expectModel != nil && modelSwitchTargetOf(a) != *cfg.expectModel {
+		m.mu.Unlock()
+		return nil, errModelSwitchSuperseded
+	}
 
 	// Snapshot the tool BEFORE applying cfg so a tool change
 	// (claude↔grok, claude→custom, etc.) can fire the device-
@@ -1949,6 +1950,9 @@ func (m *Manager) Update(id string, cfg AgentUpdateConfig) (updated *Agent, retE
 	if cfg.DeviceSwitchEnabled != nil || toolChanged {
 		SyncDeviceSwitchSkillForTool(id, cp.Tool, cp.IsDeviceSwitchEnabled(), m.logger)
 	}
+	if toolChanged {
+		SyncModelSwitchSkillForTool(id, cp.Tool, m.logger)
+	}
 
 	// Mid-switch write recorded as a pending hub-local override: the
 	// in-flight switch payload may already have been snapshotted, so
@@ -1997,20 +2001,15 @@ func (m *Manager) HasCredentials() bool {
 // chatPrep holds the common setup result shared by Chat and ChatOneShot.
 //
 // volatileContext is the per-turn block prepended to the user message
-// (current time, active todos, recent diary, query-based memory hits).
+// (current time, active todos, query-based memory hits).
 // It is intentionally NOT folded into sysPrompt: Claude's prompt cache
 // keys on the system prompt prefix, and any per-turn change there
 // invalidates the entire cache and inflates input cost.
 type chatPrep struct {
-	agentCopy           Agent
-	backend             ChatBackend
-	sysPrompt           string
-	volatileContext     string
-	sessionStartContext string
-	// diaryReinjected: volatileContext carries the post-compaction diary of
-	// this MarkDiaryReinject generation; the caller clears it once the
-	// backend accepted the turn.
-	diaryReinjected       uint64
+	agentCopy             Agent
+	backend               ChatBackend
+	sysPrompt             string
+	volatileContext       string
 	freshSessionContext   string
 	recentMessagesContext string
 	history               []HistoryTurn
@@ -2177,10 +2176,10 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		apiBase = m.groupdms.APIBase()
 		groups = m.groupdms.GroupsForAgent(agentID)
 	}
-	// Claude-Code-specific hooks (PreToolUse / PreCompact) — only
-	// claude / custom-claude understand the settings.local.json schema.
+	// Claude-Code-specific hooks (PreToolUse) — only claude /
+	// custom-claude understand the settings.local.json schema.
 	if t := NormalizeToolName(agentCopy.Tool); t == ToolClaude || t == ToolCustomClaude {
-		PrepareClaudeSettings(agentID, apiBase, agentCopy.AllowProtectedPaths, m.logger)
+		PrepareClaudeSettings(agentID, agentCopy.AllowProtectedPaths, m.logger)
 	}
 	// §3.7 device-switch skill. SyncDeviceSwitchSkillForTool
 	// dispatches based on Tool. Every supported tool (claude,
@@ -2193,6 +2192,7 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 	// toggle, and removes any stale SKILL.md when the toggle is
 	// off or the last peer was dropped.
 	SyncDeviceSwitchSkillForTool(agentID, agentCopy.Tool, agentCopy.IsDeviceSwitchEnabled(), m.logger)
+	SyncModelSwitchSkillForTool(agentID, agentCopy.Tool, m.logger)
 	// Older versions also installed kojo-attach as a project skill. A skill
 	// file is shared by every concurrent session in the agent directory, so it
 	// cannot be hidden for Slack without also racing WebUI turns. The system
@@ -2250,21 +2250,6 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		}
 	}
 	volatileContext := m.BuildVolatileContext(ctx, agentID, queryContext)
-	// The diary rides the fresh-session path; after a native compaction the
-	// main session gets it once more inside this turn's <context>.
-	// The generation is read before the summary so a PreCompact landing in
-	// between leaves a newer generation (and summary) for the next turn.
-	var diaryReinjected uint64
-	if opts.mainSession {
-		diaryReinjected = m.diaryReinjectPending(agentID)
-	}
-	sessionStartContext := m.BuildSessionStartContext(agentID)
-	if sessionStartContext == "" {
-		diaryReinjected = 0
-	} else if diaryReinjected != 0 {
-		volatileContext = injectRecentMessagesContext(volatileContext, sessionStartContext)
-		sessionStartContext = ""
-	}
 	freshSessionContext := ""
 	recentMessagesContext := ""
 	if indexNewMessages && !skipMemoryContext && backendNeedsRecentMessagesFallback(backend) &&
@@ -2290,8 +2275,6 @@ func (m *Manager) prepareChat(ctx context.Context, agentID, query string, indexN
 		backend:               backend,
 		sysPrompt:             sysPrompt,
 		volatileContext:       volatileContext,
-		sessionStartContext:   sessionStartContext,
-		diaryReinjected:       diaryReinjected,
 		freshSessionContext:   freshSessionContext,
 		recentMessagesContext: recentMessagesContext,
 		history:               history,
@@ -2329,14 +2312,13 @@ func (m *Manager) resolveTurnEffortAsync(ctx context.Context, agentID, userMessa
 	ch := make(chan turnEffort, 1)
 	go func() {
 		start := time.Now()
-		var diary, jevKey string
-		// Diary/key reads only matter for the LLM path; skip the disk
-		// reads for system turns / disabled agents / other tools.
+		var jevKey string
+		// The key only matters for the LLM path; skip the read for
+		// system turns / disabled agents / other tools.
 		if !systemTurn && snap.IsAutoEffortEnabled() && toolSupportsAutoEffort(snap.Tool) {
-			diary = RecentDiarySummary(agentID)
 			jevKey, _ = LoadTypeSafeAPIKey(m.creds) // "" → claude CLI classifier
 		}
-		eff, src := resolveTurnEffort(ctx, &snap, userMessage, systemTurn, diary, jevKey, m.logger)
+		eff, src := resolveTurnEffort(ctx, &snap, userMessage, systemTurn, jevKey, m.logger)
 		ch <- turnEffort{effort: eff, source: src, elapsed: time.Since(start)}
 	}()
 	return ch
@@ -2535,6 +2517,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	// Slack one-shot) where there is no interactive user waiting on the
 	// previous turn — backends may drop idle-window protections and prefer
 	// aggressive session reset for token conservation.
+	m.bindModelSwitchTurn(agentID, "", 0, effectiveMessage)
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
 		Goal:                  goal,
 		PreserveGoalOnCancel:  func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
@@ -2542,7 +2525,6 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		PromptGeneration:      prep.promptGeneration,
 		AutomatedTrigger:      role == "system" && goal == nil,
 		RetryOverload:         src == BusySourceCron && role == "system" && goal == nil,
-		SessionStartContext:   prep.sessionStartContext,
 		FreshSessionContext:   prep.freshSessionContext,
 		RecentMessagesContext: prep.recentMessagesContext,
 		History:               prep.history,
@@ -2567,6 +2549,7 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		},
 	})
 	if err != nil {
+		m.unbindModelSwitchTurn(agentID, effectiveMessage)
 		// Stopped before the stream started: still the turn the user sent.
 		// Otherwise the turn ended on its own failure (a later Shutdown must
 		// not note it).
@@ -2604,9 +2587,6 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 	}
 
 	m.commitMainStopNote(agentID, stopNoteETag)
-	if prep.diaryReinjected != 0 {
-		m.clearDiaryReinject(agentID, prep.diaryReinjected)
-	}
 
 	// Return a subscriber channel for the immediate caller.
 	// The raw outCh is consumed exclusively by the broadcaster.
@@ -2631,46 +2611,9 @@ func (m *Manager) Chat(ctx context.Context, agentID string, userMessage string, 
 		}
 
 		m.updatePostChatIndex(agentID)
-		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
 	}()
 
 	return callerCh, nil
-}
-
-// turnSummarizeAsync fires the post-turn incremental summarization
-// (TurnSummarize) in the background. Runs OUTSIDE the busy window — the
-// caller invokes it after processChatEvents returns, and the goroutine
-// detaches so clearBusy isn't held up by an LLM call. Best-effort: a
-// failure only defers the summary to the next turn or to the
-// pre-compaction fire, both of which resume from the same cursor.
-//
-// The goroutine is not tracked or cancelled: an agent delete/reset that
-// lands mid-summary can leave one orphan diary/marker write behind. That
-// is the same exposure the externally-triggered PreCompact hook already
-// has, and every write is fail-soft (a stale marker just causes one full
-// re-summary; delete removes the agent dir afterwards anyway). The
-// existence check below closes the common case — the agent was already
-// gone before the summary started.
-func (m *Manager) turnSummarizeAsync(agentID string, tool string) {
-	m.busyMu.Lock()
-	m.summarizing++
-	m.busyMu.Unlock()
-	go func() {
-		defer func() {
-			m.busyMu.Lock()
-			m.summarizing--
-			m.busyMu.Unlock()
-		}()
-		m.mu.Lock()
-		_, ok := m.agents[agentID]
-		m.mu.Unlock()
-		if !ok {
-			return
-		}
-		if err := TurnSummarize(agentID, tool, m.logger); err != nil {
-			m.logger.Warn("post-turn summary failed", "agent", agentID, "err", err)
-		}
-	}()
 }
 
 // OneShotOpts configures a ChatOneShot invocation. All fields are optional;
@@ -2807,6 +2750,14 @@ type HandoffArrivalReservation interface {
 // conversation (e.g. Slack thread) share context. Otherwise the chat runs
 // as a fresh ephemeral session each time, matching the legacy behaviour.
 func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
+	events, err := m.chatOneShot(ctx, agentID, userMessage, opts)
+	if err != nil {
+		m.noteModelSwitchStartFailure(agentID, userMessage, err)
+	}
+	return events, err
+}
+
+func (m *Manager) chatOneShot(ctx context.Context, agentID string, userMessage string, opts OneShotOpts) (<-chan ChatEvent, error) {
 	if opts.SessionKey != "" {
 		unlock := goalAdmissions.Lock(codexThreadRefPath(agentID, opts.SessionKey))
 		defer unlock()
@@ -3005,7 +2956,6 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		PreserveGoalOnCancel: func() bool { return m.IsSwitching(agentID) || m.NativeGoalsShuttingDown() },
 		OneShot:              oneShotMode,
 		MCPServers:           prep.mcpServers,
-		SessionStartContext:  prep.sessionStartContext,
 		SessionKey:           sessionKey,
 		ConversationKey:      opts.SessionKey,
 		// Informational only (already part of prep.sysPrompt): agy keeps
@@ -3069,8 +3019,10 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 		}
 	}
 	questionTurn := m.setupOneShotQuestions(chatCtx, agentID, osID, opts, &chatOpts)
+	m.bindModelSwitchTurn(agentID, opts.SessionKey, osID, effectiveMessage)
 	backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, chatOpts)
 	if err != nil {
+		m.unbindModelSwitchTurn(agentID, effectiveMessage)
 		if !GoalControlOnly(opts.Goal) {
 			// Stopped before the stream started (e.g. waiting for response
 			// headers): the session still holds an unanswered message.
@@ -3127,6 +3079,8 @@ func (m *Manager) ChatOneShot(ctx context.Context, agentID string, userMessage s
 			}()
 		}
 		end := m.processOneShotEvents(chatCtx, agentID, backendCh, outCh, opts.PreserveTerminalOnCancel)
+		// Before outCh closes: the adapter's arrival slot is released then.
+		m.noteModelSwitchTurnEnd(agentID, opts.SessionKey, osID, chatCtx, end, opts.HandoffArrivalReservation)
 		switch {
 		case GoalControlOnly(opts.Goal):
 		case !opts.StopNotedByCaller:
@@ -3996,7 +3950,7 @@ func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 //
 // Claude caveat: this does NOT check sessionResetThresholdTokens. If a
 // long-running thread's JSONL eventually exceeds the reset threshold,
-// sessionFileUsable will summarise + delete it on the next chat and
+// sessionFileUsable will delete it on the next chat and
 // Claude starts a new session with --session-id. CanResumeSession would
 // keep returning true (the file existed at probe time) so the resumed
 // session loses prior Slack context. The head+tail safety net is the
@@ -4004,7 +3958,7 @@ func (m *Manager) resolveBackend(agentCopy *Agent) (ChatBackend, error) {
 // re-injects the opening and most-recent slices of the thread, which
 // re-seeds the new session with enough framing to continue. Replicating
 // sessionFileUsable's token check here would either duplicate its
-// destructive side effects (preReset summary, file removal) or require
+// destructive side effect (file removal) or require
 // splitting it into a read-only probe; we accept that instead.
 func (m *Manager) CanResumeSession(agentID, sessionKey string) bool {
 	if sessionKey == "" {
@@ -4906,7 +4860,6 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 
 		backendCh, err := prep.backend.Chat(chatCtx, &prep.agentCopy, effectiveMessage, prep.sysPrompt, ChatOptions{
 			PromptGeneration:    prep.promptGeneration,
-			SessionStartContext: prep.sessionStartContext,
 			FreshSessionContext: prep.freshSessionContext,
 			// Session-less backends replay the transcript; here it has
 			// to stop short of the message being re-run, which travels
@@ -4972,14 +4925,10 @@ func (m *Manager) Regenerate(ctx context.Context, agentID, msgID, ifMatchETag st
 			return
 		}
 		m.commitMainStopNote(agentID, stopNoteETag)
-		if prep.diaryReinjected != 0 {
-			m.clearDiaryReinject(agentID, prep.diaryReinjected)
-		}
 		end := m.processChatEvents(chatCtx, agentID, backendCh, outCh)
 		m.markMainTurnEnded(agentID)
 		m.recordMainTurnStop(agentID, chatCtx, end)
 		m.updatePostChatIndex(agentID)
-		m.turnSummarizeAsync(agentID, prep.agentCopy.Tool)
 	}()
 	return nil
 }

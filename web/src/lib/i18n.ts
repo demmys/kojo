@@ -432,9 +432,9 @@ const messages = {
     ja: "このエージェントのキューが満杯 (最大100件) — キューを1件取り消すか、端末の復帰を待って。",
     en: "Queue is full for this agent (100 messages max) — cancel a queued message or wait for the device to reconnect.",
   },
-  "chat.xaiKeyMissing": {
-    ja: "xAI API キーが未設定。設定画面で登録して。",
-    en: "xAI API key is not set. Register it in Settings.",
+  "chat.sttKeyMissing": {
+    ja: "音声入力の API キーが未設定。設定画面で登録して。",
+    en: "No API key for voice input. Register one in Settings.",
   },
   "chat.holderPeerOffline": {
     ja: "ホストピアがオフライン",
@@ -521,11 +521,6 @@ const messages = {
     ja: "エージェントのステータスブロック",
     en: "Agent status block",
   },
-  "settings.inj.diary_notes.label": { ja: "日誌ノート", en: "Diary Notes" },
-  "settings.inj.diary_notes.desc": {
-    ja: "最近の活動日誌 (セッション開始時・圧縮直後のみ)",
-    en: "Recent activity diary (session start and right after compaction only)",
-  },
   "settings.inj.memory_search.label": { ja: "メモリ検索", en: "Memory Search" },
   "settings.inj.memory_search.desc": {
     ja: "メモリ検索結果 (毎ターン)",
@@ -558,6 +553,14 @@ const messages = {
   "settings.inj.call_user.desc": {
     ja: "待機せずに操作者を呼ぶ API の手順 (一覧を強調表示)",
     en: "How to page the operator without waiting (highlights the row)",
+  },
+  "settings.inj.model_switch_info.label": {
+    ja: "モデル切替情報",
+    en: "Model Switch Info",
+  },
+  "settings.inj.model_switch_info.desc": {
+    ja: "自己モデル切替後の自動ターンにモデル名とエフォートを含める",
+    en: "Model names and effort in the auto turn after a self model switch",
   },
 
   // ── AgentSettings: card titles / descriptions ──
@@ -1035,6 +1038,21 @@ const messages = {
     en: "This video format cannot be played in the browser.",
   },
   "media.download": { ja: "ダウンロード", en: "Download" },
+  "textPreview.raw": { ja: "ソース", en: "Raw" },
+  "textPreview.rendered": { ja: "表示", en: "Rendered" },
+  "textPreview.binary": {
+    ja: "テキストとして表示できない。ダウンロードして開いて。",
+    en: "This file can't be shown as text. Download it instead.",
+  },
+  "textPreview.loadFailed": { ja: "読み込みに失敗した: {error}", en: "Failed to load: {error}" },
+  "textPreview.truncated": {
+    ja: "先頭 {size} だけ表示してる。全文はダウンロードして。",
+    en: "Showing the first {size} only. Download for the full file.",
+  },
+  "textPreview.tableTruncated": {
+    ja: "表が大きすぎるから一部だけ表示してる。全体はソース表示かダウンロードで。",
+    en: "Table is too large; showing part of it. Use Raw or download for the rest.",
+  },
 
   // ── StreamingMessage / ChatMessage ──
   "stream.thinking": { ja: "思考中…", en: "Thinking…" },
@@ -1197,6 +1215,10 @@ const messages = {
   "attach.imageUnavailable": {
     ja: "画像を取得できない",
     en: "image unavailable",
+  },
+  "attach.previewTitle": {
+    ja: "{name} をプレビュー",
+    en: "Preview {name}",
   },
   "attach.downloadTitle": {
     ja: "{name} をダウンロード",
@@ -1578,6 +1600,13 @@ const messages = {
   "gs.restore": { ja: "復元", en: "Restore" },
   "gs.chat": { ja: "チャット", en: "Chat" },
   "gs.sendWithEnter": { ja: "Enter で送信", en: "Send with Enter" },
+  "gs.voiceInput": { ja: "音声入力", en: "Voice input" },
+  "gs.voiceInputHelp": {
+    ja: "チャットのマイク入力に使う文字起こし API。無効にするとマイクボタンを表示しない。API キーを登録したものだけ選べる。",
+    en: "Speech-to-text API for the chat mic. Off hides the mic button. Only providers with an API key can be selected.",
+  },
+  "gs.voiceInputOff": { ja: "無効", en: "Off" },
+  "gs.voiceInputNoKey": { ja: "{name} (API キー未設定)", en: "{name} (no API key)" },
   "gs.enterSendsHelp": {
     ja: "Enter で送信、Shift+Enter で改行",
     en: "Enter to send, Shift+Enter for newline",
